@@ -1,8 +1,11 @@
+import asyncio
+import json
+import os
 import random
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -10,6 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.auth import get_current_user
 from app.database import get_db
 from app.models import Job, Segment, User, Video
+from app.s3 import upload_bytes
 from app.schemas.jobs import JobCreate, JobDetailResponse, JobResponse, JobUpdate
 
 router = APIRouter()
@@ -17,10 +21,17 @@ router = APIRouter()
 
 @router.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
-    body: JobCreate,
+    data: str = Form(...),
+    starting_image: UploadFile | None = File(None),
+    faceswap_image: UploadFile | None = File(None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    try:
+        body = JobCreate.model_validate_json(data)
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid JSON in data field: {e}")
+
     seed = body.seed if body.seed is not None else random.randint(0, 2**63 - 1)
     job = Job(
         user_id=user.id,
@@ -29,10 +40,25 @@ async def create_job(
         height=body.height,
         fps=body.fps,
         seed=seed,
-        starting_image=body.starting_image,
     )
     db.add(job)
-    await db.flush()
+    await db.flush()  # Get job.id
+
+    # Upload starting image to S3 if provided
+    if starting_image is not None:
+        image_data = await starting_image.read()
+        ext = os.path.splitext(starting_image.filename or "image.png")[1] or ".png"
+        key = f"{job.id}/starting_image{ext}"
+        uri = await asyncio.to_thread(upload_bytes, image_data, key)
+        job.starting_image = uri
+
+    # Upload faceswap image to S3 if provided
+    faceswap_uri = None
+    if faceswap_image is not None:
+        fs_data = await faceswap_image.read()
+        ext = os.path.splitext(faceswap_image.filename or "face.png")[1] or ".png"
+        key = f"{job.id}/faceswap_source{ext}"
+        faceswap_uri = await asyncio.to_thread(upload_bytes, fs_data, key)
 
     seg = body.first_segment
     segment = Segment(
@@ -45,7 +71,7 @@ async def create_job(
         faceswap_enabled=seg.faceswap_enabled,
         faceswap_method=seg.faceswap_method,
         faceswap_source_type=seg.faceswap_source_type,
-        faceswap_image=seg.faceswap_image,
+        faceswap_image=faceswap_uri if faceswap_uri else seg.faceswap_image,
         faceswap_faces_order=seg.faceswap_faces_order,
         faceswap_faces_index=seg.faceswap_faces_index,
         auto_finalize=seg.auto_finalize,

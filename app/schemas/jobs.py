@@ -14,7 +14,6 @@ class JobCreate(BaseModel):
     height: int
     fps: int
     seed: Optional[int] = None
-    starting_image: Optional[str] = None
     first_segment: SegmentCreate
 
 
