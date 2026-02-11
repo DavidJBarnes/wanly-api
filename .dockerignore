@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+!.env.example
+__pycache__
+*.pyc
+.venv
+.pytest_cache
+LICENSE
+README.md
+.github
+.gitignore
