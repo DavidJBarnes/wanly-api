@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import tempfile
 from uuid import UUID
 
 import httpx
@@ -13,7 +14,7 @@ from app.auth import get_current_user
 from app.config import settings
 from app.database import get_db
 from app.models import Lora, User
-from app.s3 import delete_prefix, upload_bytes
+from app.s3 import delete_prefix, upload_bytes, upload_file
 from app.schemas.loras import LoraCreate, LoraListItem, LoraResponse, LoraUpdate
 
 logger = logging.getLogger(__name__)
@@ -52,14 +53,27 @@ def _civitai_auth_url(url: str) -> str:
     return f"{url}{sep}token={token}"
 
 
-async def _download_url(url: str) -> tuple[bytes, str]:
-    """Download a file from a URL. Returns (data, filename)."""
+async def _download_to_temp(url: str) -> tuple[str, str]:
+    """Stream-download a file from a URL to a temp file. Returns (temp_path, filename).
+
+    Streams in chunks to avoid loading the entire file into memory (critical
+    for the t3.micro with 1GB RAM handling 50-500MB .safetensors files).
+    """
     download_url = _civitai_auth_url(url)
     async with httpx.AsyncClient(follow_redirects=True, timeout=600) as client:
-        resp = await client.get(download_url)
-        resp.raise_for_status()
-        filename = _filename_from_response(resp, url)
-        return resp.content, filename
+        async with client.stream("GET", download_url) as resp:
+            resp.raise_for_status()
+            filename = _filename_from_response(resp, url)
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors")
+            try:
+                async for chunk in resp.aiter_bytes(chunk_size=8 * 1024 * 1024):
+                    tmp.write(chunk)
+                tmp.close()
+                return tmp.name, filename
+            except Exception:
+                tmp.close()
+                os.unlink(tmp.name)
+                raise
 
 
 def _parse_civitai_model_id(url: str) -> int | None:
@@ -154,12 +168,13 @@ async def create_lora(
 
     prefix = f"loras/{lora.id}"
 
-    # Download high-noise file
+    # Download high-noise file (streamed to temp file to avoid OOM)
     if body.high_url:
+        tmp_path = None
         try:
-            data, filename = await _download_url(body.high_url)
+            tmp_path, filename = await _download_to_temp(body.high_url)
             key = f"{prefix}/{filename}"
-            uri = await asyncio.to_thread(upload_bytes, data, key)
+            uri = await asyncio.to_thread(upload_file, tmp_path, key)
             lora.high_file = filename
             lora.high_s3_uri = uri
         except Exception:
@@ -168,13 +183,17 @@ async def create_lora(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Failed to download high-noise file from {body.high_url}",
             )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
-    # Download low-noise file
+    # Download low-noise file (streamed to temp file to avoid OOM)
     if body.low_url:
+        tmp_path = None
         try:
-            data, filename = await _download_url(body.low_url)
+            tmp_path, filename = await _download_to_temp(body.low_url)
             key = f"{prefix}/{filename}"
-            uri = await asyncio.to_thread(upload_bytes, data, key)
+            uri = await asyncio.to_thread(upload_file, tmp_path, key)
             lora.low_file = filename
             lora.low_s3_uri = uri
         except Exception:
@@ -183,6 +202,9 @@ async def create_lora(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Failed to download low-noise file from {body.low_url}",
             )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
 
     # Auto-fetch CivitAI preview
     if body.source_url and _parse_civitai_model_id(body.source_url):
@@ -230,20 +252,36 @@ async def upload_lora(
     prefix = f"loras/{lora.id}"
 
     if high_file is not None:
-        file_data = await high_file.read()
-        filename = high_file.filename or "high.safetensors"
-        key = f"{prefix}/{filename}"
-        uri = await asyncio.to_thread(upload_bytes, file_data, key)
-        lora.high_file = filename
-        lora.high_s3_uri = uri
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            while chunk := await high_file.read(8 * 1024 * 1024):
+                tmp.write(chunk)
+            tmp.close()
+            filename = high_file.filename or "high.safetensors"
+            key = f"{prefix}/{filename}"
+            uri = await asyncio.to_thread(upload_file, tmp.name, key)
+            lora.high_file = filename
+            lora.high_s3_uri = uri
+        finally:
+            tmp.close()
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
 
     if low_file is not None:
-        file_data = await low_file.read()
-        filename = low_file.filename or "low.safetensors"
-        key = f"{prefix}/{filename}"
-        uri = await asyncio.to_thread(upload_bytes, file_data, key)
-        lora.low_file = filename
-        lora.low_s3_uri = uri
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        try:
+            while chunk := await low_file.read(8 * 1024 * 1024):
+                tmp.write(chunk)
+            tmp.close()
+            filename = low_file.filename or "low.safetensors"
+            key = f"{prefix}/{filename}"
+            uri = await asyncio.to_thread(upload_file, tmp.name, key)
+            lora.low_file = filename
+            lora.low_s3_uri = uri
+        finally:
+            tmp.close()
+            if os.path.exists(tmp.name):
+                os.unlink(tmp.name)
 
     if preview_image is not None:
         img_data = await preview_image.read()

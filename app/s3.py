@@ -25,6 +25,15 @@ def upload_bytes(data: bytes, key: str) -> str:
     return uri
 
 
+def upload_file(path: str, key: str) -> str:
+    """Upload a local file to S3 using multipart. Returns the S3 URI."""
+    client = _get_client()
+    client.upload_file(path, settings.s3_bucket, key)
+    uri = f"s3://{settings.s3_bucket}/{key}"
+    logger.info("Uploaded file %s to %s", path, uri)
+    return uri
+
+
 def download_bytes(uri: str) -> bytes:
     """Download bytes from an S3 URI (s3://bucket/key)."""
     parts = uri.replace("s3://", "").split("/", 1)
