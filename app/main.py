@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.routes import auth, files, jobs, segments
+from app.routes import auth, files, jobs, loras, segments
 
 app = FastAPI(title="wanly-api")
 
@@ -17,3 +17,4 @@ app.include_router(auth.router)
 app.include_router(jobs.router)
 app.include_router(segments.router)
 app.include_router(files.router)
+app.include_router(loras.router)

@@ -12,7 +12,8 @@ from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user
 from app.database import get_db
-from app.models import Job, Segment, User, Video
+from app.models import Job, Lora, Segment, User, Video
+from app.routes.segments import _resolve_loras
 from app.s3 import upload_bytes
 from app.schemas.jobs import JobCreate, JobDetailResponse, JobResponse, JobUpdate
 
@@ -61,13 +62,14 @@ async def create_job(
         faceswap_uri = await asyncio.to_thread(upload_bytes, fs_data, key)
 
     seg = body.first_segment
+    resolved_loras = await _resolve_loras(db, seg.loras)
     segment = Segment(
         job_id=job.id,
         index=0,
         prompt=seg.prompt,
         duration_seconds=seg.duration_seconds,
         start_image=seg.start_image,
-        loras=seg.loras,
+        loras=resolved_loras,
         faceswap_enabled=seg.faceswap_enabled,
         faceswap_method=seg.faceswap_method,
         faceswap_source_type=seg.faceswap_source_type,

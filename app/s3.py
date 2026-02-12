@@ -34,6 +34,19 @@ def download_bytes(uri: str) -> bytes:
     return resp["Body"].read()
 
 
+def delete_prefix(prefix: str) -> int:
+    """Delete all objects under a prefix. Returns count of deleted objects."""
+    client = _get_client()
+    resp = client.list_objects_v2(Bucket=settings.s3_bucket, Prefix=prefix)
+    objects = resp.get("Contents", [])
+    if not objects:
+        return 0
+    delete_keys = [{"Key": obj["Key"]} for obj in objects]
+    client.delete_objects(Bucket=settings.s3_bucket, Delete={"Objects": delete_keys})
+    logger.info("Deleted %d objects under %s", len(delete_keys), prefix)
+    return len(delete_keys)
+
+
 def parse_s3_uri(uri: str) -> tuple[str, str]:
     """Parse s3://bucket/key into (bucket, key)."""
     parts = uri.replace("s3://", "").split("/", 1)

@@ -94,3 +94,23 @@ class Video(Base):
     completed_at = mapped_column(DateTime(timezone=True), nullable=True)
 
     job = relationship("Job", back_populates="videos")
+
+
+class Lora(Base):
+    __tablename__ = "loras"
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = mapped_column(String(255), nullable=False)
+    description = mapped_column(Text, nullable=True)
+    trigger_words = mapped_column(Text, nullable=True)
+    default_prompt = mapped_column(Text, nullable=True)
+    source_url = mapped_column(Text, nullable=True)
+    preview_image = mapped_column(Text, nullable=True)
+    high_file = mapped_column(String(255), nullable=True)
+    high_s3_uri = mapped_column(Text, nullable=True)
+    low_file = mapped_column(String(255), nullable=True)
+    low_s3_uri = mapped_column(Text, nullable=True)
+    default_high_weight = mapped_column(Float, nullable=False, default=1.0)
+    default_low_weight = mapped_column(Float, nullable=False, default=1.0)
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

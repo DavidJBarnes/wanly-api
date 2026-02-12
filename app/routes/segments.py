@@ -8,10 +8,42 @@ from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user
 from app.database import get_db
-from app.models import Job, Segment, User, Video
+from app.models import Job, Lora, Segment, User, Video
 from app.schemas.segments import SegmentClaimResponse, SegmentCreate, SegmentResponse, SegmentStatusUpdate
 
 router = APIRouter()
+
+
+async def _resolve_loras(db: AsyncSession, loras_input: list | None) -> list | None:
+    """Resolve lora_id references to full file info for daemon consumption."""
+    if not loras_input:
+        return loras_input
+    resolved = []
+    for item in loras_input:
+        if not isinstance(item, dict):
+            resolved.append(item)
+            continue
+        lora_id = item.get("lora_id")
+        if lora_id:
+            lora = await db.get(Lora, UUID(lora_id))
+            if lora is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"LoRA not found: {lora_id}",
+                )
+            resolved.append({
+                "lora_id": str(lora.id),
+                "high_file": lora.high_file,
+                "high_s3_uri": lora.high_s3_uri,
+                "high_weight": item.get("high_weight", lora.default_high_weight),
+                "low_file": lora.low_file,
+                "low_s3_uri": lora.low_s3_uri,
+                "low_weight": item.get("low_weight", lora.default_low_weight),
+            })
+        else:
+            # Backward compat: raw filename format
+            resolved.append(item)
+    return resolved
 
 
 @router.post("/jobs/{job_id}/segments", response_model=SegmentResponse, status_code=status.HTTP_201_CREATED)
@@ -37,13 +69,15 @@ async def add_segment(
 
     next_index = max((s.index for s in job.segments), default=-1) + 1
 
+    resolved_loras = await _resolve_loras(db, body.loras)
+
     segment = Segment(
         job_id=job.id,
         index=next_index,
         prompt=body.prompt,
         duration_seconds=body.duration_seconds,
         start_image=body.start_image,
-        loras=body.loras,
+        loras=resolved_loras,
         faceswap_enabled=body.faceswap_enabled,
         faceswap_method=body.faceswap_method,
         faceswap_source_type=body.faceswap_source_type,
