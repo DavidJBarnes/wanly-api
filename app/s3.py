@@ -56,6 +56,14 @@ def delete_prefix(prefix: str, bucket: str) -> int:
     return len(delete_keys)
 
 
+def delete_object(uri: str) -> None:
+    """Delete a single object by S3 URI."""
+    bucket, key = parse_s3_uri(uri)
+    client = _get_client()
+    client.delete_object(Bucket=bucket, Key=key)
+    logger.info("Deleted %s/%s", bucket, key)
+
+
 def parse_s3_uri(uri: str) -> tuple[str, str]:
     """Parse s3://bucket/key into (bucket, key)."""
     parts = uri.replace("s3://", "").split("/", 1)

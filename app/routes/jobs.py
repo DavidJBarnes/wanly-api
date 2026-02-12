@@ -159,6 +159,7 @@ async def update_job(
             "pending": {"paused"},
             "processing": {"paused"},
             "awaiting": {"paused", "finalized"},
+            "failed": {"paused"},
             "paused": {"pending", "processing", "awaiting"},
         }
         allowed = valid_transitions.get(job.status, set())

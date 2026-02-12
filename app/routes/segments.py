@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -10,6 +11,7 @@ from sqlalchemy.orm import selectinload
 from app.auth import get_current_user
 from app.database import get_db
 from app.models import Job, Lora, Segment, User, Video
+from app.s3 import delete_object
 from app.schemas.segments import SegmentClaimResponse, SegmentCreate, SegmentResponse, SegmentStatusUpdate
 
 logger = logging.getLogger(__name__)
@@ -64,10 +66,10 @@ async def add_segment(
     job = result.scalar_one_or_none()
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    if job.status != "awaiting":
+    if job.status not in ("awaiting", "failed"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Job must be in 'awaiting' status to add segments (current: '{job.status}')",
+            detail=f"Job must be in 'awaiting' or 'failed' status to add segments (current: '{job.status}')",
         )
 
     next_index = max((s.index for s in job.segments), default=-1) + 1
@@ -220,9 +222,108 @@ async def update_segment(
                 job.status = "finalized"
                 video = Video(job_id=job.id, status="pending")
                 db.add(video)
+            elif body.status == "failed":
+                job.status = "failed"
             else:
                 job.status = "awaiting"
 
     await db.commit()
     await db.refresh(segment)
     return segment
+
+
+@router.post("/segments/{segment_id}/retry", response_model=SegmentResponse)
+async def retry_segment(
+    segment_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+    if segment.status != "failed":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only failed segments can be retried (current: '{segment.status}')",
+        )
+
+    segment.status = "pending"
+    segment.worker_id = None
+    segment.worker_name = None
+    segment.claimed_at = None
+    segment.completed_at = None
+    segment.error_message = None
+    segment.progress_log = None
+
+    job = await db.get(Job, segment.job_id)
+    job.status = "processing"
+
+    await db.commit()
+    await db.refresh(segment)
+    return segment
+
+
+@router.delete("/segments/{segment_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_segment(
+    segment_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+        .options(selectinload(Segment.job))
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+    if segment.status not in ("failed", "completed"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only failed or completed segments can be deleted (current: '{segment.status}')",
+        )
+
+    # Cannot delete the only segment
+    job = await db.get(Job, segment.job_id)
+    all_segs_result = await db.execute(
+        select(Segment).where(Segment.job_id == job.id).order_by(Segment.index)
+    )
+    all_segs = all_segs_result.scalars().all()
+    if len(all_segs) <= 1:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot delete the only segment in a job",
+        )
+
+    # S3 cleanup
+    for path in [segment.output_path, segment.last_frame_path]:
+        if path:
+            try:
+                await asyncio.to_thread(delete_object, path)
+            except Exception:
+                logger.warning("Failed to delete S3 object: %s", path)
+
+    await db.delete(segment)
+    await db.flush()
+
+    # Re-index remaining segments
+    remaining_result = await db.execute(
+        select(Segment).where(Segment.job_id == job.id).order_by(Segment.index)
+    )
+    for i, seg in enumerate(remaining_result.scalars().all()):
+        seg.index = i
+
+    # Update job status if needed
+    has_failed = await db.execute(
+        select(Segment).where(Segment.job_id == job.id, Segment.status == "failed")
+    )
+    if job.status == "failed" and has_failed.scalar_one_or_none() is None:
+        job.status = "awaiting"
+
+    await db.commit()
