@@ -44,3 +44,19 @@ class JobDetailResponse(JobResponse):
 class JobUpdate(BaseModel):
     name: Optional[str] = None
     status: Optional[str] = None
+
+
+class WorkerStatsItem(BaseModel):
+    worker_name: str
+    segments_completed: int
+    avg_run_time: float
+    last_seen: Optional[datetime] = None
+
+
+class StatsResponse(BaseModel):
+    jobs_by_status: dict[str, int]
+    segments_by_status: dict[str, int]
+    avg_segment_run_time: Optional[float]
+    total_segments_completed: int
+    total_video_time: float
+    worker_stats: list[WorkerStatsItem]

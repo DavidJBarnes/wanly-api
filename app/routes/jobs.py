@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -16,7 +16,7 @@ from app.models import Job, Lora, Segment, User, Video
 from app.routes.segments import _resolve_loras
 from app.config import settings
 from app.s3 import upload_bytes
-from app.schemas.jobs import JobCreate, JobDetailResponse, JobResponse, JobUpdate
+from app.schemas.jobs import JobCreate, JobDetailResponse, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
 
 router = APIRouter()
 
@@ -175,3 +175,89 @@ async def update_job(
     await db.commit()
     await db.refresh(job)
     return job
+
+
+@router.get("/stats", response_model=StatsResponse)
+async def get_stats(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    # Jobs grouped by status
+    job_rows = (
+        await db.execute(
+            select(Job.status, func.count())
+            .where(Job.user_id == user.id)
+            .group_by(Job.status)
+        )
+    ).all()
+    jobs_by_status = {row[0]: row[1] for row in job_rows}
+
+    # Segments grouped by status (join through jobs for user scoping)
+    seg_rows = (
+        await db.execute(
+            select(Segment.status, func.count())
+            .join(Job, Segment.job_id == Job.id)
+            .where(Job.user_id == user.id)
+            .group_by(Segment.status)
+        )
+    ).all()
+    segments_by_status = {row[0]: row[1] for row in seg_rows}
+
+    # Avg run time and totals for completed segments
+    agg = (
+        await db.execute(
+            select(
+                func.avg(
+                    func.extract("epoch", Segment.completed_at)
+                    - func.extract("epoch", Segment.claimed_at)
+                ),
+                func.count(),
+                func.coalesce(func.sum(Segment.duration_seconds), 0),
+            )
+            .join(Job, Segment.job_id == Job.id)
+            .where(Job.user_id == user.id, Segment.status == "completed")
+        )
+    ).one()
+    avg_run_time = round(agg[0], 1) if agg[0] is not None else None
+    total_completed = agg[1]
+    total_video_time = float(agg[2])
+
+    # Worker stats
+    worker_rows = (
+        await db.execute(
+            select(
+                Segment.worker_name,
+                func.count(),
+                func.avg(
+                    func.extract("epoch", Segment.completed_at)
+                    - func.extract("epoch", Segment.claimed_at)
+                ),
+                func.max(Segment.completed_at),
+            )
+            .join(Job, Segment.job_id == Job.id)
+            .where(
+                Job.user_id == user.id,
+                Segment.status == "completed",
+                Segment.worker_name.isnot(None),
+            )
+            .group_by(Segment.worker_name)
+        )
+    ).all()
+    worker_stats = [
+        WorkerStatsItem(
+            worker_name=row[0],
+            segments_completed=row[1],
+            avg_run_time=round(row[2], 1) if row[2] else 0,
+            last_seen=row[3],
+        )
+        for row in worker_rows
+    ]
+
+    return StatsResponse(
+        jobs_by_status=jobs_by_status,
+        segments_by_status=segments_by_status,
+        avg_segment_run_time=avg_run_time,
+        total_segments_completed=total_completed,
+        total_video_time=total_video_time,
+        worker_stats=worker_stats,
+    )
