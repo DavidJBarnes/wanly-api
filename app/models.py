@@ -75,6 +75,7 @@ class Segment(Base):
     claimed_at = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at = mapped_column(DateTime(timezone=True), nullable=True)
     error_message = mapped_column(Text, nullable=True)
+    progress_log = mapped_column(Text, nullable=True)
 
     job = relationship("Job", back_populates="segments")
 

@@ -116,6 +116,7 @@ async def claim_next_segment(
         stale.status = "pending"
         stale.worker_id = None
         stale.claimed_at = None
+        stale.progress_log = None
 
     result = await db.execute(
         select(Segment)
@@ -196,6 +197,8 @@ async def update_segment(
         segment.last_frame_path = body.last_frame_path
     if body.error_message is not None:
         segment.error_message = body.error_message
+    if body.progress_log is not None:
+        segment.progress_log = body.progress_log
 
     await db.flush()
 

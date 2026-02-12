@@ -42,6 +42,7 @@ class SegmentResponse(BaseModel):
     claimed_at: Optional[datetime]
     completed_at: Optional[datetime]
     error_message: Optional[str]
+    progress_log: Optional[str]
 
     model_config = {"from_attributes": True}
 
@@ -73,3 +74,4 @@ class SegmentStatusUpdate(BaseModel):
     output_path: Optional[str] = None
     last_frame_path: Optional[str] = None
     error_message: Optional[str] = None
+    progress_log: Optional[str] = None
