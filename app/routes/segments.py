@@ -101,6 +101,7 @@ async def add_segment(
 @router.get("/segments/next")
 async def claim_next_segment(
     worker_id: UUID = Query(...),
+    worker_name: str = Query(None),
     db: AsyncSession = Depends(get_db),
 ):
     # Reset stale segments: claimed/processing for > 30 minutes with no completion
@@ -115,6 +116,7 @@ async def claim_next_segment(
         logger.warning("Resetting stale segment %s (status=%s, claimed_at=%s)", stale.id, stale.status, stale.claimed_at)
         stale.status = "pending"
         stale.worker_id = None
+        stale.worker_name = None
         stale.claimed_at = None
         stale.progress_log = None
 
@@ -133,6 +135,7 @@ async def claim_next_segment(
     now = datetime.now(timezone.utc)
     segment.status = "claimed"
     segment.worker_id = worker_id
+    segment.worker_name = worker_name
     segment.claimed_at = now
 
     job = await db.get(Job, segment.job_id)
@@ -189,7 +192,7 @@ async def update_segment(
 
     if body.status is not None:
         segment.status = body.status
-        if body.status in ("completed", "failed"):
+        if body.status in ("completed", "failed") and segment.completed_at is None:
             segment.completed_at = datetime.now(timezone.utc)
     if body.output_path is not None:
         segment.output_path = body.output_path

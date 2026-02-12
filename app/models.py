@@ -69,6 +69,7 @@ class Segment(Base):
     auto_finalize = mapped_column(Boolean, nullable=False, default=False)
     status = mapped_column(String(20), nullable=False, default="pending")
     worker_id = mapped_column(UUID(as_uuid=True), nullable=True)
+    worker_name = mapped_column(String(255), nullable=True)
     output_path = mapped_column(Text, nullable=True)
     last_frame_path = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

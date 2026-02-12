@@ -36,6 +36,7 @@ class SegmentResponse(BaseModel):
     auto_finalize: bool
     status: str
     worker_id: Optional[UUID]
+    worker_name: Optional[str]
     output_path: Optional[str]
     last_frame_path: Optional[str]
     created_at: datetime
