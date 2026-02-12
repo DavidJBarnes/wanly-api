@@ -1,4 +1,5 @@
-from datetime import datetime, timezone
+import logging
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -10,6 +11,8 @@ from app.auth import get_current_user
 from app.database import get_db
 from app.models import Job, Lora, Segment, User, Video
 from app.schemas.segments import SegmentClaimResponse, SegmentCreate, SegmentResponse, SegmentStatusUpdate
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -100,6 +103,20 @@ async def claim_next_segment(
     worker_id: UUID = Query(...),
     db: AsyncSession = Depends(get_db),
 ):
+    # Reset stale segments: claimed/processing for > 30 minutes with no completion
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+    stale_result = await db.execute(
+        select(Segment).where(
+            Segment.status.in_(["claimed", "processing"]),
+            Segment.claimed_at < stale_cutoff,
+        )
+    )
+    for stale in stale_result.scalars().all():
+        logger.warning("Resetting stale segment %s (status=%s, claimed_at=%s)", stale.id, stale.status, stale.claimed_at)
+        stale.status = "pending"
+        stale.worker_id = None
+        stale.claimed_at = None
+
     result = await db.execute(
         select(Segment)
         .join(Job, Segment.job_id == Job.id)
