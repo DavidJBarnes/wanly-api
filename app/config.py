@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     jwt_expiry_hours: int = 24
     s3_bucket: str = "wanly"
     aws_region: str = "us-west-2"
+    civitai_api_token: str = ""
 
     model_config = {"env_file": ".env"}
 

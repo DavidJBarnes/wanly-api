@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
+from app.config import settings
 from app.database import get_db
 from app.models import Lora, User
 from app.s3 import delete_prefix, upload_bytes
@@ -40,10 +41,22 @@ def _filename_from_response(resp: httpx.Response, url: str) -> str:
     return _filename_from_url(url)
 
 
+def _civitai_auth_url(url: str) -> str:
+    """Append CivitAI API token to download URLs if configured."""
+    if "civitai.com" not in url:
+        return url
+    token = settings.civitai_api_token
+    if not token:
+        return url
+    sep = "&" if "?" in url else "?"
+    return f"{url}{sep}token={token}"
+
+
 async def _download_url(url: str) -> tuple[bytes, str]:
     """Download a file from a URL. Returns (data, filename)."""
+    download_url = _civitai_auth_url(url)
     async with httpx.AsyncClient(follow_redirects=True, timeout=600) as client:
-        resp = await client.get(url)
+        resp = await client.get(download_url)
         resp.raise_for_status()
         filename = _filename_from_response(resp, url)
         return resp.content, filename
