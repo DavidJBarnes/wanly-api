@@ -109,7 +109,7 @@ async def _fetch_civitai_preview(source_url: str) -> tuple[bytes, str] | None:
     if model_id is None:
         return None
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
             resp = await client.get(f"https://civitai.com/api/v1/models/{model_id}")
             resp.raise_for_status()
             data = resp.json()
