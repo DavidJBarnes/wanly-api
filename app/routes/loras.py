@@ -109,33 +109,31 @@ async def _fetch_civitai_preview(source_url: str) -> tuple[bytes, str] | None:
     if model_id is None:
         return None
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=120) as client:
+        # User-Agent required — CloudFlare blocks requests without one
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60, headers=headers) as client:
             resp = await client.get(f"https://civitai.com/api/v1/models/{model_id}")
             resp.raise_for_status()
             data = resp.json()
-            # Walk versions → images, prefer static images
-            for version in data.get("modelVersions", []):
-                for img in version.get("images", []):
-                    img_url = img.get("url")
-                    if not img_url:
-                        continue
-                    if img.get("type", "image") == "video":
-                        continue
-                    thumb_url = _civitai_thumbnail_url(img_url)
-                    img_resp = await client.get(thumb_url)
-                    img_resp.raise_for_status()
-                    ext = _ext_from_content_type(img_resp.headers.get("content-type", ""))
-                    return img_resp.content, ext
-            # Fallback: use first image regardless of type
-            for version in data.get("modelVersions", []):
-                for img in version.get("images", []):
-                    img_url = img.get("url")
-                    if img_url:
-                        thumb_url = _civitai_thumbnail_url(img_url)
-                        img_resp = await client.get(thumb_url)
-                        img_resp.raise_for_status()
-                        ext = _ext_from_content_type(img_resp.headers.get("content-type", ""))
-                        return img_resp.content, ext
+            # Get images from first version
+            versions = data.get("modelVersions", [])
+            if not versions:
+                return None
+            images = versions[0].get("images", [])
+            # Prefer static images over videos
+            target = next((img for img in images if img.get("type") == "image"), None)
+            if not target and images:
+                target = images[0]
+            if not target or not target.get("url"):
+                return None
+            img_url = target["url"]
+            # Resize to thumbnail (videos don't support resizing)
+            if "original=true" in img_url and target.get("type") != "video":
+                img_url = img_url.replace("original=true", "width=512")
+            img_resp = await client.get(img_url)
+            img_resp.raise_for_status()
+            ext = _ext_from_content_type(img_resp.headers.get("content-type", ""))
+            return img_resp.content, ext
     except Exception:
         logger.warning("Failed to fetch CivitAI preview for %s", source_url, exc_info=True)
     return None
