@@ -5,7 +5,8 @@ class Settings(BaseSettings):
     database_url: str
     jwt_secret: str
     jwt_expiry_hours: int = 24
-    s3_bucket: str = "wanly"
+    s3_jobs_bucket: str = "wanly-jobs"
+    s3_loras_bucket: str = "wanly-loras"
     aws_region: str = "us-west-2"
     civitai_api_token: str = ""
 

@@ -16,20 +16,20 @@ def _get_client():
     return _client
 
 
-def upload_bytes(data: bytes, key: str) -> str:
+def upload_bytes(data: bytes, key: str, bucket: str) -> str:
     """Upload bytes to S3. Returns the S3 URI."""
     client = _get_client()
-    client.put_object(Bucket=settings.s3_bucket, Key=key, Body=data)
-    uri = f"s3://{settings.s3_bucket}/{key}"
+    client.put_object(Bucket=bucket, Key=key, Body=data)
+    uri = f"s3://{bucket}/{key}"
     logger.info("Uploaded %d bytes to %s", len(data), uri)
     return uri
 
 
-def upload_file(path: str, key: str) -> str:
+def upload_file(path: str, key: str, bucket: str) -> str:
     """Upload a local file to S3 using multipart. Returns the S3 URI."""
     client = _get_client()
-    client.upload_file(path, settings.s3_bucket, key)
-    uri = f"s3://{settings.s3_bucket}/{key}"
+    client.upload_file(path, bucket, key)
+    uri = f"s3://{bucket}/{key}"
     logger.info("Uploaded file %s to %s", path, uri)
     return uri
 
@@ -43,16 +43,16 @@ def download_bytes(uri: str) -> bytes:
     return resp["Body"].read()
 
 
-def delete_prefix(prefix: str) -> int:
+def delete_prefix(prefix: str, bucket: str) -> int:
     """Delete all objects under a prefix. Returns count of deleted objects."""
     client = _get_client()
-    resp = client.list_objects_v2(Bucket=settings.s3_bucket, Prefix=prefix)
+    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix)
     objects = resp.get("Contents", [])
     if not objects:
         return 0
     delete_keys = [{"Key": obj["Key"]} for obj in objects]
-    client.delete_objects(Bucket=settings.s3_bucket, Delete={"Objects": delete_keys})
-    logger.info("Deleted %d objects under %s", len(delete_keys), prefix)
+    client.delete_objects(Bucket=bucket, Delete={"Objects": delete_keys})
+    logger.info("Deleted %d objects under %s/%s", len(delete_keys), bucket, prefix)
     return len(delete_keys)
 
 

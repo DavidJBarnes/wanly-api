@@ -11,6 +11,7 @@ from fastapi import Depends
 from app.config import settings
 from app.database import get_db
 from app.models import Job, Segment, Video
+from app.config import settings
 from app.s3 import download_bytes, upload_bytes
 from app.schemas.segments import SegmentResponse
 
@@ -38,7 +39,7 @@ async def upload_file(
     else:
         key = f"uploads/{name}"
 
-    uri = await asyncio.to_thread(upload_bytes, data, key)
+    uri = await asyncio.to_thread(upload_bytes, data, key, settings.s3_jobs_bucket)
     return {"path": uri}
 
 
@@ -103,8 +104,8 @@ async def upload_segment_output(
     frame_key = f"{segment.job_id}/{segment.index}_last_frame.png"
 
     video_uri, frame_uri = await asyncio.gather(
-        asyncio.to_thread(upload_bytes, video_data, video_key),
-        asyncio.to_thread(upload_bytes, frame_data, frame_key),
+        asyncio.to_thread(upload_bytes, video_data, video_key, settings.s3_jobs_bucket),
+        asyncio.to_thread(upload_bytes, frame_data, frame_key, settings.s3_jobs_bucket),
     )
 
     segment.output_path = video_uri

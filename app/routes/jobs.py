@@ -14,6 +14,7 @@ from app.auth import get_current_user
 from app.database import get_db
 from app.models import Job, Lora, Segment, User, Video
 from app.routes.segments import _resolve_loras
+from app.config import settings
 from app.s3 import upload_bytes
 from app.schemas.jobs import JobCreate, JobDetailResponse, JobResponse, JobUpdate
 
@@ -50,7 +51,7 @@ async def create_job(
         image_data = await starting_image.read()
         ext = os.path.splitext(starting_image.filename or "image.png")[1] or ".png"
         key = f"{job.id}/starting_image{ext}"
-        uri = await asyncio.to_thread(upload_bytes, image_data, key)
+        uri = await asyncio.to_thread(upload_bytes, image_data, key, settings.s3_jobs_bucket)
         job.starting_image = uri
 
     # Upload faceswap image to S3 if provided
@@ -59,7 +60,7 @@ async def create_job(
         fs_data = await faceswap_image.read()
         ext = os.path.splitext(faceswap_image.filename or "face.png")[1] or ".png"
         key = f"{job.id}/faceswap_source{ext}"
-        faceswap_uri = await asyncio.to_thread(upload_bytes, fs_data, key)
+        faceswap_uri = await asyncio.to_thread(upload_bytes, fs_data, key, settings.s3_jobs_bucket)
 
     seg = body.first_segment
     resolved_loras = await _resolve_loras(db, seg.loras)

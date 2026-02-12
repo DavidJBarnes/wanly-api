@@ -15,6 +15,7 @@ from app.config import settings
 from app.database import get_db
 from app.models import Lora, User
 from app.s3 import delete_prefix, upload_bytes, upload_file
+LORAS_BUCKET = settings.s3_loras_bucket
 from app.schemas.loras import LoraCreate, LoraListItem, LoraResponse, LoraUpdate
 
 logger = logging.getLogger(__name__)
@@ -197,7 +198,7 @@ async def create_lora(
         try:
             tmp_path, filename = await _download_to_temp(body.high_url)
             key = f"{prefix}/{filename}"
-            uri = await asyncio.to_thread(upload_file, tmp_path, key)
+            uri = await asyncio.to_thread(upload_file, tmp_path, key, LORAS_BUCKET)
             lora.high_file = filename
             lora.high_s3_uri = uri
         except Exception:
@@ -216,7 +217,7 @@ async def create_lora(
         try:
             tmp_path, filename = await _download_to_temp(body.low_url)
             key = f"{prefix}/{filename}"
-            uri = await asyncio.to_thread(upload_file, tmp_path, key)
+            uri = await asyncio.to_thread(upload_file, tmp_path, key, LORAS_BUCKET)
             lora.low_file = filename
             lora.low_s3_uri = uri
         except Exception:
@@ -235,7 +236,7 @@ async def create_lora(
         if result:
             preview_data, ext = result
             key = f"{prefix}/preview{ext}"
-            uri = await asyncio.to_thread(upload_bytes, preview_data, key)
+            uri = await asyncio.to_thread(upload_bytes, preview_data, key, LORAS_BUCKET)
             lora.preview_image = uri
 
     await db.commit()
@@ -283,7 +284,7 @@ async def upload_lora(
             tmp.close()
             filename = high_file.filename or "high.safetensors"
             key = f"{prefix}/{filename}"
-            uri = await asyncio.to_thread(upload_file, tmp.name, key)
+            uri = await asyncio.to_thread(upload_file, tmp.name, key, LORAS_BUCKET)
             lora.high_file = filename
             lora.high_s3_uri = uri
         finally:
@@ -299,7 +300,7 @@ async def upload_lora(
             tmp.close()
             filename = low_file.filename or "low.safetensors"
             key = f"{prefix}/{filename}"
-            uri = await asyncio.to_thread(upload_file, tmp.name, key)
+            uri = await asyncio.to_thread(upload_file, tmp.name, key, LORAS_BUCKET)
             lora.low_file = filename
             lora.low_s3_uri = uri
         finally:
@@ -311,7 +312,7 @@ async def upload_lora(
         img_data = await preview_image.read()
         ext = os.path.splitext(preview_image.filename or "preview.jpg")[1] or ".jpg"
         key = f"{prefix}/preview{ext}"
-        uri = await asyncio.to_thread(upload_bytes, img_data, key)
+        uri = await asyncio.to_thread(upload_bytes, img_data, key, LORAS_BUCKET)
         lora.preview_image = uri
 
     await db.commit()
@@ -350,7 +351,7 @@ async def delete_lora(
 
     # Delete S3 files
     prefix = f"loras/{lora_id}"
-    await asyncio.to_thread(delete_prefix, prefix)
+    await asyncio.to_thread(delete_prefix, prefix, LORAS_BUCKET)
 
     await db.delete(lora)
     await db.commit()
