@@ -94,8 +94,13 @@ def _ext_from_content_type(content_type: str) -> str:
     }.get(ct, ".jpg")
 
 
+def _civitai_thumbnail_url(url: str) -> str:
+    """Convert a CivitAI image URL to a thumbnail (width=450) instead of original."""
+    return re.sub(r"/original=true/", "/width=450/", url)
+
+
 async def _fetch_civitai_preview(source_url: str) -> tuple[bytes, str] | None:
-    """Fetch the first preview image from a CivitAI model page.
+    """Fetch the first preview image from a CivitAI model page as a thumbnail.
 
     Returns (image_bytes, extension) or None.
     """
@@ -103,7 +108,6 @@ async def _fetch_civitai_preview(source_url: str) -> tuple[bytes, str] | None:
     if model_id is None:
         return None
     try:
-        headers = {"Accept": "image/jpeg,image/png,image/*;q=0.9"}
         async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
             resp = await client.get(f"https://civitai.com/api/v1/models/{model_id}")
             resp.raise_for_status()
@@ -116,7 +120,8 @@ async def _fetch_civitai_preview(source_url: str) -> tuple[bytes, str] | None:
                         continue
                     if img.get("type", "image") == "video":
                         continue
-                    img_resp = await client.get(img_url, headers=headers)
+                    thumb_url = _civitai_thumbnail_url(img_url)
+                    img_resp = await client.get(thumb_url)
                     img_resp.raise_for_status()
                     ext = _ext_from_content_type(img_resp.headers.get("content-type", ""))
                     return img_resp.content, ext
@@ -125,7 +130,8 @@ async def _fetch_civitai_preview(source_url: str) -> tuple[bytes, str] | None:
                 for img in version.get("images", []):
                     img_url = img.get("url")
                     if img_url:
-                        img_resp = await client.get(img_url, headers=headers)
+                        thumb_url = _civitai_thumbnail_url(img_url)
+                        img_resp = await client.get(thumb_url)
                         img_resp.raise_for_status()
                         ext = _ext_from_content_type(img_resp.headers.get("content-type", ""))
                         return img_resp.content, ext
