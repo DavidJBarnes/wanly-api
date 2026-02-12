@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import subprocess
 import tempfile
 from uuid import UUID
 
@@ -95,14 +96,28 @@ def _ext_from_content_type(content_type: str) -> str:
     }.get(ct, ".jpg")
 
 
-def _civitai_thumbnail_url(url: str) -> str:
-    """Convert a CivitAI image URL to a thumbnail (width=450) instead of original."""
-    return re.sub(r"/original=true/", "/width=450/", url)
+def _extract_first_frame_from_file(video_path: str) -> bytes | None:
+    """Extract first frame from a video file as WebP using ffmpeg."""
+    out_path = video_path + ".webp"
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-y", "-i", video_path, "-vframes", "1", "-q:v", "80", out_path],
+            capture_output=True, timeout=30,
+        )
+        if result.returncode != 0 or not os.path.exists(out_path):
+            logger.warning("ffmpeg failed: %s", result.stderr.decode())
+            return None
+        with open(out_path, "rb") as f:
+            return f.read()
+    finally:
+        if os.path.exists(out_path):
+            os.unlink(out_path)
 
 
 async def _fetch_civitai_preview(source_url: str) -> tuple[bytes, str] | None:
-    """Fetch the first preview image from a CivitAI model page as a thumbnail.
+    """Fetch preview from CivitAI. Handles both static images and videos.
 
+    For videos, extracts the first frame as WebP using ffmpeg (matching v1).
     Returns (image_bytes, extension) or None.
     """
     model_id = _parse_civitai_model_id(source_url)
@@ -111,29 +126,52 @@ async def _fetch_civitai_preview(source_url: str) -> tuple[bytes, str] | None:
     try:
         # User-Agent required — CloudFlare blocks requests without one
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        async with httpx.AsyncClient(follow_redirects=True, timeout=60, headers=headers) as client:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=120, headers=headers) as client:
             resp = await client.get(f"https://civitai.com/api/v1/models/{model_id}")
             resp.raise_for_status()
             data = resp.json()
-            # Get images from first version
+
             versions = data.get("modelVersions", [])
             if not versions:
                 return None
             images = versions[0].get("images", [])
+            if not images:
+                return None
+
             # Prefer static images over videos
             target = next((img for img in images if img.get("type") == "image"), None)
-            if not target and images:
+            is_video = target is None
+            if not target:
                 target = images[0]
-            if not target or not target.get("url"):
+            img_url = target.get("url", "")
+            if not img_url:
                 return None
-            img_url = target["url"]
-            # Resize to thumbnail (videos don't support resizing)
-            if "original=true" in img_url and target.get("type") != "video":
+
+            # Resize static images only — videos return 500 with width param
+            if "original=true" in img_url and not is_video:
                 img_url = img_url.replace("original=true", "width=512")
-            img_resp = await client.get(img_url)
-            img_resp.raise_for_status()
-            ext = _ext_from_content_type(img_resp.headers.get("content-type", ""))
-            return img_resp.content, ext
+
+            if is_video:
+                # Stream video to temp file to avoid OOM, then extract frame
+                tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+                try:
+                    async with client.stream("GET", img_url) as stream:
+                        stream.raise_for_status()
+                        async for chunk in stream.aiter_bytes(chunk_size=1024 * 1024):
+                            tmp.write(chunk)
+                    tmp.close()
+                    frame_data = await asyncio.to_thread(_extract_first_frame_from_file, tmp.name)
+                    if frame_data:
+                        return frame_data, ".webp"
+                    return None
+                finally:
+                    if os.path.exists(tmp.name):
+                        os.unlink(tmp.name)
+            else:
+                img_resp = await client.get(img_url)
+                img_resp.raise_for_status()
+                ext = _ext_from_content_type(img_resp.headers.get("content-type", ""))
+                return img_resp.content, ext
     except Exception:
         logger.warning("Failed to fetch CivitAI preview for %s", source_url, exc_info=True)
     return None
