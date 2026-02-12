@@ -82,12 +82,28 @@ def _parse_civitai_model_id(url: str) -> int | None:
     return int(match.group(1)) if match else None
 
 
-async def _fetch_civitai_preview(source_url: str) -> bytes | None:
-    """Fetch the first preview image from a CivitAI model page."""
+def _ext_from_content_type(content_type: str) -> str:
+    """Map Content-Type to file extension."""
+    ct = content_type.split(";")[0].strip().lower()
+    return {
+        "image/jpeg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/avif": ".avif",
+        "image/gif": ".gif",
+    }.get(ct, ".jpg")
+
+
+async def _fetch_civitai_preview(source_url: str) -> tuple[bytes, str] | None:
+    """Fetch the first preview image from a CivitAI model page.
+
+    Returns (image_bytes, extension) or None.
+    """
     model_id = _parse_civitai_model_id(source_url)
     if model_id is None:
         return None
     try:
+        headers = {"Accept": "image/jpeg,image/png,image/*;q=0.9"}
         async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
             resp = await client.get(f"https://civitai.com/api/v1/models/{model_id}")
             resp.raise_for_status()
@@ -98,20 +114,21 @@ async def _fetch_civitai_preview(source_url: str) -> bytes | None:
                     img_url = img.get("url")
                     if not img_url:
                         continue
-                    # Prefer images over videos
                     if img.get("type", "image") == "video":
                         continue
-                    img_resp = await client.get(img_url)
+                    img_resp = await client.get(img_url, headers=headers)
                     img_resp.raise_for_status()
-                    return img_resp.content
+                    ext = _ext_from_content_type(img_resp.headers.get("content-type", ""))
+                    return img_resp.content, ext
             # Fallback: use first image regardless of type
             for version in data.get("modelVersions", []):
                 for img in version.get("images", []):
                     img_url = img.get("url")
                     if img_url:
-                        img_resp = await client.get(img_url)
+                        img_resp = await client.get(img_url, headers=headers)
                         img_resp.raise_for_status()
-                        return img_resp.content
+                        ext = _ext_from_content_type(img_resp.headers.get("content-type", ""))
+                        return img_resp.content, ext
     except Exception:
         logger.warning("Failed to fetch CivitAI preview for %s", source_url, exc_info=True)
     return None
@@ -208,9 +225,10 @@ async def create_lora(
 
     # Auto-fetch CivitAI preview
     if body.source_url and _parse_civitai_model_id(body.source_url):
-        preview_data = await _fetch_civitai_preview(body.source_url)
-        if preview_data:
-            key = f"{prefix}/preview.jpg"
+        result = await _fetch_civitai_preview(body.source_url)
+        if result:
+            preview_data, ext = result
+            key = f"{prefix}/preview{ext}"
             uri = await asyncio.to_thread(upload_bytes, preview_data, key)
             lora.preview_image = uri
 

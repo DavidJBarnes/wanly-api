@@ -64,14 +64,18 @@ async def download_file(path: str):
         )
 
     # Infer content type from extension
-    if path.endswith(".png"):
-        media_type = "image/png"
-    elif path.endswith(".jpg") or path.endswith(".jpeg"):
-        media_type = "image/jpeg"
-    elif path.endswith(".mp4"):
-        media_type = "video/mp4"
-    else:
-        media_type = "application/octet-stream"
+    ext_map = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".avif": "image/avif",
+        ".gif": "image/gif",
+        ".mp4": "video/mp4",
+        ".safetensors": "application/octet-stream",
+    }
+    ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    media_type = ext_map.get(ext, "application/octet-stream")
 
     return Response(content=data, media_type=media_type)
 
