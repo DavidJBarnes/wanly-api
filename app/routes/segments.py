@@ -158,7 +158,7 @@ async def add_segment(
     )
     db.add(segment)
 
-    job.status = "processing"
+    job.status = "pending"
 
     await db.commit()
     await db.refresh(segment)
@@ -326,7 +326,7 @@ async def retry_segment(
     segment.progress_log = None
 
     job = await db.get(Job, segment.job_id)
-    job.status = "processing"
+    job.status = "pending"
 
     await db.commit()
     await db.refresh(segment)
