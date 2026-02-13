@@ -2,18 +2,17 @@ import asyncio
 import logging
 from uuid import UUID
 
-from fastapi import APIRouter, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, UploadFile, status
 from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from fastapi import Depends
 
 from app.config import settings
 from app.database import get_db
 from app.models import Job, Segment, Video
-from app.config import settings
 from app.s3 import download_bytes, upload_bytes
 from app.schemas.segments import SegmentResponse
+from app.stitch import stitch_video
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +83,7 @@ async def download_file(path: str):
 @router.post("/segments/{segment_id}/upload", response_model=SegmentResponse)
 async def upload_segment_output(
     segment_id: UUID,
+    background_tasks: BackgroundTasks,
     video: UploadFile = File(...),
     last_frame: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
@@ -129,6 +129,8 @@ async def upload_segment_output(
             job.status = "finalized"
             video_record = Video(job_id=job.id, status="pending")
             db.add(video_record)
+            await db.flush()
+            background_tasks.add_task(stitch_video, video_record.id, job.id)
         else:
             job.status = "awaiting"
 

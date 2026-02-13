@@ -5,7 +5,7 @@ import random
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -17,6 +17,7 @@ from app.routes.segments import _resolve_loras, _resolve_wildcards
 from app.config import settings
 from app.s3 import upload_bytes
 from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
+from app.stitch import stitch_video
 
 router = APIRouter()
 
@@ -99,6 +100,8 @@ async def list_jobs(
     if status_filter:
         statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
         base = base.where(Job.status.in_(statuses))
+    else:
+        base = base.where(Job.status.notin_(["finalized", "finalizing"]))
 
     total_result = await db.execute(select(func.count()).select_from(base.subquery()))
     total = total_result.scalar_one()
@@ -158,6 +161,7 @@ async def get_job(
 async def update_job(
     job_id: UUID,
     body: JobUpdate,
+    background_tasks: BackgroundTasks,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -187,6 +191,8 @@ async def update_job(
         if body.status == "finalized":
             video = Video(job_id=job.id, status="pending")
             db.add(video)
+            await db.flush()
+            background_tasks.add_task(stitch_video, video.id, job.id)
 
     await db.commit()
     await db.refresh(job)

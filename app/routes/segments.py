@@ -5,7 +5,7 @@ import re
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -15,6 +15,7 @@ from app.database import get_db
 from app.models import Job, Lora, Segment, User, Video, Wildcard
 from app.s3 import delete_object
 from app.schemas.segments import SegmentClaimResponse, SegmentCreate, SegmentResponse, SegmentStatusUpdate, WorkerSegmentResponse
+from app.stitch import stitch_video
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +252,7 @@ async def claim_next_segment(
 async def update_segment(
     segment_id: UUID,
     body: SegmentStatusUpdate,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     segment = await db.get(Segment, segment_id)
@@ -287,6 +289,8 @@ async def update_segment(
                 job.status = "finalized"
                 video = Video(job_id=job.id, status="pending")
                 db.add(video)
+                await db.flush()
+                background_tasks.add_task(stitch_video, video.id, job.id)
             elif body.status == "failed":
                 job.status = "failed"
             else:

@@ -64,6 +64,14 @@ def delete_object(uri: str) -> None:
     logger.info("Deleted %s/%s", bucket, key)
 
 
+def download_file(uri: str, local_path: str) -> None:
+    """Download an S3 object to a local file (streams to disk)."""
+    bucket, key = parse_s3_uri(uri)
+    client = _get_client()
+    client.download_file(bucket, key, local_path)
+    logger.info("Downloaded %s to %s", uri, local_path)
+
+
 def parse_s3_uri(uri: str) -> tuple[str, str]:
     """Parse s3://bucket/key into (bucket, key)."""
     parts = uri.replace("s3://", "").split("/", 1)
