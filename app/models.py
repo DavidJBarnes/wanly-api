@@ -57,6 +57,7 @@ class Segment(Base):
     job_id = mapped_column(UUID(as_uuid=True), ForeignKey("jobs.id"), nullable=False)
     index = mapped_column(Integer, nullable=False)
     prompt = mapped_column(Text, nullable=False)
+    prompt_template = mapped_column(Text, nullable=True)
     duration_seconds = mapped_column(Float, nullable=False, default=5.0)
     start_image = mapped_column(Text, nullable=True)
     loras = mapped_column(JSON, nullable=True)
@@ -114,5 +115,15 @@ class Lora(Base):
     low_s3_uri = mapped_column(Text, nullable=True)
     default_high_weight = mapped_column(Float, nullable=False, default=1.0)
     default_low_weight = mapped_column(Float, nullable=False, default=1.0)
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class Wildcard(Base):
+    __tablename__ = "wildcards"
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = mapped_column(String(255), unique=True, nullable=False)
+    options = mapped_column(JSON, nullable=False, default=list)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

@@ -32,6 +32,13 @@ class JobResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class JobListResponse(BaseModel):
+    items: list[JobResponse]
+    total: int
+    limit: int
+    offset: int
+
+
 class JobDetailResponse(JobResponse):
     segments: list[SegmentResponse]
     videos: list[VideoResponse]

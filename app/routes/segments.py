@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import random
+import re
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -10,9 +12,9 @@ from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user
 from app.database import get_db
-from app.models import Job, Lora, Segment, User, Video
+from app.models import Job, Lora, Segment, User, Video, Wildcard
 from app.s3 import delete_object
-from app.schemas.segments import SegmentClaimResponse, SegmentCreate, SegmentResponse, SegmentStatusUpdate
+from app.schemas.segments import SegmentClaimResponse, SegmentCreate, SegmentResponse, SegmentStatusUpdate, WorkerSegmentResponse
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,67 @@ async def _resolve_loras(db: AsyncSession, loras_input: list | None) -> list | N
     return resolved
 
 
+async def _resolve_wildcards(db: AsyncSession, prompt: str) -> tuple[str, str | None]:
+    """Resolve <wildcard> placeholders in a prompt.
+
+    Returns (resolved_prompt, template_or_none).
+    If no wildcards found, returns (prompt, None).
+    """
+    pattern = re.compile(r"<([^<>]+)>")
+    matches = pattern.findall(prompt)
+    if not matches:
+        return prompt, None
+
+    # Fetch all referenced wildcards in one query
+    unique_names = list(set(matches))
+    result = await db.execute(
+        select(Wildcard).where(Wildcard.name.in_(unique_names))
+    )
+    wildcards_by_name = {w.name: w for w in result.scalars().all()}
+
+    template = prompt
+    resolved = prompt
+    for name in unique_names:
+        wc = wildcards_by_name.get(name)
+        if wc and wc.options:
+            # Replace all occurrences of this wildcard
+            chosen = random.choice(wc.options)
+            resolved = resolved.replace(f"<{name}>", chosen)
+
+    return resolved, template
+
+
+@router.get("/segments", response_model=list[WorkerSegmentResponse])
+async def list_segments(
+    worker_id: UUID = Query(...),
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Segment, Job.name)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.worker_id == worker_id)
+        .order_by(Segment.completed_at.desc().nullslast(), Segment.created_at.desc())
+        .limit(limit)
+    )
+    rows = result.all()
+    return [
+        WorkerSegmentResponse(
+            id=seg.id,
+            job_id=seg.job_id,
+            job_name=job_name,
+            index=seg.index,
+            prompt=seg.prompt,
+            status=seg.status,
+            duration_seconds=seg.duration_seconds,
+            created_at=seg.created_at,
+            claimed_at=seg.claimed_at,
+            completed_at=seg.completed_at,
+        )
+        for seg, job_name in rows
+    ]
+
+
 @router.post("/jobs/{job_id}/segments", response_model=SegmentResponse, status_code=status.HTTP_201_CREATED)
 async def add_segment(
     job_id: UUID,
@@ -75,11 +138,13 @@ async def add_segment(
     next_index = max((s.index for s in job.segments), default=-1) + 1
 
     resolved_loras = await _resolve_loras(db, body.loras)
+    resolved_prompt, prompt_template = await _resolve_wildcards(db, body.prompt)
 
     segment = Segment(
         job_id=job.id,
         index=next_index,
-        prompt=body.prompt,
+        prompt=resolved_prompt,
+        prompt_template=prompt_template,
         duration_seconds=body.duration_seconds,
         start_image=body.start_image,
         loras=resolved_loras,
@@ -302,7 +367,7 @@ async def delete_segment(
         )
 
     # S3 cleanup
-    for path in [segment.output_path, segment.last_frame_path]:
+    for path in [segment.output_path, segment.last_frame_path, segment.faceswap_image]:
         if path:
             try:
                 await asyncio.to_thread(delete_object, path)

@@ -24,6 +24,7 @@ class SegmentResponse(BaseModel):
     job_id: UUID
     index: int
     prompt: str
+    prompt_template: Optional[str]
     duration_seconds: float
     start_image: Optional[str]
     loras: Optional[list[Any]]
@@ -46,6 +47,19 @@ class SegmentResponse(BaseModel):
     progress_log: Optional[str]
 
     model_config = {"from_attributes": True}
+
+
+class WorkerSegmentResponse(BaseModel):
+    id: UUID
+    job_id: UUID
+    job_name: str
+    index: int
+    prompt: str
+    status: str
+    duration_seconds: float
+    created_at: datetime
+    claimed_at: Optional[datetime]
+    completed_at: Optional[datetime]
 
 
 class SegmentClaimResponse(BaseModel):

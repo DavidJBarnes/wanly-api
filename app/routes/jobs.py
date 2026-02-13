@@ -5,7 +5,7 @@ import random
 from datetime import datetime, timezone
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -13,10 +13,10 @@ from sqlalchemy.orm import selectinload
 from app.auth import get_current_user
 from app.database import get_db
 from app.models import Job, Lora, Segment, User, Video
-from app.routes.segments import _resolve_loras
+from app.routes.segments import _resolve_loras, _resolve_wildcards
 from app.config import settings
 from app.s3 import upload_bytes
-from app.schemas.jobs import JobCreate, JobDetailResponse, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
+from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
 
 router = APIRouter()
 
@@ -64,10 +64,12 @@ async def create_job(
 
     seg = body.first_segment
     resolved_loras = await _resolve_loras(db, seg.loras)
+    resolved_prompt, prompt_template = await _resolve_wildcards(db, seg.prompt)
     segment = Segment(
         job_id=job.id,
         index=0,
-        prompt=seg.prompt,
+        prompt=resolved_prompt,
+        prompt_template=prompt_template,
         duration_seconds=seg.duration_seconds,
         start_image=seg.start_image,
         loras=resolved_loras,
@@ -85,15 +87,28 @@ async def create_job(
     return job
 
 
-@router.get("/jobs", response_model=list[JobResponse])
+@router.get("/jobs", response_model=JobListResponse)
 async def list_jobs(
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    status_filter: str | None = Query(None, alias="status"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    base = select(Job).where(Job.user_id == user.id)
+    if status_filter:
+        statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
+        base = base.where(Job.status.in_(statuses))
+
+    total_result = await db.execute(select(func.count()).select_from(base.subquery()))
+    total = total_result.scalar_one()
+
     result = await db.execute(
-        select(Job).where(Job.user_id == user.id).order_by(Job.created_at.desc())
+        base.order_by(Job.created_at.desc()).offset(offset).limit(limit)
     )
-    return result.scalars().all()
+    items = result.scalars().all()
+
+    return JobListResponse(items=items, total=total, limit=limit, offset=offset)
 
 
 @router.get("/jobs/{job_id}", response_model=JobDetailResponse)
