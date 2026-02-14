@@ -81,3 +81,35 @@ class TestJWTTokens:
         with pytest.raises(HTTPException) as exc_info:
             decode_access_token("this-is-not-a-jwt")
         assert exc_info.value.status_code == 401
+
+
+class TestUploadEndpointAuth:
+    """Verify that POST /upload rejects unauthenticated requests."""
+
+    @pytest.mark.asyncio
+    async def test_upload_without_token_returns_401(self):
+        """An anonymous POST /upload is rejected — no token means no access."""
+        from httpx import ASGITransport, AsyncClient
+        from app.main import app
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/upload", files={"file": ("test.png", b"fake-image-data", "image/png")}
+            )
+        assert resp.status_code == 401
+
+    @pytest.mark.asyncio
+    async def test_upload_with_invalid_token_returns_401(self):
+        """A request with a bogus Bearer token is rejected with 401."""
+        from httpx import ASGITransport, AsyncClient
+        from app.main import app
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.post(
+                "/upload",
+                files={"file": ("test.png", b"fake-image-data", "image/png")},
+                headers={"Authorization": "Bearer invalid-token"},
+            )
+        assert resp.status_code == 401
