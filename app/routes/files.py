@@ -7,9 +7,10 @@ from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import get_current_user
 from app.config import settings
 from app.database import get_db
-from app.models import Job, Segment, Video
+from app.models import Job, Segment, User, Video
 from app.s3 import download_bytes, upload_bytes
 from app.schemas.segments import SegmentResponse
 from app.stitch import stitch_video
@@ -24,6 +25,7 @@ async def upload_file(
     file: UploadFile = File(...),
     job_id: UUID | None = None,
     filename: str | None = None,
+    _user: User = Depends(get_current_user),
 ):
     """Upload a file to S3. Optionally scoped to a job_id folder.
 
