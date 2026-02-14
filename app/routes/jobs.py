@@ -15,9 +15,13 @@ from app.database import get_db
 from app.models import Job, Lora, Segment, User, Video
 from app.routes.segments import _resolve_loras, _resolve_wildcards
 from app.config import settings
-from app.s3 import upload_bytes
+from app.s3 import delete_prefix, upload_bytes
 from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
 from app.stitch import stitch_video
+
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -197,6 +201,37 @@ async def update_job(
     await db.commit()
     await db.refresh(job)
     return job
+
+
+@router.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_job(
+    job_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Job)
+        .where(Job.id == job_id, Job.user_id == user.id)
+        .options(selectinload(Job.segments), selectinload(Job.videos))
+    )
+    job = result.scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    # Best-effort S3 cleanup — delete all objects under the job prefix
+    try:
+        deleted = await asyncio.to_thread(delete_prefix, f"{job_id}/", settings.s3_jobs_bucket)
+        logger.info("Deleted %d S3 objects for job %s", deleted, job_id)
+    except Exception:
+        logger.warning("Failed to delete S3 objects for job %s", job_id, exc_info=True)
+
+    # Delete DB records in FK order
+    for video in job.videos:
+        await db.delete(video)
+    for segment in job.segments:
+        await db.delete(segment)
+    await db.delete(job)
+    await db.commit()
 
 
 @router.get("/stats", response_model=StatsResponse)
