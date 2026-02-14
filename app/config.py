@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     s3_loras_bucket: str = "wanly-loras"
     aws_region: str = "us-west-2"
     civitai_api_token: str = ""
+    cors_origins: str = ""
+    login_rate_limit: str = "5/minute"
 
     model_config = {"env_file": ".env"}
 
