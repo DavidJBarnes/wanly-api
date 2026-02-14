@@ -10,3 +10,4 @@ bcrypt
 boto3
 python-multipart
 httpx
+slowapi
