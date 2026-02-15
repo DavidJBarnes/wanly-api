@@ -47,11 +47,11 @@ async def list_faceswap_presets(
     """List available faceswap preset face images from S3."""
     try:
         objects = await asyncio.to_thread(_list_face_objects)
-    except Exception:
+    except Exception as exc:
         logger.exception("Failed to list faceswap presets from S3")
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            detail="Unable to list faceswap presets from S3",
+            detail=f"Unable to list faceswap presets from S3: {exc}",
         )
 
     bucket = settings.s3_faces_bucket

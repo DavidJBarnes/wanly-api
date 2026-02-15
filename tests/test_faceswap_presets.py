@@ -126,6 +126,7 @@ class TestFaceswapPresetsList:
                 resp = await client.get("/faceswap/presets")
 
         assert resp.status_code == 502
+        assert "AccessDenied" in resp.json()["detail"]
 
     @pytest.mark.asyncio
     async def test_handles_s3_pagination(self):
