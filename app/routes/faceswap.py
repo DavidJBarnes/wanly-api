@@ -3,7 +3,7 @@ import logging
 import os
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
 from app.auth import get_current_user
 from app.config import settings
@@ -14,18 +14,34 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif"}
+
 
 def _list_face_objects() -> list[dict]:
-    """List all objects in the faces bucket and return preset metadata."""
+    """List all image objects in the faces bucket, handling S3 pagination."""
     client = _get_client()
     bucket = settings.s3_faces_bucket
-    resp = client.list_objects_v2(Bucket=bucket)
-    return resp.get("Contents", [])
+    objects: list[dict] = []
+    kwargs: dict = {"Bucket": bucket}
+    while True:
+        resp = client.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents", []):
+            key = obj["Key"]
+            # Skip folder markers and non-image files
+            if key.endswith("/") or obj.get("Size", 0) == 0:
+                continue
+            ext = os.path.splitext(key)[1].lower()
+            if ext not in _IMAGE_EXTENSIONS:
+                continue
+            objects.append(obj)
+        if not resp.get("IsTruncated"):
+            break
+        kwargs["ContinuationToken"] = resp["NextContinuationToken"]
+    return objects
 
 
 @router.get("/faceswap/presets")
 async def list_faceswap_presets(
-    request: Request,
     _user: User = Depends(get_current_user),
 ):
     """List available faceswap preset face images from S3."""
@@ -39,7 +55,6 @@ async def list_faceswap_presets(
         )
 
     bucket = settings.s3_faces_bucket
-    base_url = str(request.base_url).rstrip("/")
     presets = []
     for obj in objects:
         key = obj["Key"]
@@ -48,6 +63,6 @@ async def list_faceswap_presets(
             "key": key,
             "name": os.path.splitext(os.path.basename(key))[0],
             "url": s3_uri,
-            "thumbnail_url": f"{base_url}/files?path={quote(s3_uri, safe='')}",
+            "thumbnail_url": f"/files?path={quote(s3_uri, safe='')}",
         })
     return presets
