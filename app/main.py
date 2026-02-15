@@ -5,7 +5,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.config import settings
 from app.limiter import limiter
-from app.routes import auth, files, jobs, loras, segments, wildcards
+from app.routes import auth, faceswap, files, jobs, loras, segments, wildcards
 
 app = FastAPI(title="wanly-api")
 
@@ -27,6 +27,7 @@ if _origins:
 app.include_router(auth.router)
 app.include_router(jobs.router)
 app.include_router(segments.router)
+app.include_router(faceswap.router)
 app.include_router(files.router)
 app.include_router(loras.router)
 app.include_router(wildcards.router)

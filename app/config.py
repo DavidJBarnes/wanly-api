@@ -7,6 +7,7 @@ class Settings(BaseSettings):
     jwt_expiry_hours: int = 24
     s3_jobs_bucket: str = "wanly-jobs"
     s3_loras_bucket: str = "wanly-loras"
+    s3_faces_bucket: str = "wanly-faces"
     aws_region: str = "us-west-2"
     civitai_api_token: str = ""
     cors_origins: str = ""
