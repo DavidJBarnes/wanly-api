@@ -16,7 +16,7 @@ from app.models import Job, Lora, Segment, User, Video
 from app.routes.segments import _resolve_loras, _resolve_wildcards
 from app.config import settings
 from app.s3 import delete_prefix, upload_bytes
-from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
+from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
 from app.stitch import stitch_video
 
 import logging
@@ -116,6 +116,32 @@ async def list_jobs(
     items = result.scalars().all()
 
     return JobListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.put("/jobs/reorder", status_code=status.HTTP_204_NO_CONTENT)
+async def reorder_jobs(
+    body: JobReorderRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not body.job_ids:
+        return
+
+    result = await db.execute(
+        select(Job).where(Job.id.in_(body.job_ids), Job.user_id == user.id)
+    )
+    jobs_by_id = {job.id: job for job in result.scalars().all()}
+
+    for priority, job_id in enumerate(body.job_ids):
+        job = jobs_by_id.get(job_id)
+        if job is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Job not found: {job_id}",
+            )
+        job.priority = priority
+
+    await db.commit()
 
 
 @router.get("/jobs/{job_id}", response_model=JobDetailResponse)
