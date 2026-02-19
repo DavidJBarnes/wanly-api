@@ -37,6 +37,7 @@ class Job(Base):
     seed = mapped_column(BigInteger, nullable=False)
     starting_image = mapped_column(Text, nullable=True)
     status = mapped_column(String(20), nullable=False, default="pending")
+    priority = mapped_column(Integer, nullable=False, default=0)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 

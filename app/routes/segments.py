@@ -192,7 +192,7 @@ async def claim_next_segment(
         select(Segment)
         .join(Job, Segment.job_id == Job.id)
         .where(Segment.status == "pending", Job.status.in_(["pending", "processing"]))
-        .order_by(Segment.created_at)
+        .order_by(Job.priority.asc(), Segment.created_at.asc())
         .limit(1)
         .with_for_update(skip_locked=True)
     )
