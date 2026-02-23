@@ -8,6 +8,10 @@ from app.schemas.segments import SegmentCreate, SegmentResponse
 from app.schemas.videos import VideoResponse
 
 
+class JobReorderRequest(BaseModel):
+    job_ids: list[UUID]
+
+
 class JobCreate(BaseModel):
     name: str
     width: int
@@ -25,6 +29,7 @@ class JobResponse(BaseModel):
     fps: int
     seed: int
     starting_image: Optional[str]
+    priority: int
     status: str
     created_at: datetime
     updated_at: datetime
