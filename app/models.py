@@ -26,6 +26,7 @@ class Job(Base):
     __table_args__ = (
         Index("ix_jobs_user_id", "user_id"),
         Index("ix_jobs_status", "status"),
+        Index("ix_jobs_priority", "priority"),
     )
 
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -36,6 +37,7 @@ class Job(Base):
     fps = mapped_column(Integer, nullable=False)
     seed = mapped_column(BigInteger, nullable=False)
     starting_image = mapped_column(Text, nullable=True)
+    priority = mapped_column(Integer, nullable=False, default=0)
     status = mapped_column(String(20), nullable=False, default="pending")
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

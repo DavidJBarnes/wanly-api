@@ -16,7 +16,7 @@ from app.models import Job, Lora, Segment, User, Video
 from app.routes.segments import _resolve_loras, _resolve_wildcards
 from app.config import settings
 from app.s3 import delete_prefix, upload_bytes
-from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
+from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
 from app.stitch import stitch_video
 
 import logging
@@ -40,6 +40,13 @@ async def create_job(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid JSON in data field: {e}")
 
     seed = body.seed if body.seed is not None else random.randint(0, 2**63 - 1)
+
+    # New jobs go to bottom of queue
+    max_priority_result = await db.execute(
+        select(func.coalesce(func.max(Job.priority), -1)).where(Job.user_id == user.id)
+    )
+    next_priority = max_priority_result.scalar_one() + 1
+
     job = Job(
         user_id=user.id,
         name=body.name,
@@ -47,6 +54,7 @@ async def create_job(
         height=body.height,
         fps=body.fps,
         seed=seed,
+        priority=next_priority,
     )
     db.add(job)
     await db.flush()  # Get job.id
@@ -97,6 +105,7 @@ async def list_jobs(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     status_filter: str | None = Query(None, alias="status"),
+    sort: str = Query("created_at_desc"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -110,12 +119,48 @@ async def list_jobs(
     total_result = await db.execute(select(func.count()).select_from(base.subquery()))
     total = total_result.scalar_one()
 
+    if sort == "priority_asc":
+        order = Job.priority.asc()
+    else:
+        order = Job.created_at.desc()
+
     result = await db.execute(
-        base.order_by(Job.created_at.desc()).offset(offset).limit(limit)
+        base.order_by(order).offset(offset).limit(limit)
     )
     items = result.scalars().all()
 
     return JobListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+@router.put("/jobs/reorder", response_model=list[JobResponse])
+async def reorder_jobs(
+    body: JobReorderRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    if not body.job_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="job_ids must not be empty")
+
+    # Fetch all referenced jobs, verify they belong to the user
+    result = await db.execute(
+        select(Job).where(Job.id.in_(body.job_ids), Job.user_id == user.id)
+    )
+    jobs_by_id = {job.id: job for job in result.scalars().all()}
+
+    if len(jobs_by_id) != len(body.job_ids):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Some job IDs not found or not owned by you")
+
+    # Assign priority 0, 1, 2, ... based on array position
+    for i, job_id in enumerate(body.job_ids):
+        jobs_by_id[job_id].priority = i
+
+    await db.commit()
+
+    # Return in priority order
+    ordered = [jobs_by_id[jid] for jid in body.job_ids]
+    for job in ordered:
+        await db.refresh(job)
+    return ordered
 
 
 @router.get("/jobs/{job_id}", response_model=JobDetailResponse)
