@@ -62,9 +62,18 @@ async def _download_to_temp(url: str) -> tuple[str, str]:
     for the t3.micro with 1GB RAM handling 50-500MB .safetensors files).
     """
     download_url = _civitai_auth_url(url)
-    async with httpx.AsyncClient(follow_redirects=True, timeout=600) as client:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    async with httpx.AsyncClient(follow_redirects=True, timeout=600, headers=headers) as client:
         async with client.stream("GET", download_url) as resp:
             resp.raise_for_status()
+            # Detect auth-redirect: CivitAI returns HTML login page instead of file
+            ct = resp.headers.get("content-type", "")
+            if "text/html" in ct:
+                raise RuntimeError(
+                    "CivitAI returned HTML instead of a file — "
+                    "this model likely requires authentication. "
+                    "Set CIVITAI_API_TOKEN in .env."
+                )
             filename = _filename_from_response(resp, url)
             tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".safetensors")
             try:
