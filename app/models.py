@@ -122,6 +122,20 @@ class Lora(Base):
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 
+class TitleTag(Base):
+    __tablename__ = "title_tags"
+    __table_args__ = (
+        Index("ix_title_tags_group", "group"),
+        UniqueConstraint("name", "group", name="uq_title_tags_name_group"),
+    )
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = mapped_column(String(255), nullable=False)
+    group = mapped_column(Integer, nullable=False)
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
 class Wildcard(Base):
     __tablename__ = "wildcards"
 
