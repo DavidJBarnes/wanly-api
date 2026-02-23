@@ -150,6 +150,14 @@ async def reorder_jobs(
     if len(jobs_by_id) != len(body.job_ids):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Some job IDs not found or not owned by you")
 
+    # Processing/finalizing jobs are locked — their priority must not change
+    locked = [str(jid) for jid in body.job_ids if jobs_by_id[jid].status in ("processing", "finalizing")]
+    if locked:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot reorder jobs that are processing or finalizing",
+        )
+
     # Assign priority 0, 1, 2, ... based on array position
     for i, job_id in enumerate(body.job_ids):
         jobs_by_id[job_id].priority = i
@@ -194,6 +202,7 @@ async def get_job(
         fps=job.fps,
         seed=job.seed,
         starting_image=job.starting_image,
+        priority=job.priority,
         status=job.status,
         created_at=job.created_at,
         updated_at=job.updated_at,
