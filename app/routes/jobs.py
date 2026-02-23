@@ -272,6 +272,12 @@ async def delete_job(
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
+    if job.status in ("processing", "finalizing"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot delete a job that is currently {job.status}",
+        )
+
     # Best-effort S3 cleanup — delete all objects under the job prefix
     try:
         deleted = await asyncio.to_thread(delete_prefix, f"{job_id}/", settings.s3_jobs_bucket)
