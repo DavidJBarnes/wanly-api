@@ -202,6 +202,7 @@ async def get_job(
         fps=job.fps,
         seed=job.seed,
         starting_image=job.starting_image,
+        priority=job.priority,
         status=job.status,
         created_at=job.created_at,
         updated_at=job.updated_at,
