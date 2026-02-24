@@ -15,7 +15,7 @@ from app.database import get_db
 from app.models import Job, Lora, Segment, User, Video
 from app.routes.segments import _resolve_loras, _resolve_wildcards
 from app.config import settings
-from app.s3 import delete_prefix, upload_bytes
+from app.s3 import delete_object, delete_prefix, upload_bytes
 from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
 from app.stitch import stitch_video
 
@@ -284,6 +284,58 @@ async def update_job(
     await db.commit()
     await db.refresh(job)
     return job
+
+
+@router.post("/jobs/{job_id}/reopen", response_model=JobDetailResponse)
+async def reopen_job(
+    job_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Job)
+        .where(Job.id == job_id, Job.user_id == user.id)
+        .options(selectinload(Job.segments), selectinload(Job.videos))
+    )
+    job = result.scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.status != "finalized":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only finalized jobs can be re-opened",
+        )
+
+    # Delete video records and their S3 objects
+    for video in job.videos:
+        if video.output_path:
+            try:
+                await asyncio.to_thread(delete_object, video.output_path)
+            except Exception:
+                logger.warning("Failed to delete S3 object %s", video.output_path, exc_info=True)
+        await db.delete(video)
+
+    job.status = "awaiting"
+    await db.commit()
+    await db.refresh(job, attribute_names=["segments", "videos"])
+
+    segments = job.segments
+    completed = [s for s in segments if s.status == "completed"]
+    total_run_time = 0.0
+    for s in completed:
+        if s.claimed_at and s.completed_at:
+            total_run_time += (s.completed_at - s.claimed_at).total_seconds()
+    total_video_time = sum(s.duration_seconds for s in completed)
+
+    return JobDetailResponse(
+        id=job.id, name=job.name, width=job.width, height=job.height,
+        fps=job.fps, seed=job.seed, starting_image=job.starting_image,
+        priority=job.priority, status=job.status,
+        created_at=job.created_at, updated_at=job.updated_at,
+        segments=segments, videos=job.videos,
+        segment_count=len(segments), completed_segment_count=len(completed),
+        total_run_time=total_run_time, total_video_time=total_video_time,
+    )
 
 
 @router.delete("/jobs/{job_id}", status_code=status.HTTP_204_NO_CONTENT)
