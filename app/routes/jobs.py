@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -127,9 +127,46 @@ async def list_jobs(
     result = await db.execute(
         base.order_by(order).offset(offset).limit(limit)
     )
-    items = result.scalars().all()
+    items = list(result.scalars().all())
 
-    return JobListResponse(items=items, total=total, limit=limit, offset=offset)
+    # Aggregate segment counts per job in a single query
+    job_ids = [j.id for j in items]
+    counts_map: dict[UUID, tuple[int, int]] = {}
+    if job_ids:
+        counts_result = await db.execute(
+            select(
+                Segment.job_id,
+                func.count().label("total"),
+                func.count(case((Segment.status == "completed", 1))).label("completed"),
+            )
+            .where(Segment.job_id.in_(job_ids))
+            .group_by(Segment.job_id)
+        )
+        for row in counts_result.all():
+            counts_map[row[0]] = (row[1], row[2])
+
+    response_items = []
+    for j in items:
+        seg_total, seg_completed = counts_map.get(j.id, (0, 0))
+        response_items.append(
+            JobResponse(
+                id=j.id,
+                name=j.name,
+                width=j.width,
+                height=j.height,
+                fps=j.fps,
+                seed=j.seed,
+                starting_image=j.starting_image,
+                priority=j.priority,
+                status=j.status,
+                segment_count=seg_total,
+                completed_segment_count=seg_completed,
+                created_at=j.created_at,
+                updated_at=j.updated_at,
+            )
+        )
+
+    return JobListResponse(items=response_items, total=total, limit=limit, offset=offset)
 
 
 @router.put("/jobs/reorder", response_model=list[JobResponse])

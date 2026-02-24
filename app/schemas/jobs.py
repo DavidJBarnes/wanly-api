@@ -31,6 +31,8 @@ class JobResponse(BaseModel):
     starting_image: Optional[str]
     priority: int
     status: str
+    segment_count: int = 0
+    completed_segment_count: int = 0
     created_at: datetime
     updated_at: datetime
 
