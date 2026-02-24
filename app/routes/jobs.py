@@ -120,12 +120,12 @@ async def list_jobs(
     total = total_result.scalar_one()
 
     if sort == "priority_asc":
-        order = Job.priority.asc()
+        order = [Job.priority.asc(), Job.created_at.asc()]
     else:
-        order = Job.created_at.desc()
+        order = [Job.created_at.desc()]
 
     result = await db.execute(
-        base.order_by(order).offset(offset).limit(limit)
+        base.order_by(*order).offset(offset).limit(limit)
     )
     items = list(result.scalars().all())
 
