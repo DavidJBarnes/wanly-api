@@ -338,6 +338,48 @@ async def retry_segment(
     return segment
 
 
+@router.post("/segments/{segment_id}/cancel", response_model=SegmentResponse)
+async def cancel_segment(
+    segment_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+    if segment.status not in ("pending", "claimed", "processing"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only pending, claimed, or processing segments can be cancelled (current: '{segment.status}')",
+        )
+
+    segment.status = "failed"
+    segment.error_message = "Cancelled by user"
+    segment.completed_at = datetime.now(timezone.utc)
+    segment.worker_id = None
+    segment.worker_name = None
+    segment.claimed_at = None
+
+    job = await db.get(Job, segment.job_id)
+    active_result = await db.execute(
+        select(Segment).where(
+            Segment.job_id == job.id,
+            Segment.status.in_(["pending", "claimed", "processing"]),
+        )
+    )
+    if not active_result.scalars().all():
+        job.status = "awaiting"
+
+    await db.commit()
+    await db.refresh(segment)
+    return segment
+
+
 @router.delete("/segments/{segment_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_segment(
     segment_id: UUID,
