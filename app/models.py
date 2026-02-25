@@ -61,6 +61,7 @@ class Segment(Base):
     prompt = mapped_column(Text, nullable=False)
     prompt_template = mapped_column(Text, nullable=True)
     duration_seconds = mapped_column(Float, nullable=False, default=5.0)
+    speed = mapped_column(Float, nullable=False, default=1.0)
     start_image = mapped_column(Text, nullable=True)
     loras = mapped_column(JSON, nullable=True)
     faceswap_enabled = mapped_column(Boolean, nullable=False, default=False)

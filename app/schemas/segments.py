@@ -8,6 +8,7 @@ from pydantic import BaseModel
 class SegmentCreate(BaseModel):
     prompt: str
     duration_seconds: float = 5.0
+    speed: float = 1.0
     start_image: Optional[str] = None
     loras: Optional[list[Any]] = None
     faceswap_enabled: bool = False
@@ -26,6 +27,7 @@ class SegmentResponse(BaseModel):
     prompt: str
     prompt_template: Optional[str]
     duration_seconds: float
+    speed: float
     start_image: Optional[str]
     loras: Optional[list[Any]]
     faceswap_enabled: bool
@@ -68,6 +70,7 @@ class SegmentClaimResponse(BaseModel):
     index: int
     prompt: str
     duration_seconds: float
+    speed: float
     start_image: Optional[str]
     loras: Optional[list[Any]]
     faceswap_enabled: bool

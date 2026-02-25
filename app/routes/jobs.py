@@ -84,6 +84,7 @@ async def create_job(
         prompt=resolved_prompt,
         prompt_template=prompt_template,
         duration_seconds=seg.duration_seconds,
+        speed=seg.speed,
         start_image=seg.start_image,
         loras=resolved_loras,
         faceswap_enabled=seg.faceswap_enabled,
