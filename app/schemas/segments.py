@@ -2,13 +2,13 @@ from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class SegmentCreate(BaseModel):
     prompt: str
     duration_seconds: float = 5.0
-    speed: float = 1.0
+    speed: float = Field(default=1.0, ge=0.25, le=4.0)
     start_image: Optional[str] = None
     loras: Optional[list[Any]] = None
     faceswap_enabled: bool = False
