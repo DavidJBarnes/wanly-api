@@ -54,6 +54,8 @@ async def create_job(
         height=body.height,
         fps=body.fps,
         seed=seed,
+        lightx2v_strength_high=body.lightx2v_strength_high,
+        lightx2v_strength_low=body.lightx2v_strength_low,
         priority=next_priority,
     )
     db.add(job)
@@ -158,6 +160,8 @@ async def list_jobs(
                 fps=j.fps,
                 seed=j.seed,
                 starting_image=j.starting_image,
+                lightx2v_strength_high=j.lightx2v_strength_high,
+                lightx2v_strength_low=j.lightx2v_strength_low,
                 priority=j.priority,
                 status=j.status,
                 segment_count=seg_total,
@@ -232,6 +236,8 @@ async def get_job(
         fps=job.fps,
         seed=job.seed,
         starting_image=job.starting_image,
+        lightx2v_strength_high=job.lightx2v_strength_high,
+        lightx2v_strength_low=job.lightx2v_strength_low,
         priority=job.priority,
         status=job.status,
         created_at=job.created_at,
@@ -332,6 +338,8 @@ async def reopen_job(
     return JobDetailResponse(
         id=job.id, name=job.name, width=job.width, height=job.height,
         fps=job.fps, seed=job.seed, starting_image=job.starting_image,
+        lightx2v_strength_high=job.lightx2v_strength_high,
+        lightx2v_strength_low=job.lightx2v_strength_low,
         priority=job.priority, status=job.status,
         created_at=job.created_at, updated_at=job.updated_at,
         segments=segments, videos=job.videos,
