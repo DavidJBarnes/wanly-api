@@ -426,11 +426,15 @@ async def delete_segment(
     await db.delete(segment)
     await db.flush()
 
-    # Re-index remaining segments
+    # Re-index remaining segments (use negative temp values to avoid unique constraint conflicts)
     remaining_result = await db.execute(
         select(Segment).where(Segment.job_id == job.id).order_by(Segment.index)
     )
-    for i, seg in enumerate(remaining_result.scalars().all()):
+    remaining = remaining_result.scalars().all()
+    for i, seg in enumerate(remaining):
+        seg.index = -(i + 1)
+    await db.flush()
+    for i, seg in enumerate(remaining):
         seg.index = i
 
     # Update job status if needed
