@@ -115,7 +115,7 @@ async def list_jobs(
         statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
         base = base.where(Job.status.in_(statuses))
     else:
-        base = base.where(Job.status.notin_(["finalized", "finalizing"]))
+        base = base.where(Job.status.notin_(["finalized", "finalizing", "archived"]))
 
     total_result = await db.execute(select(func.count()).select_from(base.subquery()))
     total = total_result.scalar_one()
@@ -263,11 +263,12 @@ async def update_job(
 
     if body.status is not None:
         valid_transitions = {
-            "pending": {"paused"},
+            "pending": {"paused", "archived"},
             "processing": {"paused"},
-            "awaiting": {"paused", "finalized"},
-            "failed": {"paused"},
-            "paused": {"pending", "processing", "awaiting"},
+            "awaiting": {"paused", "finalized", "archived"},
+            "failed": {"paused", "archived"},
+            "paused": {"pending", "processing", "awaiting", "archived"},
+            "archived": {"awaiting"},
         }
         allowed = valid_transitions.get(job.status, set())
         if body.status not in allowed:
