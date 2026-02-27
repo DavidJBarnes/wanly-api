@@ -4,7 +4,7 @@ from uuid import UUID
 import bcrypt
 import jwt
 from fastapi import Depends, HTTPException, status
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,6 +13,12 @@ from app.database import get_db
 from app.models import User
 
 security = HTTPBearer()
+api_key_header = APIKeyHeader(name="X-API-Key")
+
+
+async def verify_api_key(key: str = Depends(api_key_header)):
+    if not settings.api_key or key != settings.api_key:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
 
 def hash_password(password: str) -> str:
