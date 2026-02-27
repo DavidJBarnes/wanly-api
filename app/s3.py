@@ -72,6 +72,48 @@ def download_file(uri: str, local_path: str) -> None:
     logger.info("Downloaded %s to %s", uri, local_path)
 
 
+def list_common_prefixes(bucket: str, prefix: str = "", delimiter: str = "/") -> list[str]:
+    """List virtual folders. Returns prefixes like ['2026-02-27/']."""
+    client = _get_client()
+    prefixes: list[str] = []
+    params: dict = {"Bucket": bucket, "Prefix": prefix, "Delimiter": delimiter}
+    while True:
+        resp = client.list_objects_v2(**params)
+        for cp in resp.get("CommonPrefixes", []):
+            prefixes.append(cp["Prefix"])
+        if not resp.get("IsTruncated"):
+            break
+        params["ContinuationToken"] = resp["NextContinuationToken"]
+    return prefixes
+
+
+def list_objects(bucket: str, prefix: str) -> list[dict]:
+    """List all objects under a prefix. Returns [{Key, Size, LastModified}]."""
+    client = _get_client()
+    objects: list[dict] = []
+    params: dict = {"Bucket": bucket, "Prefix": prefix}
+    while True:
+        resp = client.list_objects_v2(**params)
+        for obj in resp.get("Contents", []):
+            objects.append({
+                "Key": obj["Key"],
+                "Size": obj["Size"],
+                "LastModified": obj["LastModified"].isoformat(),
+            })
+        if not resp.get("IsTruncated"):
+            break
+        params["ContinuationToken"] = resp["NextContinuationToken"]
+    return objects
+
+
+def get_first_object_key(bucket: str, prefix: str) -> str | None:
+    """First object key under a prefix (for folder thumbnails). MaxKeys=1."""
+    client = _get_client()
+    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
+    contents = resp.get("Contents", [])
+    return contents[0]["Key"] if contents else None
+
+
 def parse_s3_uri(uri: str) -> tuple[str, str]:
     """Parse s3://bucket/key into (bucket, key)."""
     parts = uri.replace("s3://", "").split("/", 1)
