@@ -147,3 +147,14 @@ class Wildcard(Base):
     options = mapped_column(JSON, nullable=False, default=list)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class PromptPreset(Base):
+    __tablename__ = "prompt_presets"
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = mapped_column(String(255), unique=True, nullable=False)
+    prompt = mapped_column(Text, nullable=False)
+    loras = mapped_column(JSON, nullable=True)
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
