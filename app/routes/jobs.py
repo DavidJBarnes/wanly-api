@@ -12,11 +12,13 @@ from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user
 from app.database import get_db
+from app.estimation import estimate_segment_time, get_estimation_rates
 from app.models import Job, Lora, Segment, User, Video
 from app.routes.segments import _resolve_loras, _resolve_wildcards
 from app.config import settings
 from app.s3 import delete_object, delete_prefix, upload_bytes
 from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
+from app.schemas.segments import SegmentResponse
 from app.stitch import stitch_video
 
 import logging
@@ -148,6 +150,36 @@ async def list_jobs(
         for row in counts_result.all():
             counts_map[row[0]] = (row[1], row[2])
 
+    # Fetch active segment info for estimation
+    active_statuses = {"pending", "claimed", "processing"}
+    active_jobs = [j for j in items if j.status in ("pending", "processing")]
+    active_job_ids = [j.id for j in active_jobs]
+    est_map: dict[UUID, float | None] = {}
+    if active_job_ids:
+        active_seg_result = await db.execute(
+            select(
+                Segment.job_id,
+                Segment.duration_seconds,
+                Segment.worker_name,
+            )
+            .where(
+                Segment.job_id.in_(active_job_ids),
+                Segment.status.in_(active_statuses),
+            )
+        )
+        active_segs = active_seg_result.all()
+        if active_segs:
+            rates = await get_estimation_rates(db, user.id)
+            for row in active_segs:
+                seg_job_id, seg_dur, seg_worker = row
+                job_obj = next((j for j in active_jobs if j.id == seg_job_id), None)
+                if job_obj:
+                    est = estimate_segment_time(
+                        rates, job_obj.width, job_obj.height, job_obj.fps,
+                        seg_dur, seg_worker,
+                    )
+                    est_map[seg_job_id] = est
+
     response_items = []
     for j in items:
         seg_total, seg_completed = counts_map.get(j.id, (0, 0))
@@ -166,6 +198,7 @@ async def list_jobs(
                 status=j.status,
                 segment_count=seg_total,
                 completed_segment_count=seg_completed,
+                estimated_run_time=est_map.get(j.id),
                 created_at=j.created_at,
                 updated_at=j.updated_at,
             )
@@ -228,6 +261,26 @@ async def get_job(
             total_run_time += (s.completed_at - s.claimed_at).total_seconds()
     total_video_time = sum(s.duration_seconds for s in completed)
 
+    # Estimate run times for non-completed segments
+    active_segs = [s for s in segments if s.status in ("pending", "claimed", "processing")]
+    seg_responses = []
+    job_est = None
+    if active_segs:
+        rates = await get_estimation_rates(db, user.id)
+        for s in segments:
+            sr = SegmentResponse.model_validate(s)
+            if s.status in ("pending", "claimed", "processing"):
+                est = estimate_segment_time(
+                    rates, job.width, job.height, job.fps,
+                    s.duration_seconds, s.worker_name,
+                )
+                sr.estimated_run_time = est
+                if job_est is None:
+                    job_est = est
+            seg_responses.append(sr)
+    else:
+        seg_responses = [SegmentResponse.model_validate(s) for s in segments]
+
     return JobDetailResponse(
         id=job.id,
         name=job.name,
@@ -240,9 +293,10 @@ async def get_job(
         lightx2v_strength_low=job.lightx2v_strength_low,
         priority=job.priority,
         status=job.status,
+        estimated_run_time=job_est,
         created_at=job.created_at,
         updated_at=job.updated_at,
-        segments=segments,
+        segments=seg_responses,
         videos=job.videos,
         segment_count=len(segments),
         completed_segment_count=len(completed),
@@ -335,14 +389,35 @@ async def reopen_job(
             total_run_time += (s.completed_at - s.claimed_at).total_seconds()
     total_video_time = sum(s.duration_seconds for s in completed)
 
+    # Estimate run times for non-completed segments
+    active_segs = [s for s in segments if s.status in ("pending", "claimed", "processing")]
+    seg_responses = []
+    job_est = None
+    if active_segs:
+        rates = await get_estimation_rates(db, user.id)
+        for s in segments:
+            sr = SegmentResponse.model_validate(s)
+            if s.status in ("pending", "claimed", "processing"):
+                est = estimate_segment_time(
+                    rates, job.width, job.height, job.fps,
+                    s.duration_seconds, s.worker_name,
+                )
+                sr.estimated_run_time = est
+                if job_est is None:
+                    job_est = est
+            seg_responses.append(sr)
+    else:
+        seg_responses = [SegmentResponse.model_validate(s) for s in segments]
+
     return JobDetailResponse(
         id=job.id, name=job.name, width=job.width, height=job.height,
         fps=job.fps, seed=job.seed, starting_image=job.starting_image,
         lightx2v_strength_high=job.lightx2v_strength_high,
         lightx2v_strength_low=job.lightx2v_strength_low,
         priority=job.priority, status=job.status,
+        estimated_run_time=job_est,
         created_at=job.created_at, updated_at=job.updated_at,
-        segments=segments, videos=job.videos,
+        segments=seg_responses, videos=job.videos,
         segment_count=len(segments), completed_segment_count=len(completed),
         total_run_time=total_run_time, total_video_time=total_video_time,
     )
