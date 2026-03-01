@@ -37,6 +37,7 @@ class JobResponse(BaseModel):
     status: str
     segment_count: int = 0
     completed_segment_count: int = 0
+    estimated_run_time: Optional[float] = None
     created_at: datetime
     updated_at: datetime
 

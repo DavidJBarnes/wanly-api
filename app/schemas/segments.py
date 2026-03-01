@@ -47,6 +47,7 @@ class SegmentResponse(BaseModel):
     completed_at: Optional[datetime]
     error_message: Optional[str]
     progress_log: Optional[str]
+    estimated_run_time: Optional[float] = None
 
     model_config = {"from_attributes": True}
 
