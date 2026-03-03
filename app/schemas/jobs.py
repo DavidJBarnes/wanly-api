@@ -20,6 +20,7 @@ class JobCreate(BaseModel):
     seed: Optional[int] = None
     lightx2v_strength_high: Optional[float] = None
     lightx2v_strength_low: Optional[float] = None
+    starting_image_uri: Optional[str] = None
     first_segment: SegmentCreate
 
 

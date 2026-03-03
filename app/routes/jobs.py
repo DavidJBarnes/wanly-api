@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import random
@@ -63,13 +64,29 @@ async def create_job(
     db.add(job)
     await db.flush()  # Get job.id
 
-    # Upload starting image to S3 if provided
+    # Upload starting image to S3 if provided (with hash-based dedup)
     if starting_image is not None:
         image_data = await starting_image.read()
-        ext = os.path.splitext(starting_image.filename or "image.png")[1] or ".png"
-        key = f"{job.id}/starting_image{ext}"
-        uri = await asyncio.to_thread(upload_bytes, image_data, key, settings.s3_jobs_bucket)
-        job.starting_image = uri
+        image_hash = hashlib.sha256(image_data).hexdigest()
+
+        # Check if this exact image already exists for this user
+        existing = await db.execute(
+            select(Job.starting_image)
+            .where(Job.user_id == user.id, Job.starting_image_hash == image_hash)
+            .limit(1)
+        )
+        existing_uri = existing.scalar_one_or_none()
+
+        if existing_uri:
+            job.starting_image = existing_uri
+        else:
+            ext = os.path.splitext(starting_image.filename or "image.png")[1] or ".png"
+            key = f"{job.id}/starting_image{ext}"
+            uri = await asyncio.to_thread(upload_bytes, image_data, key, settings.s3_jobs_bucket)
+            job.starting_image = uri
+        job.starting_image_hash = image_hash
+    elif body.starting_image_uri:
+        job.starting_image = body.starting_image_uri
 
     # Upload faceswap image to S3 if provided
     faceswap_uri = None
