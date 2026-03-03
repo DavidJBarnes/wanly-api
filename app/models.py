@@ -37,6 +37,7 @@ class Job(Base):
     fps = mapped_column(Integer, nullable=False)
     seed = mapped_column(BigInteger, nullable=False)
     starting_image = mapped_column(Text, nullable=True)
+    starting_image_hash = mapped_column(String(64), nullable=True, index=True)
     lightx2v_strength_high = mapped_column(Float, nullable=True)
     lightx2v_strength_low = mapped_column(Float, nullable=True)
     priority = mapped_column(Integer, nullable=False, default=0)
