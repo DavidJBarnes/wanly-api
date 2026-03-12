@@ -7,7 +7,7 @@ from slowapi.errors import RateLimitExceeded
 
 from app.config import settings
 from app.limiter import limiter
-from app.routes import auth, faceswap, files, images, jobs, loras, prompt_gen, prompt_presets, segments, tags, wildcards
+from app.routes import app_settings, auth, faceswap, files, images, jobs, loras, prompt_gen, prompt_presets, segments, tags, wildcards
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,7 @@ async def health_check():
     return {"status": "ok"}
 
 
+app.include_router(app_settings.router)
 app.include_router(auth.router)
 app.include_router(images.router)
 app.include_router(jobs.router)

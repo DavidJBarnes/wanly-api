@@ -20,6 +20,8 @@ class JobCreate(BaseModel):
     seed: Optional[int] = None
     lightx2v_strength_high: Optional[float] = None
     lightx2v_strength_low: Optional[float] = None
+    cfg_high: Optional[float] = None
+    cfg_low: Optional[float] = None
     starting_image_uri: Optional[str] = None
     first_segment: SegmentCreate
 
@@ -34,6 +36,8 @@ class JobResponse(BaseModel):
     starting_image: Optional[str]
     lightx2v_strength_high: Optional[float]
     lightx2v_strength_low: Optional[float]
+    cfg_high: Optional[float]
+    cfg_low: Optional[float]
     priority: int
     status: str
     segment_count: int = 0
