@@ -3,7 +3,7 @@ from uuid import UUID
 
 import bcrypt
 import jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,6 +19,33 @@ api_key_header = APIKeyHeader(name="X-API-Key")
 async def verify_api_key(key: str = Depends(api_key_header)):
     if not settings.api_key or key != settings.api_key:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+
+async def verify_api_key_or_token(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Accept either X-API-Key header (daemon) or ?token= query param (browser).
+
+    For browser media loads (<img src>, <video src>) that can't send custom headers.
+    """
+    # Try API key first
+    api_key = request.headers.get("x-api-key")
+    if api_key:
+        if settings.api_key and api_key == settings.api_key:
+            return
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+    # Try JWT query param
+    token = request.query_params.get("token")
+    if token:
+        user_id = decode_access_token(token)
+        result = await db.execute(select(User).where(User.id == user_id))
+        if result.scalar_one_or_none() is not None:
+            return
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
 
 def hash_password(password: str) -> str:

@@ -8,7 +8,7 @@ from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user, verify_api_key
+from app.auth import get_current_user, verify_api_key, verify_api_key_or_token
 from app.config import settings
 from app.database import get_db
 from app.enums import JobStatus, SegmentStatus, VideoStatus
@@ -49,7 +49,7 @@ async def upload_file(
     return {"path": uri}
 
 
-@router.get("/files", dependencies=[Depends(verify_api_key)])
+@router.get("/files", dependencies=[Depends(verify_api_key_or_token)])
 async def download_file(path: str, request: Request):
     """Download a file from S3 by its S3 URI.
 
