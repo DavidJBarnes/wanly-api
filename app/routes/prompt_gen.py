@@ -69,16 +69,7 @@ async def _runpod_vision(image_b64: str, prompt: str, model: str) -> str:
         resp.raise_for_status()
         data = resp.json()
 
-    if data.get("status") == "FAILED":
-        raise RuntimeError(data.get("error", "RunPod vision job failed"))
-
-    # OpenAI chat format response nested in RunPod output
-    output = data.get("output", {})
-    choices = output.get("choices", [])
-    if choices:
-        return choices[0]["message"]["content"]
-
-    raise RuntimeError(f"Unexpected RunPod response: {data}")
+    return _parse_runpod_response(data)
 
 
 async def _runpod_text(prompt: str, model: str) -> str:
@@ -95,13 +86,35 @@ async def _runpod_text(prompt: str, model: str) -> str:
         resp.raise_for_status()
         data = resp.json()
 
-    if data.get("status") == "FAILED":
-        raise RuntimeError(data.get("error", "RunPod text job failed"))
+    return _parse_runpod_response(data)
 
-    output = data.get("output", {})
-    choices = output.get("choices", [])
-    if choices:
-        return choices[0]["message"]["content"]
+
+def _parse_runpod_response(data: dict) -> str:
+    """Extract message content from RunPod serverless response."""
+    if data.get("status") == "FAILED":
+        raise RuntimeError(data.get("error", "RunPod job failed"))
+
+    output = data.get("output")
+    logger.info("RunPod response output type: %s", type(output).__name__)
+
+    # output is a dict with choices (standard OpenAI format)
+    if isinstance(output, dict):
+        choices = output.get("choices", [])
+        if choices:
+            return choices[0]["message"]["content"]
+
+    # output is a list (some worker versions)
+    if isinstance(output, list) and output:
+        first = output[0]
+        if isinstance(first, dict):
+            if "message" in first:
+                return first["message"]["content"]
+            if "choices" in first:
+                return first["choices"][0]["message"]["content"]
+
+    # output is a plain string
+    if isinstance(output, str):
+        return output
 
     raise RuntimeError(f"Unexpected RunPod response: {data}")
 
