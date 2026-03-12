@@ -23,9 +23,87 @@ router = APIRouter()
 # In-memory template overrides (reset on restart)
 _template_overrides: dict[str, str] = {}
 
+RUNPOD_TIMEOUT = 300.0
+
 
 def _get_template(key: str) -> str:
     return _template_overrides.get(key, getattr(settings, f"ollama_{key}"))
+
+
+def _runpod_url() -> str:
+    eid = settings.runpod_ollama_endpoint_id
+    return f"https://api.runpod.ai/v2/{eid}/runsync"
+
+
+def _runpod_headers() -> dict[str, str]:
+    return {
+        "Authorization": f"Bearer {settings.runpod_api_key}",
+        "Content-Type": "application/json",
+    }
+
+
+async def _runpod_vision(image_b64: str, prompt: str, model: str) -> str:
+    """Call RunPod serverless Ollama with a vision model (OpenAI chat format)."""
+    payload = {
+        "input": {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/png;base64,{image_b64}"
+                            },
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": 300,
+        }
+    }
+    async with httpx.AsyncClient(timeout=RUNPOD_TIMEOUT) as client:
+        resp = await client.post(_runpod_url(), headers=_runpod_headers(), json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    if data.get("status") == "FAILED":
+        raise RuntimeError(data.get("error", "RunPod vision job failed"))
+
+    # OpenAI chat format response nested in RunPod output
+    output = data.get("output", {})
+    choices = output.get("choices", [])
+    if choices:
+        return choices[0]["message"]["content"]
+
+    raise RuntimeError(f"Unexpected RunPod response: {data}")
+
+
+async def _runpod_text(prompt: str, model: str) -> str:
+    """Call RunPod serverless Ollama with a text model (OpenAI chat format)."""
+    payload = {
+        "input": {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 300,
+        }
+    }
+    async with httpx.AsyncClient(timeout=RUNPOD_TIMEOUT) as client:
+        resp = await client.post(_runpod_url(), headers=_runpod_headers(), json=payload)
+        resp.raise_for_status()
+        data = resp.json()
+
+    if data.get("status") == "FAILED":
+        raise RuntimeError(data.get("error", "RunPod text job failed"))
+
+    output = data.get("output", {})
+    choices = output.get("choices", [])
+    if choices:
+        return choices[0]["message"]["content"]
+
+    raise RuntimeError(f"Unexpected RunPod response: {data}")
 
 
 @router.post("/prompt/generate", response_model=PromptGenResponse)
@@ -47,51 +125,38 @@ async def generate_prompt(
     else:
         image_b64 = body.image_base64
 
-    ollama_url = settings.ollama_url
-
     # Step 2: Vision model — describe the image
-    vision_payload = {
-        "model": _get_template("vision_model"),
-        "prompt": _get_template("vision_prompt"),
-        "images": [image_b64],
-        "stream": False,
-    }
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        try:
-            resp = await client.post(f"{ollama_url}/api/generate", json=vision_payload)
-            resp.raise_for_status()
-            description = resp.json()["response"]
-        except Exception:
-            logger.exception("Ollama vision call failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Ollama vision model failed — is Ollama running?",
-            )
+    try:
+        description = await _runpod_vision(
+            image_b64,
+            _get_template("vision_prompt"),
+            _get_template("vision_model"),
+        )
+    except Exception:
+        logger.exception("RunPod vision call failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Vision model failed — check RunPod endpoint",
+        )
 
     # Step 3: Text model — generate video prompt from description
     prefix = body.prompt_prefix or ""
     template = _get_template("text_prompt")
-    # Strip " of {prefix}" when no prefix provided
     if not prefix and " of {prefix}" in template:
         template = template.replace(" of {prefix}", "")
     text_prompt = template.replace("{prefix}", prefix).replace("{description}", description)
 
-    text_payload = {
-        "model": _get_template("text_model"),
-        "prompt": text_prompt,
-        "stream": False,
-    }
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        try:
-            resp = await client.post(f"{ollama_url}/api/generate", json=text_payload)
-            resp.raise_for_status()
-            generated_prompt = resp.json()["response"]
-        except Exception:
-            logger.exception("Ollama text call failed")
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Ollama text model failed — is Ollama running?",
-            )
+    try:
+        generated_prompt = await _runpod_text(
+            text_prompt,
+            _get_template("text_model"),
+        )
+    except Exception:
+        logger.exception("RunPod text call failed")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Text model failed — check RunPod endpoint",
+        )
 
     return PromptGenResponse(prompt=generated_prompt.strip(), description=description.strip())
 
