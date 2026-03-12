@@ -69,9 +69,12 @@ async def generate_prompt(
             )
 
     # Step 3: Text model — generate video prompt from description
-    prefix = body.prompt_prefix
-    intro = f"Here is a still image description of {prefix}:" if prefix else "Here is a still image description:"
-    text_prompt = f"{intro}\n\n{description}\n\n{_get_template('text_prompt')}"
+    prefix = body.prompt_prefix or ""
+    template = _get_template("text_prompt")
+    # Strip " of {prefix}" when no prefix provided
+    if not prefix and " of {prefix}" in template:
+        template = template.replace(" of {prefix}", "")
+    text_prompt = template.replace("{prefix}", prefix).replace("{description}", description)
 
     text_payload = {
         "model": _get_template("text_model"),
