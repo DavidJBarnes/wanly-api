@@ -56,7 +56,7 @@ async def generate_prompt(
         "images": [image_b64],
         "stream": False,
     }
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:
         try:
             resp = await client.post(f"{ollama_url}/api/generate", json=vision_payload)
             resp.raise_for_status()
@@ -69,16 +69,19 @@ async def generate_prompt(
             )
 
     # Step 3: Text model — generate video prompt from description
-    prefix = body.prompt_prefix
-    intro = f"Here is a still image description of {prefix}:" if prefix else "Here is a still image description:"
-    text_prompt = f"{intro}\n\n{description}\n\n{_get_template('text_prompt')}"
+    prefix = body.prompt_prefix or ""
+    template = _get_template("text_prompt")
+    # Strip " of {prefix}" when no prefix provided
+    if not prefix and " of {prefix}" in template:
+        template = template.replace(" of {prefix}", "")
+    text_prompt = template.replace("{prefix}", prefix).replace("{description}", description)
 
     text_payload = {
         "model": _get_template("text_model"),
         "prompt": text_prompt,
         "stream": False,
     }
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:
         try:
             resp = await client.post(f"{ollama_url}/api/generate", json=text_payload)
             resp.raise_for_status()
