@@ -72,11 +72,20 @@ async def _runpod_vision(image_b64: str, prompt: str, model: str) -> str:
     if data.get("status") == "FAILED":
         raise RuntimeError(data.get("error", "RunPod vision job failed"))
 
-    # OpenAI chat format response nested in RunPod output
-    output = data.get("output", {})
-    choices = output.get("choices", [])
-    if choices:
-        return choices[0]["message"]["content"]
+    output = data.get("output")
+    logger.info("RunPod vision response structure: %s", type(output))
+
+    # RunPod may wrap the OpenAI response differently depending on worker version
+    if isinstance(output, dict):
+        choices = output.get("choices", [])
+        if choices:
+            return choices[0]["message"]["content"]
+    elif isinstance(output, list) and output:
+        first = output[0]
+        if isinstance(first, dict) and "message" in first:
+            return first["message"]["content"]
+        if isinstance(first, dict) and "choices" in first:
+            return first["choices"][0]["message"]["content"]
 
     raise RuntimeError(f"Unexpected RunPod response: {data}")
 
@@ -98,10 +107,19 @@ async def _runpod_text(prompt: str, model: str) -> str:
     if data.get("status") == "FAILED":
         raise RuntimeError(data.get("error", "RunPod text job failed"))
 
-    output = data.get("output", {})
-    choices = output.get("choices", [])
-    if choices:
-        return choices[0]["message"]["content"]
+    output = data.get("output")
+    logger.info("RunPod text response structure: %s", type(output))
+
+    if isinstance(output, dict):
+        choices = output.get("choices", [])
+        if choices:
+            return choices[0]["message"]["content"]
+    elif isinstance(output, list) and output:
+        first = output[0]
+        if isinstance(first, dict) and "message" in first:
+            return first["message"]["content"]
+        if isinstance(first, dict) and "choices" in first:
+            return first["choices"][0]["message"]["content"]
 
     raise RuntimeError(f"Unexpected RunPod response: {data}")
 
