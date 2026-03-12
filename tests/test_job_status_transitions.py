@@ -1,30 +1,20 @@
 """Unit tests for the job status state machine.
 
-The transition rules live in app/routes/jobs.py:update_job. These tests
+The transition rules live in app/enums.py:JOB_VALID_TRANSITIONS. These tests
 verify the rules as pure data — no HTTP requests, no database, just the
 state machine logic itself.
 """
 
 import pytest
 
-# Extracted from app/routes/jobs.py — the single source of truth for
-# which user-initiated status transitions are allowed.
-VALID_TRANSITIONS: dict[str, set[str]] = {
-    "pending": {"paused"},
-    "processing": {"paused"},
-    "awaiting": {"paused", "finalized"},
-    "failed": {"paused"},
-    "paused": {"pending", "processing", "awaiting"},
-}
+from app.enums import JOB_VALID_TRANSITIONS, JobStatus
 
-ALL_STATUSES = {
-    "pending", "processing", "awaiting", "failed",
-    "paused", "finalized", "finalizing",
-}
+ALL_STATUSES = set(JobStatus)
 
 
 def is_transition_allowed(current: str, target: str) -> bool:
-    return target in VALID_TRANSITIONS.get(current, set())
+    """Check if a user-initiated status transition is allowed."""
+    return target in JOB_VALID_TRANSITIONS.get(current, set())
 
 
 class TestValidTransitions:
@@ -32,13 +22,18 @@ class TestValidTransitions:
 
     @pytest.mark.parametrize("current,target", [
         ("pending", "paused"),
+        ("pending", "archived"),
         ("processing", "paused"),
         ("awaiting", "paused"),
         ("awaiting", "finalized"),
+        ("awaiting", "archived"),
         ("failed", "paused"),
+        ("failed", "archived"),
         ("paused", "pending"),
         ("paused", "processing"),
         ("paused", "awaiting"),
+        ("paused", "archived"),
+        ("archived", "awaiting"),
     ])
     def test_allowed(self, current, target):
         assert is_transition_allowed(current, target)
@@ -88,3 +83,25 @@ class TestPauseSymmetry:
             assert not is_transition_allowed("paused", s), (
                 f"paused -> {s} should be blocked"
             )
+
+
+class TestArchiveTransitions:
+    """Archive transitions are available from non-active statuses."""
+
+    def test_pending_can_archive(self):
+        assert is_transition_allowed("pending", "archived")
+
+    def test_awaiting_can_archive(self):
+        assert is_transition_allowed("awaiting", "archived")
+
+    def test_failed_can_archive(self):
+        assert is_transition_allowed("failed", "archived")
+
+    def test_paused_can_archive(self):
+        assert is_transition_allowed("paused", "archived")
+
+    def test_archived_can_unarchive_to_awaiting(self):
+        assert is_transition_allowed("archived", "awaiting")
+
+    def test_processing_cannot_archive(self):
+        assert not is_transition_allowed("processing", "archived")

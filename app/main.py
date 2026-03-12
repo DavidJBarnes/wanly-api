@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
@@ -6,6 +8,8 @@ from slowapi.errors import RateLimitExceeded
 from app.config import settings
 from app.limiter import limiter
 from app.routes import auth, faceswap, files, images, jobs, loras, prompt_presets, segments, tags, wildcards
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="wanly-api")
 
@@ -23,6 +27,14 @@ if _origins:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+
+# --- Health check ------------------------------------------------------------
+@app.get("/health")
+async def health_check():
+    """Liveness/readiness probe for deployment health checks."""
+    return {"status": "ok"}
+
 
 app.include_router(auth.router)
 app.include_router(images.router)

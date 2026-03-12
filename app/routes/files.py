@@ -8,9 +8,10 @@ from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user
+from app.auth import get_current_user, verify_api_key
 from app.config import settings
 from app.database import get_db
+from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.models import Job, Segment, User, Video
 from app.s3 import download_bytes, upload_bytes
 from app.schemas.segments import SegmentResponse
@@ -48,7 +49,7 @@ async def upload_file(
     return {"path": uri}
 
 
-@router.get("/files")
+@router.get("/files", dependencies=[Depends(verify_api_key)])
 async def download_file(path: str, request: Request):
     """Download a file from S3 by its S3 URI.
 
@@ -103,7 +104,7 @@ async def download_file(path: str, request: Request):
     return Response(content=data, media_type=media_type, headers=headers)
 
 
-@router.post("/segments/{segment_id}/upload", response_model=SegmentResponse)
+@router.post("/segments/{segment_id}/upload", response_model=SegmentResponse, dependencies=[Depends(verify_api_key)])
 async def upload_segment_output(
     segment_id: UUID,
     background_tasks: BackgroundTasks,
@@ -133,7 +134,7 @@ async def upload_segment_output(
 
     segment.output_path = video_uri
     segment.last_frame_path = frame_uri
-    segment.status = "completed"
+    segment.status = SegmentStatus.COMPLETED
 
     from datetime import datetime, timezone
     segment.completed_at = datetime.now(timezone.utc)
@@ -143,19 +144,19 @@ async def upload_segment_output(
     result = await db.execute(
         select(Segment).where(
             Segment.job_id == job.id,
-            Segment.status.in_(["pending", "claimed", "processing"]),
+            Segment.status.in_([SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING]),
         )
     )
     active_segments = result.scalars().all()
     if len(active_segments) == 0:
         if segment.auto_finalize:
-            job.status = "finalized"
-            video_record = Video(job_id=job.id, status="pending")
+            job.status = JobStatus.FINALIZED
+            video_record = Video(job_id=job.id, status=VideoStatus.PENDING)
             db.add(video_record)
             await db.flush()
             background_tasks.add_task(stitch_video, video_record.id, job.id)
         else:
-            job.status = "awaiting"
+            job.status = JobStatus.AWAITING
 
     await db.commit()
     await db.refresh(segment)

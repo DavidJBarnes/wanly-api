@@ -10,6 +10,7 @@ from sqlalchemy import select
 
 from app.config import settings
 from app.database import async_session
+from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.models import Job, Segment, Video
 from app.s3 import download_file, upload_file
 
@@ -26,13 +27,13 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
             if not job or not video:
                 logger.error("stitch_video: job %s or video %s not found", job_id, video_id)
                 return
-            job.status = "finalizing"
+            job.status = JobStatus.FINALIZING
             await db.commit()
 
             # Fetch completed segments ordered by index
             result = await db.execute(
                 select(Segment)
-                .where(Segment.job_id == job_id, Segment.status == "completed")
+                .where(Segment.job_id == job_id, Segment.status == SegmentStatus.COMPLETED)
                 .order_by(Segment.index)
             )
             segments = result.scalars().all()
@@ -89,9 +90,9 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
             total_duration = sum(s.duration_seconds for s in segments)
             video.output_path = s3_uri
             video.duration_seconds = total_duration
-            video.status = "completed"
+            video.status = VideoStatus.COMPLETED
             video.completed_at = datetime.now(timezone.utc)
-            job.status = "finalized"
+            job.status = JobStatus.FINALIZED
             await db.commit()
             logger.info("Stitch complete for job %s -> %s", job_id, s3_uri)
 
@@ -102,10 +103,10 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                 video = await db.get(Video, video_id)
                 job = await db.get(Job, job_id)
                 if video:
-                    video.status = "failed"
+                    video.status = VideoStatus.FAILED
                     video.error_message = str(e)[:2000]
                 if job:
-                    job.status = "finalized"
+                    job.status = JobStatus.FINALIZED
                 await db.commit()
             except Exception:
                 logger.exception("Failed to record stitch error for job %s", job_id)

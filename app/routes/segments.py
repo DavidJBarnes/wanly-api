@@ -10,8 +10,9 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.auth import get_current_user
+from app.auth import get_current_user, verify_api_key
 from app.database import get_db
+from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.models import Job, Lora, Segment, User, Video, Wildcard
 from app.s3 import delete_object
 from app.schemas.segments import SegmentClaimResponse, SegmentCreate, SegmentResponse, SegmentStatusUpdate, WorkerSegmentResponse
@@ -84,7 +85,7 @@ async def _resolve_wildcards(db: AsyncSession, prompt: str) -> tuple[str, str | 
     return resolved, template
 
 
-@router.get("/segments", response_model=list[WorkerSegmentResponse])
+@router.get("/segments", response_model=list[WorkerSegmentResponse], dependencies=[Depends(verify_api_key)])
 async def list_segments(
     worker_id: UUID = Query(...),
     limit: int = Query(50, ge=1, le=200),
@@ -130,7 +131,7 @@ async def add_segment(
     job = result.scalar_one_or_none()
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    if job.status not in ("awaiting", "failed"):
+    if job.status not in (JobStatus.AWAITING, JobStatus.FAILED):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Job must be in 'awaiting' or 'failed' status to add segments (current: '{job.status}')",
@@ -160,14 +161,14 @@ async def add_segment(
     )
     db.add(segment)
 
-    job.status = "pending"
+    job.status = JobStatus.PENDING
 
     await db.commit()
     await db.refresh(segment)
     return segment
 
 
-@router.get("/segments/next")
+@router.get("/segments/next", dependencies=[Depends(verify_api_key)])
 async def claim_next_segment(
     worker_id: UUID = Query(...),
     worker_name: str = Query(None),
@@ -177,13 +178,13 @@ async def claim_next_segment(
     stale_cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
     stale_result = await db.execute(
         select(Segment).where(
-            Segment.status.in_(["claimed", "processing"]),
+            Segment.status.in_([SegmentStatus.CLAIMED, SegmentStatus.PROCESSING]),
             Segment.claimed_at < stale_cutoff,
         )
     )
     for stale in stale_result.scalars().all():
         logger.warning("Resetting stale segment %s (status=%s, claimed_at=%s)", stale.id, stale.status, stale.claimed_at)
-        stale.status = "pending"
+        stale.status = SegmentStatus.PENDING
         stale.worker_id = None
         stale.worker_name = None
         stale.claimed_at = None
@@ -192,7 +193,7 @@ async def claim_next_segment(
     result = await db.execute(
         select(Segment)
         .join(Job, Segment.job_id == Job.id)
-        .where(Segment.status == "pending", Job.status.in_(["pending", "processing"]))
+        .where(Segment.status == SegmentStatus.PENDING, Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]))
         .order_by(Job.priority.asc(), Segment.created_at.asc())
         .limit(1)
         .with_for_update(skip_locked=True)
@@ -202,14 +203,14 @@ async def claim_next_segment(
         return None
 
     now = datetime.now(timezone.utc)
-    segment.status = "claimed"
+    segment.status = SegmentStatus.CLAIMED
     segment.worker_id = worker_id
     segment.worker_name = worker_name
     segment.claimed_at = now
 
     job = await db.get(Job, segment.job_id)
-    if job.status == "pending":
-        job.status = "processing"
+    if job.status == JobStatus.PENDING:
+        job.status = JobStatus.PROCESSING
 
     # Resolve start_image
     resolved_start_image = segment.start_image
@@ -253,7 +254,7 @@ async def claim_next_segment(
     )
 
 
-@router.patch("/segments/{segment_id}", response_model=SegmentResponse)
+@router.patch("/segments/{segment_id}", response_model=SegmentResponse, dependencies=[Depends(verify_api_key)])
 async def update_segment(
     segment_id: UUID,
     body: SegmentStatusUpdate,
@@ -266,7 +267,7 @@ async def update_segment(
 
     if body.status is not None:
         segment.status = body.status
-        if body.status in ("completed", "failed") and segment.completed_at is None:
+        if body.status in (SegmentStatus.COMPLETED, SegmentStatus.FAILED) and segment.completed_at is None:
             segment.completed_at = datetime.now(timezone.utc)
     if body.output_path is not None:
         segment.output_path = body.output_path
@@ -280,26 +281,26 @@ async def update_segment(
     await db.flush()
 
     # Check if job needs status update
-    if body.status in ("completed", "failed"):
+    if body.status in (SegmentStatus.COMPLETED, SegmentStatus.FAILED):
         job = await db.get(Job, segment.job_id)
         result = await db.execute(
             select(Segment).where(
                 Segment.job_id == job.id,
-                Segment.status.in_(["pending", "claimed", "processing"]),
+                Segment.status.in_([SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING]),
             )
         )
         active_segments = result.scalars().all()
         if len(active_segments) == 0:
-            if segment.auto_finalize and body.status == "completed":
-                job.status = "finalized"
-                video = Video(job_id=job.id, status="pending")
+            if segment.auto_finalize and body.status == SegmentStatus.COMPLETED:
+                job.status = JobStatus.FINALIZED
+                video = Video(job_id=job.id, status=VideoStatus.PENDING)
                 db.add(video)
                 await db.flush()
                 background_tasks.add_task(stitch_video, video.id, job.id)
-            elif body.status == "failed":
-                job.status = "failed"
+            elif body.status == SegmentStatus.FAILED:
+                job.status = JobStatus.FAILED
             else:
-                job.status = "awaiting"
+                job.status = JobStatus.AWAITING
 
     await db.commit()
     await db.refresh(segment)
@@ -320,13 +321,13 @@ async def retry_segment(
     segment = result.scalar_one_or_none()
     if segment is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
-    if segment.status != "failed":
+    if segment.status != SegmentStatus.FAILED:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Only failed segments can be retried (current: '{segment.status}')",
         )
 
-    segment.status = "pending"
+    segment.status = SegmentStatus.PENDING
     segment.worker_id = None
     segment.worker_name = None
     segment.claimed_at = None
@@ -335,7 +336,7 @@ async def retry_segment(
     segment.progress_log = None
 
     job = await db.get(Job, segment.job_id)
-    job.status = "pending"
+    job.status = JobStatus.PENDING
 
     await db.commit()
     await db.refresh(segment)
@@ -356,13 +357,13 @@ async def cancel_segment(
     segment = result.scalar_one_or_none()
     if segment is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
-    if segment.status not in ("pending", "claimed", "processing"):
+    if segment.status not in (SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Only pending, claimed, or processing segments can be cancelled (current: '{segment.status}')",
         )
 
-    segment.status = "failed"
+    segment.status = SegmentStatus.FAILED
     segment.error_message = "Cancelled by user"
     segment.completed_at = datetime.now(timezone.utc)
     segment.worker_id = None
@@ -373,11 +374,11 @@ async def cancel_segment(
     active_result = await db.execute(
         select(Segment).where(
             Segment.job_id == job.id,
-            Segment.status.in_(["pending", "claimed", "processing"]),
+            Segment.status.in_([SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING]),
         )
     )
     if not active_result.scalars().all():
-        job.status = "awaiting"
+        job.status = JobStatus.AWAITING
 
     await db.commit()
     await db.refresh(segment)
@@ -399,7 +400,7 @@ async def delete_segment(
     segment = result.scalar_one_or_none()
     if segment is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
-    if segment.status not in ("failed", "completed"):
+    if segment.status not in (SegmentStatus.FAILED, SegmentStatus.COMPLETED):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Only failed or completed segments can be deleted (current: '{segment.status}')",
@@ -441,9 +442,9 @@ async def delete_segment(
 
     # Update job status if needed
     has_failed = await db.execute(
-        select(Segment).where(Segment.job_id == job.id, Segment.status == "failed")
+        select(Segment).where(Segment.job_id == job.id, Segment.status == SegmentStatus.FAILED)
     )
-    if job.status == "failed" and has_failed.scalar_one_or_none() is None:
-        job.status = "awaiting"
+    if job.status == JobStatus.FAILED and has_failed.scalar_one_or_none() is None:
+        job.status = JobStatus.AWAITING
 
     await db.commit()

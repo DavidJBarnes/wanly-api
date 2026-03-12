@@ -5,6 +5,8 @@ from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, 
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import DeclarativeBase, mapped_column, relationship
 
+from app.enums import JobStatus, SegmentStatus, VideoStatus
+
 
 class Base(DeclarativeBase):
     pass
@@ -30,7 +32,7 @@ class Job(Base):
     )
 
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    user_id = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    user_id = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     name = mapped_column(String(255), nullable=False)
     width = mapped_column(Integer, nullable=False)
     height = mapped_column(Integer, nullable=False)
@@ -41,13 +43,13 @@ class Job(Base):
     lightx2v_strength_high = mapped_column(Float, nullable=True)
     lightx2v_strength_low = mapped_column(Float, nullable=True)
     priority = mapped_column(Integer, nullable=False, default=0)
-    status = mapped_column(String(20), nullable=False, default="pending")
+    status = mapped_column(String(20), nullable=False, default=JobStatus.PENDING)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     user = relationship("User", back_populates="jobs")
-    segments = relationship("Segment", back_populates="job", order_by="Segment.index")
-    videos = relationship("Video", back_populates="job")
+    segments = relationship("Segment", back_populates="job", order_by="Segment.index", cascade="all, delete-orphan", passive_deletes=True)
+    videos = relationship("Video", back_populates="job", cascade="all, delete-orphan", passive_deletes=True)
 
 
 class Segment(Base):
@@ -59,7 +61,7 @@ class Segment(Base):
     )
 
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    job_id = mapped_column(UUID(as_uuid=True), ForeignKey("jobs.id"), nullable=False)
+    job_id = mapped_column(UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
     index = mapped_column(Integer, nullable=False)
     prompt = mapped_column(Text, nullable=False)
     prompt_template = mapped_column(Text, nullable=True)
@@ -74,7 +76,7 @@ class Segment(Base):
     faceswap_faces_order = mapped_column(Text, nullable=True)
     faceswap_faces_index = mapped_column(Text, nullable=True)
     auto_finalize = mapped_column(Boolean, nullable=False, default=False)
-    status = mapped_column(String(20), nullable=False, default="pending")
+    status = mapped_column(String(20), nullable=False, default=SegmentStatus.PENDING)
     worker_id = mapped_column(UUID(as_uuid=True), nullable=True)
     worker_name = mapped_column(String(255), nullable=True)
     output_path = mapped_column(Text, nullable=True)
@@ -95,10 +97,10 @@ class Video(Base):
     )
 
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    job_id = mapped_column(UUID(as_uuid=True), ForeignKey("jobs.id"), nullable=False)
+    job_id = mapped_column(UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
     output_path = mapped_column(Text, nullable=True)
     duration_seconds = mapped_column(Float, nullable=True)
-    status = mapped_column(String(20), nullable=False, default="pending")
+    status = mapped_column(String(20), nullable=False, default=VideoStatus.PENDING)
     error_message = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     completed_at = mapped_column(DateTime(timezone=True), nullable=True)
