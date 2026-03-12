@@ -247,6 +247,8 @@ async def claim_next_segment(
         initial_reference_image=job.starting_image,
         lightx2v_strength_high=job.lightx2v_strength_high,
         lightx2v_strength_low=job.lightx2v_strength_low,
+        cfg_high=job.cfg_high,
+        cfg_low=job.cfg_low,
         width=job.width,
         height=job.height,
         fps=job.fps,

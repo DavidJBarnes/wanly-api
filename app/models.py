@@ -42,6 +42,8 @@ class Job(Base):
     starting_image_hash = mapped_column(String(64), nullable=True, index=True)
     lightx2v_strength_high = mapped_column(Float, nullable=True)
     lightx2v_strength_low = mapped_column(Float, nullable=True)
+    cfg_high = mapped_column(Float, nullable=True)
+    cfg_low = mapped_column(Float, nullable=True)
     priority = mapped_column(Integer, nullable=False, default=0)
     status = mapped_column(String(20), nullable=False, default=JobStatus.PENDING)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -149,6 +151,14 @@ class Wildcard(Base):
     name = mapped_column(String(255), unique=True, nullable=False)
     options = mapped_column(JSON, nullable=False, default=list)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class AppSetting(Base):
+    __tablename__ = "app_settings"
+
+    key = mapped_column(String(255), primary_key=True)
+    value = mapped_column(Text, nullable=False)
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 
