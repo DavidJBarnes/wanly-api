@@ -3,6 +3,7 @@ from uuid import UUID
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.enums import SegmentStatus
 from app.models import Job, Segment
 
 
@@ -26,7 +27,7 @@ async def get_estimation_rates(
         .join(Job, Segment.job_id == Job.id)
         .where(
             Job.user_id == user_id,
-            Segment.status == "completed",
+            Segment.status == SegmentStatus.COMPLETED,
             Segment.claimed_at.isnot(None),
             Segment.completed_at.isnot(None),
             Segment.duration_seconds > 0,

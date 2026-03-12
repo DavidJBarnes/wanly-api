@@ -12,11 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user
+from app.config import settings
 from app.database import get_db
+from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStatus
 from app.estimation import estimate_segment_time, get_estimation_rates
 from app.models import Job, Lora, Segment, User, Video
 from app.routes.segments import _resolve_loras, _resolve_wildcards
-from app.config import settings
 from app.s3 import delete_object, delete_prefix, upload_bytes
 from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
 from app.schemas.segments import SegmentResponse
@@ -136,7 +137,7 @@ async def list_jobs(
         statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
         base = base.where(Job.status.in_(statuses))
     else:
-        base = base.where(Job.status.notin_(["finalized", "finalizing", "archived"]))
+        base = base.where(Job.status.notin_([JobStatus.FINALIZED, JobStatus.FINALIZING, JobStatus.ARCHIVED]))
 
     total_result = await db.execute(select(func.count()).select_from(base.subquery()))
     total = total_result.scalar_one()
@@ -159,7 +160,7 @@ async def list_jobs(
             select(
                 Segment.job_id,
                 func.count().label("total"),
-                func.count(case((Segment.status == "completed", 1))).label("completed"),
+                func.count(case((Segment.status == SegmentStatus.COMPLETED, 1))).label("completed"),
             )
             .where(Segment.job_id.in_(job_ids))
             .group_by(Segment.job_id)
@@ -168,8 +169,8 @@ async def list_jobs(
             counts_map[row[0]] = (row[1], row[2])
 
     # Fetch active segment info for estimation
-    active_statuses = {"pending", "claimed", "processing"}
-    active_jobs = [j for j in items if j.status in ("pending", "processing")]
+    active_statuses = {SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING}
+    active_jobs = [j for j in items if j.status in (JobStatus.PENDING, JobStatus.PROCESSING)]
     active_job_ids = [j.id for j in active_jobs]
     est_map: dict[UUID, float | None] = {}
     if active_job_ids:
@@ -271,7 +272,7 @@ async def get_job(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
     segments = job.segments
-    completed = [s for s in segments if s.status == "completed"]
+    completed = [s for s in segments if s.status == SegmentStatus.COMPLETED]
     total_run_time = 0.0
     for s in completed:
         if s.claimed_at and s.completed_at:
@@ -279,14 +280,14 @@ async def get_job(
     total_video_time = sum(s.duration_seconds for s in completed)
 
     # Estimate run times for non-completed segments
-    active_segs = [s for s in segments if s.status in ("pending", "claimed", "processing")]
+    active_segs = [s for s in segments if s.status in (SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING)]
     seg_responses = []
     job_est = None
     if active_segs:
         rates = await get_estimation_rates(db, user.id)
         for s in segments:
             sr = SegmentResponse.model_validate(s)
-            if s.status in ("pending", "claimed", "processing"):
+            if s.status in (SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING):
                 est = estimate_segment_time(
                     rates, job.width, job.height, job.fps,
                     s.duration_seconds, s.worker_name,
@@ -339,23 +340,15 @@ async def update_job(
         job.name = body.name
 
     if body.status is not None:
-        valid_transitions = {
-            "pending": {"paused", "archived"},
-            "processing": {"paused"},
-            "awaiting": {"paused", "finalized", "archived"},
-            "failed": {"paused", "archived"},
-            "paused": {"pending", "processing", "awaiting", "archived"},
-            "archived": {"awaiting"},
-        }
-        allowed = valid_transitions.get(job.status, set())
+        allowed = JOB_VALID_TRANSITIONS.get(job.status, set())
         if body.status not in allowed:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Cannot transition from '{job.status}' to '{body.status}'",
             )
         job.status = body.status
-        if body.status == "finalized":
-            video = Video(job_id=job.id, status="pending")
+        if body.status == JobStatus.FINALIZED:
+            video = Video(job_id=job.id, status=VideoStatus.PENDING)
             db.add(video)
             await db.flush()
             background_tasks.add_task(stitch_video, video.id, job.id)
@@ -379,7 +372,7 @@ async def reopen_job(
     job = result.scalar_one_or_none()
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-    if job.status != "finalized":
+    if job.status != JobStatus.FINALIZED:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only finalized jobs can be re-opened",
@@ -394,12 +387,12 @@ async def reopen_job(
                 logger.warning("Failed to delete S3 object %s", video.output_path, exc_info=True)
         await db.delete(video)
 
-    job.status = "awaiting"
+    job.status = JobStatus.AWAITING
     await db.commit()
     await db.refresh(job, attribute_names=["segments", "videos"])
 
     segments = job.segments
-    completed = [s for s in segments if s.status == "completed"]
+    completed = [s for s in segments if s.status == SegmentStatus.COMPLETED]
     total_run_time = 0.0
     for s in completed:
         if s.claimed_at and s.completed_at:
@@ -407,14 +400,14 @@ async def reopen_job(
     total_video_time = sum(s.duration_seconds for s in completed)
 
     # Estimate run times for non-completed segments
-    active_segs = [s for s in segments if s.status in ("pending", "claimed", "processing")]
+    active_segs = [s for s in segments if s.status in (SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING)]
     seg_responses = []
     job_est = None
     if active_segs:
         rates = await get_estimation_rates(db, user.id)
         for s in segments:
             sr = SegmentResponse.model_validate(s)
-            if s.status in ("pending", "claimed", "processing"):
+            if s.status in (SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING):
                 est = estimate_segment_time(
                     rates, job.width, job.height, job.fps,
                     s.duration_seconds, s.worker_name,
@@ -455,7 +448,7 @@ async def delete_job(
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
-    if job.status in ("processing", "finalizing"):
+    if job.status in (JobStatus.PROCESSING, JobStatus.FINALIZING):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot delete a job that is currently {job.status}",
@@ -515,7 +508,7 @@ async def get_stats(
                 func.coalesce(func.sum(Segment.duration_seconds), 0),
             )
             .join(Job, Segment.job_id == Job.id)
-            .where(Job.user_id == user.id, Segment.status == "completed")
+            .where(Job.user_id == user.id, Segment.status == SegmentStatus.COMPLETED)
         )
     ).one()
     avg_run_time = round(agg[0], 1) if agg[0] is not None else None
@@ -537,7 +530,7 @@ async def get_stats(
             .join(Job, Segment.job_id == Job.id)
             .where(
                 Job.user_id == user.id,
-                Segment.status == "completed",
+                Segment.status == SegmentStatus.COMPLETED,
                 Segment.worker_name.isnot(None),
             )
             .group_by(Segment.worker_name)

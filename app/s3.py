@@ -44,16 +44,24 @@ def download_bytes(uri: str) -> bytes:
 
 
 def delete_prefix(prefix: str, bucket: str) -> int:
-    """Delete all objects under a prefix. Returns count of deleted objects."""
+    """Delete all objects under a prefix (paginated). Returns count of deleted objects."""
     client = _get_client()
-    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix)
-    objects = resp.get("Contents", [])
-    if not objects:
-        return 0
-    delete_keys = [{"Key": obj["Key"]} for obj in objects]
-    client.delete_objects(Bucket=bucket, Delete={"Objects": delete_keys})
-    logger.info("Deleted %d objects under %s/%s", len(delete_keys), bucket, prefix)
-    return len(delete_keys)
+    total_deleted = 0
+    params: dict = {"Bucket": bucket, "Prefix": prefix}
+    while True:
+        resp = client.list_objects_v2(**params)
+        objects = resp.get("Contents", [])
+        if not objects:
+            break
+        delete_keys = [{"Key": obj["Key"]} for obj in objects]
+        client.delete_objects(Bucket=bucket, Delete={"Objects": delete_keys})
+        total_deleted += len(delete_keys)
+        if not resp.get("IsTruncated"):
+            break
+        params["ContinuationToken"] = resp["NextContinuationToken"]
+    if total_deleted:
+        logger.info("Deleted %d objects under %s/%s", total_deleted, bucket, prefix)
+    return total_deleted
 
 
 def delete_object(uri: str) -> None:
