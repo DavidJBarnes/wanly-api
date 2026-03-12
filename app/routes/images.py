@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
 
-from app.auth import get_current_user
+from app.auth import get_current_user, verify_api_key_or_token
 from app.config import settings
 from app.s3 import (
     delete_object,
@@ -17,7 +17,7 @@ from app.s3 import (
 router = APIRouter(tags=["images"])
 
 
-@router.post("/images/upload", dependencies=[Depends(get_current_user)])
+@router.post("/images/upload", dependencies=[Depends(verify_api_key_or_token)])
 async def upload_image(file: UploadFile, filename: str | None = None):
     data = await file.read()
     if not filename:
