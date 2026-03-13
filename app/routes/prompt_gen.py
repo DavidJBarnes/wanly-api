@@ -24,15 +24,16 @@ router = APIRouter()
 _template_overrides: dict[str, str] = {}
 
 RUNPOD_TIMEOUT = 300.0
+RUNPOD_POLL_INTERVAL = 3.0
 
 
 def _get_template(key: str) -> str:
     return _template_overrides.get(key, getattr(settings, f"ollama_{key}"))
 
 
-def _runpod_url() -> str:
+def _runpod_base_url() -> str:
     eid = settings.runpod_ollama_endpoint_id
-    return f"https://api.runpod.ai/v2/{eid}/runsync"
+    return f"https://api.runpod.ai/v2/{eid}"
 
 
 def _runpod_headers() -> dict[str, str]:
@@ -40,6 +41,39 @@ def _runpod_headers() -> dict[str, str]:
         "Authorization": f"Bearer {settings.runpod_api_key}",
         "Content-Type": "application/json",
     }
+
+
+async def _runpod_poll(job_id: str, client: httpx.AsyncClient) -> dict:
+    """Poll RunPod status endpoint until job completes or fails."""
+    url = f"{_runpod_base_url()}/status/{job_id}"
+    elapsed = 0.0
+    while elapsed < RUNPOD_TIMEOUT:
+        await asyncio.sleep(RUNPOD_POLL_INTERVAL)
+        elapsed += RUNPOD_POLL_INTERVAL
+        resp = await client.get(url, headers=_runpod_headers())
+        resp.raise_for_status()
+        data = resp.json()
+        st = data.get("status")
+        if st in ("COMPLETED", "FAILED"):
+            return data
+        logger.debug("RunPod job %s still %s (%.0fs)", job_id, st, elapsed)
+    raise RuntimeError(f"RunPod job {job_id} timed out after {RUNPOD_TIMEOUT}s")
+
+
+async def _runpod_call(payload: dict) -> dict:
+    """Submit to RunPod runsync, poll if worker is cold-starting."""
+    async with httpx.AsyncClient(timeout=RUNPOD_TIMEOUT) as client:
+        resp = await client.post(
+            f"{_runpod_base_url()}/runsync", headers=_runpod_headers(), json=payload
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        if data.get("status") in ("IN_QUEUE", "IN_PROGRESS"):
+            logger.info("RunPod job %s queued, polling...", data["id"])
+            data = await _runpod_poll(data["id"], client)
+
+    return data
 
 
 async def _runpod_vision(image_b64: str, prompt: str, model: str) -> str:
@@ -64,12 +98,7 @@ async def _runpod_vision(image_b64: str, prompt: str, model: str) -> str:
             "max_tokens": 300,
         }
     }
-    async with httpx.AsyncClient(timeout=RUNPOD_TIMEOUT) as client:
-        resp = await client.post(_runpod_url(), headers=_runpod_headers(), json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-
-    return _parse_runpod_response(data)
+    return _parse_runpod_response(await _runpod_call(payload))
 
 
 async def _runpod_text(prompt: str, model: str) -> str:
@@ -81,12 +110,7 @@ async def _runpod_text(prompt: str, model: str) -> str:
             "max_tokens": 300,
         }
     }
-    async with httpx.AsyncClient(timeout=RUNPOD_TIMEOUT) as client:
-        resp = await client.post(_runpod_url(), headers=_runpod_headers(), json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-
-    return _parse_runpod_response(data)
+    return _parse_runpod_response(await _runpod_call(payload))
 
 
 def _parse_runpod_response(data: dict) -> str:
