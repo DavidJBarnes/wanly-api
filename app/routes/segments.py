@@ -13,7 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.auth import get_current_user, verify_api_key
 from app.database import get_db
 from app.enums import JobStatus, SegmentStatus, VideoStatus
-from app.models import Job, Lora, Segment, User, Video, Wildcard
+from app.models import AppSetting, Job, Lora, Segment, User, Video, Wildcard
 from app.s3 import delete_object
 from app.schemas.segments import SegmentClaimResponse, SegmentCreate, SegmentResponse, SegmentStatusUpdate, WorkerSegmentResponse
 from app.stitch import stitch_video
@@ -226,6 +226,10 @@ async def claim_next_segment(
             if prev_segment is not None:
                 resolved_start_image = prev_segment.last_frame_path
 
+    # Fetch negative_prompt from app settings
+    neg_setting = await db.get(AppSetting, "negative_prompt")
+    negative_prompt = neg_setting.value if neg_setting else None
+
     await db.commit()
     await db.refresh(segment)
 
@@ -249,6 +253,7 @@ async def claim_next_segment(
         lightx2v_strength_low=job.lightx2v_strength_low,
         cfg_high=job.cfg_high,
         cfg_low=job.cfg_low,
+        negative_prompt=negative_prompt,
         width=job.width,
         height=job.height,
         fps=job.fps,
