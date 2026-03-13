@@ -23,6 +23,11 @@ class LoraUpdate(BaseModel):
     trigger_words: Optional[str] = None
     default_prompt: Optional[str] = None
     source_url: Optional[str] = None
+    preview_image: Optional[str] = None
+    high_file: Optional[str] = None
+    high_s3_uri: Optional[str] = None
+    low_file: Optional[str] = None
+    low_s3_uri: Optional[str] = None
     default_high_weight: Optional[float] = None
     default_low_weight: Optional[float] = None
 
