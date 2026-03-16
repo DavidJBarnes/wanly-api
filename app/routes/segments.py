@@ -390,6 +390,7 @@ async def get_segment_frames(
     segment_id: UUID,
     position: str = Query(..., pattern="^(start|end)$"),
     count: int = Query(5, ge=1, le=20),
+    trim: int = Query(0, ge=0),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -430,14 +431,22 @@ async def get_segment_frames(
         num, den = r_rate.split("/")
         fps = float(num) / float(den)
 
-        # Determine frame range
+        # Determine frame range centered on the trim cut point
         count = min(count, total_frames)
         if position == "start":
-            start_frame = 0
-            end_frame = count - 1
+            # Cut point is at frame index `trim` — center around it
+            cut = min(trim, total_frames - 1)
+            half = count // 2
+            start_frame = max(cut - half, 0)
+            end_frame = min(start_frame + count - 1, total_frames - 1)
+            start_frame = max(end_frame - count + 1, 0)
         else:
-            start_frame = max(total_frames - count, 0)
-            end_frame = total_frames - 1
+            # Cut point is at frame index `total_frames - trim` — center around it
+            cut = max(total_frames - trim, 0)
+            half = count // 2
+            start_frame = max(cut - half, 0)
+            end_frame = min(start_frame + count - 1, total_frames - 1)
+            start_frame = max(end_frame - count + 1, 0)
 
         # Extract frames
         extract_cmd = [
