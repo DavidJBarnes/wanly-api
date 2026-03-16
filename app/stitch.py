@@ -16,6 +16,50 @@ from app.s3 import download_file, upload_file
 
 logger = logging.getLogger(__name__)
 
+FADE_DURATION = 1.0
+
+
+def _apply_fades(input_path: str, output_path: str, duration: float,
+                 fade_in: bool, fade_out: bool) -> None:
+    """Re-encode a segment with fade-in and/or fade-out filters."""
+    vfilters = []
+    if fade_in:
+        vfilters.append(f"fade=t=in:st=0:d={FADE_DURATION}")
+    if fade_out:
+        fade_start = max(duration - FADE_DURATION, 0)
+        vfilters.append(f"fade=t=out:st={fade_start}:d={FADE_DURATION}")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-vf", ",".join(vfilters),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "aac",
+        output_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=300)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg fade failed: {proc.stderr.decode()[-500:]}")
+
+
+def _compute_fades(segments: list) -> list[tuple[bool, bool]]:
+    """Return (fade_in, fade_out) for each segment based on transition settings.
+
+    A segment's transition controls what happens *after* it (fade-out on itself,
+    fade-in on the next segment). The last segment's transition is ignored.
+    """
+    n = len(segments)
+    result = [(False, False)] * n
+    for i in range(n):
+        fade_in = False
+        fade_out = False
+        if i > 0 and segments[i - 1].transition == "fade":
+            fade_in = True
+        if i < n - 1 and segments[i].transition == "fade":
+            fade_out = True
+        result[i] = (fade_in, fade_out)
+    return result
+
 
 async def stitch_video(video_id: UUID, job_id: UUID) -> None:
     """Background task: download segment videos, concat with ffmpeg, upload result."""
@@ -56,10 +100,29 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                     await asyncio.to_thread(download_file, seg.output_path, str(local_path))
                     local_files.append(local_name)
 
+                # Apply fade transitions where needed
+                needs_fade = _compute_fades(segments)
+                concat_names = []
+                for i, (seg, local_name) in enumerate(zip(segments, local_files)):
+                    fade_in, fade_out = needs_fade[i]
+                    if fade_in or fade_out:
+                        faded_name = f"seg_{seg.index:03d}_faded.mp4"
+                        await asyncio.to_thread(
+                            _apply_fades,
+                            str(tmppath / local_name),
+                            str(tmppath / faded_name),
+                            seg.duration_seconds,
+                            fade_in,
+                            fade_out,
+                        )
+                        concat_names.append(faded_name)
+                    else:
+                        concat_names.append(local_name)
+
                 # Write ffmpeg concat list
                 concat_list = tmppath / "concat.txt"
                 concat_list.write_text(
-                    "\n".join(f"file '{name}'" for name in local_files)
+                    "\n".join(f"file '{name}'" for name in concat_names)
                 )
 
                 # Run ffmpeg concat (no re-encoding)
