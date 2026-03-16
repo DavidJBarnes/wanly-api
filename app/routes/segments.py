@@ -1,8 +1,13 @@
 import asyncio
+import base64
+import json
 import logging
 import random
 import re
+import subprocess
+import tempfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
@@ -14,8 +19,17 @@ from app.auth import get_current_user, verify_api_key
 from app.database import get_db
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.models import AppSetting, Job, Lora, Segment, User, Video, Wildcard
-from app.s3 import delete_object
-from app.schemas.segments import SegmentClaimResponse, SegmentCreate, SegmentResponse, SegmentStatusUpdate, WorkerSegmentResponse
+from app.s3 import delete_object, download_file
+from app.schemas.segments import (
+    FramePreview,
+    FramePreviewResponse,
+    SegmentClaimResponse,
+    SegmentCreate,
+    SegmentResponse,
+    SegmentStatusUpdate,
+    SegmentTrimUpdate,
+    WorkerSegmentResponse,
+)
 from app.stitch import stitch_video
 
 logger = logging.getLogger(__name__)
@@ -338,6 +352,118 @@ async def update_segment_transition(
     await db.commit()
     await db.refresh(segment)
     return segment
+
+
+@router.patch("/segments/{segment_id}/trim", response_model=SegmentResponse)
+async def update_segment_trim(
+    segment_id: UUID,
+    body: SegmentTrimUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+
+    job = await db.get(Job, segment.job_id)
+    total_frames = int(segment.duration_seconds * job.fps)
+    if body.trim_start_frames + body.trim_end_frames >= total_frames:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Trim exceeds total frames ({total_frames})",
+        )
+
+    segment.trim_start_frames = body.trim_start_frames
+    segment.trim_end_frames = body.trim_end_frames
+    await db.commit()
+    await db.refresh(segment)
+    return segment
+
+
+@router.get("/segments/{segment_id}/frames", response_model=FramePreviewResponse)
+async def get_segment_frames(
+    segment_id: UUID,
+    position: str = Query(..., pattern="^(start|end)$"),
+    count: int = Query(5, ge=1, le=20),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+    if not segment.output_path:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Segment has no output video")
+
+    job = await db.get(Job, segment.job_id)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        video_path = tmppath / "segment.mp4"
+        await asyncio.to_thread(download_file, segment.output_path, str(video_path))
+
+        # Get total frame count via ffprobe
+        probe_cmd = [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-count_frames",
+            "-show_entries", "stream=nb_read_frames,r_frame_rate",
+            "-of", "json",
+            str(video_path),
+        ]
+        probe = await asyncio.to_thread(subprocess.run, probe_cmd, capture_output=True, timeout=60)
+        if probe.returncode != 0:
+            raise HTTPException(status_code=500, detail="ffprobe failed")
+        probe_data = json.loads(probe.stdout)
+        stream = probe_data["streams"][0]
+        total_frames = int(stream["nb_read_frames"])
+        r_rate = stream["r_frame_rate"]
+        num, den = r_rate.split("/")
+        fps = float(num) / float(den)
+
+        # Determine frame range
+        count = min(count, total_frames)
+        if position == "start":
+            start_frame = 0
+            end_frame = count - 1
+        else:
+            start_frame = max(total_frames - count, 0)
+            end_frame = total_frames - 1
+
+        # Extract frames
+        extract_cmd = [
+            "ffmpeg", "-y",
+            "-i", str(video_path),
+            "-vf", f"select='between(n\\,{start_frame}\\,{end_frame})',scale=320:-1",
+            "-vsync", "vfr",
+            str(tmppath / "frame_%03d.jpg"),
+        ]
+        extract = await asyncio.to_thread(subprocess.run, extract_cmd, capture_output=True, timeout=60)
+        if extract.returncode != 0:
+            raise HTTPException(status_code=500, detail="ffmpeg frame extraction failed")
+
+        # Build response
+        frames = []
+        for i in range(count):
+            frame_path = tmppath / f"frame_{i+1:03d}.jpg"
+            if not frame_path.exists():
+                break
+            b64 = base64.b64encode(frame_path.read_bytes()).decode()
+            frames.append(FramePreview(
+                frame_index=start_frame + i,
+                data_url=f"data:image/jpeg;base64,{b64}",
+            ))
+
+        return FramePreviewResponse(total_frames=total_frames, fps=fps, frames=frames)
 
 
 @router.post("/segments/{segment_id}/retry", response_model=SegmentResponse)
