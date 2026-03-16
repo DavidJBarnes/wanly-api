@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SegmentCreate(BaseModel):
@@ -39,6 +39,8 @@ class SegmentResponse(BaseModel):
     faceswap_faces_index: Optional[str]
     auto_finalize: bool
     transition: Optional[str]
+    trim_start_frames: int
+    trim_end_frames: int
     status: str
     worker_id: Optional[UUID]
     worker_name: Optional[str]
@@ -94,6 +96,22 @@ class SegmentClaimResponse(BaseModel):
     seed: int
 
     model_config = {"from_attributes": True}
+
+
+class SegmentTrimUpdate(BaseModel):
+    trim_start_frames: int = Field(ge=0)
+    trim_end_frames: int = Field(ge=0)
+
+
+class FramePreview(BaseModel):
+    frame_index: int
+    data_url: str
+
+
+class FramePreviewResponse(BaseModel):
+    total_frames: int
+    fps: float
+    frames: list[FramePreview]
 
 
 class SegmentStatusUpdate(BaseModel):

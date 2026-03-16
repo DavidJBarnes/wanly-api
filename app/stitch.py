@@ -17,6 +17,7 @@ from app.s3 import download_file, upload_file
 logger = logging.getLogger(__name__)
 
 FADE_DURATION = 1.0
+FLASH_DURATION = 1.0
 
 
 def _apply_fades(input_path: str, output_path: str, duration: float,
@@ -42,11 +43,59 @@ def _apply_fades(input_path: str, output_path: str, duration: float,
         raise RuntimeError(f"ffmpeg fade failed: {proc.stderr.decode()[-500:]}")
 
 
+def _generate_black(output_path: str, duration: float, width: int, height: int, fps: int) -> None:
+    """Generate a short black video clip."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:d={duration}:r={fps}",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-an",
+        output_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg black gen failed: {proc.stderr.decode()[-500:]}")
+
+
+def _apply_trim(input_path: str, output_path: str, fps: int,
+                 trim_start_frames: int, trim_end_frames: int) -> float:
+    """Re-encode a segment with frames trimmed from start/end. Returns new duration."""
+    # Get actual duration via ffprobe
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+        capture_output=True, timeout=60,
+    )
+    if probe.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {probe.stderr.decode()[-500:]}")
+    actual_duration = float(probe.stdout.decode().strip())
+
+    start_time = trim_start_frames / fps
+    end_trim_time = trim_end_frames / fps
+    new_duration = actual_duration - start_time - end_trim_time
+    if new_duration <= 0:
+        raise ValueError(f"Trim removes entire video: start={start_time}s end_trim={end_trim_time}s duration={actual_duration}s")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-ss", str(start_time),
+        "-i", input_path,
+        "-t", str(new_duration),
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-c:a", "aac",
+        output_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=300)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg trim failed: {proc.stderr.decode()[-500:]}")
+    return new_duration
+
+
 def _compute_fades(segments: list) -> list[tuple[bool, bool]]:
     """Return (fade_in, fade_out) for each segment based on transition settings.
 
     A segment's transition controls what happens *after* it (fade-out on itself,
-    fade-in on the next segment). The last segment's transition is ignored.
+    fade-in on the next segment). The last segment can also fade out (fade to black).
     """
     n = len(segments)
     result = [(False, False)] * n
@@ -55,7 +104,7 @@ def _compute_fades(segments: list) -> list[tuple[bool, bool]]:
         fade_out = False
         if i > 0 and segments[i - 1].transition == "fade":
             fade_in = True
-        if i < n - 1 and segments[i].transition == "fade":
+        if segments[i].transition == "fade":
             fade_out = True
         result[i] = (fade_in, fade_out)
     return result
@@ -100,7 +149,23 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                     await asyncio.to_thread(download_file, seg.output_path, str(local_path))
                     local_files.append(local_name)
 
-                # Apply fade transitions where needed
+                # Trim pass: apply trim to segments with non-zero trim values
+                durations = [seg.duration_seconds for seg in segments]
+                for i, seg in enumerate(segments):
+                    if seg.trim_start_frames > 0 or seg.trim_end_frames > 0:
+                        trimmed_name = f"seg_{seg.index:03d}_trimmed.mp4"
+                        new_dur = await asyncio.to_thread(
+                            _apply_trim,
+                            str(tmppath / local_files[i]),
+                            str(tmppath / trimmed_name),
+                            job.fps,
+                            seg.trim_start_frames,
+                            seg.trim_end_frames,
+                        )
+                        local_files[i] = trimmed_name
+                        durations[i] = new_dur
+
+                # Apply transitions
                 needs_fade = _compute_fades(segments)
                 concat_names = []
                 for i, (seg, local_name) in enumerate(zip(segments, local_files)):
@@ -111,13 +176,26 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                             _apply_fades,
                             str(tmppath / local_name),
                             str(tmppath / faded_name),
-                            seg.duration_seconds,
+                            durations[i],
                             fade_in,
                             fade_out,
                         )
                         concat_names.append(faded_name)
                     else:
                         concat_names.append(local_name)
+
+                    # Insert black clip for "flash" transition
+                    if seg.transition == "flash":
+                        black_name = f"black_{seg.index:03d}.mp4"
+                        await asyncio.to_thread(
+                            _generate_black,
+                            str(tmppath / black_name),
+                            FLASH_DURATION,
+                            job.width,
+                            job.height,
+                            job.fps,
+                        )
+                        concat_names.append(black_name)
 
                 # Write ffmpeg concat list
                 concat_list = tmppath / "concat.txt"
@@ -150,7 +228,7 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                 )
 
             # Update video record
-            total_duration = sum(s.duration_seconds for s in segments)
+            total_duration = sum(durations)
             video.output_path = s3_uri
             video.duration_seconds = total_duration
             video.status = VideoStatus.COMPLETED
