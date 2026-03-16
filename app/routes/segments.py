@@ -331,7 +331,7 @@ async def update_segment_transition(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
 
     transition = body.get("transition")
-    if transition is not None and transition not in ("fade",):
+    if transition is not None and transition not in ("fade", "flash"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid transition: {transition}")
 
     segment.transition = transition

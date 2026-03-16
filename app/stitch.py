@@ -17,6 +17,7 @@ from app.s3 import download_file, upload_file
 logger = logging.getLogger(__name__)
 
 FADE_DURATION = 1.0
+FLASH_DURATION = 1.0
 
 
 def _apply_fades(input_path: str, output_path: str, duration: float,
@@ -40,6 +41,20 @@ def _apply_fades(input_path: str, output_path: str, duration: float,
     proc = subprocess.run(cmd, capture_output=True, timeout=300)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg fade failed: {proc.stderr.decode()[-500:]}")
+
+
+def _generate_black(output_path: str, duration: float, width: int, height: int, fps: int) -> None:
+    """Generate a short black video clip."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:d={duration}:r={fps}",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-an",
+        output_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=60)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg black gen failed: {proc.stderr.decode()[-500:]}")
 
 
 def _compute_fades(segments: list) -> list[tuple[bool, bool]]:
@@ -100,7 +115,7 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                     await asyncio.to_thread(download_file, seg.output_path, str(local_path))
                     local_files.append(local_name)
 
-                # Apply fade transitions where needed
+                # Apply transitions
                 needs_fade = _compute_fades(segments)
                 concat_names = []
                 for i, (seg, local_name) in enumerate(zip(segments, local_files)):
@@ -118,6 +133,19 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                         concat_names.append(faded_name)
                     else:
                         concat_names.append(local_name)
+
+                    # Insert black clip for "flash" transition
+                    if i < len(segments) - 1 and seg.transition == "flash":
+                        black_name = f"black_{seg.index:03d}.mp4"
+                        await asyncio.to_thread(
+                            _generate_black,
+                            str(tmppath / black_name),
+                            FLASH_DURATION,
+                            job.width,
+                            job.height,
+                            job.fps,
+                        )
+                        concat_names.append(black_name)
 
                 # Write ffmpeg concat list
                 concat_list = tmppath / "concat.txt"
