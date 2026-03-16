@@ -314,6 +314,32 @@ async def update_segment(
     return segment
 
 
+@router.patch("/segments/{segment_id}/transition", response_model=SegmentResponse)
+async def update_segment_transition(
+    segment_id: UUID,
+    body: dict,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+
+    transition = body.get("transition")
+    if transition is not None and transition not in ("fade",):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid transition: {transition}")
+
+    segment.transition = transition
+    await db.commit()
+    await db.refresh(segment)
+    return segment
+
+
 @router.post("/segments/{segment_id}/retry", response_model=SegmentResponse)
 async def retry_segment(
     segment_id: UUID,
