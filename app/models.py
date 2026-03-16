@@ -78,6 +78,7 @@ class Segment(Base):
     faceswap_faces_order = mapped_column(Text, nullable=True)
     faceswap_faces_index = mapped_column(Text, nullable=True)
     auto_finalize = mapped_column(Boolean, nullable=False, default=False)
+    transition = mapped_column(String(20), nullable=True, default=None)
     status = mapped_column(String(20), nullable=False, default=SegmentStatus.PENDING)
     worker_id = mapped_column(UUID(as_uuid=True), nullable=True)
     worker_name = mapped_column(String(255), nullable=True)

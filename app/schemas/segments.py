@@ -18,6 +18,7 @@ class SegmentCreate(BaseModel):
     faceswap_faces_order: Optional[str] = None
     faceswap_faces_index: Optional[str] = None
     auto_finalize: bool = False
+    transition: Optional[str] = None
 
 
 class SegmentResponse(BaseModel):
@@ -37,6 +38,7 @@ class SegmentResponse(BaseModel):
     faceswap_faces_order: Optional[str]
     faceswap_faces_index: Optional[str]
     auto_finalize: bool
+    transition: Optional[str]
     status: str
     worker_id: Optional[UUID]
     worker_name: Optional[str]
