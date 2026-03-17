@@ -12,6 +12,7 @@ from app.s3 import (
     get_first_object_key,
     list_common_prefixes,
     list_objects,
+    move_object,
     upload_bytes,
 )
 
@@ -98,6 +99,27 @@ async def list_folder_images(date: str):
         for obj in objects
         if not obj["Key"].endswith("/.folder")
     ]
+
+
+@router.post("/images/move", dependencies=[Depends(get_current_user)])
+async def move_images(body: dict):
+    """Move one or more images to a target folder (S3 copy + delete)."""
+    keys: list[str] = body.get("keys", [])
+    target_folder: str = body.get("target_folder", "").strip()
+    if not keys:
+        raise HTTPException(status_code=400, detail="No keys provided")
+    if not target_folder:
+        raise HTTPException(status_code=400, detail="target_folder is required")
+    bucket = settings.s3_images_bucket
+
+    async def _move_one(src_key: str) -> str:
+        filename = src_key.split("/", 1)[1] if "/" in src_key else src_key
+        dst_key = f"{target_folder}/{filename}"
+        await asyncio.to_thread(move_object, bucket, src_key, dst_key)
+        return dst_key
+
+    moved = await asyncio.gather(*[_move_one(k) for k in keys])
+    return {"moved": len(moved)}
 
 
 @router.delete("/images", dependencies=[Depends(get_current_user)])
