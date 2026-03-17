@@ -1,8 +1,9 @@
 import asyncio
+import re
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 
 from app.auth import get_current_user, verify_api_key_or_token
 from app.config import settings
@@ -16,9 +17,15 @@ from app.s3 import (
 
 router = APIRouter(tags=["images"])
 
+_FOLDER_NAME_RE = re.compile(r"^[a-zA-Z0-9 _-]+$")
+
 
 @router.post("/images/upload", dependencies=[Depends(verify_api_key_or_token)])
-async def upload_image(file: UploadFile, filename: str | None = None):
+async def upload_image(
+    file: UploadFile,
+    filename: str | None = None,
+    folder: str | None = Form(None),
+):
     data = await file.read()
     if not filename:
         ext = ""
@@ -27,11 +34,32 @@ async def upload_image(file: UploadFile, filename: str | None = None):
         else:
             ext = ".png"
         filename = f"{uuid.uuid4().hex}{ext}"
-    date_prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    key = f"{date_prefix}/{filename}"
+    if folder:
+        prefix = folder.strip()
+    else:
+        prefix = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    key = f"{prefix}/{filename}"
     bucket = settings.s3_images_bucket
     uri = await asyncio.to_thread(upload_bytes, data, key, bucket)
     return {"path": uri}
+
+
+@router.post("/images/folders", dependencies=[Depends(get_current_user)])
+async def create_folder(body: dict):
+    name = body.get("name", "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Folder name is required")
+    if len(name) > 100:
+        raise HTTPException(status_code=400, detail="Folder name too long (max 100)")
+    if not _FOLDER_NAME_RE.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail="Folder name may only contain letters, numbers, spaces, dashes, and underscores",
+        )
+    bucket = settings.s3_images_bucket
+    marker_key = f"{name}/.folder"
+    await asyncio.to_thread(upload_bytes, b"", marker_key, bucket)
+    return {"name": name}
 
 
 @router.get("/images/folders", dependencies=[Depends(get_current_user)])
@@ -68,6 +96,7 @@ async def list_folder_images(date: str):
             "last_modified": obj["LastModified"],
         }
         for obj in objects
+        if not obj["Key"].endswith("/.folder")
     ]
 
 

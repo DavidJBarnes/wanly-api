@@ -115,11 +115,13 @@ def list_objects(bucket: str, prefix: str) -> list[dict]:
 
 
 def get_first_object_key(bucket: str, prefix: str) -> str | None:
-    """First object key under a prefix (for folder thumbnails). MaxKeys=1."""
+    """First non-marker object key under a prefix (for folder thumbnails)."""
     client = _get_client()
-    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=1)
-    contents = resp.get("Contents", [])
-    return contents[0]["Key"] if contents else None
+    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=5)
+    for obj in resp.get("Contents", []):
+        if not obj["Key"].endswith("/.folder"):
+            return obj["Key"]
+    return None
 
 
 def parse_s3_uri(uri: str) -> tuple[str, str]:
