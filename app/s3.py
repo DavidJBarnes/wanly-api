@@ -124,6 +124,18 @@ def get_first_object_key(bucket: str, prefix: str) -> str | None:
     return None
 
 
+def move_object(bucket: str, src_key: str, dst_key: str) -> None:
+    """Copy an object within the same bucket then delete the original."""
+    client = _get_client()
+    client.copy_object(
+        Bucket=bucket,
+        CopySource={"Bucket": bucket, "Key": src_key},
+        Key=dst_key,
+    )
+    client.delete_object(Bucket=bucket, Key=src_key)
+    logger.info("Moved %s/%s → %s/%s", bucket, src_key, bucket, dst_key)
+
+
 def parse_s3_uri(uri: str) -> tuple[str, str]:
     """Parse s3://bucket/key into (bucket, key)."""
     parts = uri.replace("s3://", "").split("/", 1)
