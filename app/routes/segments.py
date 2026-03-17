@@ -19,7 +19,7 @@ from app.auth import get_current_user, verify_api_key
 from app.database import get_db
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.models import AppSetting, Job, Lora, Segment, User, Video, Wildcard
-from app.s3 import delete_object, download_file
+from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
     FramePreview,
     FramePreviewResponse,
@@ -602,11 +602,30 @@ async def delete_segment(
         select(Segment).where(Segment.job_id == job.id).order_by(Segment.index)
     )
     remaining = remaining_result.scalars().all()
+    old_indices = {seg.id: seg.index for seg in remaining}
     for i, seg in enumerate(remaining):
         seg.index = -(i + 1)
     await db.flush()
     for i, seg in enumerate(remaining):
         seg.index = i
+
+    # Rename S3 files for segments whose index changed
+    for seg in remaining:
+        old_idx = old_indices[seg.id]
+        if old_idx == seg.index:
+            continue
+        for attr in ("output_path", "last_frame_path"):
+            old_path = getattr(seg, attr)
+            if not old_path:
+                continue
+            try:
+                bucket, old_key = parse_s3_uri(old_path)
+                new_key = old_key.replace(f"/{old_idx}_", f"/{seg.index}_", 1)
+                if new_key != old_key:
+                    await asyncio.to_thread(move_object, bucket, old_key, new_key)
+                    setattr(seg, attr, f"s3://{bucket}/{new_key}")
+            except Exception:
+                logger.warning("Failed to rename S3 object for segment %s: %s", seg.id, old_path)
 
     # Update job status if needed
     has_failed = await db.execute(
