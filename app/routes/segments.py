@@ -15,7 +15,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.auth import get_current_user, verify_api_key
+from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
 from app.database import get_db
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.models import AppSetting, Job, Lora, Segment, User, Video, Wildcard
@@ -99,7 +99,7 @@ async def _resolve_wildcards(db: AsyncSession, prompt: str) -> tuple[str, str | 
     return resolved, template
 
 
-@router.get("/segments", response_model=list[WorkerSegmentResponse], dependencies=[Depends(verify_api_key)])
+@router.get("/segments", response_model=list[WorkerSegmentResponse], dependencies=[Depends(verify_api_key_or_bearer)])
 async def list_segments(
     worker_id: UUID = Query(...),
     limit: int = Query(50, ge=1, le=200),
