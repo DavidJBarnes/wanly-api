@@ -21,6 +21,29 @@ async def verify_api_key(key: str = Depends(api_key_header)):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
 
+async def verify_api_key_or_bearer(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Accept either X-API-Key header (daemon) or Authorization Bearer JWT (console)."""
+    api_key = request.headers.get("x-api-key")
+    if api_key:
+        if settings.api_key and api_key == settings.api_key:
+            return
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
+
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.startswith("Bearer "):
+        token = auth_header[7:]
+        user_id = decode_access_token(token)
+        result = await db.execute(select(User).where(User.id == user_id))
+        if result.scalar_one_or_none() is not None:
+            return
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+
+
 async def verify_api_key_or_token(
     request: Request,
     db: AsyncSession = Depends(get_db),
