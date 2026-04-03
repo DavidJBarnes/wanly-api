@@ -246,8 +246,8 @@ async def claim_next_segment(
                 previous_motion_keywords = prev_segment.motion_keywords
                 if prev_segment.reference_frames:
                     reference_frames = prev_segment.reference_frames.copy()
-                if prev_segment.output_path and prev_segment.output_path not in reference_frames:
-                    reference_frames.append(prev_segment.output_path)
+                if prev_segment.last_frame_path and prev_segment.last_frame_path not in reference_frames:
+                    reference_frames.append(prev_segment.last_frame_path)
                     reference_frames = reference_frames[-3:]
 
     # Fetch negative_prompt from app settings
