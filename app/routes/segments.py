@@ -228,6 +228,9 @@ async def claim_next_segment(
 
     # Resolve start_image
     resolved_start_image = segment.start_image
+    previous_segment = None
+    previous_motion_keywords = None
+    reference_frames = []
     if resolved_start_image is None:
         if segment.index == 0:
             resolved_start_image = job.starting_image
@@ -239,6 +242,13 @@ async def claim_next_segment(
             prev_segment = prev_result.scalar_one_or_none()
             if prev_segment is not None:
                 resolved_start_image = prev_segment.last_frame_path
+                previous_segment = prev_segment
+                previous_motion_keywords = prev_segment.motion_keywords
+                if prev_segment.reference_frames:
+                    reference_frames = prev_segment.reference_frames.copy()
+                if prev_segment.output_path and prev_segment.output_path not in reference_frames:
+                    reference_frames.append(prev_segment.output_path)
+                    reference_frames = reference_frames[-3:]
 
     # Fetch negative_prompt from app settings
     neg_setting = await db.get(AppSetting, "negative_prompt")
@@ -263,6 +273,9 @@ async def claim_next_segment(
         faceswap_faces_order=segment.faceswap_faces_order,
         faceswap_faces_index=segment.faceswap_faces_index,
         initial_reference_image=job.starting_image,
+        motion_keywords=segment.motion_keywords,
+        previous_motion_keywords=previous_motion_keywords,
+        reference_frames=reference_frames if reference_frames else None,
         lightx2v_strength_high=job.lightx2v_strength_high,
         lightx2v_strength_low=job.lightx2v_strength_low,
         cfg_high=job.cfg_high,
@@ -298,6 +311,8 @@ async def update_segment(
         segment.error_message = body.error_message
     if body.progress_log is not None:
         segment.progress_log = body.progress_log
+    if body.motion_keywords is not None:
+        segment.motion_keywords = body.motion_keywords
 
     await db.flush()
 
