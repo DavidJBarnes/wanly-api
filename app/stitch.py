@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 FADE_DURATION = 1.0
 FLASH_DURATION = 1.0
-CROSS_DISSOLVE_FRAMES = 12
 
 
 def _apply_fades(input_path: str, output_path: str, duration: float,
@@ -111,62 +110,6 @@ def _compute_fades(segments: list) -> list[tuple[bool, bool]]:
     return result
 
 
-def _apply_cross_dissolve(seg_a_path: str, seg_b_path: str, output_a_path: str, fps: int, num_frames: int) -> None:
-    """Apply cross-dissolve blend between end of seg_a and start of seg_b.
-    
-    Args:
-        seg_a_path: Path to segment A video
-        seg_b_path: Path to segment B video  
-        output_a_path: Output path for modified segment A (with end blend baked in)
-        fps: Frames per second for accurate timing
-        num_frames: Number of frames to blend (e.g., 12)
-    """
-    blend_duration = num_frames / fps
-    
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", seg_a_path,
-        "-i", seg_b_path,
-        "-filter_complex", f"[0:v][1:v]blend=all_mode=normal:shortest=0:repeatlast=0:blend_start={int(num_frames)}[outv]",
-        "-map", "[outv]",
-        "-t", f"{blend_duration}",
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        output_a_path,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, timeout=300)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg cross-dissolve failed: {proc.stderr.decode()[-500:]}")
-
-
-def _extract_end_frames(video_path: str, output_path: str, num_frames: int) -> None:
-    """Extract the last N frames from a video as a separate video file."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-vf", f"select='gte(n\\,{num_frames})',setpts=N/FRAME_RATE/TB",
-        "-frames:v", str(num_frames),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        output_path,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, timeout=120)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg extract end frames failed: {proc.stderr.decode()[-500:]}")
-
-
-def _extract_start_frames(video_path: str, output_path: str, num_frames: int) -> None:
-    """Extract the first N frames from a video as a separate video file."""
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-frames:v", str(num_frames),
-        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        output_path,
-    ]
-    proc = subprocess.run(cmd, capture_output=True, timeout=120)
-    if proc.returncode != 0:
-        raise RuntimeError(f"ffmpeg extract start frames failed: {proc.stderr.decode()[-500:]}")
-
-
 async def stitch_video(video_id: UUID, job_id: UUID) -> None:
     """Background task: download segment videos, concat with ffmpeg, upload result."""
     async with async_session() as db:
@@ -253,67 +196,6 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                             job.fps,
                         )
                         concat_names.append(black_name)
-
-                # Apply cross-dissolve transitions between consecutive segments
-                if len(segments) > 1:
-                    processed_files = list(concat_names)
-                    for i in range(len(segments) - 1):
-                        seg_a = segments[i]
-                        seg_b = segments[i + 1]
-                        if seg_a.transition == "dissolve" or (seg_a.transition is None and seg_b.transition is None):
-                            dissolve_frames = CROSS_DISSOLVE_FRAMES
-                            file_a = processed_files[i]
-                            file_b = processed_files[i + 1]
-                            dissolved_a = f"seg_{seg_a.index:03d}_dissolved.mp4"
-                            dissolved_b = f"seg_{seg_b.index:03d}_dissolved.mp4"
-                            end_blend = f"seg_{seg_a.index:03d}_end_blend.mp4"
-                            start_blend = f"seg_{seg_b.index:03d}_start_blend.mp4"
-                            await asyncio.to_thread(
-                                _extract_end_frames,
-                                str(tmppath / file_a),
-                                str(tmppath / end_blend),
-                                dissolve_frames,
-                            )
-                            await asyncio.to_thread(
-                                _extract_start_frames,
-                                str(tmppath / file_b),
-                                str(tmppath / start_blend),
-                                dissolve_frames,
-                            )
-                            await asyncio.to_thread(
-                                _apply_cross_dissolve,
-                                str(tmppath / end_blend),
-                                str(tmppath / start_blend),
-                                str(tmppath / dissolved_a),
-                                job.fps,
-                                dissolve_frames,
-                            )
-                            blend_duration = dissolve_frames / job.fps
-                            trim_a = f"seg_{seg_a.index:03d}_dissolved_trim.mp4"
-                            trim_b = f"seg_{seg_b.index:03d}_dissolved_trim.mp4"
-                            subprocess.run(
-                                [
-                                    "ffmpeg", "-y",
-                                    "-i", str(tmppath / dissolved_a),
-                                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                                    "-t", str(blend_duration),
-                                    str(tmppath / trim_a),
-                                ],
-                                capture_output=True, timeout=120,
-                            )
-                            subprocess.run(
-                                [
-                                    "ffmpeg", "-y",
-                                    "-ss", str(blend_duration),
-                                    "-i", str(tmppath / file_b),
-                                    "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-                                    str(tmppath / trim_b),
-                                ],
-                                capture_output=True, timeout=120,
-                            )
-                            processed_files[i] = trim_a
-                            processed_files[i + 1] = trim_b
-                    concat_names = processed_files
 
                 # Write ffmpeg concat list
                 concat_list = tmppath / "concat.txt"
