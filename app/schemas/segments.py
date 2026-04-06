@@ -42,6 +42,7 @@ class SegmentResponse(BaseModel):
     trim_start_frames: int
     trim_end_frames: int
     motion_keywords: Optional[list[str]] = None
+    motion_magnitude: Optional[float] = None
     reference_frames: Optional[list[str]] = None
     status: str
     worker_id: Optional[UUID]
@@ -88,7 +89,9 @@ class SegmentClaimResponse(BaseModel):
     faceswap_faces_index: Optional[str]
     initial_reference_image: Optional[str] = None
     motion_keywords: Optional[list[str]] = None
+    motion_magnitude: Optional[float] = None
     previous_motion_keywords: Optional[list[str]] = None
+    previous_motion_magnitude: Optional[float] = None
     reference_frames: Optional[list[str]] = None
     lightx2v_strength_high: Optional[float] = None
     lightx2v_strength_low: Optional[float] = None
@@ -126,3 +129,5 @@ class SegmentStatusUpdate(BaseModel):
     error_message: Optional[str] = None
     progress_log: Optional[str] = None
     motion_keywords: Optional[list[str]] = None
+    motion_magnitude: Optional[float] = None
+    motion_magnitude: Optional[float] = None

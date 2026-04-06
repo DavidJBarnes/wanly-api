@@ -82,6 +82,7 @@ class Segment(Base):
     trim_start_frames = mapped_column(Integer, nullable=False, default=0)
     trim_end_frames = mapped_column(Integer, nullable=False, default=0)
     motion_keywords = mapped_column(JSON, nullable=True)
+    motion_magnitude = mapped_column(Float, nullable=True)
     reference_frames = mapped_column(JSON, nullable=True)
     status = mapped_column(String(20), nullable=False, default=SegmentStatus.PENDING)
     worker_id = mapped_column(UUID(as_uuid=True), nullable=True)
