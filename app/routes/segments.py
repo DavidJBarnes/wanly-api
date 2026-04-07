@@ -230,6 +230,7 @@ async def claim_next_segment(
     resolved_start_image = segment.start_image
     previous_segment = None
     previous_motion_keywords = None
+    previous_motion_magnitude = None
     reference_frames = []
     if resolved_start_image is None:
         if segment.index == 0:
@@ -244,6 +245,7 @@ async def claim_next_segment(
                 resolved_start_image = prev_segment.last_frame_path
                 previous_segment = prev_segment
                 previous_motion_keywords = prev_segment.motion_keywords
+                previous_motion_magnitude = prev_segment.motion_magnitude
                 if prev_segment.reference_frames:
                     reference_frames = prev_segment.reference_frames.copy()
                 if prev_segment.last_frame_path and prev_segment.last_frame_path not in reference_frames:
@@ -275,6 +277,7 @@ async def claim_next_segment(
         initial_reference_image=job.starting_image,
         motion_keywords=segment.motion_keywords,
         previous_motion_keywords=previous_motion_keywords,
+        previous_motion_magnitude=previous_motion_magnitude,
         reference_frames=reference_frames if reference_frames else None,
         lightx2v_strength_high=job.lightx2v_strength_high,
         lightx2v_strength_low=job.lightx2v_strength_low,
@@ -313,6 +316,8 @@ async def update_segment(
         segment.progress_log = body.progress_log
     if body.motion_keywords is not None:
         segment.motion_keywords = body.motion_keywords
+    if body.motion_magnitude is not None:
+        segment.motion_magnitude = body.motion_magnitude
 
     await db.flush()
 
