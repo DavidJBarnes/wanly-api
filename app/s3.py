@@ -136,6 +136,17 @@ def move_object(bucket: str, src_key: str, dst_key: str) -> None:
     logger.info("Moved %s/%s → %s/%s", bucket, src_key, bucket, dst_key)
 
 
+def generate_presigned_url(uri: str, expires: int = 3600) -> str:
+    """Generate a presigned GET URL for an S3 URI. Default expiry: 1 hour."""
+    bucket, key = parse_s3_uri(uri)
+    client = _get_client()
+    return client.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires,
+    )
+
+
 def parse_s3_uri(uri: str) -> tuple[str, str]:
     """Parse s3://bucket/key into (bucket, key)."""
     parts = uri.replace("s3://", "").split("/", 1)

@@ -1,10 +1,9 @@
 import asyncio
-import hashlib
 import logging
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile, status
-from fastapi.responses import Response
+from fastapi.responses import RedirectResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -13,12 +12,9 @@ from app.config import settings
 from app.database import get_db
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.models import Job, Segment, User, Video
-from app.s3 import download_bytes, upload_bytes
+from app.s3 import generate_presigned_url, upload_bytes
 from app.schemas.segments import SegmentResponse
 from app.stitch import stitch_video
-
-# Extensions that benefit from browser caching (immutable once written)
-_CACHEABLE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".avif", ".gif", ".mp4"}
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +46,11 @@ async def upload_file(
 
 
 @router.get("/files", dependencies=[Depends(verify_api_key_or_token)])
-async def download_file(path: str, request: Request):
-    """Download a file from S3 by its S3 URI.
+async def download_file(path: str):
+    """Redirect to a presigned S3 URL for the given S3 URI.
 
-    Used by daemons to fetch start images and faceswap images without
-    needing AWS credentials.
+    Used by the console and daemons to fetch images and videos.
+    Auth is checked first, then the client downloads directly from S3.
     """
     if not path.startswith("s3://"):
         raise HTTPException(
@@ -62,46 +58,15 @@ async def download_file(path: str, request: Request):
             detail="Path must be an S3 URI (s3://...)",
         )
 
-    ext = "." + path.rsplit(".", 1)[-1].lower() if "." in path else ""
-    cacheable = ext in _CACHEABLE_EXTS
-
-    # ETag derived from the S3 path (content at a given path is immutable)
-    etag = None
-    if cacheable:
-        etag = '"' + hashlib.sha256(path.encode()).hexdigest()[:16] + '"'
-        if_none_match = request.headers.get("if-none-match")
-        if if_none_match and if_none_match == etag:
-            return Response(status_code=304, headers={"ETag": etag})
-
     try:
-        data = await asyncio.to_thread(download_bytes, path)
+        url = await asyncio.to_thread(generate_presigned_url, path)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"File not found: {e}",
         )
 
-    # Infer content type from extension
-    ext_map = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".webp": "image/webp",
-        ".avif": "image/avif",
-        ".gif": "image/gif",
-        ".mp4": "video/mp4",
-        ".safetensors": "application/octet-stream",
-    }
-    media_type = ext_map.get(ext, "application/octet-stream")
-
-    headers = {}
-    if cacheable:
-        headers["Cache-Control"] = "public, max-age=86400, immutable"
-        headers["ETag"] = etag
-    else:
-        headers["Cache-Control"] = "no-store"
-
-    return Response(content=data, media_type=media_type, headers=headers)
+    return RedirectResponse(url=url, status_code=307)
 
 
 @router.post("/segments/{segment_id}/upload", response_model=SegmentResponse, dependencies=[Depends(verify_api_key)])
