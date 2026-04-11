@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     civitai_api_token: str = ""
     cors_origins: str = ""
     login_rate_limit: str = "5/minute"
+    heartbeat_offline_seconds: int = 120
 
     model_config = {"env_file": ".env"}
 

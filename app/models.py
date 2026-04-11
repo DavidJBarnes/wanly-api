@@ -2,8 +2,8 @@ import uuid
 from datetime import datetime, timezone
 
 from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
-from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.orm import DeclarativeBase, mapped_column, relationship
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 
@@ -177,3 +177,21 @@ class PromptPreset(Base):
     loras = mapped_column(JSON, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class Worker(Base):
+    __tablename__ = "workers"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    friendly_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    hostname: Mapped[str] = mapped_column(String(255), nullable=False)
+    ip_address: Mapped[str] = mapped_column(String(45), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="online-idle")
+    comfyui_running: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    last_heartbeat: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    gpu_stats: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)
+    sd_scripts: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)
+    a1111: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)
+    drain_after_jobs: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
