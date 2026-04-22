@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 
-from app.auth import get_current_user, verify_api_key_or_token
+from app.auth import get_current_user, verify_api_key_or_bearer
 from app.config import settings
 from app.s3 import (
     delete_object,
@@ -21,7 +21,7 @@ router = APIRouter(tags=["images"])
 _FOLDER_NAME_RE = re.compile(r"^[a-zA-Z0-9 _-]+$")
 
 
-@router.post("/images/upload", dependencies=[Depends(verify_api_key_or_token)])
+@router.post("/images/upload", dependencies=[Depends(verify_api_key_or_bearer)])
 async def upload_image(
     file: UploadFile,
     filename: str | None = None,
