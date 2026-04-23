@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import random
+import re
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -18,7 +19,19 @@ from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStat
 from app.estimation import estimate_segment_time, get_estimation_rates
 from app.models import Job, Lora, Segment, User, Video
 from app.routes.segments import _resolve_loras, _resolve_wildcards
-from app.s3 import delete_object, delete_prefix, upload_bytes
+from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
+
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+
+
+def _image_ext(filename: str | None) -> str:
+    ext = os.path.splitext(filename or "")[1].lower()
+    return ext if ext in _ALLOWED_IMAGE_EXTS else ".png"
+
+
+def _starting_image_key(user_id: UUID, image_hash: str, ext: str) -> str:
+    return f"users/{user_id}/starting_images/{image_hash}{ext}"
 from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
 from app.schemas.segments import SegmentResponse
 from app.stitch import stitch_video
@@ -28,6 +41,29 @@ import logging
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+@router.get("/jobs/starting-image-exists")
+async def starting_image_exists(
+    sha256: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Check whether this user has already uploaded a starting image with the given SHA-256.
+
+    The console hashes files client-side and calls this before POSTing a new job —
+    if the image is already in S3 for this user, the console passes
+    `starting_image_hash` in the job body instead of re-uploading the bytes.
+    """
+    if not _SHA256_RE.match(sha256):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid SHA-256 hash")
+    result = await db.execute(
+        select(Job.starting_image)
+        .where(Job.user_id == user.id, Job.starting_image_hash == sha256)
+        .limit(1)
+    )
+    uri = result.scalar_one_or_none()
+    return {"exists": uri is not None, "uri": uri}
 
 
 @router.post("/jobs", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
@@ -67,12 +103,12 @@ async def create_job(
     db.add(job)
     await db.flush()  # Get job.id
 
-    # Upload starting image to S3 if provided (with hash-based dedup)
+    # Upload starting image to S3 if provided (with hash-based storage + bandwidth dedup)
     if starting_image is not None:
         image_data = await starting_image.read()
         image_hash = hashlib.sha256(image_data).hexdigest()
 
-        # Check if this exact image already exists for this user
+        # If this user has already uploaded this exact image, reuse its URI.
         existing = await db.execute(
             select(Job.starting_image)
             .where(Job.user_id == user.id, Job.starting_image_hash == image_hash)
@@ -83,11 +119,28 @@ async def create_job(
         if existing_uri:
             job.starting_image = existing_uri
         else:
-            ext = os.path.splitext(starting_image.filename or "image.png")[1] or ".png"
-            key = f"{job.id}/starting_image{ext}"
+            ext = _image_ext(starting_image.filename)
+            key = _starting_image_key(user.id, image_hash, ext)
             uri = await asyncio.to_thread(upload_bytes, image_data, key, settings.s3_jobs_bucket)
             job.starting_image = uri
         job.starting_image_hash = image_hash
+    elif body.starting_image_hash:
+        # Client already hashed the file and confirmed the server has it — skip re-upload.
+        if not _SHA256_RE.match(body.starting_image_hash):
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid SHA-256 hash")
+        existing = await db.execute(
+            select(Job.starting_image)
+            .where(Job.user_id == user.id, Job.starting_image_hash == body.starting_image_hash)
+            .limit(1)
+        )
+        existing_uri = existing.scalar_one_or_none()
+        if not existing_uri:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No existing image found for that hash; upload the file instead.",
+            )
+        job.starting_image = existing_uri
+        job.starting_image_hash = body.starting_image_hash
     elif body.starting_image_uri:
         job.starting_image = body.starting_image_uri
 
@@ -461,9 +514,28 @@ async def delete_job(
             detail=f"Cannot delete a job that is currently {job.status}",
         )
 
-    # Best-effort S3 cleanup — delete all objects under the job prefix
+    # Best-effort S3 cleanup — delete objects under the job prefix, but keep any
+    # still referenced by another job (legacy dedup stored starting images under
+    # the uploading job's prefix; new uploads live under users/{uid}/ so don't
+    # collide with this cleanup at all).
     try:
-        deleted = await asyncio.to_thread(delete_prefix, f"{job_id}/", settings.s3_jobs_bucket)
+        bucket = settings.s3_jobs_bucket
+        prefix = f"{job_id}/"
+        prefix_uri = f"s3://{bucket}/{prefix}"
+        ref_result = await db.execute(
+            select(Job.starting_image).where(
+                Job.user_id == user.id,
+                Job.id != job_id,
+                Job.starting_image.like(f"{prefix_uri}%"),
+            )
+        )
+        referenced = {uri for uri in ref_result.scalars().all() if uri}
+        if referenced:
+            deleted = await asyncio.to_thread(
+                delete_prefix_except, prefix, bucket, referenced
+            )
+        else:
+            deleted = await asyncio.to_thread(delete_prefix, prefix, bucket)
         logger.info("Deleted %d S3 objects for job %s", deleted, job_id)
     except Exception:
         logger.warning("Failed to delete S3 objects for job %s", job_id, exc_info=True)
