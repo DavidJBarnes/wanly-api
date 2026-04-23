@@ -16,10 +16,13 @@ def _get_client():
     return _client
 
 
+_IMMUTABLE_CACHE_CONTROL = "public, max-age=86400, immutable"
+
+
 def upload_bytes(data: bytes, key: str, bucket: str) -> str:
     """Upload bytes to S3. Returns the S3 URI."""
     client = _get_client()
-    client.put_object(Bucket=bucket, Key=key, Body=data)
+    client.put_object(Bucket=bucket, Key=key, Body=data, CacheControl=_IMMUTABLE_CACHE_CONTROL)
     uri = f"s3://{bucket}/{key}"
     logger.info("Uploaded %d bytes to %s", len(data), uri)
     return uri
@@ -28,7 +31,7 @@ def upload_bytes(data: bytes, key: str, bucket: str) -> str:
 def upload_file(path: str, key: str, bucket: str) -> str:
     """Upload a local file to S3 using multipart. Returns the S3 URI."""
     client = _get_client()
-    client.upload_file(path, bucket, key)
+    client.upload_file(path, bucket, key, ExtraArgs={"CacheControl": _IMMUTABLE_CACHE_CONTROL})
     uri = f"s3://{bucket}/{key}"
     logger.info("Uploaded file %s to %s", path, uri)
     return uri

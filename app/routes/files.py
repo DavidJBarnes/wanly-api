@@ -66,7 +66,13 @@ async def download_file(path: str):
             detail=f"File not found: {e}",
         )
 
-    return RedirectResponse(url=url, status_code=307)
+    # Cache the redirect for less than the presigned URL's 1h lifetime so the
+    # browser never replays a cached redirect pointing to an expired signature.
+    return RedirectResponse(
+        url=url,
+        status_code=307,
+        headers={"Cache-Control": "public, max-age=300"},
+    )
 
 
 @router.post("/segments/{segment_id}/upload", response_model=SegmentResponse, dependencies=[Depends(verify_api_key)])
