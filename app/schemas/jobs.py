@@ -23,6 +23,7 @@ class JobCreate(BaseModel):
     cfg_high: Optional[float] = None
     cfg_low: Optional[float] = None
     starting_image_uri: Optional[str] = None
+    starting_image_hash: Optional[str] = None
     first_segment: SegmentCreate
 
 

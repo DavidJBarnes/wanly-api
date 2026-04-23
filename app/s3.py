@@ -64,6 +64,35 @@ def delete_prefix(prefix: str, bucket: str) -> int:
     return total_deleted
 
 
+def delete_prefix_except(prefix: str, bucket: str, except_uris: set[str]) -> int:
+    """Delete objects under a prefix, skipping any whose s3:// URI is in except_uris.
+
+    Used when a job-prefix cleanup needs to avoid deleting shared content still
+    referenced by other jobs (e.g. a legacy deduped starting image).
+    """
+    client = _get_client()
+    prefix_uri = f"s3://{bucket}/"
+    except_keys = {
+        uri[len(prefix_uri):] for uri in except_uris if uri.startswith(prefix_uri)
+    }
+    total_deleted = 0
+    params: dict = {"Bucket": bucket, "Prefix": prefix}
+    while True:
+        resp = client.list_objects_v2(**params)
+        objects = resp.get("Contents", [])
+        to_delete = [{"Key": o["Key"]} for o in objects if o["Key"] not in except_keys]
+        if to_delete:
+            client.delete_objects(Bucket=bucket, Delete={"Objects": to_delete})
+            total_deleted += len(to_delete)
+        if not resp.get("IsTruncated"):
+            break
+        params["ContinuationToken"] = resp["NextContinuationToken"]
+    if total_deleted:
+        logger.info("Deleted %d objects under %s/%s (kept %d shared)",
+                    total_deleted, bucket, prefix, len(except_keys))
+    return total_deleted
+
+
 def delete_object(uri: str) -> None:
     """Delete a single object by S3 URI."""
     bucket, key = parse_s3_uri(uri)
