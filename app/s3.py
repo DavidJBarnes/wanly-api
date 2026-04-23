@@ -1,4 +1,5 @@
 import logging
+import mimetypes
 
 import boto3
 
@@ -19,10 +20,21 @@ def _get_client():
 _IMMUTABLE_CACHE_CONTROL = "public, max-age=86400, immutable"
 
 
+def _content_type_for(key: str) -> str:
+    guess, _ = mimetypes.guess_type(key)
+    return guess or "binary/octet-stream"
+
+
 def upload_bytes(data: bytes, key: str, bucket: str) -> str:
     """Upload bytes to S3. Returns the S3 URI."""
     client = _get_client()
-    client.put_object(Bucket=bucket, Key=key, Body=data, CacheControl=_IMMUTABLE_CACHE_CONTROL)
+    client.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=data,
+        CacheControl=_IMMUTABLE_CACHE_CONTROL,
+        ContentType=_content_type_for(key),
+    )
     uri = f"s3://{bucket}/{key}"
     logger.info("Uploaded %d bytes to %s", len(data), uri)
     return uri
@@ -31,7 +43,15 @@ def upload_bytes(data: bytes, key: str, bucket: str) -> str:
 def upload_file(path: str, key: str, bucket: str) -> str:
     """Upload a local file to S3 using multipart. Returns the S3 URI."""
     client = _get_client()
-    client.upload_file(path, bucket, key, ExtraArgs={"CacheControl": _IMMUTABLE_CACHE_CONTROL})
+    client.upload_file(
+        path,
+        bucket,
+        key,
+        ExtraArgs={
+            "CacheControl": _IMMUTABLE_CACHE_CONTROL,
+            "ContentType": _content_type_for(key),
+        },
+    )
     uri = f"s3://{bucket}/{key}"
     logger.info("Uploaded file %s to %s", path, uri)
     return uri
@@ -168,8 +188,12 @@ def move_object(bucket: str, src_key: str, dst_key: str) -> None:
     logger.info("Moved %s/%s → %s/%s", bucket, src_key, bucket, dst_key)
 
 
-def generate_presigned_url(uri: str, expires: int = 3600) -> str:
-    """Generate a presigned GET URL for an S3 URI. Default expiry: 1 hour."""
+def generate_presigned_url(uri: str, expires: int = 21600) -> str:
+    """Generate a presigned GET URL for an S3 URI. Default expiry: 6 hours.
+
+    The /api/files redirect caches for <6h so the browser never replays a
+    cached redirect that points to an expired signature.
+    """
     bucket, key = parse_s3_uri(uri)
     client = _get_client()
     return client.generate_presigned_url(

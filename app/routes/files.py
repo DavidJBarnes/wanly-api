@@ -66,12 +66,12 @@ async def download_file(path: str):
             detail=f"File not found: {e}",
         )
 
-    # Cache the redirect for less than the presigned URL's 1h lifetime so the
+    # Cache the redirect for less than the presigned URL's 6h lifetime so the
     # browser never replays a cached redirect pointing to an expired signature.
     return RedirectResponse(
         url=url,
         status_code=307,
-        headers={"Cache-Control": "public, max-age=300"},
+        headers={"Cache-Control": "public, max-age=18000"},
     )
 
 
