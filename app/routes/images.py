@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 
-from app.auth import get_current_user, verify_api_key_or_bearer
+from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
 from app.config import settings
 from app.s3 import (
     delete_object,
@@ -137,7 +137,7 @@ async def delete_image(path: str = Query(...)):
 _CONTENT_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
 
 
-@router.get("/images/download", dependencies=[Depends(verify_api_key_or_bearer)])
+@router.get("/images/download", dependencies=[Depends(verify_api_key_or_token)])
 async def download_image_bytes(path: str = Query(...)):
     """Return raw image bytes for canvas processing in the browser.
 
