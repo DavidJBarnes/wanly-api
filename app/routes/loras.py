@@ -46,7 +46,7 @@ def _filename_from_response(resp: httpx.Response, url: str) -> str:
 
 def _civitai_auth_url(url: str) -> str:
     """Append CivitAI API token to download URLs if configured."""
-    if "civitai.com" not in url:
+    if "civitai.com" not in url and "civitai.red" not in url:
         return url
     token = settings.civitai_api_token
     if not token:
