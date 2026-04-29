@@ -4,11 +4,13 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
+from fastapi.responses import Response
 
 from app.auth import get_current_user, verify_api_key_or_bearer
 from app.config import settings
 from app.s3 import (
     delete_object,
+    download_bytes,
     get_first_object_key,
     list_common_prefixes,
     list_objects,
@@ -130,3 +132,25 @@ async def delete_image(path: str = Query(...)):
         raise HTTPException(status_code=400, detail="Path must be in the images bucket")
     await asyncio.to_thread(delete_object, path)
     return {"ok": True}
+
+
+_CONTENT_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
+
+
+@router.get("/images/download", dependencies=[Depends(verify_api_key_or_bearer)])
+async def download_image_bytes(path: str = Query(...)):
+    """Return raw image bytes for canvas processing in the browser.
+
+    Unlike /files, this does not redirect to S3. Returning bytes directly means
+    FastAPI's CORS middleware covers the response, so the console can fetch() the
+    image and draw it to a canvas without triggering cross-origin taint.
+    """
+    bucket = settings.s3_images_bucket
+    if not path.startswith(f"s3://{bucket}/"):
+        raise HTTPException(status_code=400, detail="Path must be in the images bucket")
+    try:
+        data = await asyncio.to_thread(download_bytes, path)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Image not found: {e}")
+    ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+    return Response(content=data, media_type=_CONTENT_TYPES.get(ext, "application/octet-stream"))
