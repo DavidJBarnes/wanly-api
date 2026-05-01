@@ -65,7 +65,7 @@ async def create_folder(body: dict):
     return {"name": name}
 
 
-@router.get("/images/folders", dependencies=[Depends(get_current_user)])
+@router.get("/images/folders", dependencies=[Depends(verify_api_key_or_bearer)])
 async def list_folders():
     """List date folders in the images bucket, newest first."""
     bucket = settings.s3_images_bucket
