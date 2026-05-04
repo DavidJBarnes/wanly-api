@@ -5,9 +5,13 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
 from app.config import settings
+from app.database import get_db
+from app.models import Job
 from app.s3 import (
     delete_object,
     download_bytes,
@@ -135,6 +139,26 @@ async def delete_image(path: str = Query(...)):
 
 
 _CONTENT_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
+
+
+@router.get("/images/jobs", dependencies=[Depends(get_current_user)])
+async def get_image_jobs(
+    path: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """Return jobs that use the given image as their starting image."""
+    result = await db.execute(
+        select(Job.id, Job.name, Job.created_at)
+        .where(Job.user_id == user.id, Job.starting_image == path)
+        .order_by(Job.created_at.desc())
+        .limit(50)
+    )
+    rows = result.all()
+    return [
+        {"id": str(row[0]), "name": row[1], "created_at": row[2].isoformat()}
+        for row in rows
+    ]
 
 
 @router.get("/images/download", dependencies=[Depends(verify_api_key_or_token)])
