@@ -184,13 +184,15 @@ async def list_jobs(
     offset: int = Query(0, ge=0),
     status_filter: str | None = Query(None, alias="status"),
     sort: str = Query("created_at_desc"),
-    name: str | None = Query(None, description="Filter jobs by name (case-insensitive partial match)"),
+    name: str | None = Query(None, min_length=1, max_length=255, description="Filter jobs by name (case-insensitive partial match)"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     base = select(Job).where(Job.user_id == user.id)
     if name:
-        base = base.where(Job.name.ilike(f"%{name}%"))
+        # Escape SQL LIKE wildcards in user input to prevent unintended matches
+        safe = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        base = base.where(Job.name.ilike(f"%{safe}%", escape="\\"))
     if status_filter:
         statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
         base = base.where(Job.status.in_(statuses))
