@@ -228,6 +228,17 @@ async def list_jobs(
         for row in counts_result.all():
             counts_map[row[0]] = (row[1], row[2])
 
+    # Aggregate faceswap status per job
+    faceswap_map: dict[UUID, bool] = {}
+    if job_ids:
+        faceswap_result = await db.execute(
+            select(Segment.job_id, func.bool_or(Segment.faceswap_enabled))
+            .where(Segment.job_id.in_(job_ids))
+            .group_by(Segment.job_id)
+        )
+        for row in faceswap_result.all():
+            faceswap_map[row[0]] = bool(row[1])
+
     # Fetch active segment info for estimation
     active_statuses = {SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING}
     active_jobs = [j for j in items if j.status in (JobStatus.PENDING, JobStatus.PROCESSING)]
@@ -279,6 +290,7 @@ async def list_jobs(
                 segment_count=seg_total,
                 completed_segment_count=seg_completed,
                 estimated_run_time=est_map.get(j.id),
+                faceswap_enabled=faceswap_map.get(j.id, False),
                 created_at=j.created_at,
                 updated_at=j.updated_at,
             )
