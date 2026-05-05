@@ -166,14 +166,32 @@ def list_objects(bucket: str, prefix: str) -> list[dict]:
     return objects
 
 
-def get_first_object_key(bucket: str, prefix: str) -> str | None:
-    """First non-marker object key under a prefix (for folder thumbnails)."""
+def get_folder_info(bucket: str, prefix: str) -> dict | None:
+    """Return thumbnail key and creation date for a folder prefix.
+
+    Uses the .folder marker's LastModified for creation time if present,
+    otherwise falls back to the first non-marker object.
+    """
     client = _get_client()
-    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=5)
-    for obj in resp.get("Contents", []):
-        if not obj["Key"].endswith("/.folder"):
-            return obj["Key"]
-    return None
+    resp = client.list_objects_v2(Bucket=bucket, Prefix=prefix, MaxKeys=20)
+    contents = resp.get("Contents", [])
+    if not contents:
+        return None
+
+    marker = None
+    first_image = None
+    for obj in contents:
+        if obj["Key"].endswith("/.folder"):
+            marker = obj
+        elif first_image is None:
+            first_image = obj
+        if marker and first_image:
+            break
+
+    key = first_image["Key"] if first_image else None
+    created_at_obj = marker if marker else first_image
+    created_at = created_at_obj["LastModified"].isoformat() if created_at_obj else None
+    return {"key": key, "created_at": created_at}
 
 
 def move_object(bucket: str, src_key: str, dst_key: str) -> None:

@@ -15,7 +15,7 @@ from app.models import Job
 from app.s3 import (
     delete_object,
     download_bytes,
-    get_first_object_key,
+    get_folder_info,
     list_common_prefixes,
     list_objects,
     move_object,
@@ -71,20 +71,20 @@ async def create_folder(body: dict):
 
 @router.get("/images/folders", dependencies=[Depends(verify_api_key_or_bearer)])
 async def list_folders():
-    """List date folders in the images bucket, newest first."""
+    """List folders in the images bucket, sorted by creation date newest first."""
     bucket = settings.s3_images_bucket
     prefixes = await asyncio.to_thread(list_common_prefixes, bucket)
-    # Sort newest first (prefixes look like "2026-02-27/")
-    prefixes.sort(reverse=True)
 
-    # Get first object in each folder for thumbnails (parallel)
-    async def _thumb(prefix: str) -> dict:
+    async def _folder_info(prefix: str) -> dict:
         name = prefix.rstrip("/")
-        key = await asyncio.to_thread(get_first_object_key, bucket, prefix)
-        thumbnail = f"s3://{bucket}/{key}" if key else None
-        return {"name": name, "thumbnail": thumbnail}
+        info = await asyncio.to_thread(get_folder_info, bucket, prefix)
+        thumbnail = f"s3://{bucket}/{info["key"]}" if info and info.get("key") else None
+        created_at = info["created_at"] if info else None
+        return {"name": name, "thumbnail": thumbnail, "created_at": created_at}
 
-    folders = await asyncio.gather(*[_thumb(p) for p in prefixes])
+    folders = await asyncio.gather(*[_folder_info(p) for p in prefixes])
+    # Sort by created_at descending (newest first); folders with no date go last
+    folders.sort(key=lambda f: f["created_at"] or "", reverse=True)
     return list(folders)
 
 
