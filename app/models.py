@@ -179,6 +179,20 @@ class PromptPreset(Base):
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 
+class Favorite(Base):
+    __tablename__ = "favorites"
+    __table_args__ = (
+        UniqueConstraint("user_id", "item_type", "item_ref", name="uq_favorites_user_type_ref"),
+        Index("ix_favorites_user_type", "user_id", "item_type"),
+    )
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = mapped_column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    item_type = mapped_column(String(20), nullable=False)
+    item_ref = mapped_column(String(500), nullable=False)
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class Worker(Base):
     __tablename__ = "workers"
 
