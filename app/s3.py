@@ -221,6 +221,21 @@ def generate_presigned_url(uri: str, expires: int = 21600) -> str:
     )
 
 
+def head_object(uri: str) -> dict | None:
+    """Return {Key, Size, LastModified} for a single S3 object, or None."""
+    bucket, key = parse_s3_uri(uri)
+    client = _get_client()
+    try:
+        resp = client.head_object(Bucket=bucket, Key=key)
+        return {
+            "Key": key,
+            "Size": resp["ContentLength"],
+            "LastModified": resp["LastModified"].isoformat(),
+        }
+    except Exception:
+        return None
+
+
 def parse_s3_uri(uri: str) -> tuple[str, str]:
     """Parse s3://bucket/key into (bucket, key)."""
     parts = uri.replace("s3://", "").split("/", 1)

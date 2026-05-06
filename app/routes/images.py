@@ -11,11 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
 from app.config import settings
 from app.database import get_db
-from app.models import Job
+from app.models import Favorite, Job
 from app.s3 import (
     delete_object,
     download_bytes,
     get_folder_info,
+    head_object,
     list_common_prefixes,
     list_objects,
     move_object,
@@ -105,6 +106,36 @@ async def list_folder_images(date: str):
         for obj in objects
         if not obj["Key"].endswith("/.folder")
     ]
+
+
+@router.get("/images/favorites", dependencies=[Depends(get_current_user)])
+async def list_favorite_images(
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return all favorited images across all folders with metadata."""
+    result = await db.execute(
+        select(Favorite.item_ref)
+        .where(Favorite.user_id == user.id, Favorite.item_type == "image")
+        .order_by(Favorite.created_at.desc())
+    )
+    refs = [row[0] for row in result.all()]
+
+    async def _meta(uri: str) -> dict | None:
+        obj = await asyncio.to_thread(head_object, uri)
+        if not obj:
+            return None
+        key = obj["Key"]
+        return {
+            "key": key,
+            "path": uri,
+            "filename": key.split("/", 1)[1] if "/" in key else key,
+            "size": obj["Size"],
+            "last_modified": obj["LastModified"],
+        }
+
+    items = await asyncio.gather(*[_meta(ref) for ref in refs])
+    return [item for item in items if item is not None]
 
 
 @router.post("/images/move", dependencies=[Depends(get_current_user)])
