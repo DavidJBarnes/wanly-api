@@ -156,6 +156,13 @@ async def add_segment(
     resolved_loras = await _resolve_loras(db, body.loras)
     resolved_prompt, prompt_template = await _resolve_wildcards(db, body.prompt)
 
+    # Inherit negative_prompt from prior segment if not explicitly set.
+    # Segments are eagerly loaded and ordered by index via the relationship,
+    # so job.segments[-1] reliably returns the previous segment.
+    negative_prompt = body.negative_prompt
+    if negative_prompt is None and job.segments:
+        negative_prompt = job.segments[-1].negative_prompt
+
     segment = Segment(
         job_id=job.id,
         index=next_index,
@@ -171,6 +178,7 @@ async def add_segment(
         faceswap_image=body.faceswap_image,
         faceswap_faces_order=body.faceswap_faces_order,
         faceswap_faces_index=body.faceswap_faces_index,
+        negative_prompt=negative_prompt,
         auto_finalize=body.auto_finalize,
     )
     db.add(segment)
@@ -252,9 +260,12 @@ async def claim_next_segment(
                     reference_frames.append(prev_segment.last_frame_path)
                     reference_frames = reference_frames[-3:]
 
-    # Fetch negative_prompt from app settings
-    neg_setting = await db.get(AppSetting, "negative_prompt")
-    negative_prompt = neg_setting.value if neg_setting else None
+    # Use segment negative_prompt if set, otherwise fall back to global app setting
+    if segment.negative_prompt is not None:
+        negative_prompt = segment.negative_prompt
+    else:
+        neg_setting = await db.get(AppSetting, "negative_prompt")
+        negative_prompt = neg_setting.value if neg_setting else None
 
     await db.commit()
     await db.refresh(segment)

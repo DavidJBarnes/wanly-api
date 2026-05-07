@@ -17,6 +17,7 @@ class SegmentCreate(BaseModel):
     faceswap_image: Optional[str] = None
     faceswap_faces_order: Optional[str] = None
     faceswap_faces_index: Optional[str] = None
+    negative_prompt: Optional[str] = None
     auto_finalize: bool = False
     transition: Optional[str] = None
 
@@ -37,6 +38,7 @@ class SegmentResponse(BaseModel):
     faceswap_image: Optional[str]
     faceswap_faces_order: Optional[str]
     faceswap_faces_index: Optional[str]
+    negative_prompt: Optional[str] = None
     auto_finalize: bool
     transition: Optional[str]
     trim_start_frames: int
