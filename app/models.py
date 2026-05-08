@@ -29,6 +29,7 @@ class Job(Base):
         Index("ix_jobs_user_id", "user_id"),
         Index("ix_jobs_status", "status"),
         Index("ix_jobs_priority", "priority"),
+        Index("ix_jobs_starting_image", "starting_image"),
     )
 
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

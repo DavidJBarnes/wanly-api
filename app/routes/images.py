@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
 from app.config import settings
 from app.database import get_db
+from app.enums import JobStatus
 from app.models import Favorite, Job
 from app.s3 import (
     delete_object,
@@ -105,7 +106,7 @@ async def list_folder_images(
     if paths:
         result = await db.execute(
             select(Job.starting_image)
-            .where(Job.user_id == user.id, Job.starting_image.in_(paths))
+            .where(Job.user_id == user.id, Job.starting_image.in_(paths), Job.status != JobStatus.ARCHIVED)
             .distinct()
         )
         in_use_set = {row[0] for row in result.all()}
