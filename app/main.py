@@ -10,7 +10,7 @@ from slowapi.errors import RateLimitExceeded
 from app.config import settings
 from app.heartbeat_monitor import heartbeat_monitor
 from app.limiter import limiter
-from app.routes import app_settings, auth, faceswap, favorites, files, images, jobs, loras, prompt_presets, segments, tags, wildcards, workers
+from app.routes import app_settings, auth, faceswap, favorites, files, images, jobs, loras, prompt_presets, segments, tags, videos, wildcards, workers
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,7 @@ app.include_router(faceswap.router)
 app.include_router(files.router)
 app.include_router(loras.router)
 app.include_router(tags.router)
+app.include_router(videos.router)
 app.include_router(wildcards.router)
 app.include_router(prompt_presets.router)
 app.include_router(workers.router)

@@ -111,6 +111,7 @@ class Video(Base):
     duration_seconds = mapped_column(Float, nullable=True)
     status = mapped_column(String(20), nullable=False, default=VideoStatus.PENDING)
     error_message = mapped_column(Text, nullable=True)
+    tags = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     completed_at = mapped_column(DateTime(timezone=True), nullable=True)
 

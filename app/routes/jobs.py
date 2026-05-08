@@ -12,6 +12,8 @@ from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from sqlalchemy import or_
+
 from app.auth import get_current_user
 from app.config import settings
 from app.database import get_db
@@ -186,14 +188,24 @@ async def list_jobs(
     status_filter: str | None = Query(None, alias="status"),
     sort: str = Query("created_at_desc"),
     name: str | None = Query(None, min_length=1, max_length=255, description="Filter jobs by name (case-insensitive partial match)"),
+    search: str | None = Query(None, min_length=1, max_length=255, alias="q", description="Search jobs by name or video tags (case-insensitive partial match)"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     base = select(Job).where(Job.user_id == user.id)
     if name:
-        # Escape SQL LIKE wildcards in user input to prevent unintended matches
         safe = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         base = base.where(Job.name.ilike(f"%{safe}%", escape="\\"))
+    if search:
+        safe = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{safe}%"
+        tag_job_ids = select(Video.job_id).where(Video.tags.ilike(pattern, escape="\\")).subquery()
+        base = base.where(
+            or_(
+                Job.name.ilike(pattern, escape="\\"),
+                Job.id.in_(select(tag_job_ids.c.job_id)),
+            )
+        )
     if status_filter:
         statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
         base = base.where(Job.status.in_(statuses))
@@ -239,6 +251,17 @@ async def list_jobs(
         )
         for row in faceswap_result.all():
             faceswap_map[row[0]] = bool(row[1])
+
+    # Fetch tags from the first completed video per job
+    tags_map: dict[UUID, str | None] = {}
+    if job_ids:
+        tags_result = await db.execute(
+            select(Video.job_id, Video.tags)
+            .where(Video.job_id.in_(job_ids), Video.status == "completed")
+        )
+        for row in tags_result.all():
+            if row[0] not in tags_map:
+                tags_map[row[0]] = row[1]
 
     # Fetch active segment info for estimation
     active_statuses = {SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING}
@@ -292,6 +315,7 @@ async def list_jobs(
                 completed_segment_count=seg_completed,
                 estimated_run_time=est_map.get(j.id),
                 faceswap_enabled=faceswap_map.get(j.id, False),
+                tags=tags_map.get(j.id),
                 created_at=j.created_at,
                 updated_at=j.updated_at,
             )
