@@ -421,7 +421,9 @@ async def update_job(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(Job).where(Job.id == job_id, Job.user_id == user.id))
+    result = await db.execute(
+        select(Job).where(Job.id == job_id, Job.user_id == user.id).with_for_update()
+    )
     job = result.scalar_one_or_none()
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
