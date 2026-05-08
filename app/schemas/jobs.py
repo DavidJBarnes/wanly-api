@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Optional
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.schemas.segments import SegmentCreate, SegmentResponse
 from app.schemas.videos import VideoResponse
@@ -71,6 +71,7 @@ class JobDetailResponse(JobResponse):
 class JobUpdate(BaseModel):
     name: Optional[str] = None
     status: Optional[str] = None
+    tags: Optional[str] = Field(None, max_length=500, description="Comma-separated tags")
 
 
 class WorkerStatsItem(BaseModel):
