@@ -188,7 +188,7 @@ async def list_jobs(
     status_filter: str | None = Query(None, alias="status"),
     sort: str = Query("created_at_desc"),
     name: str | None = Query(None, min_length=1, max_length=255, description="Filter jobs by name (case-insensitive partial match)"),
-    search: str | None = Query(None, min_length=1, max_length=255, alias="q", description="Search jobs by name or video tags (case-insensitive partial match)"),
+    search: str | None = Query(None, min_length=1, max_length=255, alias="q", description="Search jobs by name or tags (case-insensitive partial match)"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -199,11 +199,10 @@ async def list_jobs(
     if search:
         safe = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         pattern = f"%{safe}%"
-        tag_job_ids = select(Video.job_id).where(Video.tags.ilike(pattern, escape="\\")).subquery()
         base = base.where(
             or_(
                 Job.name.ilike(pattern, escape="\\"),
-                Job.id.in_(select(tag_job_ids.c.job_id)),
+                Job.tags.ilike(pattern, escape="\\"),
             )
         )
     if status_filter:
@@ -251,17 +250,6 @@ async def list_jobs(
         )
         for row in faceswap_result.all():
             faceswap_map[row[0]] = bool(row[1])
-
-    # Fetch tags from the first completed video per job
-    tags_map: dict[UUID, str | None] = {}
-    if job_ids:
-        tags_result = await db.execute(
-            select(Video.job_id, Video.tags)
-            .where(Video.job_id.in_(job_ids), Video.status == "completed")
-        )
-        for row in tags_result.all():
-            if row[0] not in tags_map:
-                tags_map[row[0]] = row[1]
 
     # Fetch active segment info for estimation
     active_statuses = {SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING}
@@ -315,7 +303,7 @@ async def list_jobs(
                 completed_segment_count=seg_completed,
                 estimated_run_time=est_map.get(j.id),
                 faceswap_enabled=faceswap_map.get(j.id, False),
-                tags=tags_map.get(j.id),
+                tags=j.tags,
                 created_at=j.created_at,
                 updated_at=j.updated_at,
             )
@@ -412,6 +400,7 @@ async def get_job(
         cfg_low=job.cfg_low,
         priority=job.priority,
         status=job.status,
+        tags=job.tags,
         estimated_run_time=job_est,
         created_at=job.created_at,
         updated_at=job.updated_at,
@@ -439,6 +428,9 @@ async def update_job(
 
     if body.name is not None:
         job.name = body.name
+
+    if body.tags is not None:
+        job.tags = body.tags
 
     if body.status is not None:
         allowed = JOB_VALID_TRANSITIONS.get(job.status, set())
@@ -527,6 +519,7 @@ async def reopen_job(
         lightx2v_strength_low=job.lightx2v_strength_low,
         cfg_high=job.cfg_high, cfg_low=job.cfg_low,
         priority=job.priority, status=job.status,
+        tags=job.tags,
         estimated_run_time=job_est,
         created_at=job.created_at, updated_at=job.updated_at,
         segments=seg_responses, videos=job.videos,

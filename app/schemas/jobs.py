@@ -71,6 +71,7 @@ class JobDetailResponse(JobResponse):
 class JobUpdate(BaseModel):
     name: Optional[str] = None
     status: Optional[str] = None
+    tags: Optional[str] = None
 
 
 class WorkerStatsItem(BaseModel):
