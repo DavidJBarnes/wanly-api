@@ -252,16 +252,16 @@ async def list_jobs(
         for row in faceswap_result.all():
             faceswap_map[row[0]] = bool(row[1])
 
-    # Fetch tags from each job's first completed video
+    # Fetch tags from the first completed video per job
     tags_map: dict[UUID, str | None] = {}
     if job_ids:
         tags_result = await db.execute(
             select(Video.job_id, Video.tags)
             .where(Video.job_id.in_(job_ids), Video.status == "completed")
-            .distinct(Video.job_id)
         )
         for row in tags_result.all():
-            tags_map[row[0]] = row[1]
+            if row[0] not in tags_map:
+                tags_map[row[0]] = row[1]
 
     # Fetch active segment info for estimation
     active_statuses = {SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING}
