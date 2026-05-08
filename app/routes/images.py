@@ -90,11 +90,26 @@ async def list_folders():
 
 
 @router.get("/images/folder/{date}", dependencies=[Depends(get_current_user)])
-async def list_folder_images(date: str):
-    """List images in a date folder."""
+async def list_folder_images(
+    date: str,
+    db: AsyncSession = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """List images in a date folder, with in_use flag indicating if used by any job."""
     bucket = settings.s3_images_bucket
     prefix = f"{date}/"
     objects = await asyncio.to_thread(list_objects, bucket, prefix)
+
+    paths = [f"s3://{bucket}/{obj['Key']}" for obj in objects if not obj["Key"].endswith("/.folder")]
+    in_use_set: set[str] = set()
+    if paths:
+        result = await db.execute(
+            select(Job.starting_image)
+            .where(Job.user_id == user.id, Job.starting_image.in_(paths))
+            .distinct()
+        )
+        in_use_set = {row[0] for row in result.all()}
+
     return [
         {
             "key": obj["Key"],
@@ -102,6 +117,7 @@ async def list_folder_images(date: str):
             "filename": obj["Key"].split("/", 1)[1] if "/" in obj["Key"] else obj["Key"],
             "size": obj["Size"],
             "last_modified": obj["LastModified"],
+            "in_use": f"s3://{bucket}/{obj['Key']}" in in_use_set,
         }
         for obj in objects
         if not obj["Key"].endswith("/.folder")
