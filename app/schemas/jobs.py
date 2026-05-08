@@ -45,6 +45,7 @@ class JobResponse(BaseModel):
     completed_segment_count: int = 0
     estimated_run_time: Optional[float] = None
     faceswap_enabled: bool = False
+    tags: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
