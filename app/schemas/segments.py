@@ -124,6 +124,15 @@ class FramePreviewResponse(BaseModel):
     frames: list[FramePreview]
 
 
+class SegmentReprocessRequest(BaseModel):
+    faceswap_enabled: bool = True
+    faceswap_method: Optional[str] = None
+    faceswap_source_type: Optional[str] = None
+    faceswap_image: Optional[str] = None
+    faceswap_faces_order: Optional[str] = None
+    faceswap_faces_index: Optional[str] = None
+
+
 class SegmentStatusUpdate(BaseModel):
     status: Optional[str] = None
     output_path: Optional[str] = None
@@ -131,5 +140,4 @@ class SegmentStatusUpdate(BaseModel):
     error_message: Optional[str] = None
     progress_log: Optional[str] = None
     motion_keywords: Optional[list[str]] = None
-    motion_magnitude: Optional[float] = None
     motion_magnitude: Optional[float] = None

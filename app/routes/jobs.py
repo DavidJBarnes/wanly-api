@@ -19,6 +19,7 @@ from app.config import settings
 from app.database import get_db
 from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStatus
 from app.estimation import estimate_segment_time, get_estimation_rates
+from app.helpers import upload_faceswap_image
 from app.models import Job, Lora, Segment, User, Video
 from app.routes.segments import _resolve_loras, _resolve_wildcards
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
@@ -149,10 +150,7 @@ async def create_job(
     # Upload faceswap image to S3 if provided
     faceswap_uri = None
     if faceswap_image is not None:
-        fs_data = await faceswap_image.read()
-        ext = os.path.splitext(faceswap_image.filename or "face.png")[1] or ".png"
-        key = f"{job.id}/faceswap_source{ext}"
-        faceswap_uri = await asyncio.to_thread(upload_bytes, fs_data, key, settings.s3_jobs_bucket)
+        faceswap_uri = await upload_faceswap_image(faceswap_image, job.id)
 
     seg = body.first_segment
     resolved_loras = await _resolve_loras(db, seg.loras)

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -18,6 +18,7 @@ from sqlalchemy.orm import selectinload
 from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
 from app.database import get_db
 from app.enums import JobStatus, SegmentStatus, VideoStatus
+from app.helpers import upload_faceswap_image
 from app.models import AppSetting, Job, Lora, Segment, User, Video, Wildcard
 from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
@@ -25,6 +26,7 @@ from app.schemas.segments import (
     FramePreviewResponse,
     SegmentClaimResponse,
     SegmentCreate,
+    SegmentReprocessRequest,
     SegmentResponse,
     SegmentStatusUpdate,
     SegmentTrimUpdate,
@@ -534,6 +536,71 @@ async def retry_segment(
     segment.error_message = None
     segment.progress_log = None
 
+    job = await db.get(Job, segment.job_id)
+    job.status = JobStatus.PENDING
+
+    await db.commit()
+    await db.refresh(segment)
+    return segment
+
+
+@router.post("/segments/{segment_id}/reprocess", response_model=SegmentResponse)
+async def reprocess_segment(
+    segment_id: UUID,
+    data: str = Form(...),
+    faceswap_image: UploadFile | None = File(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    try:
+        body = SegmentReprocessRequest.model_validate_json(data)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Invalid JSON in data field: {e}",
+        )
+
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+    if segment.status != SegmentStatus.COMPLETED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only completed segments can be reprocessed (current: '{segment.status}')",
+        )
+
+    # Upload faceswap source image if provided
+    faceswap_uri = None
+    if faceswap_image is not None:
+        faceswap_uri = await upload_faceswap_image(
+            faceswap_image, segment.job_id, key_suffix="faceswap_source_reprocess"
+        )
+
+    # Update faceswap fields
+    segment.faceswap_enabled = body.faceswap_enabled
+    segment.faceswap_method = body.faceswap_method
+    segment.faceswap_source_type = body.faceswap_source_type
+    segment.faceswap_image = faceswap_uri if faceswap_uri else body.faceswap_image
+    segment.faceswap_faces_order = body.faceswap_faces_order
+    segment.faceswap_faces_index = body.faceswap_faces_index
+
+    # Reset segment for re-processing
+    segment.status = SegmentStatus.PENDING
+    segment.output_path = None
+    segment.last_frame_path = None
+    segment.worker_id = None
+    segment.worker_name = None
+    segment.claimed_at = None
+    segment.completed_at = None
+    segment.error_message = None
+    segment.progress_log = None
+
+    # Reset job so daemon picks it up
     job = await db.get(Job, segment.job_id)
     job.status = JobStatus.PENDING
 
