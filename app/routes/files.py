@@ -106,6 +106,7 @@ async def upload_segment_output(
     segment.output_path = video_uri
     segment.last_frame_path = frame_uri
     segment.status = SegmentStatus.COMPLETED
+    segment.reprocess_type = None
 
     from datetime import datetime, timezone
     segment.completed_at = datetime.now(timezone.utc)
