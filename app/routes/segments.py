@@ -574,6 +574,13 @@ async def reprocess_segment(
             detail=f"Only completed segments can be reprocessed (current: '{segment.status}')",
         )
 
+    job = await db.get(Job, segment.job_id)
+    if job.status == JobStatus.ARCHIVED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot reprocess segments in an archived job",
+        )
+
     # Upload faceswap source image if provided
     faceswap_uri = None
     if faceswap_image is not None:
@@ -581,11 +588,19 @@ async def reprocess_segment(
             faceswap_image, segment.job_id, key_suffix="faceswap_source_reprocess"
         )
 
+    # Validate faceswap image is resolvable
+    effective_image = faceswap_uri or body.faceswap_image
+    if body.faceswap_enabled and not effective_image and body.faceswap_source_type != "start_frame":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Faceswap is enabled but no source image was provided",
+        )
+
     # Update faceswap fields
     segment.faceswap_enabled = body.faceswap_enabled
     segment.faceswap_method = body.faceswap_method
     segment.faceswap_source_type = body.faceswap_source_type
-    segment.faceswap_image = faceswap_uri if faceswap_uri else body.faceswap_image
+    segment.faceswap_image = effective_image
     segment.faceswap_faces_order = body.faceswap_faces_order
     segment.faceswap_faces_index = body.faceswap_faces_index
 
@@ -601,7 +616,6 @@ async def reprocess_segment(
     segment.progress_log = None
 
     # Reset job so daemon picks it up
-    job = await db.get(Job, segment.job_id)
     job.status = JobStatus.PENDING
 
     await db.commit()
