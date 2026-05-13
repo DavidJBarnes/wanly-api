@@ -297,6 +297,8 @@ async def claim_next_segment(
         cfg_high=job.cfg_high,
         cfg_low=job.cfg_low,
         negative_prompt=negative_prompt,
+        reprocess_type=segment.reprocess_type,
+        output_path=segment.output_path,
         width=job.width,
         height=job.height,
         fps=job.fps,
@@ -604,10 +606,9 @@ async def reprocess_segment(
     segment.faceswap_faces_order = body.faceswap_faces_order
     segment.faceswap_faces_index = body.faceswap_faces_index
 
-    # Reset segment for re-processing
+    # Reset segment for faceswap-only reprocessing (preserve existing output)
+    segment.reprocess_type = "faceswap"
     segment.status = SegmentStatus.PENDING
-    segment.output_path = None
-    segment.last_frame_path = None
     segment.worker_id = None
     segment.worker_name = None
     segment.claimed_at = None

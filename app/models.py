@@ -87,6 +87,7 @@ class Segment(Base):
     motion_magnitude = mapped_column(Float, nullable=True)
     reference_frames = mapped_column(JSON, nullable=True)
     negative_prompt = mapped_column(Text, nullable=True)
+    reprocess_type = mapped_column(String(20), nullable=True)
     status = mapped_column(String(20), nullable=False, default=SegmentStatus.PENDING)
     worker_id = mapped_column(UUID(as_uuid=True), nullable=True)
     worker_name = mapped_column(String(255), nullable=True)
