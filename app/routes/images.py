@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
@@ -240,6 +240,56 @@ async def update_image_tags(
 
     await db.commit()
     return {"path": path, "tags": tags_val}
+
+
+@router.get("/images/search", dependencies=[Depends(get_current_user)])
+async def search_images(
+    q: str = Query(..., min_length=1, max_length=500),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """Search images across all folders by tags (case-insensitive partial match)."""
+    safe = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{safe}%"
+
+    count_q = select(func.count()).select_from(ImageMeta).where(
+        ImageMeta.tags.ilike(pattern, escape="\\")
+    )
+    total = (await db.execute(count_q)).scalar() or 0
+
+    meta_q = (
+        select(ImageMeta)
+        .where(ImageMeta.tags.ilike(pattern, escape="\\"))
+        .order_by(ImageMeta.updated_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    meta_rows = (await db.execute(meta_q)).scalars().all()
+
+    async def _meta(meta: ImageMeta) -> dict:
+        bucket = settings.s3_images_bucket
+        obj = await asyncio.to_thread(head_object, meta.path)
+        if not obj:
+            return None
+        key = obj["Key"]
+        return {
+            "key": key,
+            "path": meta.path,
+            "filename": key.split("/", 1)[1] if "/" in key else key,
+            "size": obj["Size"],
+            "last_modified": obj["LastModified"],
+            "tags": meta.tags,
+        }
+
+    items = []
+    for row in meta_rows:
+        item = await _meta(row)
+        if item:
+            items.append(item)
+
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
 _CONTENT_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
