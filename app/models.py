@@ -198,6 +198,14 @@ class Favorite(Base):
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class ImageMeta(Base):
+    __tablename__ = "image_meta"
+
+    path = mapped_column(Text, primary_key=True)
+    tags = mapped_column(Text, nullable=True)
+    updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
 class Worker(Base):
     __tablename__ = "workers"
 
