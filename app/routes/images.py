@@ -5,14 +5,15 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
 from app.config import settings
 from app.database import get_db
 from app.enums import JobStatus
-from app.models import Favorite, Job
+from app.models import Favorite, ImageMeta, Job
+from app.schemas.images import ImageTagsUpdate
 from app.s3 import (
     delete_object,
     download_bytes,
@@ -103,6 +104,7 @@ async def list_folder_images(
 
     paths = [f"s3://{bucket}/{obj['Key']}" for obj in objects if not obj["Key"].endswith("/.folder")]
     in_use_set: set[str] = set()
+    tags_map: dict[str, str] = {}
     if paths:
         result = await db.execute(
             select(Job.starting_image)
@@ -110,6 +112,13 @@ async def list_folder_images(
             .distinct()
         )
         in_use_set = {row[0] for row in result.all()}
+
+        meta_result = await db.execute(
+            select(ImageMeta.path, ImageMeta.tags).where(ImageMeta.path.in_(paths))
+        )
+        for row in meta_result.all():
+            if row[1]:
+                tags_map[row[0]] = row[1]
 
     return [
         {
@@ -119,6 +128,7 @@ async def list_folder_images(
             "size": obj["Size"],
             "last_modified": obj["LastModified"],
             "in_use": f"s3://{bucket}/{obj['Key']}" in in_use_set,
+            "tags": tags_map.get(f"s3://{bucket}/{obj['Key']}"),
         }
         for obj in objects
         if not obj["Key"].endswith("/.folder")
@@ -152,6 +162,17 @@ async def list_favorite_images(
         }
 
     items = await asyncio.gather(*[_meta(ref) for ref in refs])
+
+    uris = [item["path"] for item in items if item is not None]
+    if uris:
+        meta_result = await db.execute(
+            select(ImageMeta.path, ImageMeta.tags).where(ImageMeta.path.in_(uris))
+        )
+        tags_map = {row[0]: row[1] for row in meta_result.all() if row[1]}
+        for item in items:
+            if item is not None:
+                item["tags"] = tags_map.get(item["path"])
+
     return [item for item in items if item is not None]
 
 
@@ -184,6 +205,91 @@ async def delete_image(path: str = Query(...)):
         raise HTTPException(status_code=400, detail="Path must be in the images bucket")
     await asyncio.to_thread(delete_object, path)
     return {"ok": True}
+
+
+@router.patch("/images/tags", dependencies=[Depends(get_current_user)])
+async def update_image_tags(
+    path: str = Query(...),
+    body: ImageTagsUpdate = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Update tags for an image by S3 URI."""
+    bucket = settings.s3_images_bucket
+    if not path.startswith(f"s3://{bucket}/"):
+        raise HTTPException(status_code=400, detail="Path must be in the images bucket")
+
+    result = await db.execute(select(ImageMeta).where(ImageMeta.path == path))
+    meta = result.scalar_one_or_none()
+
+    if body and body.tags:
+        tags_val = body.tags.strip()
+        if not tags_val:
+            tags_val = None
+    else:
+        tags_val = None
+
+    if tags_val is None:
+        if meta:
+            await db.delete(meta)
+    else:
+        if meta:
+            meta.tags = tags_val
+        else:
+            meta = ImageMeta(path=path, tags=tags_val)
+            db.add(meta)
+
+    await db.commit()
+    return {"path": path, "tags": tags_val}
+
+
+@router.get("/images/search", dependencies=[Depends(get_current_user)])
+async def search_images(
+    q: str = Query(..., min_length=1, max_length=500),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: AsyncSession = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """Search images across all folders by tags (case-insensitive partial match)."""
+    safe = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    pattern = f"%{safe}%"
+
+    count_q = select(func.count()).select_from(ImageMeta).where(
+        ImageMeta.tags.ilike(pattern, escape="\\")
+    )
+    total = (await db.execute(count_q)).scalar() or 0
+
+    meta_q = (
+        select(ImageMeta)
+        .where(ImageMeta.tags.ilike(pattern, escape="\\"))
+        .order_by(ImageMeta.updated_at.desc())
+        .offset(offset)
+        .limit(limit)
+    )
+    meta_rows = (await db.execute(meta_q)).scalars().all()
+
+    async def _meta(meta: ImageMeta) -> dict:
+        bucket = settings.s3_images_bucket
+        obj = await asyncio.to_thread(head_object, meta.path)
+        if not obj:
+            return None
+        key = obj["Key"]
+        return {
+            "key": key,
+            "path": meta.path,
+            "filename": key.split("/", 1)[1] if "/" in key else key,
+            "size": obj["Size"],
+            "last_modified": obj["LastModified"],
+            "tags": meta.tags,
+        }
+
+    items = []
+    for row in meta_rows:
+        item = await _meta(row)
+        if item:
+            items.append(item)
+
+    return {"items": items, "total": total, "limit": limit, "offset": offset}
 
 
 _CONTENT_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
