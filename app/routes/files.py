@@ -123,7 +123,7 @@ async def upload_segment_output(
     if len(active_segments) == 0:
         if segment.auto_finalize:
             job.status = JobStatus.FINALIZED
-            video_record = Video(job_id=job.id, status=VideoStatus.PENDING)
+            video_record = Video(job_id=job.id, status=VideoStatus.PENDING, tags=job.tags)
             db.add(video_record)
             await db.flush()
             background_tasks.add_task(stitch_video, video_record.id, job.id)

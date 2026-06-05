@@ -25,6 +25,7 @@ class JobCreate(BaseModel):
     starting_image_uri: Optional[str] = None
     starting_image_hash: Optional[str] = None
     first_segment: SegmentCreate
+    tags: Optional[str] = Field(None, max_length=500)
 
 
 class JobResponse(BaseModel):

@@ -102,6 +102,7 @@ async def create_job(
         cfg_high=body.cfg_high,
         cfg_low=body.cfg_low,
         priority=next_priority,
+        tags=body.tags,
     )
     db.add(job)
     await db.flush()  # Get job.id
@@ -441,7 +442,7 @@ async def update_job(
             )
         job.status = body.status
         if body.status == JobStatus.FINALIZED:
-            video = Video(job_id=job.id, status=VideoStatus.PENDING)
+            video = Video(job_id=job.id, status=VideoStatus.PENDING, tags=job.tags)
             db.add(video)
             await db.flush()
             background_tasks.add_task(stitch_video, video.id, job.id)
