@@ -176,6 +176,62 @@ async def list_favorite_images(
     return [item for item in items if item is not None]
 
 
+@router.get("/images/untagged", dependencies=[Depends(get_current_user)])
+async def list_untagged_images(
+    user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return all images across all folders that have no tags — for tagging triage.
+
+    "Untagged" means no image_meta row at all, or a row with empty/whitespace tags.
+    Since never-tagged images have no row, this is a cross-folder scan minus the
+    set of paths with non-empty tags.
+    """
+    bucket = settings.s3_images_bucket
+    prefixes = await asyncio.to_thread(list_common_prefixes, bucket)
+    object_lists = await asyncio.gather(
+        *[asyncio.to_thread(list_objects, bucket, prefix) for prefix in prefixes]
+    )
+    objects = [
+        obj
+        for sublist in object_lists
+        for obj in sublist
+        if not obj["Key"].endswith("/.folder")
+    ]
+    paths = [f"s3://{bucket}/{obj['Key']}" for obj in objects]
+
+    tagged: set[str] = set()
+    in_use_set: set[str] = set()
+    if paths:
+        meta_result = await db.execute(
+            select(ImageMeta.path, ImageMeta.tags).where(ImageMeta.path.in_(paths))
+        )
+        tagged = {row[0] for row in meta_result.all() if row[1] and row[1].strip()}
+
+        in_use_result = await db.execute(
+            select(Job.starting_image)
+            .where(Job.user_id == user.id, Job.starting_image.in_(paths), Job.status != JobStatus.ARCHIVED)
+            .distinct()
+        )
+        in_use_set = {row[0] for row in in_use_result.all()}
+
+    untagged = [
+        {
+            "key": obj["Key"],
+            "path": f"s3://{bucket}/{obj['Key']}",
+            "filename": obj["Key"].split("/", 1)[1] if "/" in obj["Key"] else obj["Key"],
+            "size": obj["Size"],
+            "last_modified": obj["LastModified"],
+            "in_use": f"s3://{bucket}/{obj['Key']}" in in_use_set,
+            "tags": None,
+        }
+        for obj in objects
+        if f"s3://{bucket}/{obj['Key']}" not in tagged
+    ]
+    untagged.sort(key=lambda x: x["last_modified"], reverse=True)
+    return untagged
+
+
 @router.post("/images/move", dependencies=[Depends(get_current_user)])
 async def move_images(body: dict):
     """Move one or more images to a target folder (S3 copy + delete)."""
