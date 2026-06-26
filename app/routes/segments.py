@@ -182,6 +182,10 @@ async def add_segment(
         faceswap_faces_index=body.faceswap_faces_index,
         negative_prompt=negative_prompt,
         auto_finalize=body.auto_finalize,
+        steps_total=body.steps_total,
+        high_noise_steps=body.high_noise_steps,
+        shift_high=body.shift_high,
+        shift_low=body.shift_low,
     )
     db.add(segment)
 
@@ -296,6 +300,10 @@ async def claim_next_segment(
         lightx2v_strength_low=job.lightx2v_strength_low,
         cfg_high=job.cfg_high,
         cfg_low=job.cfg_low,
+        steps_total=segment.steps_total,
+        high_noise_steps=segment.high_noise_steps,
+        shift_high=segment.shift_high,
+        shift_low=segment.shift_low,
         negative_prompt=negative_prompt,
         reprocess_type=segment.reprocess_type,
         output_path=segment.output_path,
