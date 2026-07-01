@@ -18,10 +18,7 @@ class JobCreate(BaseModel):
     height: int
     fps: int
     seed: Optional[int] = None
-    lightx2v_strength_high: Optional[float] = None
-    lightx2v_strength_low: Optional[float] = None
-    cfg_high: Optional[float] = None
-    cfg_low: Optional[float] = None
+    mode: str = "identity"  # GenerationMode — locked for all segments; daemon resolves the preset
     starting_image_uri: Optional[str] = None
     starting_image_hash: Optional[str] = None
     first_segment: SegmentCreate
@@ -36,10 +33,7 @@ class JobResponse(BaseModel):
     fps: int
     seed: int
     starting_image: Optional[str]
-    lightx2v_strength_high: Optional[float]
-    lightx2v_strength_low: Optional[float]
-    cfg_high: Optional[float]
-    cfg_low: Optional[float]
+    mode: str = "identity"
     priority: int
     status: str
     segment_count: int = 0

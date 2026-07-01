@@ -13,10 +13,6 @@ router = APIRouter()
 
 # Defaults if a key is missing from the DB
 _DEFAULTS = {
-    "cfg_high": "1",
-    "cfg_low": "1",
-    "lightx2v_strength_high": "2.0",
-    "lightx2v_strength_low": "1.0",
     "negative_prompt": "",
 }
 
@@ -29,10 +25,6 @@ async def _get_all_settings(db: AsyncSession) -> dict[str, str]:
 
 def _to_response(settings: dict[str, str]) -> AppSettingsResponse:
     return AppSettingsResponse(
-        cfg_high=float(settings["cfg_high"]),
-        cfg_low=float(settings["cfg_low"]),
-        lightx2v_strength_high=float(settings["lightx2v_strength_high"]),
-        lightx2v_strength_low=float(settings["lightx2v_strength_low"]),
         negative_prompt=settings["negative_prompt"],
     )
 
