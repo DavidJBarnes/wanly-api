@@ -35,6 +35,19 @@ class VideoStatus(StrEnum):
     FAILED = "failed"
 
 
+class GenerationMode(StrEnum):
+    """Generation mode presets — a full profile (model + sampler knobs) resolved
+    by the daemon. Set once per job (like seed) and locked for all its segments.
+    See daemon MODE_PRESETS for the values each maps to."""
+    IDENTITY = "identity"      # Wan22 Base (Character Identity) — resident, ~16m
+    EXPRESSION = "expression"  # Wan22 Base (Identity + Expression) — de-distill/offload, ~21m
+    DASIWA = "dasiwa"          # DaSiWa (Fast) — distilled remix, ~13m, weaker identity
+
+    @classmethod
+    def _missing_(cls, value):
+        return cls.IDENTITY  # unknown/legacy → safe default
+
+
 # User-initiated job status transitions (used by PATCH /jobs/{id})
 JOB_VALID_TRANSITIONS: dict[str, set[str]] = {
     JobStatus.PENDING: {JobStatus.PAUSED, JobStatus.ARCHIVED},

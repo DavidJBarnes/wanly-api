@@ -95,10 +95,7 @@ class SegmentClaimResponse(BaseModel):
     previous_motion_keywords: Optional[list[str]] = None
     previous_motion_magnitude: Optional[float] = None
     reference_frames: Optional[list[str]] = None
-    lightx2v_strength_high: Optional[float] = None
-    lightx2v_strength_low: Optional[float] = None
-    cfg_high: Optional[float] = None
-    cfg_low: Optional[float] = None
+    mode: str = "identity"  # GenerationMode from the job — daemon resolves model + sampler preset
     negative_prompt: Optional[str] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None
