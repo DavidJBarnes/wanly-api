@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
@@ -254,12 +254,16 @@ async def move_images(body: dict):
 
 
 @router.delete("/images", dependencies=[Depends(get_current_user)])
-async def delete_image(path: str = Query(...)):
-    """Delete a single image by S3 URI."""
+async def delete_image(path: str = Query(...), db: AsyncSession = Depends(get_db)):
+    """Delete a single image by S3 URI, plus its DB references (tags + favorites)
+    so it doesn't linger as a dead reference in Favorites/Untagged views."""
     bucket = settings.s3_images_bucket
     if not path.startswith(f"s3://{bucket}/"):
         raise HTTPException(status_code=400, detail="Path must be in the images bucket")
     await asyncio.to_thread(delete_object, path)
+    await db.execute(delete(ImageMeta).where(ImageMeta.path == path))
+    await db.execute(delete(Favorite).where(Favorite.item_type == "image", Favorite.item_ref == path))
+    await db.commit()
     return {"ok": True}
 
 
