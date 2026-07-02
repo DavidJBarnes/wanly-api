@@ -42,6 +42,7 @@ class GenerationMode(StrEnum):
     IDENTITY = "identity"      # Wan22 Base (Character Identity) — resident, ~16m
     EXPRESSION = "expression"  # Wan22 Base (Identity + Expression) — de-distill/offload, ~21m
     DASIWA = "dasiwa"          # DaSiWa (Fast) — distilled remix, ~13m, weaker identity
+    REMIX = "remix"            # Wan22 Remix (Enhanced Motions) — baked motion, 3090-only (not on RunPod)
 
     @classmethod
     def _missing_(cls, value):
