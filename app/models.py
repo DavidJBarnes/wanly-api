@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, backref, mapped_column, relationship
 
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 
@@ -42,6 +42,9 @@ class Job(Base):
     starting_image = mapped_column(Text, nullable=True)
     starting_image_hash = mapped_column(String(64), nullable=True, index=True)
     mode = mapped_column(String(20), nullable=False, default="identity", server_default="identity")
+    # Final Cut: a final_cut job re-renders source_job's finalized video through Wan Animate.
+    kind = mapped_column(String(20), nullable=False, default="generate", server_default="generate")
+    source_job_id = mapped_column(UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True)
     priority = mapped_column(Integer, nullable=False, default=0)
     status = mapped_column(String(20), nullable=False, default=JobStatus.PENDING)
     tags = mapped_column(Text, nullable=True)
@@ -51,6 +54,8 @@ class Job(Base):
     user = relationship("User", back_populates="jobs")
     segments = relationship("Segment", back_populates="job", order_by="Segment.index", cascade="all, delete-orphan", passive_deletes=True)
     videos = relationship("Video", back_populates="job", cascade="all, delete-orphan", passive_deletes=True)
+    # Lineage: final_cuts = jobs derived from this one; source_job = the job a final_cut derives from.
+    final_cuts = relationship("Job", backref=backref("source_job", remote_side=[id]))
 
 
 class Segment(Base):
@@ -85,6 +90,9 @@ class Segment(Base):
     reference_frames = mapped_column(JSON, nullable=True)
     negative_prompt = mapped_column(Text, nullable=True)
     reprocess_type = mapped_column(String(20), nullable=True)
+    # Final Cut (reprocess_type="animate"): Wan Animate mode (move/mix) + preset (fast/highres).
+    animate_mode = mapped_column(String(20), nullable=True)
+    animate_preset = mapped_column(String(20), nullable=True)
     status = mapped_column(String(20), nullable=False, default=SegmentStatus.PENDING)
     worker_id = mapped_column(UUID(as_uuid=True), nullable=True)
     worker_name = mapped_column(String(255), nullable=True)

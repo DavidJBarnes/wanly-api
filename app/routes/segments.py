@@ -296,6 +296,8 @@ async def claim_next_segment(
         negative_prompt=negative_prompt,
         reprocess_type=segment.reprocess_type,
         output_path=segment.output_path,
+        animate_mode=segment.animate_mode,
+        animate_preset=segment.animate_preset,
         width=job.width,
         height=job.height,
         fps=job.fps,

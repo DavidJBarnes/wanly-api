@@ -34,6 +34,8 @@ class JobResponse(BaseModel):
     seed: int
     starting_image: Optional[str]
     mode: str = "identity"
+    kind: str = "generate"
+    source_job_id: Optional[UUID] = None
     priority: int
     status: str
     segment_count: int = 0
@@ -54,9 +56,28 @@ class JobListResponse(BaseModel):
     offset: int
 
 
+class FinalCutCreate(BaseModel):
+    mode: str = "mix"           # Wan Animate mode: "move" (regen scene) | "mix" (keep source scene)
+    preset: str = "fast"        # "fast" | "highres"
+    loras: Optional[list] = None  # optional character LoRA(s), same shape as segment loras ([{lora_id, low_weight}])
+    reference_image_uri: Optional[str] = None  # override reference; default = source job's starting_image
+
+
+class FinalCutSummary(BaseModel):
+    id: UUID
+    name: str
+    kind: str = "final_cut"
+    status: str
+    created_at: datetime
+    video: Optional[VideoResponse] = None
+
+    model_config = {"from_attributes": True}
+
+
 class JobDetailResponse(JobResponse):
     segments: list[SegmentResponse]
     videos: list[VideoResponse]
+    final_cuts: list[FinalCutSummary] = []
     segment_count: int
     completed_segment_count: int
     total_run_time: float
