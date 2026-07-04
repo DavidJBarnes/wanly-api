@@ -35,8 +35,9 @@ def _image_ext(filename: str | None) -> str:
 
 def _starting_image_key(user_id: UUID, image_hash: str, ext: str) -> str:
     return f"users/{user_id}/starting_images/{image_hash}{ext}"
-from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
+from app.schemas.jobs import FinalCutCreate, FinalCutSummary, JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
 from app.schemas.segments import SegmentResponse
+from app.schemas.videos import VideoResponse
 from app.stitch import stitch_video
 
 import logging
@@ -379,6 +380,22 @@ async def get_job(
     else:
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
+    # Final Cut lineage: child jobs derived from this one, each with its finalized video.
+    fc_result = await db.execute(
+        select(Job)
+        .where(Job.source_job_id == job.id)
+        .options(selectinload(Job.videos))
+        .order_by(Job.created_at.asc())
+    )
+    final_cuts = []
+    for fc in fc_result.scalars().all():
+        fc_video = next((v for v in fc.videos if v.status == VideoStatus.COMPLETED and v.output_path), None)
+        final_cuts.append(FinalCutSummary(
+            id=fc.id, name=fc.name, kind=fc.kind, status=fc.status,
+            created_at=fc.created_at,
+            video=VideoResponse.model_validate(fc_video) if fc_video else None,
+        ))
+
     return JobDetailResponse(
         id=job.id,
         name=job.name,
@@ -388,6 +405,8 @@ async def get_job(
         seed=job.seed,
         starting_image=job.starting_image,
         mode=job.mode,
+        kind=job.kind,
+        source_job_id=job.source_job_id,
         priority=job.priority,
         status=job.status,
         tags=job.tags,
@@ -396,11 +415,96 @@ async def get_job(
         updated_at=job.updated_at,
         segments=seg_responses,
         videos=job.videos,
+        final_cuts=final_cuts,
         segment_count=len(segments),
         completed_segment_count=len(completed),
         total_run_time=total_run_time,
         total_video_time=total_video_time,
     )
+
+
+@router.post("/jobs/{job_id}/final-cut", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
+async def create_final_cut(
+    job_id: UUID,
+    body: FinalCutCreate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Final Cut: re-render a job's finalized video through Wan Animate as a linked child job.
+
+    Driving video = the source job's finalized video (stored on the animate segment's output_path,
+    read by the daemon like a faceswap reprocess). Reference/character = an override or the source's
+    starting image. Enters the normal segment queue so nothing collides on the GPU.
+    """
+    result = await db.execute(
+        select(Job)
+        .where(Job.id == job_id, Job.user_id == user.id)
+        .options(selectinload(Job.videos), selectinload(Job.segments))
+    )
+    source = result.scalar_one_or_none()
+    if source is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    driving_video = next((v for v in source.videos if v.status == VideoStatus.COMPLETED and v.output_path), None)
+    if driving_video is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source job has no finalized video to Final Cut")
+
+    reference = body.reference_image_uri or source.starting_image
+    if not reference:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No reference image — source job has no starting image; provide reference_image_uri",
+        )
+    if body.mode not in ("move", "mix"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mode must be 'move' or 'mix'")
+    if body.preset not in ("fast", "highres"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="preset must be 'fast' or 'highres'")
+
+    resolved_loras = await _resolve_loras(db, body.loras)
+
+    # New jobs go to the bottom of the queue.
+    max_priority_result = await db.execute(
+        select(func.coalesce(func.max(Job.priority), -1)).where(Job.user_id == user.id)
+    )
+    next_priority = max_priority_result.scalar_one() + 1
+    fc_count = await db.execute(select(func.count()).select_from(Job).where(Job.source_job_id == source.id))
+    fc_num = fc_count.scalar_one() + 1
+
+    fc_job = Job(
+        user_id=user.id,
+        name=f"Final Cut {fc_num} — {source.name}"[:255],
+        width=source.width,
+        height=source.height,
+        fps=source.fps,
+        seed=source.seed,
+        mode=source.mode,
+        kind="final_cut",
+        source_job_id=source.id,
+        priority=next_priority,
+        starting_image=reference,
+        tags=source.tags,
+    )
+    db.add(fc_job)
+    await db.flush()
+
+    prompt = source.segments[0].prompt if source.segments else "natural realistic human motion, detailed face, cinematic lighting"
+    animate_segment = Segment(
+        job_id=fc_job.id,
+        index=0,
+        prompt=prompt,
+        duration_seconds=driving_video.duration_seconds or 5.0,
+        start_image=reference,                     # character reference for Animate
+        loras=resolved_loras,
+        output_path=driving_video.output_path,     # driving video (read by daemon like a reprocess input)
+        reprocess_type="animate",
+        animate_mode=body.mode,
+        animate_preset=body.preset,
+        auto_finalize=True,                        # single segment -> job finalizes -> Video on completion
+    )
+    db.add(animate_segment)
+    await db.commit()
+    await db.refresh(fc_job)
+    return fc_job
 
 
 @router.patch("/jobs/{job_id}", response_model=JobResponse)

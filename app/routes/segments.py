@@ -196,6 +196,7 @@ async def add_segment(
 async def claim_next_segment(
     worker_id: UUID = Query(...),
     worker_name: str = Query(None),
+    supports_animate: bool = Query(False, description="Worker has the Wan Animate stack (Final Cut)"),
     db: AsyncSession = Depends(get_db),
 ):
     # Reset stale segments: claimed/processing for > 30 minutes with no completion
@@ -214,11 +215,16 @@ async def claim_next_segment(
         stale.claimed_at = None
         stale.progress_log = None
 
-    result = await db.execute(
+    seg_query = (
         select(Segment)
         .join(Job, Segment.job_id == Job.id)
         .where(Segment.status == SegmentStatus.PENDING, Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]))
-        .order_by(Job.priority.asc(), Segment.created_at.asc())
+    )
+    if not supports_animate:
+        # Only Animate-capable workers (Final Cut) may claim animate segments.
+        seg_query = seg_query.where(Segment.reprocess_type.is_distinct_from("animate"))
+    result = await db.execute(
+        seg_query.order_by(Job.priority.asc(), Segment.created_at.asc())
         .limit(1)
         .with_for_update(skip_locked=True)
     )
@@ -296,6 +302,8 @@ async def claim_next_segment(
         negative_prompt=negative_prompt,
         reprocess_type=segment.reprocess_type,
         output_path=segment.output_path,
+        animate_mode=segment.animate_mode,
+        animate_preset=segment.animate_preset,
         width=job.width,
         height=job.height,
         fps=job.fps,
