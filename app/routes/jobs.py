@@ -487,7 +487,7 @@ async def create_final_cut(
     db.add(fc_job)
     await db.flush()
 
-    prompt = source.segments[0].prompt if source.segments else "natural realistic human motion, detailed face, cinematic lighting"
+    prompt = body.prompt or (source.segments[0].prompt if source.segments else "natural realistic human motion, detailed face, cinematic lighting")
     animate_segment = Segment(
         job_id=fc_job.id,
         index=0,
