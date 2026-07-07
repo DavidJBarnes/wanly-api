@@ -196,8 +196,6 @@ async def add_segment(
 async def claim_next_segment(
     worker_id: UUID = Query(...),
     worker_name: str = Query(None),
-    supports_animate: bool = Query(False, description="Worker has the Wan Animate stack (legacy Final Cut)"),
-    supports_facefusion: bool = Query(False, description="Worker has FaceFusion (Final Cut)"),
     db: AsyncSession = Depends(get_db),
 ):
     # Reset stale segments: claimed/processing for > 30 minutes with no completion
@@ -216,19 +214,11 @@ async def claim_next_segment(
         stale.claimed_at = None
         stale.progress_log = None
 
-    seg_query = (
+    result = await db.execute(
         select(Segment)
         .join(Job, Segment.job_id == Job.id)
         .where(Segment.status == SegmentStatus.PENDING, Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]))
-    )
-    if not supports_animate:
-        # Only Animate-capable workers (Final Cut) may claim animate segments.
-        seg_query = seg_query.where(Segment.reprocess_type.is_distinct_from("animate"))
-    if not supports_facefusion:
-        # Only FaceFusion-capable workers (Final Cut) may claim facefusion segments.
-        seg_query = seg_query.where(Segment.reprocess_type.is_distinct_from("facefusion"))
-    result = await db.execute(
-        seg_query.order_by(Job.priority.asc(), Segment.created_at.asc())
+        .order_by(Job.priority.asc(), Segment.created_at.asc())
         .limit(1)
         .with_for_update(skip_locked=True)
     )
@@ -302,14 +292,13 @@ async def claim_next_segment(
         previous_motion_keywords=previous_motion_keywords,
         previous_motion_magnitude=previous_motion_magnitude,
         reference_frames=reference_frames if reference_frames else None,
-        mode=job.mode,
+        lightx2v_strength_high=job.lightx2v_strength_high,
+        lightx2v_strength_low=job.lightx2v_strength_low,
+        cfg_high=job.cfg_high,
+        cfg_low=job.cfg_low,
         negative_prompt=negative_prompt,
         reprocess_type=segment.reprocess_type,
         output_path=segment.output_path,
-        animate_mode=segment.animate_mode,
-        animate_preset=segment.animate_preset,
-        facefusion_face_index=segment.facefusion_face_index,
-        facefusion_distance=segment.facefusion_distance,
         width=job.width,
         height=job.height,
         fps=job.fps,

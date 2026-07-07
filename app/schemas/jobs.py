@@ -18,7 +18,10 @@ class JobCreate(BaseModel):
     height: int
     fps: int
     seed: Optional[int] = None
-    mode: str = "identity"  # GenerationMode — locked for all segments; daemon resolves the preset
+    lightx2v_strength_high: Optional[float] = None
+    lightx2v_strength_low: Optional[float] = None
+    cfg_high: Optional[float] = None
+    cfg_low: Optional[float] = None
     starting_image_uri: Optional[str] = None
     starting_image_hash: Optional[str] = None
     first_segment: SegmentCreate
@@ -33,9 +36,10 @@ class JobResponse(BaseModel):
     fps: int
     seed: int
     starting_image: Optional[str]
-    mode: str = "identity"
-    kind: str = "generate"
-    source_job_id: Optional[UUID] = None
+    lightx2v_strength_high: Optional[float]
+    lightx2v_strength_low: Optional[float]
+    cfg_high: Optional[float]
+    cfg_low: Optional[float]
     priority: int
     status: str
     segment_count: int = 0
@@ -56,28 +60,9 @@ class JobListResponse(BaseModel):
     offset: int
 
 
-class FinalCutCreate(BaseModel):
-    # Final Cut now swaps a character's face onto the finalized video via FaceFusion.
-    reference_image_uri: Optional[str] = None  # face to swap in; default = source job's starting_image
-    face_index: int = 0          # which face to swap in a multi-person clip (0=first, left-to-right)
-    distance: Optional[float] = None  # FaceFusion reference-face-distance; None -> daemon auto
-
-
-class FinalCutSummary(BaseModel):
-    id: UUID
-    name: str
-    kind: str = "final_cut"
-    status: str
-    created_at: datetime
-    video: Optional[VideoResponse] = None
-
-    model_config = {"from_attributes": True}
-
-
 class JobDetailResponse(JobResponse):
     segments: list[SegmentResponse]
     videos: list[VideoResponse]
-    final_cuts: list[FinalCutSummary] = []
     segment_count: int
     completed_segment_count: int
     total_run_time: float

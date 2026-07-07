@@ -35,9 +35,8 @@ def _image_ext(filename: str | None) -> str:
 
 def _starting_image_key(user_id: UUID, image_hash: str, ext: str) -> str:
     return f"users/{user_id}/starting_images/{image_hash}{ext}"
-from app.schemas.jobs import FinalCutCreate, FinalCutSummary, JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
+from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
 from app.schemas.segments import SegmentResponse
-from app.schemas.videos import VideoResponse
 from app.stitch import stitch_video
 
 import logging
@@ -98,7 +97,10 @@ async def create_job(
         height=body.height,
         fps=body.fps,
         seed=seed,
-        mode=body.mode,
+        lightx2v_strength_high=body.lightx2v_strength_high,
+        lightx2v_strength_low=body.lightx2v_strength_low,
+        cfg_high=body.cfg_high,
+        cfg_low=body.cfg_low,
         priority=next_priority,
         tags=body.tags,
     )
@@ -290,7 +292,10 @@ async def list_jobs(
                 fps=j.fps,
                 seed=j.seed,
                 starting_image=j.starting_image,
-                mode=j.mode,
+                lightx2v_strength_high=j.lightx2v_strength_high,
+                lightx2v_strength_low=j.lightx2v_strength_low,
+                cfg_high=j.cfg_high,
+                cfg_low=j.cfg_low,
                 priority=j.priority,
                 status=j.status,
                 segment_count=seg_total,
@@ -380,22 +385,6 @@ async def get_job(
     else:
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
-    # Final Cut lineage: child jobs derived from this one, each with its finalized video.
-    fc_result = await db.execute(
-        select(Job)
-        .where(Job.source_job_id == job.id)
-        .options(selectinload(Job.videos))
-        .order_by(Job.created_at.asc())
-    )
-    final_cuts = []
-    for fc in fc_result.scalars().all():
-        fc_video = next((v for v in fc.videos if v.status == VideoStatus.COMPLETED and v.output_path), None)
-        final_cuts.append(FinalCutSummary(
-            id=fc.id, name=fc.name, kind=fc.kind, status=fc.status,
-            created_at=fc.created_at,
-            video=VideoResponse.model_validate(fc_video) if fc_video else None,
-        ))
-
     return JobDetailResponse(
         id=job.id,
         name=job.name,
@@ -404,9 +393,10 @@ async def get_job(
         fps=job.fps,
         seed=job.seed,
         starting_image=job.starting_image,
-        mode=job.mode,
-        kind=job.kind,
-        source_job_id=job.source_job_id,
+        lightx2v_strength_high=job.lightx2v_strength_high,
+        lightx2v_strength_low=job.lightx2v_strength_low,
+        cfg_high=job.cfg_high,
+        cfg_low=job.cfg_low,
         priority=job.priority,
         status=job.status,
         tags=job.tags,
@@ -415,92 +405,11 @@ async def get_job(
         updated_at=job.updated_at,
         segments=seg_responses,
         videos=job.videos,
-        final_cuts=final_cuts,
         segment_count=len(segments),
         completed_segment_count=len(completed),
         total_run_time=total_run_time,
         total_video_time=total_video_time,
     )
-
-
-@router.post("/jobs/{job_id}/final-cut", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
-async def create_final_cut(
-    job_id: UUID,
-    body: FinalCutCreate,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Final Cut: face-swap a character onto a job's finalized video via FaceFusion, as a linked child job.
-
-    Driving video = the source job's finalized video (stored on the facefusion segment's output_path,
-    read by the daemon like a faceswap reprocess). Reference face = an override or the source's
-    starting image. Enters the normal segment queue so nothing collides on the GPU.
-    """
-    result = await db.execute(
-        select(Job)
-        .where(Job.id == job_id, Job.user_id == user.id)
-        .options(selectinload(Job.videos), selectinload(Job.segments))
-    )
-    source = result.scalar_one_or_none()
-    if source is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
-
-    driving_video = next((v for v in source.videos if v.status == VideoStatus.COMPLETED and v.output_path), None)
-    if driving_video is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Source job has no finalized video to Final Cut")
-
-    reference = body.reference_image_uri or source.starting_image
-    if not reference:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No reference image — source job has no starting image; provide reference_image_uri",
-        )
-    if body.face_index < 0:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="face_index must be >= 0")
-    if body.distance is not None and not (0.0 <= body.distance <= 1.5):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="distance must be between 0.0 and 1.5")
-
-    # New jobs go to the bottom of the queue.
-    max_priority_result = await db.execute(
-        select(func.coalesce(func.max(Job.priority), -1)).where(Job.user_id == user.id)
-    )
-    next_priority = max_priority_result.scalar_one() + 1
-    fc_count = await db.execute(select(func.count()).select_from(Job).where(Job.source_job_id == source.id))
-    fc_num = fc_count.scalar_one() + 1
-
-    fc_job = Job(
-        user_id=user.id,
-        name=f"Final Cut {fc_num} — {source.name}"[:255],
-        width=source.width,
-        height=source.height,
-        fps=source.fps,
-        seed=source.seed,
-        mode=source.mode,
-        kind="final_cut",
-        source_job_id=source.id,
-        priority=next_priority,
-        starting_image=reference,
-        tags=source.tags,
-    )
-    db.add(fc_job)
-    await db.flush()
-
-    facefusion_segment = Segment(
-        job_id=fc_job.id,
-        index=0,
-        prompt="",                                 # unused by FaceFusion (no generation step)
-        duration_seconds=driving_video.duration_seconds or 5.0,
-        start_image=reference,                     # the face to swap in
-        output_path=driving_video.output_path,     # driving video (read by daemon like a reprocess input)
-        reprocess_type="facefusion",
-        facefusion_face_index=body.face_index,
-        facefusion_distance=body.distance,
-        auto_finalize=True,                        # single segment -> job finalizes -> Video on completion
-    )
-    db.add(facefusion_segment)
-    await db.commit()
-    await db.refresh(fc_job)
-    return fc_job
 
 
 @router.patch("/jobs/{job_id}", response_model=JobResponse)
@@ -607,7 +516,9 @@ async def reopen_job(
     return JobDetailResponse(
         id=job.id, name=job.name, width=job.width, height=job.height,
         fps=job.fps, seed=job.seed, starting_image=job.starting_image,
-        mode=job.mode,
+        lightx2v_strength_high=job.lightx2v_strength_high,
+        lightx2v_strength_low=job.lightx2v_strength_low,
+        cfg_high=job.cfg_high, cfg_low=job.cfg_low,
         priority=job.priority, status=job.status,
         tags=job.tags,
         estimated_run_time=job_est,
