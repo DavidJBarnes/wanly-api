@@ -57,11 +57,10 @@ class JobListResponse(BaseModel):
 
 
 class FinalCutCreate(BaseModel):
-    mode: str = "mix"           # Wan Animate mode: "move" (regen scene) | "mix" (keep source scene)
-    preset: str = "fast"        # "fast" | "highres"
-    loras: Optional[list] = None  # optional character LoRA(s), same shape as segment loras ([{lora_id, low_weight}])
-    reference_image_uri: Optional[str] = None  # override reference; default = source job's starting_image
-    prompt: Optional[str] = None  # scene prompt (matters for move mode); default = source job's prompt
+    # Final Cut now swaps a character's face onto the finalized video via FaceFusion.
+    reference_image_uri: Optional[str] = None  # face to swap in; default = source job's starting_image
+    face_index: int = 0          # which face to swap in a multi-person clip (0=first, left-to-right)
+    distance: Optional[float] = None  # FaceFusion reference-face-distance; None -> daemon auto
 
 
 class FinalCutSummary(BaseModel):
