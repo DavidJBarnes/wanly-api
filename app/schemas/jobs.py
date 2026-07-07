@@ -22,6 +22,8 @@ class JobCreate(BaseModel):
     lightx2v_strength_low: Optional[float] = None
     cfg_high: Optional[float] = None
     cfg_low: Optional[float] = None
+    steps_total: Optional[int] = None
+    high_noise_steps: Optional[int] = None
     starting_image_uri: Optional[str] = None
     starting_image_hash: Optional[str] = None
     first_segment: SegmentCreate
@@ -40,6 +42,8 @@ class JobResponse(BaseModel):
     lightx2v_strength_low: Optional[float]
     cfg_high: Optional[float]
     cfg_low: Optional[float]
+    steps_total: Optional[int] = None
+    high_noise_steps: Optional[int] = None
     priority: int
     status: str
     segment_count: int = 0
