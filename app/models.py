@@ -93,6 +93,9 @@ class Segment(Base):
     # Final Cut (reprocess_type="animate"): Wan Animate mode (move/mix) + preset (fast/highres).
     animate_mode = mapped_column(String(20), nullable=True)
     animate_preset = mapped_column(String(20), nullable=True)
+    # Final Cut (reprocess_type="facefusion"): FaceFusion face-swap params.
+    facefusion_face_index = mapped_column(Integer, nullable=False, server_default="0")
+    facefusion_distance = mapped_column(Float, nullable=True)
     status = mapped_column(String(20), nullable=False, default=SegmentStatus.PENDING)
     worker_id = mapped_column(UUID(as_uuid=True), nullable=True)
     worker_name = mapped_column(String(255), nullable=True)

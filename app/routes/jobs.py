@@ -430,10 +430,10 @@ async def create_final_cut(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Final Cut: re-render a job's finalized video through Wan Animate as a linked child job.
+    """Final Cut: face-swap a character onto a job's finalized video via FaceFusion, as a linked child job.
 
-    Driving video = the source job's finalized video (stored on the animate segment's output_path,
-    read by the daemon like a faceswap reprocess). Reference/character = an override or the source's
+    Driving video = the source job's finalized video (stored on the facefusion segment's output_path,
+    read by the daemon like a faceswap reprocess). Reference face = an override or the source's
     starting image. Enters the normal segment queue so nothing collides on the GPU.
     """
     result = await db.execute(
@@ -455,12 +455,10 @@ async def create_final_cut(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No reference image — source job has no starting image; provide reference_image_uri",
         )
-    if body.mode not in ("move", "mix"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="mode must be 'move' or 'mix'")
-    if body.preset not in ("fast", "highres"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="preset must be 'fast' or 'highres'")
-
-    resolved_loras = await _resolve_loras(db, body.loras)
+    if body.face_index < 0:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="face_index must be >= 0")
+    if body.distance is not None and not (0.0 <= body.distance <= 1.5):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="distance must be between 0.0 and 1.5")
 
     # New jobs go to the bottom of the queue.
     max_priority_result = await db.execute(
@@ -487,21 +485,19 @@ async def create_final_cut(
     db.add(fc_job)
     await db.flush()
 
-    prompt = body.prompt or (source.segments[0].prompt if source.segments else "natural realistic human motion, detailed face, cinematic lighting")
-    animate_segment = Segment(
+    facefusion_segment = Segment(
         job_id=fc_job.id,
         index=0,
-        prompt=prompt,
+        prompt="",                                 # unused by FaceFusion (no generation step)
         duration_seconds=driving_video.duration_seconds or 5.0,
-        start_image=reference,                     # character reference for Animate
-        loras=resolved_loras,
+        start_image=reference,                     # the face to swap in
         output_path=driving_video.output_path,     # driving video (read by daemon like a reprocess input)
-        reprocess_type="animate",
-        animate_mode=body.mode,
-        animate_preset=body.preset,
+        reprocess_type="facefusion",
+        facefusion_face_index=body.face_index,
+        facefusion_distance=body.distance,
         auto_finalize=True,                        # single segment -> job finalizes -> Video on completion
     )
-    db.add(animate_segment)
+    db.add(facefusion_segment)
     await db.commit()
     await db.refresh(fc_job)
     return fc_job

@@ -196,7 +196,8 @@ async def add_segment(
 async def claim_next_segment(
     worker_id: UUID = Query(...),
     worker_name: str = Query(None),
-    supports_animate: bool = Query(False, description="Worker has the Wan Animate stack (Final Cut)"),
+    supports_animate: bool = Query(False, description="Worker has the Wan Animate stack (legacy Final Cut)"),
+    supports_facefusion: bool = Query(False, description="Worker has FaceFusion (Final Cut)"),
     db: AsyncSession = Depends(get_db),
 ):
     # Reset stale segments: claimed/processing for > 30 minutes with no completion
@@ -223,6 +224,9 @@ async def claim_next_segment(
     if not supports_animate:
         # Only Animate-capable workers (Final Cut) may claim animate segments.
         seg_query = seg_query.where(Segment.reprocess_type.is_distinct_from("animate"))
+    if not supports_facefusion:
+        # Only FaceFusion-capable workers (Final Cut) may claim facefusion segments.
+        seg_query = seg_query.where(Segment.reprocess_type.is_distinct_from("facefusion"))
     result = await db.execute(
         seg_query.order_by(Job.priority.asc(), Segment.created_at.asc())
         .limit(1)
@@ -304,6 +308,8 @@ async def claim_next_segment(
         output_path=segment.output_path,
         animate_mode=segment.animate_mode,
         animate_preset=segment.animate_preset,
+        facefusion_face_index=segment.facefusion_face_index,
+        facefusion_distance=segment.facefusion_distance,
         width=job.width,
         height=job.height,
         fps=job.fps,
