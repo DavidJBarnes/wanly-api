@@ -298,6 +298,7 @@ async def claim_next_segment(
         cfg_low=job.cfg_low,
         steps_total=job.steps_total,
         high_noise_steps=job.high_noise_steps,
+        flow_shift=job.flow_shift,
         negative_prompt=negative_prompt,
         reprocess_type=segment.reprocess_type,
         output_path=segment.output_path,

@@ -101,6 +101,7 @@ class SegmentClaimResponse(BaseModel):
     cfg_low: Optional[float] = None
     steps_total: Optional[int] = None
     high_noise_steps: Optional[int] = None
+    flow_shift: Optional[float] = None
     negative_prompt: Optional[str] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None
