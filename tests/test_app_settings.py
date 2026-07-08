@@ -15,6 +15,9 @@ class TestAppSettingsSchemas:
             cfg_low=1.0,
             lightx2v_strength_high=2.0,
             lightx2v_strength_low=1.0,
+            steps_total=4,
+            high_noise_steps=2,
+            flow_shift=5.0,
             negative_prompt="bad quality, blurry",
         )
         assert resp.negative_prompt == "bad quality, blurry"
@@ -71,6 +74,9 @@ class TestToResponse:
             "cfg_low": "1.0",
             "lightx2v_strength_high": "2.0",
             "lightx2v_strength_low": "1.0",
+            "steps_total": "4",
+            "high_noise_steps": "2",
+            "flow_shift": "5",
             "negative_prompt": "ugly, blurry",
         }
         resp = _to_response(settings)
@@ -85,6 +91,9 @@ class TestToResponse:
             "cfg_low": "1",
             "lightx2v_strength_high": "2.0",
             "lightx2v_strength_low": "1.0",
+            "steps_total": "4",
+            "high_noise_steps": "2",
+            "flow_shift": "5",
             "negative_prompt": "",
         }
         resp = _to_response(settings)

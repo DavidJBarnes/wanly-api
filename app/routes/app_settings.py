@@ -17,6 +17,9 @@ _DEFAULTS = {
     "cfg_low": "1",
     "lightx2v_strength_high": "2.0",
     "lightx2v_strength_low": "1.0",
+    "steps_total": "4",
+    "high_noise_steps": "2",
+    "flow_shift": "5",
     "negative_prompt": "",
 }
 
@@ -33,6 +36,9 @@ def _to_response(settings: dict[str, str]) -> AppSettingsResponse:
         cfg_low=float(settings["cfg_low"]),
         lightx2v_strength_high=float(settings["lightx2v_strength_high"]),
         lightx2v_strength_low=float(settings["lightx2v_strength_low"]),
+        steps_total=int(settings["steps_total"]),
+        high_noise_steps=int(settings["high_noise_steps"]),
+        flow_shift=float(settings["flow_shift"]),
         negative_prompt=settings["negative_prompt"],
     )
 
