@@ -47,6 +47,7 @@ class Job(Base):
     cfg_low = mapped_column(Float, nullable=True)
     steps_total = mapped_column(Integer, nullable=True)
     high_noise_steps = mapped_column(Integer, nullable=True)
+    flow_shift = mapped_column(Float, nullable=True)
     priority = mapped_column(Integer, nullable=False, default=0)
     status = mapped_column(String(20), nullable=False, default=JobStatus.PENDING)
     tags = mapped_column(Text, nullable=True)

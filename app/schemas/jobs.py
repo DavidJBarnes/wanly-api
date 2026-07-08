@@ -24,6 +24,7 @@ class JobCreate(BaseModel):
     cfg_low: Optional[float] = None
     steps_total: Optional[int] = None
     high_noise_steps: Optional[int] = None
+    flow_shift: Optional[float] = None
     starting_image_uri: Optional[str] = None
     starting_image_hash: Optional[str] = None
     first_segment: SegmentCreate
@@ -44,6 +45,7 @@ class JobResponse(BaseModel):
     cfg_low: Optional[float]
     steps_total: Optional[int] = None
     high_noise_steps: Optional[int] = None
+    flow_shift: Optional[float] = None
     priority: int
     status: str
     segment_count: int = 0
