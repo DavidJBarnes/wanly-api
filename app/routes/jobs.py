@@ -191,10 +191,13 @@ async def list_jobs(
     sort: str = Query("created_at_desc"),
     name: str | None = Query(None, min_length=1, max_length=255, description="Filter jobs by name (case-insensitive partial match)"),
     search: str | None = Query(None, min_length=1, max_length=255, alias="q", description="Search jobs by name or tags (case-insensitive partial match)"),
+    starred: bool | None = Query(None, description="Only jobs flagged as successful configs"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     base = select(Job).where(Job.user_id == user.id)
+    if starred:
+        base = base.where(Job.config_starred.is_(True))
     if name:
         safe = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         base = base.where(Job.name.ilike(f"%{safe}%", escape="\\"))
@@ -210,7 +213,9 @@ async def list_jobs(
     if status_filter:
         statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
         base = base.where(Job.status.in_(statuses))
-    else:
+    elif not starred:
+        # Starred = "successful configs" and those are usually finalized jobs, so the
+        # star filter must see all statuses; only hide finalized/archived otherwise.
         base = base.where(Job.status.notin_([JobStatus.FINALIZED, JobStatus.FINALIZING, JobStatus.ARCHIVED]))
 
     total_result = await db.execute(select(func.count()).select_from(base.subquery()))
@@ -441,6 +446,9 @@ async def update_job(
 
     if body.tags is not None:
         job.tags = body.tags
+
+    if body.config_starred is not None:
+        job.config_starred = body.config_starred
 
     if body.status is not None:
         allowed = JOB_VALID_TRANSITIONS.get(job.status, set())
