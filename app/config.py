@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     cors_origins: str = ""
     login_rate_limit: str = "5/minute"
     heartbeat_offline_seconds: int = 120
+    # Interim seam smoothing: crossfade (xfade) overlap between consecutive segments,
+    # in seconds. 0 disables it (hard-cut concat, prior behavior). Superseded later by
+    # VACE video-conditioned continuation.
+    stitch_crossfade_seconds: float = 0.0
 
     model_config = {"env_file": ".env"}
 

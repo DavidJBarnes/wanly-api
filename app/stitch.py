@@ -91,6 +91,55 @@ def _apply_trim(input_path: str, output_path: str, fps: int,
     return new_duration
 
 
+def _crossfade_concat(input_paths: list[str], durations: list[float],
+                      crossfade: float, fps: int, output_path: str) -> float:
+    """Blend consecutive segments with an xfade crossfade (overlapping seam) and
+    re-encode to a single clip. Returns the total output duration.
+
+    Each boundary overlaps by ``d`` seconds, so the output is shorter than the sum
+    of the parts by ``d * (n - 1)``. ``d`` is clamped to fit the shortest segment.
+    Raises ValueError if a crossfade can't be applied (too few clips / too short).
+    """
+    n = len(input_paths)
+    if n < 2:
+        raise ValueError("crossfade needs at least 2 segments")
+    # Clamp the overlap so it never exceeds the shortest clip (leave a small margin).
+    d = min(crossfade, min(durations) - 0.05)
+    if d <= 0:
+        raise ValueError(f"crossfade {crossfade}s does not fit shortest segment {min(durations)}s")
+
+    cmd = ["ffmpeg", "-y"]
+    for p in input_paths:
+        cmd += ["-i", p]
+
+    # Normalize every input to a common fps/timebase/format so xfade lines up.
+    filters = [f"[{i}:v]settb=AVTB,fps={fps},format=yuv420p[v{i}]" for i in range(n)]
+
+    running = durations[0]
+    prev_label = "v0"
+    for i in range(1, n):
+        offset = running - d
+        out_label = "out" if i == n - 1 else f"x{i}"
+        filters.append(
+            f"[{prev_label}][v{i}]xfade=transition=fade:duration={d}:"
+            f"offset={offset:.4f}[{out_label}]"
+        )
+        running = running + durations[i] - d
+        prev_label = out_label
+
+    cmd += [
+        "-filter_complex", ";".join(filters),
+        "-map", "[out]",
+        "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+        "-an",
+        output_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=600)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg crossfade failed: {proc.stderr.decode()[-500:]}")
+    return running
+
+
 def _compute_fades(segments: list) -> list[tuple[bool, bool]]:
     """Return (fade_in, fade_out) for each segment based on transition settings.
 
@@ -165,61 +214,90 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                         local_files[i] = trimmed_name
                         durations[i] = new_dur
 
-                # Apply transitions
-                needs_fade = _compute_fades(segments)
-                concat_names = []
-                for i, (seg, local_name) in enumerate(zip(segments, local_files)):
-                    fade_in, fade_out = needs_fade[i]
-                    if fade_in or fade_out:
-                        faded_name = f"seg_{seg.index:03d}_faded.mp4"
-                        await asyncio.to_thread(
-                            _apply_fades,
-                            str(tmppath / local_name),
-                            str(tmppath / faded_name),
-                            durations[i],
-                            fade_in,
-                            fade_out,
-                        )
-                        concat_names.append(faded_name)
-                    else:
-                        concat_names.append(local_name)
+                # Seam handling: interim crossfade blend (opt-in) vs hard-cut concat.
+                # Crossfade overlaps consecutive segments to soften the seam; it can't
+                # coexist with fade-to-black / flash transitions, so those still take the
+                # concat path. VACE will later supersede this with real continuation.
+                crossfade = settings.stitch_crossfade_seconds or 0.0
+                transitions_used = any(seg.transition in ("fade", "flash") for seg in segments)
+                use_crossfade = crossfade > 0 and len(segments) >= 2 and not transitions_used
 
-                    # Insert black clip for "flash" transition
-                    if seg.transition == "flash":
-                        black_name = f"black_{seg.index:03d}.mp4"
-                        await asyncio.to_thread(
-                            _generate_black,
-                            str(tmppath / black_name),
-                            FLASH_DURATION,
-                            job.width,
-                            job.height,
-                            job.fps,
-                        )
-                        concat_names.append(black_name)
-
-                # Write ffmpeg concat list
-                concat_list = tmppath / "concat.txt"
-                concat_list.write_text(
-                    "\n".join(f"file '{name}'" for name in concat_names)
-                )
-
-                # Run ffmpeg concat (no re-encoding)
                 output_path = tmppath / "final.mp4"
-                proc = await asyncio.to_thread(
-                    subprocess.run,
-                    [
-                        "ffmpeg", "-y",
-                        "-f", "concat",
-                        "-safe", "0",
-                        "-i", str(concat_list),
-                        "-c", "copy",
-                        str(output_path),
-                    ],
-                    capture_output=True,
-                    timeout=300,
-                )
-                if proc.returncode != 0:
-                    raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode()[-500:]}")
+                total_duration = sum(durations)
+
+                if use_crossfade:
+                    try:
+                        total_duration = await asyncio.to_thread(
+                            _crossfade_concat,
+                            [str(tmppath / f) for f in local_files],
+                            durations,
+                            crossfade,
+                            job.fps,
+                            str(output_path),
+                        )
+                        logger.info(
+                            "Stitched job %s with %.2fs crossfade across %d segments",
+                            job_id, crossfade, len(segments),
+                        )
+                    except ValueError as e:
+                        logger.warning("Crossfade skipped (%s); using hard-cut concat", e)
+                        use_crossfade = False
+
+                if not use_crossfade:
+                    # Apply transitions
+                    needs_fade = _compute_fades(segments)
+                    concat_names = []
+                    for i, (seg, local_name) in enumerate(zip(segments, local_files)):
+                        fade_in, fade_out = needs_fade[i]
+                        if fade_in or fade_out:
+                            faded_name = f"seg_{seg.index:03d}_faded.mp4"
+                            await asyncio.to_thread(
+                                _apply_fades,
+                                str(tmppath / local_name),
+                                str(tmppath / faded_name),
+                                durations[i],
+                                fade_in,
+                                fade_out,
+                            )
+                            concat_names.append(faded_name)
+                        else:
+                            concat_names.append(local_name)
+
+                        # Insert black clip for "flash" transition
+                        if seg.transition == "flash":
+                            black_name = f"black_{seg.index:03d}.mp4"
+                            await asyncio.to_thread(
+                                _generate_black,
+                                str(tmppath / black_name),
+                                FLASH_DURATION,
+                                job.width,
+                                job.height,
+                                job.fps,
+                            )
+                            concat_names.append(black_name)
+
+                    # Write ffmpeg concat list
+                    concat_list = tmppath / "concat.txt"
+                    concat_list.write_text(
+                        "\n".join(f"file '{name}'" for name in concat_names)
+                    )
+
+                    # Run ffmpeg concat (no re-encoding)
+                    proc = await asyncio.to_thread(
+                        subprocess.run,
+                        [
+                            "ffmpeg", "-y",
+                            "-f", "concat",
+                            "-safe", "0",
+                            "-i", str(concat_list),
+                            "-c", "copy",
+                            str(output_path),
+                        ],
+                        capture_output=True,
+                        timeout=300,
+                    )
+                    if proc.returncode != 0:
+                        raise RuntimeError(f"ffmpeg failed: {proc.stderr.decode()[-500:]}")
 
                 # Upload to S3
                 s3_key = f"{job_id}/final.mp4"
@@ -227,8 +305,7 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                     upload_file, str(output_path), s3_key, settings.s3_jobs_bucket
                 )
 
-            # Update video record
-            total_duration = sum(durations)
+            # Update video record (total_duration set during stitch — crossfade shortens it)
             video.output_path = s3_uri
             video.duration_seconds = total_duration
             video.status = VideoStatus.COMPLETED
