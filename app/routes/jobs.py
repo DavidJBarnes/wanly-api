@@ -258,6 +258,53 @@ async def list_jobs(
         for row in faceswap_result.all():
             faceswap_map[row[0]] = bool(row[1])
 
+    # Aggregate distinct LoRAs (with weights) per job from its segment configs, resolving names.
+    loras_map: dict[UUID, list[dict]] = {}
+    if job_ids:
+        seg_loras_result = await db.execute(
+            select(Segment.job_id, Segment.loras)
+            .where(Segment.job_id.in_(job_ids), Segment.loras.isnot(None))
+        )
+        raw_buckets: dict[UUID, dict] = {}
+        referenced_ids: set[UUID] = set()
+        for seg_job_id, seg_loras in seg_loras_result.all():
+            if not seg_loras:
+                continue
+            bucket = raw_buckets.setdefault(seg_job_id, {})
+            for lora in seg_loras:
+                key = (
+                    lora.get("lora_id"),
+                    lora.get("high_file"),
+                    lora.get("low_file"),
+                    lora.get("high_weight"),
+                    lora.get("low_weight"),
+                )
+                bucket[key] = lora
+                lid = lora.get("lora_id")
+                if lid:
+                    try:
+                        referenced_ids.add(UUID(str(lid)))
+                    except (ValueError, TypeError):
+                        pass
+        name_map: dict[str, str] = {}
+        if referenced_ids:
+            name_result = await db.execute(
+                select(Lora.id, Lora.name).where(Lora.id.in_(referenced_ids))
+            )
+            name_map = {str(r[0]): r[1] for r in name_result.all()}
+        for seg_job_id, bucket in raw_buckets.items():
+            loras_map[seg_job_id] = [
+                {
+                    "lora_id": lora.get("lora_id"),
+                    "name": name_map.get(str(lora.get("lora_id"))),
+                    "high_file": lora.get("high_file"),
+                    "low_file": lora.get("low_file"),
+                    "high_weight": lora.get("high_weight"),
+                    "low_weight": lora.get("low_weight"),
+                }
+                for lora in bucket.values()
+            ]
+
     # Fetch active segment info for estimation
     active_statuses = {SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING}
     active_jobs = [j for j in items if j.status in (JobStatus.PENDING, JobStatus.PROCESSING)]
@@ -308,11 +355,13 @@ async def list_jobs(
                 high_noise_steps=j.high_noise_steps,
                 flow_shift=j.flow_shift,
                 priority=j.priority,
+                config_starred=j.config_starred,
                 status=j.status,
                 segment_count=seg_total,
                 completed_segment_count=seg_completed,
                 estimated_run_time=est_map.get(j.id),
                 faceswap_enabled=faceswap_map.get(j.id, False),
+                loras=loras_map.get(j.id, []),
                 tags=j.tags,
                 created_at=j.created_at,
                 updated_at=j.updated_at,
@@ -412,6 +461,7 @@ async def get_job(
         high_noise_steps=job.high_noise_steps,
         flow_shift=job.flow_shift,
         priority=job.priority,
+        config_starred=job.config_starred,
         status=job.status,
         tags=job.tags,
         estimated_run_time=job_est,
