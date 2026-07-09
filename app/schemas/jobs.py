@@ -31,6 +31,15 @@ class JobCreate(BaseModel):
     tags: Optional[str] = Field(None, max_length=500)
 
 
+class JobLoraSummary(BaseModel):
+    lora_id: Optional[str] = None
+    name: Optional[str] = None
+    high_file: Optional[str] = None
+    low_file: Optional[str] = None
+    high_weight: Optional[float] = None
+    low_weight: Optional[float] = None
+
+
 class JobResponse(BaseModel):
     id: UUID
     name: str
@@ -53,6 +62,7 @@ class JobResponse(BaseModel):
     completed_segment_count: int = 0
     estimated_run_time: Optional[float] = None
     faceswap_enabled: bool = False
+    loras: list[JobLoraSummary] = []
     tags: Optional[str] = None
     created_at: datetime
     updated_at: datetime
