@@ -50,6 +50,8 @@ class Job(Base):
     flow_shift = mapped_column(Float, nullable=True)
     priority = mapped_column(Integer, nullable=False, default=0)
     config_starred = mapped_column(Boolean, nullable=False, default=False)
+    # Per-job continuation-mode override ("traditional"|"vace"); NULL -> global app setting.
+    continuation_mode = mapped_column(String(20), nullable=True)
     status = mapped_column(String(20), nullable=False, default=JobStatus.PENDING)
     tags = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

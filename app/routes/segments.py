@@ -269,6 +269,18 @@ async def claim_next_segment(
         neg_setting = await db.get(AppSetting, "negative_prompt")
         negative_prompt = neg_setting.value if neg_setting else None
 
+    # Resolve continuation mode API-side (VACE vs traditional). seg0 is always i2v;
+    # VACE requires index>0 + the previous segment's video. The daemon falls back to
+    # traditional if it isn't VACE-capable, so flipping this is safe.
+    mode_setting = await db.get(AppSetting, "continuation_mode")
+    global_mode = mode_setting.value if mode_setting else "traditional"
+    overlap_setting = await db.get(AppSetting, "vace_overlap_frames")
+    vace_overlap = int(overlap_setting.value) if overlap_setting else 12
+    effective_mode = job.continuation_mode or global_mode
+    prev_output_path = previous_segment.output_path if previous_segment else None
+    use_vace = effective_mode == "vace" and segment.index > 0 and prev_output_path is not None
+    continuation_mode = "vace" if use_vace else "traditional"
+
     await db.commit()
     await db.refresh(segment)
 
@@ -306,6 +318,9 @@ async def claim_next_segment(
         height=job.height,
         fps=job.fps,
         seed=job.seed,
+        continuation_mode=continuation_mode,
+        previous_output_path=prev_output_path if use_vace else None,
+        vace_overlap_frames=vace_overlap,
     )
 
 

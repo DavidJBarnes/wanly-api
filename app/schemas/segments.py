@@ -109,6 +109,11 @@ class SegmentClaimResponse(BaseModel):
     height: int
     fps: int
     seed: int
+    # Continuation strategy for THIS segment, resolved API-side. "vace" only for
+    # index>0 when enabled + the previous segment's video is available; else "traditional".
+    continuation_mode: str = "traditional"
+    previous_output_path: Optional[str] = None  # prev segment video (VACE control source)
+    vace_overlap_frames: int = 12
 
     model_config = {"from_attributes": True}
 
