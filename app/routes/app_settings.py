@@ -21,6 +21,8 @@ _DEFAULTS = {
     "high_noise_steps": "2",
     "flow_shift": "5",
     "negative_prompt": "",
+    "continuation_mode": "traditional",
+    "vace_overlap_frames": "12",
 }
 
 
@@ -40,6 +42,8 @@ def _to_response(settings: dict[str, str]) -> AppSettingsResponse:
         high_noise_steps=int(settings["high_noise_steps"]),
         flow_shift=float(settings["flow_shift"]),
         negative_prompt=settings["negative_prompt"],
+        continuation_mode=settings.get("continuation_mode", "traditional"),
+        vace_overlap_frames=int(settings.get("vace_overlap_frames", "12")),
     )
 
 

@@ -12,6 +12,10 @@ class AppSettingsResponse(BaseModel):
     high_noise_steps: int
     flow_shift: float
     negative_prompt: str
+    # Segment continuation strategy: "traditional" (last-frame i2v handoff, current)
+    # or "vace" (video-conditioned continuation). vace_overlap_frames = kept tail length.
+    continuation_mode: str = "traditional"
+    vace_overlap_frames: int = 12
 
 
 class AppSettingsUpdate(BaseModel):
@@ -23,3 +27,5 @@ class AppSettingsUpdate(BaseModel):
     high_noise_steps: Optional[int] = None
     flow_shift: Optional[float] = None
     negative_prompt: Optional[str] = None
+    continuation_mode: Optional[str] = None
+    vace_overlap_frames: Optional[int] = None
