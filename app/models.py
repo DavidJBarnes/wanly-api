@@ -91,6 +91,10 @@ class Segment(Base):
     trim_end_frames = mapped_column(Integer, nullable=False, default=0)
     motion_keywords = mapped_column(JSON, nullable=True)
     motion_magnitude = mapped_column(Float, nullable=True)
+    # Length (seconds) of the reconstructed lead-in a VACE-continuation segment carries.
+    # Stitch trims this off the previous segment's tail so the reconstruction replaces it
+    # seamlessly. NULL for traditional (non-VACE) segments.
+    vace_overlap_seconds = mapped_column(Float, nullable=True)
     reference_frames = mapped_column(JSON, nullable=True)
     negative_prompt = mapped_column(Text, nullable=True)
     reprocess_type = mapped_column(String(20), nullable=True)

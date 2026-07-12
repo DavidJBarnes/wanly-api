@@ -151,3 +151,4 @@ class SegmentStatusUpdate(BaseModel):
     progress_log: Optional[str] = None
     motion_keywords: Optional[list[str]] = None
     motion_magnitude: Optional[float] = None
+    vace_overlap_seconds: Optional[float] = None
