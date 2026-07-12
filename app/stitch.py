@@ -198,10 +198,22 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                     await asyncio.to_thread(download_file, seg.output_path, str(local_path))
                     local_files.append(local_name)
 
-                # Trim pass: apply trim to segments with non-zero trim values
+                # Trim pass: apply trim to segments with non-zero trim values.
                 durations = [seg.duration_seconds for seg in segments]
+                # VACE overlap: a continuation segment carries a reconstructed lead-in
+                # (vace_overlap_seconds) that re-creates the previous segment's tail. Trim
+                # that tail off the *previous* segment so the reconstruction replaces it —
+                # consecutive frames across the seam, rather than jumping to the first
+                # generated frame (which drifts slightly and reads as a hitch).
+                extra_end_trim = [0] * len(segments)
                 for i, seg in enumerate(segments):
-                    if seg.trim_start_frames > 0 or seg.trim_end_frames > 0:
+                    overlap = seg.vace_overlap_seconds
+                    if overlap and i > 0:
+                        extra_end_trim[i - 1] += round(overlap * job.fps)
+                        durations[i] += overlap  # actual output = intended + reconstructed lead-in
+                for i, seg in enumerate(segments):
+                    end_trim = seg.trim_end_frames + extra_end_trim[i]
+                    if seg.trim_start_frames > 0 or end_trim > 0:
                         trimmed_name = f"seg_{seg.index:03d}_trimmed.mp4"
                         new_dur = await asyncio.to_thread(
                             _apply_trim,
@@ -209,7 +221,7 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                             str(tmppath / trimmed_name),
                             job.fps,
                             seg.trim_start_frames,
-                            seg.trim_end_frames,
+                            end_trim,
                         )
                         local_files[i] = trimmed_name
                         durations[i] = new_dur

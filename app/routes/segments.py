@@ -351,6 +351,8 @@ async def update_segment(
         segment.motion_keywords = body.motion_keywords
     if body.motion_magnitude is not None:
         segment.motion_magnitude = body.motion_magnitude
+    if body.vace_overlap_seconds is not None:
+        segment.vace_overlap_seconds = body.vace_overlap_seconds
 
     await db.flush()
 
