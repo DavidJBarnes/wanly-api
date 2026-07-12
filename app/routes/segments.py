@@ -279,7 +279,16 @@ async def claim_next_segment(
     vace_overlap = int(overlap_setting.value) if overlap_setting else 12
     effective_mode = job.continuation_mode or global_mode
     prev_output_path = previous_segment.output_path if previous_segment else None
-    use_vace = effective_mode == "vace" and segment.index > 0 and prev_output_path is not None
+    # VACE's activation memory doesn't fit above ~480p on a 24GB card — 720p OOMs at the
+    # sampler (block-swap only offloads weights, not activations). Cap VACE by resolution;
+    # larger frames fall back to the traditional hard-cut continuation.
+    vace_fits_vram = max(job.width, job.height) <= 896
+    use_vace = (
+        effective_mode == "vace"
+        and segment.index > 0
+        and prev_output_path is not None
+        and vace_fits_vram
+    )
     continuation_mode = "vace" if use_vace else "traditional"
 
     # AR hologram carrier: the source is the job's finalized stitched video, not this
