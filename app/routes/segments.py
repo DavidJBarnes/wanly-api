@@ -202,6 +202,7 @@ async def add_segment(
 async def claim_next_segment(
     worker_id: UUID = Query(...),
     worker_name: str = Query(None),
+    kind: str = Query(None, description="'gpu' (exclude holograms), 'hologram' (only holograms), or None (any)"),
     db: AsyncSession = Depends(get_db),
 ):
     # Reset stale segments: claimed/processing for > 30 minutes with no completion
@@ -220,17 +221,30 @@ async def claim_next_segment(
         stale.claimed_at = None
         stale.progress_log = None
 
-    result = await db.execute(
-        select(Segment)
-        .join(Job, Segment.job_id == Job.id)
-        .where(
+    # Split work by kind so the CPU-only hologram track runs concurrently with GPU generation:
+    #   kind="gpu"      -> generations only (exclude hologram carriers)
+    #   kind="hologram" -> hologram carriers only (claimable even on FINALIZED jobs)
+    #   kind=None       -> either (legacy combined behavior)
+    if kind == "hologram":
+        where = (Segment.status == SegmentStatus.PENDING, Segment.reprocess_type == "ar_hologram")
+    elif kind == "gpu":
+        where = (
+            Segment.status == SegmentStatus.PENDING,
+            Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
+            Segment.reprocess_type.is_distinct_from("ar_hologram"),
+        )
+    else:
+        where = (
             Segment.status == SegmentStatus.PENDING,
             or_(
                 Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
-                # Hologram carriers are claimable even on a FINALIZED job (they don't change it).
                 Segment.reprocess_type == "ar_hologram",
             ),
         )
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(*where)
         .order_by(Job.priority.asc(), Segment.created_at.asc())
         .limit(1)
         .with_for_update(skip_locked=True)
