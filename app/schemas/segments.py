@@ -51,6 +51,9 @@ class SegmentResponse(BaseModel):
     worker_name: Optional[str]
     output_path: Optional[str]
     last_frame_path: Optional[str]
+    hologram_video_path: Optional[str] = None
+    hologram_manifest_path: Optional[str] = None
+    hologram_poster_path: Optional[str] = None
     created_at: datetime
     claimed_at: Optional[datetime]
     completed_at: Optional[datetime]
@@ -114,6 +117,11 @@ class SegmentClaimResponse(BaseModel):
     continuation_mode: str = "traditional"
     previous_output_path: Optional[str] = None  # prev segment video (VACE control source)
     vace_overlap_frames: int = 12
+    # AR hologram (reprocess_type="ar_hologram"): the source is the job's finalized stitched
+    # video (not this carrier segment's own output); params drive the daemon matte + manifest.
+    hologram_source_path: Optional[str] = None
+    hologram_key_color: Optional[str] = None
+    hologram_subject_height_m: Optional[float] = None
 
     model_config = {"from_attributes": True}
 
@@ -141,6 +149,13 @@ class SegmentReprocessRequest(BaseModel):
     faceswap_image: Optional[str] = None
     faceswap_faces_order: Optional[str] = None
     faceswap_faces_index: Optional[str] = None
+
+
+class HologramRequest(BaseModel):
+    """Per-request overrides for a 'Make Hologram' action. Unset -> AppSetting -> hardcoded default."""
+
+    subject_height_m: Optional[float] = None
+    key_color: Optional[str] = None
 
 
 class SegmentStatusUpdate(BaseModel):

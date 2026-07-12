@@ -95,6 +95,14 @@ class Segment(Base):
     # Stitch trims this off the previous segment's tail so the reconstruction replaces it
     # seamlessly. NULL for traditional (non-VACE) segments.
     vace_overlap_seconds = mapped_column(Float, nullable=True)
+    # AR hologram (Tier-0). When a finalized job's index-0 segment is reused as the carrier
+    # for reprocess_type="ar_hologram": the two params drive the daemon matte + manifest, the
+    # three paths hold the packed color+alpha mp4, the hologram.json manifest, and the poster.
+    hologram_key_color = mapped_column(String(20), nullable=True)
+    hologram_subject_height_m = mapped_column(Float, nullable=True)
+    hologram_video_path = mapped_column(Text, nullable=True)
+    hologram_manifest_path = mapped_column(Text, nullable=True)
+    hologram_poster_path = mapped_column(Text, nullable=True)
     reference_frames = mapped_column(JSON, nullable=True)
     negative_prompt = mapped_column(Text, nullable=True)
     reprocess_type = mapped_column(String(20), nullable=True)

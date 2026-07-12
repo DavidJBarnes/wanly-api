@@ -133,3 +133,58 @@ async def upload_segment_output(
     await db.commit()
     await db.refresh(segment)
     return segment
+
+
+@router.post(
+    "/segments/{segment_id}/hologram_upload",
+    response_model=SegmentResponse,
+    dependencies=[Depends(verify_api_key)],
+)
+async def upload_hologram_output(
+    segment_id: UUID,
+    video: UploadFile = File(...),
+    manifest: UploadFile = File(...),
+    poster: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload AR hologram artifacts (packed color+alpha mp4 + manifest + poster).
+
+    Called by the daemon after an ar_hologram carrier segment completes. Stores the three
+    artifacts on the segment's hologram_* columns, preserves the carrier's own
+    output/last_frame, and does NOT re-stitch — the job just returns to FINALIZED.
+    """
+    segment = await db.get(Segment, segment_id)
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+
+    video_data = await video.read()
+    manifest_data = await manifest.read()
+    poster_data = await poster.read()
+
+    video_key = f"{segment.job_id}/{segment.index}_hologram.mp4"
+    manifest_key = f"{segment.job_id}/{segment.index}_hologram.json"
+    poster_key = f"{segment.job_id}/{segment.index}_hologram_poster.png"
+
+    video_uri, manifest_uri, poster_uri = await asyncio.gather(
+        asyncio.to_thread(upload_bytes, video_data, video_key, settings.s3_jobs_bucket),
+        asyncio.to_thread(upload_bytes, manifest_data, manifest_key, settings.s3_jobs_bucket),
+        asyncio.to_thread(upload_bytes, poster_data, poster_key, settings.s3_jobs_bucket),
+    )
+
+    segment.hologram_video_path = video_uri
+    segment.hologram_manifest_path = manifest_uri
+    segment.hologram_poster_path = poster_uri
+    segment.status = SegmentStatus.COMPLETED
+    segment.reprocess_type = None
+
+    from datetime import datetime, timezone
+
+    segment.completed_at = datetime.now(timezone.utc)
+
+    # Holograms only run on already-finalized jobs; restore that status, no re-stitch.
+    job = await db.get(Job, segment.job_id)
+    job.status = JobStatus.FINALIZED
+
+    await db.commit()
+    await db.refresh(segment)
+    return segment

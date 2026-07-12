@@ -24,6 +24,7 @@ from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
     FramePreview,
     FramePreviewResponse,
+    HologramRequest,
     SegmentClaimResponse,
     SegmentCreate,
     SegmentReprocessRequest,
@@ -281,6 +282,19 @@ async def claim_next_segment(
     use_vace = effective_mode == "vace" and segment.index > 0 and prev_output_path is not None
     continuation_mode = "vace" if use_vace else "traditional"
 
+    # AR hologram carrier: the source is the job's finalized stitched video, not this
+    # segment's own output. The daemon mattes/packs it into a color+alpha hologram.
+    hologram_source_path = None
+    if segment.reprocess_type == "ar_hologram":
+        holo_video = (
+            await db.execute(
+                select(Video)
+                .where(Video.job_id == job.id, Video.status == VideoStatus.COMPLETED)
+                .order_by(Video.created_at.desc())
+            )
+        ).scalars().first()
+        hologram_source_path = holo_video.output_path if holo_video else None
+
     await db.commit()
     await db.refresh(segment)
 
@@ -321,6 +335,9 @@ async def claim_next_segment(
         continuation_mode=continuation_mode,
         previous_output_path=prev_output_path if use_vace else None,
         vace_overlap_frames=vace_overlap,
+        hologram_source_path=hologram_source_path,
+        hologram_key_color=segment.hologram_key_color,
+        hologram_subject_height_m=segment.hologram_subject_height_m,
     )
 
 
@@ -642,6 +659,78 @@ async def reprocess_segment(
     await db.commit()
     await db.refresh(segment)
     return segment
+
+
+@router.post("/jobs/{job_id}/hologram", response_model=SegmentResponse)
+async def make_hologram(
+    job_id: UUID,
+    body: HologramRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create an AR hologram from a finalized job's stitched video.
+
+    Reuses the reprocess queue: the job's lowest-index segment becomes the carrier
+    (reprocess_type="ar_hologram"); the daemon mattes the job's final video into a packed
+    color+alpha hologram + manifest + poster. The carrier's own output is preserved.
+    """
+    job = await db.get(Job, job_id)
+    if job is None or job.user_id != user.id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.status != JobStatus.FINALIZED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Only finalized jobs can be turned into holograms (current: '{job.status}')",
+        )
+
+    holo_video = (
+        await db.execute(
+            select(Video)
+            .where(Video.job_id == job.id, Video.status == VideoStatus.COMPLETED)
+            .order_by(Video.created_at.desc())
+        )
+    ).scalars().first()
+    if holo_video is None or not holo_video.output_path:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Job has no finalized video to source the hologram from",
+        )
+
+    carrier = (
+        await db.execute(
+            select(Segment).where(Segment.job_id == job.id).order_by(Segment.index.asc())
+        )
+    ).scalars().first()
+    if carrier is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job has no segments")
+
+    # Resolve params: request override -> AppSetting global -> hardcoded default.
+    key_setting = await db.get(AppSetting, "hologram_key_color")
+    key_color = body.key_color or (key_setting.value if key_setting else None) or "0x00b140"
+    height_setting = await db.get(AppSetting, "hologram_subject_height_m")
+    subject_height = (
+        body.subject_height_m
+        if body.subject_height_m is not None
+        else (float(height_setting.value) if height_setting else 1.70)
+    )
+
+    carrier.hologram_key_color = key_color
+    carrier.hologram_subject_height_m = subject_height
+    # Reuse the carrier as the ar_hologram queue item (preserve its own output/last_frame).
+    carrier.reprocess_type = "ar_hologram"
+    carrier.status = SegmentStatus.PENDING
+    carrier.worker_id = None
+    carrier.worker_name = None
+    carrier.claimed_at = None
+    carrier.completed_at = None
+    carrier.error_message = None
+    carrier.progress_log = None
+
+    job.status = JobStatus.PENDING
+
+    await db.commit()
+    await db.refresh(carrier)
+    return carrier
 
 
 @router.post("/segments/{segment_id}/cancel", response_model=SegmentResponse)
