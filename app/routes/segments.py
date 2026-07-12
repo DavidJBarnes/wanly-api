@@ -11,7 +11,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import select, text
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -36,6 +36,11 @@ from app.schemas.segments import (
 from app.stitch import stitch_video
 
 logger = logging.getLogger(__name__)
+
+# AR hologram work rides a dedicated carrier segment at this sentinel index (far above any
+# real segment count), so the real video segments and the job's finalized status are never
+# touched. The console hides segments at/above this index from the segment list.
+HOLOGRAM_CARRIER_INDEX = 1000
 
 router = APIRouter()
 
@@ -218,7 +223,14 @@ async def claim_next_segment(
     result = await db.execute(
         select(Segment)
         .join(Job, Segment.job_id == Job.id)
-        .where(Segment.status == SegmentStatus.PENDING, Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]))
+        .where(
+            Segment.status == SegmentStatus.PENDING,
+            or_(
+                Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
+                # Hologram carriers are claimable even on a FINALIZED job (they don't change it).
+                Segment.reprocess_type == "ar_hologram",
+            ),
+        )
         .order_by(Job.priority.asc(), Segment.created_at.asc())
         .limit(1)
         .with_for_update(skip_locked=True)
@@ -382,8 +394,9 @@ async def update_segment(
 
     await db.flush()
 
-    # Check if job needs status update
-    if body.status in (SegmentStatus.COMPLETED, SegmentStatus.FAILED):
+    # Check if job needs status update. Hologram carriers are exempt — they don't affect the
+    # source job's status (a failed hologram must not flip a finalized job to FAILED).
+    if body.status in (SegmentStatus.COMPLETED, SegmentStatus.FAILED) and segment.reprocess_type != "ar_hologram":
         job = await db.get(Job, segment.job_id)
         result = await db.execute(
             select(Segment).where(
@@ -705,14 +718,6 @@ async def make_hologram(
             detail="Job has no finalized video to source the hologram from",
         )
 
-    carrier = (
-        await db.execute(
-            select(Segment).where(Segment.job_id == job.id).order_by(Segment.index.asc())
-        )
-    ).scalars().first()
-    if carrier is None:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Job has no segments")
-
     # Resolve params: request override -> AppSetting global -> hardcoded default.
     key_setting = await db.get(AppSetting, "hologram_key_color")
     key_color = body.key_color or (key_setting.value if key_setting else None) or "0x00b140"
@@ -723,19 +728,39 @@ async def make_hologram(
         else (float(height_setting.value) if height_setting else 1.70)
     )
 
+    # Dedicated hologram carrier at a sentinel index — a separate queue item, so the real
+    # video segments and the job's FINALIZED status are left completely untouched. Reused
+    # (reset) on re-make. The daemon claims it via the ar_hologram claim path; the console
+    # hides it from the segment list.
+    carrier = (
+        await db.execute(
+            select(Segment).where(
+                Segment.job_id == job.id, Segment.index == HOLOGRAM_CARRIER_INDEX
+            )
+        )
+    ).scalars().first()
+    if carrier is None:
+        carrier = Segment(
+            job_id=job.id,
+            index=HOLOGRAM_CARRIER_INDEX,
+            prompt="[ar_hologram]",
+            status=SegmentStatus.PENDING,
+        )
+        db.add(carrier)
+    else:
+        carrier.status = SegmentStatus.PENDING
+        carrier.worker_id = None
+        carrier.worker_name = None
+        carrier.claimed_at = None
+        carrier.completed_at = None
+        carrier.error_message = None
+        carrier.progress_log = None
+        carrier.hologram_video_path = None
+        carrier.hologram_manifest_path = None
+        carrier.hologram_poster_path = None
+    carrier.reprocess_type = "ar_hologram"
     carrier.hologram_key_color = key_color
     carrier.hologram_subject_height_m = subject_height
-    # Reuse the carrier as the ar_hologram queue item (preserve its own output/last_frame).
-    carrier.reprocess_type = "ar_hologram"
-    carrier.status = SegmentStatus.PENDING
-    carrier.worker_id = None
-    carrier.worker_name = None
-    carrier.claimed_at = None
-    carrier.completed_at = None
-    carrier.error_message = None
-    carrier.progress_log = None
-
-    job.status = JobStatus.PENDING
 
     await db.commit()
     await db.refresh(carrier)
