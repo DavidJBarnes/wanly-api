@@ -733,6 +733,28 @@ async def make_hologram(
     return carrier
 
 
+@router.get("/segments/{segment_id}/hologram")
+async def get_hologram(
+    segment_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return a segment's hologram artifact S3 paths (for the WebXR AR player)."""
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None or not segment.hologram_video_path:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hologram not found")
+    return {
+        "video_path": segment.hologram_video_path,
+        "manifest_path": segment.hologram_manifest_path,
+        "poster_path": segment.hologram_poster_path,
+    }
+
+
 @router.post("/segments/{segment_id}/cancel", response_model=SegmentResponse)
 async def cancel_segment(
     segment_id: UUID,
