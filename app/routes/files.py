@@ -185,6 +185,22 @@ async def upload_hologram_output(
     job = await db.get(Job, segment.job_id)
     job.status = JobStatus.FINALIZED
 
+    # Tag the job (and its finalized video) "AR" so it's findable via the videos search.
+    def _with_ar(tags: str | None) -> str:
+        items = [t.strip() for t in (tags or "").split(",") if t.strip()]
+        if not any(t.lower() == "ar" for t in items):
+            items.append("AR")
+        return ",".join(items)
+
+    job.tags = _with_ar(job.tags)
+    holo_video = (
+        await db.execute(
+            select(Video).where(Video.job_id == job.id, Video.status == VideoStatus.COMPLETED)
+        )
+    ).scalars().first()
+    if holo_video:
+        holo_video.tags = _with_ar(holo_video.tags)
+
     await db.commit()
     await db.refresh(segment)
     return segment
