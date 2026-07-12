@@ -47,6 +47,7 @@ class SegmentResponse(BaseModel):
     motion_magnitude: Optional[float] = None
     reference_frames: Optional[list[str]] = None
     status: str
+    reprocess_type: Optional[str] = None
     worker_id: Optional[UUID]
     worker_name: Optional[str]
     output_path: Optional[str]
