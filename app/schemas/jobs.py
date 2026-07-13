@@ -66,6 +66,7 @@ class JobResponse(BaseModel):
     faceswap_enabled: bool = False
     loras: list[JobLoraSummary] = []
     tags: Optional[str] = None
+    video_preset_id: Optional[UUID] = None
     continuation_mode: Optional[str] = None
     identity_reference_image: Optional[str] = None
     created_at: datetime
