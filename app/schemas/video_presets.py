@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel
 
+from app.schemas.prompt_presets import LoraSlot
+
 
 class VideoPresetCreate(BaseModel):
     name: str
@@ -14,6 +16,7 @@ class VideoPresetCreate(BaseModel):
     steps_total: Optional[int] = None
     high_noise_steps: Optional[int] = None
     flow_shift: Optional[float] = None
+    loras: Optional[list[LoraSlot]] = None
 
 
 class VideoPresetUpdate(BaseModel):
@@ -25,6 +28,7 @@ class VideoPresetUpdate(BaseModel):
     steps_total: Optional[int] = None
     high_noise_steps: Optional[int] = None
     flow_shift: Optional[float] = None
+    loras: Optional[list[LoraSlot]] = None
 
 
 class VideoPresetResponse(BaseModel):
@@ -37,6 +41,7 @@ class VideoPresetResponse(BaseModel):
     steps_total: Optional[int] = None
     high_noise_steps: Optional[int] = None
     flow_shift: Optional[float] = None
+    loras: Optional[list[LoraSlot]] = None
     created_at: datetime
     updated_at: datetime
 

@@ -225,6 +225,9 @@ class VideoSettingsPreset(Base):
     steps_total = mapped_column(Integer, nullable=True)
     high_noise_steps = mapped_column(Integer, nullable=True)
     flow_shift = mapped_column(Float, nullable=True)
+    # 1:N LoRAs that constitute this recipe — each {lora_id, high_weight, low_weight} (expert
+    # placement). Resolved live at claim time when a job/segment links this preset.
+    loras = mapped_column(JSON, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
