@@ -54,6 +54,7 @@ class SegmentResponse(BaseModel):
     worker_name: Optional[str]
     output_path: Optional[str]
     last_frame_path: Optional[str]
+    hologram_flavor: Optional[str] = None
     hologram_video_path: Optional[str] = None
     hologram_manifest_path: Optional[str] = None
     hologram_poster_path: Optional[str] = None
@@ -127,6 +128,7 @@ class SegmentClaimResponse(BaseModel):
     hologram_source_path: Optional[str] = None
     hologram_key_color: Optional[str] = None
     hologram_subject_height_m: Optional[float] = None
+    hologram_flavor: Optional[str] = None
 
     model_config = {"from_attributes": True}
 
@@ -165,6 +167,7 @@ class HologramRequest(BaseModel):
 
     subject_height_m: Optional[float] = None
     key_color: Optional[str] = None
+    flavor: Optional[str] = None  # "2d_matte" (default) or "2.5d_depth"
 
 
 class SegmentStatusUpdate(BaseModel):

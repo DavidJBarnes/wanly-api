@@ -105,6 +105,9 @@ class Segment(Base):
     # three paths hold the packed color+alpha mp4, the hologram.json manifest, and the poster.
     hologram_key_color = mapped_column(String(20), nullable=True)
     hologram_subject_height_m = mapped_column(Float, nullable=True)
+    # "2d_matte" (flat, Tier-0) or "2.5d_depth" (depth-displaced mesh, Tier-1). One flavor per
+    # video at a time — re-making overwrites the single carrier's artifacts.
+    hologram_flavor = mapped_column(String(16), nullable=True)
     hologram_video_path = mapped_column(Text, nullable=True)
     hologram_manifest_path = mapped_column(Text, nullable=True)
     hologram_poster_path = mapped_column(Text, nullable=True)

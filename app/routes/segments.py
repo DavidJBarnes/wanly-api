@@ -394,6 +394,7 @@ async def claim_next_segment(
         hologram_source_path=hologram_source_path,
         hologram_key_color=segment.hologram_key_color,
         hologram_subject_height_m=segment.hologram_subject_height_m,
+        hologram_flavor=segment.hologram_flavor,
     )
 
 
@@ -784,6 +785,10 @@ async def make_hologram(
         if body.subject_height_m is not None
         else (float(height_setting.value) if height_setting else 1.70)
     )
+    flavor_setting = await db.get(AppSetting, "hologram_flavor")
+    flavor = body.flavor or (flavor_setting.value if flavor_setting else None) or "2d_matte"
+    if flavor not in ("2d_matte", "2.5d_depth"):
+        flavor = "2d_matte"
 
     # Dedicated hologram carrier at a sentinel index — a separate queue item, so the real
     # video segments and the job's FINALIZED status are left completely untouched. Reused
@@ -818,6 +823,7 @@ async def make_hologram(
     carrier.reprocess_type = "ar_hologram"
     carrier.hologram_key_color = key_color
     carrier.hologram_subject_height_m = subject_height
+    carrier.hologram_flavor = flavor
 
     await db.commit()
     await db.refresh(carrier)
@@ -840,6 +846,7 @@ async def get_hologram(
     if segment is None or not segment.hologram_video_path:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Hologram not found")
     return {
+        "flavor": segment.hologram_flavor or "2d_matte",
         "video_path": segment.hologram_video_path,
         "manifest_path": segment.hologram_manifest_path,
         "poster_path": segment.hologram_poster_path,
