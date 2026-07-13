@@ -108,6 +108,8 @@ class SegmentClaimResponse(BaseModel):
     steps_total: Optional[int] = None
     high_noise_steps: Optional[int] = None
     flow_shift: Optional[float] = None
+    sampler_name: Optional[str] = None
+    scheduler: Optional[str] = None
     negative_prompt: Optional[str] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None

@@ -16,6 +16,8 @@ class VideoPresetCreate(BaseModel):
     steps_total: Optional[int] = None
     high_noise_steps: Optional[int] = None
     flow_shift: Optional[float] = None
+    sampler_name: Optional[str] = None
+    scheduler: Optional[str] = None
     loras: Optional[list[LoraSlot]] = None
 
 
@@ -28,6 +30,8 @@ class VideoPresetUpdate(BaseModel):
     steps_total: Optional[int] = None
     high_noise_steps: Optional[int] = None
     flow_shift: Optional[float] = None
+    sampler_name: Optional[str] = None
+    scheduler: Optional[str] = None
     loras: Optional[list[LoraSlot]] = None
 
 
@@ -41,6 +45,8 @@ class VideoPresetResponse(BaseModel):
     steps_total: Optional[int] = None
     high_noise_steps: Optional[int] = None
     flow_shift: Optional[float] = None
+    sampler_name: Optional[str] = None
+    scheduler: Optional[str] = None
     loras: Optional[list[LoraSlot]] = None
     created_at: datetime
     updated_at: datetime

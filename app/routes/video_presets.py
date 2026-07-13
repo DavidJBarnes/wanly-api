@@ -43,7 +43,12 @@ async def create_video_preset(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Preset '{body.name}' already exists",
         )
-    preset = VideoSettingsPreset(name=body.name, **{p: getattr(body, p) for p in _PARAMS})
+    preset = VideoSettingsPreset(
+        name=body.name,
+        sampler_name=body.sampler_name,
+        scheduler=body.scheduler,
+        **{p: getattr(body, p) for p in _PARAMS},
+    )
     if body.loras is not None:
         preset.loras = [slot.model_dump() for slot in body.loras]
     db.add(preset)
@@ -68,6 +73,10 @@ async def update_video_preset(
         v = getattr(body, p)
         if v is not None:
             setattr(preset, p, v)
+    if body.sampler_name is not None:
+        preset.sampler_name = body.sampler_name
+    if body.scheduler is not None:
+        preset.scheduler = body.scheduler
     if body.loras is not None:
         preset.loras = [slot.model_dump() for slot in body.loras]
     await db.commit()

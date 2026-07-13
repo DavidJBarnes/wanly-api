@@ -332,6 +332,9 @@ async def claim_next_segment(
             # leaves the segment's own LoRAs untouched.
             if preset.loras:
                 effective_loras = await _resolve_loras(db, preset.loras)
+    # Sampler/scheduler only come from a preset (empty -> daemon default euler/simple).
+    sampler_name = getattr(vsettings, "sampler_name", None) or None
+    scheduler = getattr(vsettings, "scheduler", None) or None
 
     # AR hologram carrier: the source is the job's finalized stitched video, not this
     # segment's own output. The daemon mattes/packs it into a color+alpha hologram.
@@ -376,6 +379,8 @@ async def claim_next_segment(
         steps_total=vsettings.steps_total,
         high_noise_steps=vsettings.high_noise_steps,
         flow_shift=vsettings.flow_shift,
+        sampler_name=sampler_name,
+        scheduler=scheduler,
         negative_prompt=negative_prompt,
         reprocess_type=segment.reprocess_type,
         output_path=segment.output_path,
