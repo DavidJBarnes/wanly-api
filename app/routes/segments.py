@@ -323,10 +323,15 @@ async def claim_next_segment(
     # Live-linked, so editing a preset changes future claims that reference it.
     vp_id = segment.video_preset_id or job.video_preset_id
     vsettings = job
+    effective_loras = segment.loras
     if vp_id is not None:
         preset = await db.get(VideoSettingsPreset, vp_id)
         if preset is not None:
             vsettings = preset
+            # A full-recipe preset owns its LoRAs (resolved live); a sampler-only preset
+            # leaves the segment's own LoRAs untouched.
+            if preset.loras:
+                effective_loras = await _resolve_loras(db, preset.loras)
 
     # AR hologram carrier: the source is the job's finalized stitched video, not this
     # segment's own output. The daemon mattes/packs it into a color+alpha hologram.
@@ -352,7 +357,7 @@ async def claim_next_segment(
         duration_seconds=segment.duration_seconds,
         speed=segment.speed,
         start_image=resolved_start_image,
-        loras=segment.loras,
+        loras=effective_loras,
         faceswap_enabled=segment.faceswap_enabled,
         faceswap_method=segment.faceswap_method,
         faceswap_source_type=segment.faceswap_source_type,
