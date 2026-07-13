@@ -48,6 +48,11 @@ class Job(Base):
     steps_total = mapped_column(Integer, nullable=True)
     high_noise_steps = mapped_column(Integer, nullable=True)
     flow_shift = mapped_column(Float, nullable=True)
+    # Optional link to a named video-settings preset (job default). Live: the 7 sampler values
+    # are read from the preset at claim time. NULL -> use this job's raw params above.
+    video_preset_id = mapped_column(
+        UUID(as_uuid=True), ForeignKey("video_settings_presets.id", ondelete="SET NULL"), nullable=True
+    )
     priority = mapped_column(Integer, nullable=False, default=0)
     config_starred = mapped_column(Boolean, nullable=False, default=False)
     # Per-job continuation-mode override ("traditional"|"vace"); NULL -> global app setting.
@@ -106,6 +111,10 @@ class Segment(Base):
     reference_frames = mapped_column(JSON, nullable=True)
     negative_prompt = mapped_column(Text, nullable=True)
     reprocess_type = mapped_column(String(20), nullable=True)
+    # Per-segment video-settings override (live link). Takes precedence over the job's preset.
+    video_preset_id = mapped_column(
+        UUID(as_uuid=True), ForeignKey("video_settings_presets.id", ondelete="SET NULL"), nullable=True
+    )
     status = mapped_column(String(20), nullable=False, default=SegmentStatus.PENDING)
     worker_id = mapped_column(UUID(as_uuid=True), nullable=True)
     worker_name = mapped_column(String(255), nullable=True)
@@ -198,6 +207,24 @@ class PromptPreset(Base):
     name = mapped_column(String(255), unique=True, nullable=False)
     prompt = mapped_column(Text, nullable=False)
     loras = mapped_column(JSON, nullable=True)
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class VideoSettingsPreset(Base):
+    """A named bundle of the 7 sampler params, selectable per-job and per-segment (live link)."""
+
+    __tablename__ = "video_settings_presets"
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = mapped_column(String(255), unique=True, nullable=False)
+    lightx2v_strength_high = mapped_column(Float, nullable=True)
+    lightx2v_strength_low = mapped_column(Float, nullable=True)
+    cfg_high = mapped_column(Float, nullable=True)
+    cfg_low = mapped_column(Float, nullable=True)
+    steps_total = mapped_column(Integer, nullable=True)
+    high_noise_steps = mapped_column(Integer, nullable=True)
+    flow_shift = mapped_column(Float, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 

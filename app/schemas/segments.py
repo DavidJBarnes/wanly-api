@@ -20,6 +20,7 @@ class SegmentCreate(BaseModel):
     negative_prompt: Optional[str] = None
     auto_finalize: bool = False
     transition: Optional[str] = None
+    video_preset_id: Optional[UUID] = None
 
 
 class SegmentResponse(BaseModel):
@@ -48,6 +49,7 @@ class SegmentResponse(BaseModel):
     reference_frames: Optional[list[str]] = None
     status: str
     reprocess_type: Optional[str] = None
+    video_preset_id: Optional[UUID] = None
     worker_id: Optional[UUID]
     worker_name: Optional[str]
     output_path: Optional[str]
@@ -130,6 +132,10 @@ class SegmentClaimResponse(BaseModel):
 class SegmentTrimUpdate(BaseModel):
     trim_start_frames: int = Field(ge=0)
     trim_end_frames: int = Field(ge=0)
+
+
+class SegmentVideoPresetUpdate(BaseModel):
+    video_preset_id: Optional[UUID] = None
 
 
 class FramePreview(BaseModel):
