@@ -596,6 +596,8 @@ async def reopen_job(
         lightx2v_strength_low=job.lightx2v_strength_low,
         cfg_high=job.cfg_high, cfg_low=job.cfg_low,
         steps_total=job.steps_total, high_noise_steps=job.high_noise_steps, flow_shift=job.flow_shift,
+        video_preset_id=job.video_preset_id, continuation_mode=job.continuation_mode,
+        identity_reference_image=job.identity_reference_image,
         priority=job.priority, status=job.status,
         tags=job.tags,
         estimated_run_time=job_est,
