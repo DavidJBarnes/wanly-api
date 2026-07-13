@@ -204,3 +204,25 @@ async def upload_hologram_output(
     await db.commit()
     await db.refresh(segment)
     return segment
+
+
+@router.post(
+    "/jobs/{job_id}/identity_reference",
+    dependencies=[Depends(verify_api_key)],
+)
+async def upload_identity_reference(
+    job_id: UUID,
+    image: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set a job's canonical VACE identity reference — a face crop from seg0 the daemon uploads
+    after seg0 completes. Fed to every downstream segment's VACE ref_images to anchor identity."""
+    job = await db.get(Job, job_id)
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    data = await image.read()
+    key = f"{job_id}/identity_reference.png"
+    uri = await asyncio.to_thread(upload_bytes, data, key, settings.s3_jobs_bucket)
+    job.identity_reference_image = uri
+    await db.commit()
+    return {"identity_reference_image": uri}

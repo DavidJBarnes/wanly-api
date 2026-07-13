@@ -57,6 +57,9 @@ class Job(Base):
     config_starred = mapped_column(Boolean, nullable=False, default=False)
     # Per-job continuation-mode override ("traditional"|"vace"); NULL -> global app setting.
     continuation_mode = mapped_column(String(20), nullable=True)
+    # Canonical identity reference for VACE continuation: a face crop from seg0, set by the daemon
+    # after seg0 completes and fed to every downstream segment's VACE ref_images (anchors identity).
+    identity_reference_image = mapped_column(Text, nullable=True)
     status = mapped_column(String(20), nullable=False, default=JobStatus.PENDING)
     tags = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

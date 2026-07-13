@@ -105,6 +105,7 @@ async def create_job(
         high_noise_steps=body.high_noise_steps,
         flow_shift=body.flow_shift,
         video_preset_id=body.video_preset_id,
+        continuation_mode=body.continuation_mode,
         priority=next_priority,
         tags=body.tags,
     )
