@@ -367,7 +367,7 @@ async def claim_next_segment(
         faceswap_image=segment.faceswap_image,
         faceswap_faces_order=segment.faceswap_faces_order,
         faceswap_faces_index=segment.faceswap_faces_index,
-        initial_reference_image=job.starting_image,
+        initial_reference_image=job.identity_reference_image or job.starting_image,
         motion_keywords=segment.motion_keywords,
         previous_motion_keywords=previous_motion_keywords,
         previous_motion_magnitude=previous_motion_magnitude,

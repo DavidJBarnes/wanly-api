@@ -26,6 +26,7 @@ class JobCreate(BaseModel):
     high_noise_steps: Optional[int] = None
     flow_shift: Optional[float] = None
     video_preset_id: Optional[UUID] = None
+    continuation_mode: Optional[str] = None  # "traditional" | "vace" (NULL -> global default)
     starting_image_uri: Optional[str] = None
     starting_image_hash: Optional[str] = None
     first_segment: SegmentCreate
@@ -65,6 +66,8 @@ class JobResponse(BaseModel):
     faceswap_enabled: bool = False
     loras: list[JobLoraSummary] = []
     tags: Optional[str] = None
+    continuation_mode: Optional[str] = None
+    identity_reference_image: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
