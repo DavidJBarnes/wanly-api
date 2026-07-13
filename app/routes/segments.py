@@ -19,7 +19,7 @@ from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
 from app.database import get_db
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.helpers import upload_faceswap_image
-from app.models import AppSetting, Job, Lora, Segment, User, Video, Wildcard
+from app.models import AppSetting, Job, Lora, Segment, User, Video, VideoSettingsPreset, Wildcard
 from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
     FramePreview,
@@ -31,6 +31,7 @@ from app.schemas.segments import (
     SegmentResponse,
     SegmentStatusUpdate,
     SegmentTrimUpdate,
+    SegmentVideoPresetUpdate,
     WorkerSegmentResponse,
 )
 from app.stitch import stitch_video
@@ -188,6 +189,7 @@ async def add_segment(
         faceswap_faces_index=body.faceswap_faces_index,
         negative_prompt=negative_prompt,
         auto_finalize=body.auto_finalize,
+        video_preset_id=body.video_preset_id,
     )
     db.add(segment)
 
@@ -317,6 +319,15 @@ async def claim_next_segment(
     )
     continuation_mode = "vace" if use_vace else "traditional"
 
+    # Resolve video (sampler) settings: segment's preset -> job's preset -> job's raw params.
+    # Live-linked, so editing a preset changes future claims that reference it.
+    vp_id = segment.video_preset_id or job.video_preset_id
+    vsettings = job
+    if vp_id is not None:
+        preset = await db.get(VideoSettingsPreset, vp_id)
+        if preset is not None:
+            vsettings = preset
+
     # AR hologram carrier: the source is the job's finalized stitched video, not this
     # segment's own output. The daemon mattes/packs it into a color+alpha hologram.
     hologram_source_path = None
@@ -353,13 +364,13 @@ async def claim_next_segment(
         previous_motion_keywords=previous_motion_keywords,
         previous_motion_magnitude=previous_motion_magnitude,
         reference_frames=reference_frames if reference_frames else None,
-        lightx2v_strength_high=job.lightx2v_strength_high,
-        lightx2v_strength_low=job.lightx2v_strength_low,
-        cfg_high=job.cfg_high,
-        cfg_low=job.cfg_low,
-        steps_total=job.steps_total,
-        high_noise_steps=job.high_noise_steps,
-        flow_shift=job.flow_shift,
+        lightx2v_strength_high=vsettings.lightx2v_strength_high,
+        lightx2v_strength_low=vsettings.lightx2v_strength_low,
+        cfg_high=vsettings.cfg_high,
+        cfg_low=vsettings.cfg_low,
+        steps_total=vsettings.steps_total,
+        high_noise_steps=vsettings.high_noise_steps,
+        flow_shift=vsettings.flow_shift,
         negative_prompt=negative_prompt,
         reprocess_type=segment.reprocess_type,
         output_path=segment.output_path,
@@ -488,6 +499,28 @@ async def update_segment_trim(
 
     segment.trim_start_frames = body.trim_start_frames
     segment.trim_end_frames = body.trim_end_frames
+    await db.commit()
+    await db.refresh(segment)
+    return segment
+
+
+@router.patch("/segments/{segment_id}/video-preset", response_model=SegmentResponse)
+async def update_segment_video_preset(
+    segment_id: UUID,
+    body: SegmentVideoPresetUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Set/clear a segment's video-settings preset override (applies to the next claim)."""
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+    segment.video_preset_id = body.video_preset_id
     await db.commit()
     await db.refresh(segment)
     return segment

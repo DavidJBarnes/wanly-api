@@ -104,6 +104,7 @@ async def create_job(
         steps_total=body.steps_total,
         high_noise_steps=body.high_noise_steps,
         flow_shift=body.flow_shift,
+        video_preset_id=body.video_preset_id,
         priority=next_priority,
         tags=body.tags,
     )
@@ -176,6 +177,7 @@ async def create_job(
         faceswap_faces_index=seg.faceswap_faces_index,
         negative_prompt=seg.negative_prompt,
         auto_finalize=seg.auto_finalize,
+        video_preset_id=seg.video_preset_id,
     )
     db.add(segment)
     await db.commit()
@@ -499,6 +501,9 @@ async def update_job(
 
     if body.config_starred is not None:
         job.config_starred = body.config_starred
+
+    if body.video_preset_id is not None:
+        job.video_preset_id = body.video_preset_id
 
     if body.status is not None:
         allowed = JOB_VALID_TRANSITIONS.get(job.status, set())

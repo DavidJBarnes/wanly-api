@@ -25,6 +25,7 @@ class JobCreate(BaseModel):
     steps_total: Optional[int] = None
     high_noise_steps: Optional[int] = None
     flow_shift: Optional[float] = None
+    video_preset_id: Optional[UUID] = None
     starting_image_uri: Optional[str] = None
     starting_image_hash: Optional[str] = None
     first_segment: SegmentCreate
@@ -91,6 +92,7 @@ class JobUpdate(BaseModel):
     status: Optional[str] = None
     tags: Optional[str] = Field(None, max_length=500, description="Comma-separated tags")
     config_starred: Optional[bool] = Field(None, description="Flag this job's config as a successful one")
+    video_preset_id: Optional[UUID] = Field(None, description="Job default video-settings preset")
 
 
 class WorkerStatsItem(BaseModel):
