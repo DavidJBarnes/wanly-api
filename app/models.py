@@ -200,17 +200,6 @@ class AppSetting(Base):
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 
-class PromptPreset(Base):
-    __tablename__ = "prompt_presets"
-
-    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = mapped_column(String(255), unique=True, nullable=False)
-    prompt = mapped_column(Text, nullable=False)
-    loras = mapped_column(JSON, nullable=True)
-    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-
-
 class VideoSettingsPreset(Base):
     """A named bundle of the 7 sampler params, selectable per-job and per-segment (live link)."""
 
@@ -232,6 +221,9 @@ class VideoSettingsPreset(Base):
     # 1:N LoRAs that constitute this recipe — each {lora_id, high_weight, low_weight} (expert
     # placement). Resolved live at claim time when a job/segment links this preset.
     loras = mapped_column(JSON, nullable=True)
+    # Default prompt for this recipe. A snapshot default that fills the prompt field at job
+    # creation (overridable at submit) — NOT live-linked like loras/sampler params.
+    prompt = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
