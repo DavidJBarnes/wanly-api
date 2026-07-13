@@ -47,6 +47,7 @@ async def create_video_preset(
         name=body.name,
         sampler_name=body.sampler_name,
         scheduler=body.scheduler,
+        prompt=body.prompt,
         **{p: getattr(body, p) for p in _PARAMS},
     )
     if body.loras is not None:
@@ -79,6 +80,8 @@ async def update_video_preset(
         preset.scheduler = body.scheduler
     if body.loras is not None:
         preset.loras = [slot.model_dump() for slot in body.loras]
+    if body.prompt is not None:
+        preset.prompt = body.prompt
     await db.commit()
     await db.refresh(preset)
     return preset
