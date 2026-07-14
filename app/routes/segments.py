@@ -408,7 +408,10 @@ async def claim_next_segment(
         width=job.width,
         height=job.height,
         fps=job.fps,
-        seed=job.seed,
+        # Per-segment seed = job.seed + index: seg0 stays exactly job.seed (reproducible),
+        # later segments get decorrelated noise so they don't repeat the same motion pattern.
+        # Whole job still reproduces identically from job.seed. Modulo keeps it in range.
+        seed=(job.seed + segment.index) % (2**63 - 1),
         continuation_mode=continuation_mode,
         previous_output_path=prev_output_path if use_vace else None,
         vace_overlap_frames=vace_overlap,
