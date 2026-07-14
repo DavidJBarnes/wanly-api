@@ -16,6 +16,9 @@ class AppSettingsResponse(BaseModel):
     # or "vace" (video-conditioned continuation). vace_overlap_frames = kept tail length.
     continuation_mode: str = "traditional"
     vace_overlap_frames: int = 12
+    # Seed re-anchor: faceswap each continuation segment's last frame to the canonical
+    # identity before it seeds the next segment (only fires when a successor exists).
+    seed_faceswap: bool = False
 
 
 class AppSettingsUpdate(BaseModel):
@@ -29,3 +32,4 @@ class AppSettingsUpdate(BaseModel):
     negative_prompt: Optional[str] = None
     continuation_mode: Optional[str] = None
     vace_overlap_frames: Optional[int] = None
+    seed_faceswap: Optional[bool] = None
