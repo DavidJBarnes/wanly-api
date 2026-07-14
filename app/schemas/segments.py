@@ -123,6 +123,9 @@ class SegmentClaimResponse(BaseModel):
     continuation_mode: str = "traditional"
     previous_output_path: Optional[str] = None  # prev segment video (VACE control source)
     vace_overlap_frames: int = 12
+    # Seed re-anchor: faceswap this segment's last frame to the canonical identity before it
+    # seeds the next segment (resolved API-side: setting on AND a successor segment exists).
+    seed_faceswap: bool = False
     # AR hologram (reprocess_type="ar_hologram"): the source is the job's finalized stitched
     # video (not this carrier segment's own output); params drive the daemon matte + manifest.
     hologram_source_path: Optional[str] = None

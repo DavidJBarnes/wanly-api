@@ -325,6 +325,20 @@ async def claim_next_segment(
     )
     continuation_mode = "vace" if use_vace else "traditional"
 
+    # Seed re-anchor: faceswap this segment's last frame to the canonical identity before it
+    # seeds the next segment. Only when the global setting is on AND a later segment exists
+    # (so single-segment / final segments never pay the extra faceswap round-trip).
+    sf_setting = await db.get(AppSetting, "seed_faceswap")
+    seed_faceswap_on = bool(sf_setting) and sf_setting.value.strip().lower() in ("1", "true", "on", "yes")
+    seed_faceswap = False
+    if seed_faceswap_on:
+        successor_id = await db.scalar(
+            select(Segment.id)
+            .where(Segment.job_id == job.id, Segment.index > segment.index)
+            .limit(1)
+        )
+        seed_faceswap = successor_id is not None
+
     # Resolve video (sampler) settings: segment's preset -> job's preset -> job's raw params.
     # Live-linked, so editing a preset changes future claims that reference it.
     vp_id = segment.video_preset_id or job.video_preset_id
@@ -390,6 +404,7 @@ async def claim_next_segment(
         negative_prompt=negative_prompt,
         reprocess_type=segment.reprocess_type,
         output_path=segment.output_path,
+        seed_faceswap=seed_faceswap,
         width=job.width,
         height=job.height,
         fps=job.fps,
