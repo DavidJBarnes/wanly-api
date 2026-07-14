@@ -311,8 +311,14 @@ async def claim_next_segment(
     # sampler (block-swap only offloads weights, not activations). Cap VACE by resolution;
     # larger frames fall back to the traditional hard-cut continuation.
     vace_fits_vram = max(job.width, job.height) <= 896
+    # VACE neutralized 2026-07-14: traditional i2v continuation is the validated path.
+    # VACE runs a T2V base + always-distilled sampler, so it can't use the i2v motion/
+    # identity recipe — it's a weak identity lever (see identity-drift audit). Kept dormant
+    # (all the build code/columns remain); flip _VACE_ENABLED back to True to re-activate.
+    _VACE_ENABLED = False
     use_vace = (
-        effective_mode == "vace"
+        _VACE_ENABLED
+        and effective_mode == "vace"
         and segment.index > 0
         and prev_output_path is not None
         and vace_fits_vram
