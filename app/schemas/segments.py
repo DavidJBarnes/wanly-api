@@ -132,6 +132,34 @@ class SegmentClaimResponse(BaseModel):
     hologram_key_color: Optional[str] = None
     hologram_subject_height_m: Optional[float] = None
     hologram_flavor: Optional[str] = None
+    # Foundry smashcut (reprocess_type="smashcut_concat"): ordered source clip paths + transition.
+    smashcut_clip_paths: Optional[list[str]] = None
+    smashcut_transition: Optional[str] = None
+
+    model_config = {"from_attributes": True}
+
+
+class SmashcutRequest(BaseModel):
+    """Build a smashcut: hard-cut concat of hand-picked segment clips (same resolution)."""
+    name: str
+    segment_ids: list[UUID]  # ordered
+    transition: str = "seamless"  # "seamless" (butt-splice) | "black" (dip-to-black)
+
+
+class SegmentClipResponse(BaseModel):
+    """A segment surfaced as a pickable clip in the Foundry pool / smashcut builder."""
+    id: UUID
+    job_id: UUID
+    job_name: str
+    index: int
+    output_path: Optional[str] = None
+    thumbnail_path: Optional[str] = None  # last_frame_path
+    width: int
+    height: int
+    fps: int
+    duration_seconds: float
+    motion_magnitude: Optional[float] = None
+    favorite: bool = False
 
     model_config = {"from_attributes": True}
 

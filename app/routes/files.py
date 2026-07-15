@@ -136,6 +136,53 @@ async def upload_segment_output(
 
 
 @router.post(
+    "/segments/{segment_id}/smashcut_upload",
+    response_model=SegmentResponse,
+    dependencies=[Depends(verify_api_key)],
+)
+async def upload_smashcut_output(
+    segment_id: UUID,
+    video: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """Upload the concatenated smashcut video.
+
+    Called by the daemon after a smashcut_concat carrier completes. Creates the container job's
+    finalized Video (so it appears in the library) and flips the container job to FINALIZED.
+    """
+    segment = await db.get(Segment, segment_id)
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+
+    video_data = await video.read()
+    video_key = f"{segment.job_id}/smashcut.mp4"
+    video_uri = await asyncio.to_thread(upload_bytes, video_data, video_key, settings.s3_jobs_bucket)
+
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+
+    segment.status = SegmentStatus.COMPLETED
+    segment.reprocess_type = None
+    segment.output_path = video_uri
+    segment.completed_at = now
+
+    job = await db.get(Job, segment.job_id)
+    job.status = JobStatus.FINALIZED
+    video_record = Video(
+        job_id=job.id,
+        output_path=video_uri,
+        status=VideoStatus.COMPLETED,
+        tags=job.tags,
+        completed_at=now,
+    )
+    db.add(video_record)
+
+    await db.commit()
+    await db.refresh(segment)
+    return segment
+
+
+@router.post(
     "/segments/{segment_id}/hologram_upload",
     response_model=SegmentResponse,
     dependencies=[Depends(verify_api_key)],

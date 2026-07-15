@@ -117,6 +117,10 @@ class Segment(Base):
     reference_frames = mapped_column(JSON, nullable=True)
     negative_prompt = mapped_column(Text, nullable=True)
     reprocess_type = mapped_column(String(20), nullable=True)
+    # Foundry smashcut carrier (reprocess_type="smashcut_concat"): ordered list of source clip
+    # output_paths to concatenate + the transition style ("seamless" | "black").
+    smashcut_clip_paths = mapped_column(JSON, nullable=True)
+    smashcut_transition = mapped_column(String(20), nullable=True)
     # Per-segment video-settings override (live link). Takes precedence over the job's preset.
     video_preset_id = mapped_column(
         UUID(as_uuid=True), ForeignKey("video_settings_presets.id", ondelete="SET NULL"), nullable=True
