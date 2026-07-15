@@ -24,6 +24,7 @@ class VideoPresetCreate(BaseModel):
     scheduler: Optional[str] = None
     loras: Optional[list[LoraSlot]] = None
     prompt: Optional[str] = None
+    notes: Optional[str] = None
 
 
 class VideoPresetUpdate(BaseModel):
@@ -39,6 +40,7 @@ class VideoPresetUpdate(BaseModel):
     scheduler: Optional[str] = None
     loras: Optional[list[LoraSlot]] = None
     prompt: Optional[str] = None
+    notes: Optional[str] = None
 
 
 class VideoPresetResponse(BaseModel):
@@ -55,6 +57,7 @@ class VideoPresetResponse(BaseModel):
     scheduler: Optional[str] = None
     loras: Optional[list[LoraSlot]] = None
     prompt: Optional[str] = None
+    notes: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
