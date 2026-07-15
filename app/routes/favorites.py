@@ -10,7 +10,7 @@ from app.models import Favorite, User
 
 router = APIRouter(tags=["favorites"])
 
-VALID_TYPES = {"video", "image"}
+VALID_TYPES = {"video", "image", "segment"}
 
 
 @router.post("/favorites/toggle", dependencies=[Depends(get_current_user)])

@@ -26,14 +26,17 @@ from app.schemas.segments import (
     FramePreviewResponse,
     HologramRequest,
     SegmentClaimResponse,
+    SegmentClipResponse,
     SegmentCreate,
     SegmentReprocessRequest,
     SegmentResponse,
     SegmentStatusUpdate,
     SegmentTrimUpdate,
     SegmentVideoPresetUpdate,
+    SmashcutRequest,
     WorkerSegmentResponse,
 )
+from app.models import Favorite
 from app.stitch import stitch_video
 
 logger = logging.getLogger(__name__)
@@ -42,6 +45,14 @@ logger = logging.getLogger(__name__)
 # real segment count), so the real video segments and the job's finalized status are never
 # touched. The console hides segments at/above this index from the segment list.
 HOLOGRAM_CARRIER_INDEX = 1000
+
+# Foundry smashcut work rides its own carrier segment at this sentinel index on a dedicated
+# container job (no start image, no real segments). CPU-only (ffmpeg concat), claimed on the
+# same CPU track as holograms.
+SMASHCUT_CARRIER_INDEX = 2000
+
+# Reprocess types that run on the CPU-only track (no ComfyUI/GPU): holograms + smashcut concat.
+_CPU_REPROCESS_TYPES = ("ar_hologram", "smashcut_concat")
 
 router = APIRouter()
 
@@ -223,24 +234,33 @@ async def claim_next_segment(
         stale.claimed_at = None
         stale.progress_log = None
 
-    # Split work by kind so the CPU-only hologram track runs concurrently with GPU generation:
-    #   kind="gpu"      -> generations only (exclude hologram carriers)
-    #   kind="hologram" -> hologram carriers only (claimable even on FINALIZED jobs)
+    # Split work by kind so the CPU-only reprocess track runs concurrently with GPU generation:
+    #   kind="gpu"      -> generations only (exclude CPU reprocess carriers)
+    #   kind="hologram" -> CPU-only reprocess carriers: holograms + smashcut (claimable even on
+    #                      FINALIZED/FINALIZING jobs)
     #   kind=None       -> either (legacy combined behavior)
     if kind == "hologram":
-        where = (Segment.status == SegmentStatus.PENDING, Segment.reprocess_type == "ar_hologram")
+        where = (
+            Segment.status == SegmentStatus.PENDING,
+            Segment.reprocess_type.in_(_CPU_REPROCESS_TYPES),
+        )
     elif kind == "gpu":
         where = (
             Segment.status == SegmentStatus.PENDING,
             Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
-            Segment.reprocess_type.is_distinct_from("ar_hologram"),
+            # real generations (reprocess_type NULL) + GPU reprocess (faceswap); exclude CPU carriers.
+            # NULL NOT IN (...) is NULL (excludes), so OR the NULL case in explicitly.
+            or_(
+                Segment.reprocess_type.is_(None),
+                Segment.reprocess_type.not_in(_CPU_REPROCESS_TYPES),
+            ),
         )
     else:
         where = (
             Segment.status == SegmentStatus.PENDING,
             or_(
                 Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
-                Segment.reprocess_type == "ar_hologram",
+                Segment.reprocess_type.in_(_CPU_REPROCESS_TYPES),
             ),
         )
     result = await db.execute(
@@ -372,6 +392,8 @@ async def claim_next_segment(
     await db.commit()
     await db.refresh(segment)
 
+    smashcut_clip_paths = segment.smashcut_clip_paths if segment.reprocess_type == "smashcut_concat" else None
+
     return SegmentClaimResponse(
         id=segment.id,
         job_id=segment.job_id,
@@ -419,6 +441,8 @@ async def claim_next_segment(
         hologram_key_color=segment.hologram_key_color,
         hologram_subject_height_m=segment.hologram_subject_height_m,
         hologram_flavor=segment.hologram_flavor,
+        smashcut_clip_paths=smashcut_clip_paths,
+        smashcut_transition=segment.smashcut_transition,
     )
 
 
@@ -849,6 +873,139 @@ async def make_hologram(
     carrier.hologram_subject_height_m = subject_height
     carrier.hologram_flavor = flavor
 
+    await db.commit()
+    await db.refresh(carrier)
+    return carrier
+
+
+@router.get("/segments/clips", response_model=list[SegmentClipResponse])
+async def list_segment_clips(
+    favorites_only: bool = Query(False),
+    width: int = Query(None, description="Resolution filter (with height) for the smashcut res-lock"),
+    height: int = Query(None),
+    limit: int = Query(60, le=200),
+    offset: int = Query(0, ge=0),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """List completed real-generation segments as pickable clips for the Foundry pool / smashcut."""
+    fav_rows = (
+        await db.execute(
+            select(Favorite.item_ref).where(
+                Favorite.user_id == user.id, Favorite.item_type == "segment"
+            )
+        )
+    ).scalars().all()
+    fav_ids = set(fav_rows)
+
+    where = [
+        Job.user_id == user.id,
+        Segment.status == SegmentStatus.COMPLETED,
+        Segment.output_path.is_not(None),
+        Segment.reprocess_type.is_(None),          # real generations only, not carriers/faceswap
+        Segment.index < HOLOGRAM_CARRIER_INDEX,     # exclude sentinel carriers
+    ]
+    if width is not None and height is not None:
+        where += [Job.width == width, Job.height == height]
+    if favorites_only:
+        if not fav_ids:
+            return []
+        where.append(Segment.id.in_([UUID(r) for r in fav_ids]))
+
+    rows = (
+        await db.execute(
+            select(Segment, Job)
+            .join(Job, Segment.job_id == Job.id)
+            .where(*where)
+            .order_by(Segment.created_at.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+    ).all()
+
+    return [
+        SegmentClipResponse(
+            id=seg.id,
+            job_id=job.id,
+            job_name=job.name,
+            index=seg.index,
+            output_path=seg.output_path,
+            thumbnail_path=seg.last_frame_path,
+            width=job.width,
+            height=job.height,
+            fps=job.fps,
+            duration_seconds=seg.duration_seconds,
+            motion_magnitude=seg.motion_magnitude,
+            favorite=str(seg.id) in fav_ids,
+        )
+        for seg, job in rows
+    ]
+
+
+@router.post("/smashcut", response_model=SegmentResponse)
+async def create_smashcut(
+    body: SmashcutRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Assemble hand-picked segment clips into one hard-cut montage.
+
+    Creates a minimal container Job (no start image) hosting a smashcut carrier segment; the
+    daemon concatenates the ordered clips (seamless butt-splice or dip-to-black) into the
+    container's finalized Video. All clips must share resolution (enforced client-side + here).
+    """
+    if len(body.segment_ids) < 2:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick at least 2 clips")
+    if body.transition not in ("seamless", "black"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid transition")
+
+    # Resolve the picked segments (must be the user's, completed, with output). Preserve order.
+    rows = (
+        await db.execute(
+            select(Segment, Job)
+            .join(Job, Segment.job_id == Job.id)
+            .where(Segment.id.in_(body.segment_ids), Job.user_id == user.id)
+        )
+    ).all()
+    by_id = {seg.id: (seg, job) for seg, job in rows}
+    ordered = [by_id.get(sid) for sid in body.segment_ids]
+    if any(item is None for item in ordered):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="One or more clips not found")
+    clip_paths = []
+    for seg, _job in ordered:
+        if seg.status != SegmentStatus.COMPLETED or not seg.output_path:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="A clip is not a completed video")
+        clip_paths.append(seg.output_path)
+
+    # Resolution lock — all clips must match (first clip sets the montage resolution).
+    first_job = ordered[0][1]
+    w, h, fps = first_job.width, first_job.height, first_job.fps
+    if any(job.width != w or job.height != h for _seg, job in ordered):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="All clips must share resolution")
+
+    # Minimal container job (no start image). FINALIZING so the GPU claim ignores it; the CPU
+    # reprocess track claims the carrier regardless of job status, then upload sets FINALIZED.
+    container = Job(
+        user_id=user.id,
+        name=body.name.strip() or "Smashcut",
+        width=w, height=h, fps=fps,
+        seed=random.randint(0, 2**63 - 1),
+        status=JobStatus.FINALIZING,
+        tags="smashcut",
+    )
+    db.add(container)
+    await db.flush()
+
+    carrier = Segment(
+        job_id=container.id,
+        index=SMASHCUT_CARRIER_INDEX,
+        prompt="[smashcut]",
+        status=SegmentStatus.PENDING,
+        reprocess_type="smashcut_concat",
+        smashcut_clip_paths=clip_paths,
+        smashcut_transition=body.transition,
+    )
+    db.add(carrier)
     await db.commit()
     await db.refresh(carrier)
     return carrier
