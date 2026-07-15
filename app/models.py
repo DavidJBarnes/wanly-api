@@ -234,6 +234,8 @@ class VideoSettingsPreset(Base):
     # Default prompt for this recipe. A snapshot default that fills the prompt field at job
     # creation (overridable at submit) — NOT live-linked like loras/sampler params.
     prompt = mapped_column(Text, nullable=True)
+    # Free-form notes about this recipe (what it's for, gotchas). Not used by generation.
+    notes = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
