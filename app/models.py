@@ -111,6 +111,10 @@ class Segment(Base):
     # "2d_matte" (flat, Tier-0) or "2.5d_depth" (depth-displaced mesh, Tier-1). One flavor per
     # video at a time — re-making overwrites the single carrier's artifacts.
     hologram_flavor = mapped_column(String(16), nullable=True)
+    # Relief depth in meters for the 2.5d_depth flavor (how far the nearest pixels are pushed
+    # toward the viewer). Per-remake knob from the console dialog; daemon falls back to its
+    # config default when null.
+    hologram_depth_scale_m = mapped_column(Float, nullable=True)
     hologram_video_path = mapped_column(Text, nullable=True)
     hologram_manifest_path = mapped_column(Text, nullable=True)
     hologram_poster_path = mapped_column(Text, nullable=True)
