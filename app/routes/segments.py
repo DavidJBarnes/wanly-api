@@ -441,6 +441,7 @@ async def claim_next_segment(
         hologram_key_color=segment.hologram_key_color,
         hologram_subject_height_m=segment.hologram_subject_height_m,
         hologram_flavor=segment.hologram_flavor,
+        hologram_depth_scale_m=segment.hologram_depth_scale_m,
         smashcut_clip_paths=smashcut_clip_paths,
         smashcut_transition=segment.smashcut_transition,
     )
@@ -837,6 +838,9 @@ async def make_hologram(
     flavor = body.flavor or (flavor_setting.value if flavor_setting else None) or "2d_matte"
     if flavor not in ("2d_matte", "2.5d_depth"):
         flavor = "2d_matte"
+    depth_scale = body.depth_scale_m
+    if depth_scale is not None:
+        depth_scale = max(0.03, min(0.60, float(depth_scale)))
 
     # Dedicated hologram carrier at a sentinel index — a separate queue item, so the real
     # video segments and the job's FINALIZED status are left completely untouched. Reused
@@ -872,6 +876,7 @@ async def make_hologram(
     carrier.hologram_key_color = key_color
     carrier.hologram_subject_height_m = subject_height
     carrier.hologram_flavor = flavor
+    carrier.hologram_depth_scale_m = depth_scale
 
     await db.commit()
     await db.refresh(carrier)
@@ -1031,6 +1036,9 @@ async def get_hologram(
         "video_path": segment.hologram_video_path,
         "manifest_path": segment.hologram_manifest_path,
         "poster_path": segment.hologram_poster_path,
+        # Cache-buster for the player: hologram artifacts live at fixed S3 keys and the /files
+        # redirect is cached for hours, so a remake would otherwise replay the previous flavor.
+        "version": segment.completed_at.isoformat() if segment.completed_at else None,
     }
 
 

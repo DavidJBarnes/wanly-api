@@ -55,6 +55,7 @@ class SegmentResponse(BaseModel):
     output_path: Optional[str]
     last_frame_path: Optional[str]
     hologram_flavor: Optional[str] = None
+    hologram_depth_scale_m: Optional[float] = None
     hologram_video_path: Optional[str] = None
     hologram_manifest_path: Optional[str] = None
     hologram_poster_path: Optional[str] = None
@@ -132,6 +133,7 @@ class SegmentClaimResponse(BaseModel):
     hologram_key_color: Optional[str] = None
     hologram_subject_height_m: Optional[float] = None
     hologram_flavor: Optional[str] = None
+    hologram_depth_scale_m: Optional[float] = None
     # Foundry smashcut (reprocess_type="smashcut_concat"): ordered source clip paths + transition.
     smashcut_clip_paths: Optional[list[str]] = None
     smashcut_transition: Optional[str] = None
@@ -199,6 +201,7 @@ class HologramRequest(BaseModel):
     subject_height_m: Optional[float] = None
     key_color: Optional[str] = None
     flavor: Optional[str] = None  # "2d_matte" (default) or "2.5d_depth"
+    depth_scale_m: Optional[float] = None  # 2.5d relief depth in meters (clamped 0.03..0.60)
 
 
 class SegmentStatusUpdate(BaseModel):
