@@ -169,6 +169,34 @@ class TestHandBuiltResponses:
         pytest.fail("no SegmentClaimResponse construction found in app/routes/segments.py")
 
 
+class TestSubjectImageMirroring:
+    """The console reuses the starting-image upload slot for the Lynx subject, so
+    create_job mirrors the resolved URI across."""
+
+    @staticmethod
+    def _mirror_source():
+        tree = ast.parse((ROOT / "app" / "routes" / "jobs.py").read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                src = ast.unparse(node)
+                if "lynx_subject_image" in src and "generation_engine" in src:
+                    return src
+        return None
+
+    def test_mirror_exists(self):
+        assert self._mirror_source() is not None, (
+            "create_job must map starting_image -> lynx_subject_image for Lynx jobs, "
+            "or a console-submitted Lynx job reaches the daemon with no subject."
+        )
+
+    def test_mirror_only_applies_to_lynx(self):
+        assert "'lynx'" in self._mirror_source()
+
+    def test_mirror_does_not_clobber_an_explicit_value(self):
+        # guarded by `not job.lynx_subject_image`
+        assert "not job.lynx_subject_image" in self._mirror_source()
+
+
 class TestMigration:
     """Migration 050 must match the model, or a deployed API 500s on a column that
     exists in Python and not in Postgres."""
