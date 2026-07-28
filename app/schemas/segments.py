@@ -59,6 +59,8 @@ class SegmentResponse(BaseModel):
     hologram_video_path: Optional[str] = None
     hologram_manifest_path: Optional[str] = None
     hologram_poster_path: Optional[str] = None
+    # Lynx identity QA written by the daemon after a Lynx render (measurement only).
+    lynx_identity_scores: Optional[dict[str, Any]] = None
     created_at: datetime
     claimed_at: Optional[datetime]
     completed_at: Optional[datetime]
@@ -137,6 +139,24 @@ class SegmentClaimResponse(BaseModel):
     # Foundry smashcut (reprocess_type="smashcut_concat"): ordered source clip paths + transition.
     smashcut_clip_paths: Optional[list[str]] = None
     smashcut_transition: Optional[str] = None
+    # === Lynx identity-preserving engine (resolved from the job) ===
+    # generation_engine="lynx" routes the daemon to build_lynx_workflow. Each lynx_*
+    # value is a per-job override; None means "use the daemon's settings default".
+    generation_engine: Optional[str] = None
+    lynx_subject_image: Optional[str] = None
+    lynx_ip_scale: Optional[float] = None
+    lynx_ref_scale: Optional[float] = None
+    lynx_cfg_scale: Optional[float] = None
+    lynx_start_percent: Optional[float] = None
+    lynx_end_percent: Optional[float] = None
+    lynx_ref_blocks_to_use: Optional[str] = None
+    lynx_ip_layers: Optional[str] = None
+    lynx_resampler: Optional[str] = None
+    lynx_steps: Optional[int] = None
+    lynx_cfg: Optional[float] = None
+    lynx_shift: Optional[float] = None
+    lynx_scheduler: Optional[str] = None
+    lynx_distill_strength: Optional[float] = None
 
     model_config = {"from_attributes": True}
 
@@ -213,3 +233,5 @@ class SegmentStatusUpdate(BaseModel):
     motion_keywords: Optional[list[str]] = None
     motion_magnitude: Optional[float] = None
     vace_overlap_seconds: Optional[float] = None
+    # Lynx identity QA measured by the daemon. Measurement only — no gating.
+    lynx_identity_scores: Optional[dict[str, Any]] = None

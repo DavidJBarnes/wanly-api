@@ -60,6 +60,33 @@ class Job(Base):
     # Canonical identity reference for VACE continuation: a face crop from seg0, set by the daemon
     # after seg0 completes and fed to every downstream segment's VACE ref_images (anchors identity).
     identity_reference_image = mapped_column(Text, nullable=True)
+    # === Lynx identity-preserving engine (ByteDance Lynx on Wan2.1 T2V-14B) ===
+    # generation_engine selects the daemon's graph builder: NULL/"wan22" -> the default
+    # 2.2 i2v path, "lynx" -> build_lynx_workflow. Lynx is a different base model family,
+    # so the daemon fails loudly rather than falling back if it cannot run it.
+    generation_engine = mapped_column(String(20), nullable=True)
+    # Subject image conditioning identity via ArcFace + VAE reference features. NOT a start
+    # frame — this is a T2V base, so the subject never appears as frame 0.
+    lynx_subject_image = mapped_column(Text, nullable=True)
+    # Adapter strengths: ip = who the face is (ID adapter), ref = fine appearance detail
+    # (reference adapter). NULL -> the daemon's settings default.
+    lynx_ip_scale = mapped_column(Float, nullable=True)
+    lynx_ref_scale = mapped_column(Float, nullable=True)
+    lynx_cfg_scale = mapped_column(Float, nullable=True)
+    # Denoise window over which the ref adapter applies, as a fraction of total steps.
+    lynx_start_percent = mapped_column(Float, nullable=True)
+    lynx_end_percent = mapped_column(Float, nullable=True)
+    # Comma-separated DiT block indices/ranges for the ref feature; NULL/"" -> all blocks.
+    lynx_ref_blocks_to_use = mapped_column(Text, nullable=True)
+    # A/B arm. These are a MATCHED PAIR — a mixed pair loads silently and yields garbage
+    # identity, so the daemon rejects a mismatch.
+    lynx_ip_layers = mapped_column(Text, nullable=True)
+    lynx_resampler = mapped_column(Text, nullable=True)
+    lynx_steps = mapped_column(Integer, nullable=True)
+    lynx_cfg = mapped_column(Float, nullable=True)
+    lynx_shift = mapped_column(Float, nullable=True)
+    lynx_scheduler = mapped_column(String(32), nullable=True)
+    lynx_distill_strength = mapped_column(Float, nullable=True)
     status = mapped_column(String(20), nullable=False, default=JobStatus.PENDING)
     tags = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
@@ -119,6 +146,12 @@ class Segment(Base):
     hologram_manifest_path = mapped_column(Text, nullable=True)
     hologram_poster_path = mapped_column(Text, nullable=True)
     reference_frames = mapped_column(JSON, nullable=True)
+    # Lynx identity QA, written by the daemon after a Lynx render: per-frame cosine
+    # similarities of sampled output frames against the subject, plus summary stats.
+    # Measurement only — nothing gates on it. Shape:
+    # {"scores": [...], "mean": f, "min": f, "max": f,
+    #  "frames_sampled": n, "frames_with_face": n}
+    lynx_identity_scores = mapped_column(JSON, nullable=True)
     negative_prompt = mapped_column(Text, nullable=True)
     reprocess_type = mapped_column(String(20), nullable=True)
     # Foundry smashcut carrier (reprocess_type="smashcut_concat"): ordered list of source clip
