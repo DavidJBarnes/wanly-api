@@ -444,6 +444,23 @@ async def claim_next_segment(
         hologram_depth_scale_m=segment.hologram_depth_scale_m,
         smashcut_clip_paths=smashcut_clip_paths,
         smashcut_transition=segment.smashcut_transition,
+        # Lynx tunables live on the job (they describe the whole generation, not one
+        # segment) and are passed through verbatim: None means "daemon settings default".
+        generation_engine=job.generation_engine,
+        lynx_subject_image=job.lynx_subject_image,
+        lynx_ip_scale=job.lynx_ip_scale,
+        lynx_ref_scale=job.lynx_ref_scale,
+        lynx_cfg_scale=job.lynx_cfg_scale,
+        lynx_start_percent=job.lynx_start_percent,
+        lynx_end_percent=job.lynx_end_percent,
+        lynx_ref_blocks_to_use=job.lynx_ref_blocks_to_use,
+        lynx_ip_layers=job.lynx_ip_layers,
+        lynx_resampler=job.lynx_resampler,
+        lynx_steps=job.lynx_steps,
+        lynx_cfg=job.lynx_cfg,
+        lynx_shift=job.lynx_shift,
+        lynx_scheduler=job.lynx_scheduler,
+        lynx_distill_strength=job.lynx_distill_strength,
     )
 
 
@@ -476,6 +493,19 @@ async def update_segment(
         segment.motion_magnitude = body.motion_magnitude
     if body.vace_overlap_seconds is not None:
         segment.vace_overlap_seconds = body.vace_overlap_seconds
+    if body.lynx_identity_scores is not None:
+        # Identity QA is measurement only — persisted so the ip/ref calibration can be
+        # argued from numbers later. Never affects segment status.
+        segment.lynx_identity_scores = body.lynx_identity_scores
+        logger.info(
+            "segment %s lynx identity QA: mean=%s min=%s max=%s (%s/%s frames with a face)",
+            segment.id,
+            body.lynx_identity_scores.get("mean"),
+            body.lynx_identity_scores.get("min"),
+            body.lynx_identity_scores.get("max"),
+            body.lynx_identity_scores.get("frames_with_face"),
+            body.lynx_identity_scores.get("frames_sampled"),
+        )
 
     await db.flush()
 

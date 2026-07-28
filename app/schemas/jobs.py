@@ -27,6 +27,25 @@ class JobCreate(BaseModel):
     flow_shift: Optional[float] = None
     video_preset_id: Optional[UUID] = None
     continuation_mode: Optional[str] = None  # "traditional" | "vace" (NULL -> global default)
+    # === Lynx identity-preserving engine ===
+    # generation_engine="lynx" routes the job to the Lynx graph builder. Every lynx_*
+    # tunable is optional: None -> the daemon's settings default (the same
+    # per-job-override precedence the sampler params above use).
+    generation_engine: Optional[str] = None
+    lynx_subject_image: Optional[str] = None
+    lynx_ip_scale: Optional[float] = None
+    lynx_ref_scale: Optional[float] = None
+    lynx_cfg_scale: Optional[float] = None
+    lynx_start_percent: Optional[float] = None
+    lynx_end_percent: Optional[float] = None
+    lynx_ref_blocks_to_use: Optional[str] = None
+    lynx_ip_layers: Optional[str] = None
+    lynx_resampler: Optional[str] = None
+    lynx_steps: Optional[int] = None
+    lynx_cfg: Optional[float] = None
+    lynx_shift: Optional[float] = None
+    lynx_scheduler: Optional[str] = None
+    lynx_distill_strength: Optional[float] = None
     starting_image_uri: Optional[str] = None
     starting_image_hash: Optional[str] = None
     first_segment: SegmentCreate
@@ -68,6 +87,25 @@ class JobResponse(BaseModel):
     tags: Optional[str] = None
     video_preset_id: Optional[UUID] = None
     continuation_mode: Optional[str] = None
+    # === Lynx identity-preserving engine ===
+    # generation_engine="lynx" routes the job to the Lynx graph builder. Every lynx_*
+    # tunable is optional: None -> the daemon's settings default (the same
+    # per-job-override precedence the sampler params above use).
+    generation_engine: Optional[str] = None
+    lynx_subject_image: Optional[str] = None
+    lynx_ip_scale: Optional[float] = None
+    lynx_ref_scale: Optional[float] = None
+    lynx_cfg_scale: Optional[float] = None
+    lynx_start_percent: Optional[float] = None
+    lynx_end_percent: Optional[float] = None
+    lynx_ref_blocks_to_use: Optional[str] = None
+    lynx_ip_layers: Optional[str] = None
+    lynx_resampler: Optional[str] = None
+    lynx_steps: Optional[int] = None
+    lynx_cfg: Optional[float] = None
+    lynx_shift: Optional[float] = None
+    lynx_scheduler: Optional[str] = None
+    lynx_distill_strength: Optional[float] = None
     identity_reference_image: Optional[str] = None
     created_at: datetime
     updated_at: datetime
