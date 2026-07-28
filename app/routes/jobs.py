@@ -169,6 +169,14 @@ async def create_job(
     elif body.starting_image_uri:
         job.starting_image = body.starting_image_uri
 
+    # Lynx conditions identity on a subject image. The console reuses the starting-image
+    # upload path for it (same crop/hash-dedup machinery), so mirror the resolved URI
+    # across unless the caller set lynx_subject_image explicitly. Despite sharing the
+    # upload slot it is NOT a first frame — Lynx is a T2V base, and the subject never
+    # appears as frame 0.
+    if job.generation_engine == "lynx" and not job.lynx_subject_image:
+        job.lynx_subject_image = job.starting_image
+
     # Upload faceswap image to S3 if provided
     faceswap_uri = None
     if faceswap_image is not None:
