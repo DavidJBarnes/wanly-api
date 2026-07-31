@@ -13,6 +13,22 @@ from app.schemas.workers import WorkerDrain, WorkerHeartbeat, WorkerRegister, Wo
 router = APIRouter()
 
 
+def reregistered_drain_state(
+    current_status: str | None, current_drain_after: int | None
+) -> tuple[str, int | None]:
+    """Status + drain countdown for a worker that is re-registering.
+
+    A re-register must NOT cancel a pending drain. The daemon re-registers on every
+    start, and a RunPod container respawns automatically when the daemon exits — so
+    resetting here silently erased operator drain requests roughly 30s after they took
+    effect, and the worker went straight back to claiming work. Cancelling a drain is
+    an explicit action: DELETE /workers/{id}/drain.
+    """
+    if current_status == "draining":
+        return "draining", None
+    return "online-idle", current_drain_after
+
+
 @router.post("/workers", response_model=WorkerResponse, status_code=201, dependencies=[Depends(verify_api_key)])
 async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_db)):
     # Upsert: if friendly_name already exists, reclaim that row
@@ -24,8 +40,9 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
         worker.hostname = body.hostname
         worker.ip_address = body.ip_address
         worker.comfyui_running = body.comfyui_running
-        worker.status = "online-idle"
-        worker.drain_after_jobs = None
+        worker.status, worker.drain_after_jobs = reregistered_drain_state(
+            worker.status, worker.drain_after_jobs
+        )
         worker.last_heartbeat = datetime.now(timezone.utc)
     else:
         worker = Worker(
