@@ -392,7 +392,9 @@ async def claim_next_segment(
     await db.commit()
     await db.refresh(segment)
 
-    smashcut_clip_paths = segment.smashcut_clip_paths if segment.reprocess_type == "smashcut_concat" else None
+    is_smashcut = segment.reprocess_type == "smashcut_concat"
+    smashcut_clip_paths = segment.smashcut_clip_paths if is_smashcut else None
+    smashcut_clip_speeds = segment.smashcut_clip_speeds if is_smashcut else None
 
     return SegmentClaimResponse(
         id=segment.id,
@@ -444,6 +446,7 @@ async def claim_next_segment(
         hologram_depth_scale_m=segment.hologram_depth_scale_m,
         smashcut_clip_paths=smashcut_clip_paths,
         smashcut_transition=segment.smashcut_transition,
+        smashcut_clip_speeds=smashcut_clip_speeds,
         # Lynx tunables live on the job (they describe the whole generation, not one
         # segment) and are passed through verbatim: None means "daemon settings default".
         generation_engine=job.generation_engine,
@@ -977,6 +980,36 @@ async def list_segment_clips(
     ]
 
 
+SMASHCUT_SPEED_MIN = 0.25
+SMASHCUT_SPEED_MAX = 4.0
+
+
+def normalize_clip_speeds(clip_count: int, speeds: list[float] | None) -> list[float] | None:
+    """Validate per-clip smashcut playback speeds, aligned 1:1 with the ordered clips.
+
+    Collapses to None when nothing is actually retimed, which keeps the daemon on its fast
+    stream-copy concat path — the field is a request for extra work, so an all-1.0 list must
+    not read as one. Bounds match Segment.speed's, though the two are unrelated: that one is
+    generation-time motion density, this one is playback rate on a finished clip.
+    """
+    if speeds is None:
+        return None
+    if len(speeds) != clip_count:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Expected {clip_count} clip speeds to match the picked clips, got {len(speeds)}",
+        )
+    for s in speeds:
+        if not SMASHCUT_SPEED_MIN <= s <= SMASHCUT_SPEED_MAX:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Clip speed {s}x is outside {SMASHCUT_SPEED_MIN}x-{SMASHCUT_SPEED_MAX}x",
+            )
+    if all(s == 1.0 for s in speeds):
+        return None
+    return [float(s) for s in speeds]
+
+
 @router.post("/smashcut", response_model=SegmentResponse)
 async def create_smashcut(
     body: SmashcutRequest,
@@ -993,6 +1026,7 @@ async def create_smashcut(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Pick at least 2 clips")
     if body.transition not in ("seamless", "black"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid transition")
+    clip_speeds = normalize_clip_speeds(len(body.segment_ids), body.clip_speeds)
 
     # Resolve the picked segments (must be the user's, completed, with output). Preserve order.
     rows = (
@@ -1039,6 +1073,7 @@ async def create_smashcut(
         reprocess_type="smashcut_concat",
         smashcut_clip_paths=clip_paths,
         smashcut_transition=body.transition,
+        smashcut_clip_speeds=clip_speeds,
     )
     db.add(carrier)
     await db.commit()

@@ -139,6 +139,7 @@ class SegmentClaimResponse(BaseModel):
     # Foundry smashcut (reprocess_type="smashcut_concat"): ordered source clip paths + transition.
     smashcut_clip_paths: Optional[list[str]] = None
     smashcut_transition: Optional[str] = None
+    smashcut_clip_speeds: Optional[list[float]] = None
     # === Lynx identity-preserving engine (resolved from the job) ===
     # generation_engine="lynx" routes the daemon to build_lynx_workflow. Each lynx_*
     # value is a per-job override; None means "use the daemon's settings default".
@@ -166,6 +167,9 @@ class SmashcutRequest(BaseModel):
     name: str
     segment_ids: list[UUID]  # ordered
     transition: str = "seamless"  # "seamless" (butt-splice) | "black" (dip-to-black)
+    # Per-clip playback speed, aligned 1:1 with segment_ids. Omit (or send all 1.0) for no
+    # retiming. <1 is slow-motion, >1 is fast-forward.
+    clip_speeds: Optional[list[float]] = None
 
 
 class SegmentClipResponse(BaseModel):

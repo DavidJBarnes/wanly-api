@@ -158,6 +158,10 @@ class Segment(Base):
     # output_paths to concatenate + the transition style ("seamless" | "black").
     smashcut_clip_paths = mapped_column(JSON, nullable=True)
     smashcut_transition = mapped_column(String(20), nullable=True)
+    # Per-clip playback speed, aligned 1:1 with smashcut_clip_paths. NULL means "no retiming"
+    # (the common case) and keeps the daemon on its fast stream-copy concat path. Distinct
+    # from Segment.speed above, which is a generation-time motion-density knob.
+    smashcut_clip_speeds = mapped_column(JSON, nullable=True)
     # Per-segment video-settings override (live link). Takes precedence over the job's preset.
     video_preset_id = mapped_column(
         UUID(as_uuid=True), ForeignKey("video_settings_presets.id", ondelete="SET NULL"), nullable=True
