@@ -81,6 +81,26 @@ async def get_estimation_rates(
     }
 
 
+def sum_estimated_queue_time(rates: dict, segments) -> float:
+    """Total estimated seconds for a set of queued segments.
+
+    Each row is (width, height, fps, duration_seconds, worker_name).
+
+    A segment the estimator cannot price — no completed run at that config and no global
+    rate to fall back on — contributes nothing rather than a guess. That makes the total
+    read low on a cold database instead of confidently wrong, which is the safer failure
+    for a number used to decide whether there is time to queue more work.
+    """
+    total = 0.0
+    for width, height, fps, duration_seconds, worker_name in segments:
+        if not duration_seconds:
+            continue
+        est = estimate_segment_time(rates, width, height, fps, duration_seconds, worker_name)
+        if est:
+            total += est
+    return round(total, 1)
+
+
 def estimate_segment_time(
     rates: dict,
     width: int,

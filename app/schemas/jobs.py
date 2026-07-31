@@ -147,7 +147,10 @@ class WorkerStatsItem(BaseModel):
 class StatsResponse(BaseModel):
     jobs_by_status: dict[str, int]
     segments_by_status: dict[str, int]
-    avg_segment_run_time: Optional[float]
-    total_segments_completed: int
-    total_video_time: float
+    # Windowed rather than lifetime: a rolling average over every segment ever run stops
+    # moving, so it says nothing about how the rig is performing now.
+    avg_segment_run_time_24h: Optional[float]
+    # Estimated seconds of work still queued: every active segment of every active job,
+    # priced with the same estimator the job queue uses.
+    total_queue_time: float
     worker_stats: list[WorkerStatsItem]

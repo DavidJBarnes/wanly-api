@@ -4,7 +4,7 @@ import json
 import os
 import random
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
@@ -18,7 +18,7 @@ from app.auth import get_current_user
 from app.config import settings
 from app.database import get_db
 from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStatus
-from app.estimation import estimate_segment_time, get_estimation_rates
+from app.estimation import estimate_segment_time, get_estimation_rates, sum_estimated_queue_time
 from app.helpers import upload_faceswap_image
 from app.models import Job, Lora, Segment, User, Video
 from app.routes.segments import _resolve_loras, _resolve_wildcards
@@ -739,6 +739,18 @@ async def delete_job(
     await db.commit()
 
 
+STATS_WINDOW_HOURS = 24
+# What counts as "still queued". Mirrors the job-queue view so the dashboard total and the
+# per-job estimates there are derived from the same set of work. Awaiting jobs are excluded:
+# they are blocked on a prompt, so their segments are not waiting on a worker.
+QUEUE_JOB_STATUSES = (JobStatus.PENDING, JobStatus.PROCESSING)
+QUEUE_SEGMENT_STATUSES = (
+    SegmentStatus.PENDING,
+    SegmentStatus.CLAIMED,
+    SegmentStatus.PROCESSING,
+)
+
+
 @router.get("/stats", response_model=StatsResponse)
 async def get_stats(
     user: User = Depends(get_current_user),
@@ -765,24 +777,49 @@ async def get_stats(
     ).all()
     segments_by_status = {row[0]: row[1] for row in seg_rows}
 
-    # Avg run time and totals for completed segments
-    agg = (
+    # Avg run time over a rolling window, not all of history. A lifetime average barely
+    # moves once there are thousands of segments behind it, so it stops reflecting how the
+    # current models, settings and workers are actually performing.
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=STATS_WINDOW_HOURS)
+    avg_run_time = (
         await db.execute(
             select(
                 func.avg(
                     func.extract("epoch", Segment.completed_at)
                     - func.extract("epoch", Segment.claimed_at)
-                ),
-                func.count(),
-                func.coalesce(func.sum(Segment.duration_seconds), 0),
+                )
             )
             .join(Job, Segment.job_id == Job.id)
-            .where(Job.user_id == user.id, Segment.status == SegmentStatus.COMPLETED)
+            .where(
+                Job.user_id == user.id,
+                Segment.status == SegmentStatus.COMPLETED,
+                Segment.claimed_at.isnot(None),
+                Segment.completed_at >= cutoff,
+            )
         )
-    ).one()
-    avg_run_time = round(agg[0], 1) if agg[0] is not None else None
-    total_completed = agg[1]
-    total_video_time = float(agg[2])
+    ).scalar_one_or_none()
+    avg_run_time = round(avg_run_time, 1) if avg_run_time is not None else None
+
+    # Work still outstanding, priced with the same estimator the job queue uses so the two
+    # views agree. Segments the estimator cannot price (no comparable completed run yet)
+    # contribute nothing, so this reads low rather than guessing.
+    queue_rows = (
+        await db.execute(
+            select(
+                Job.width, Job.height, Job.fps, Segment.duration_seconds, Segment.worker_name
+            )
+            .join(Job, Segment.job_id == Job.id)
+            .where(
+                Job.user_id == user.id,
+                Job.status.in_(QUEUE_JOB_STATUSES),
+                Segment.status.in_(QUEUE_SEGMENT_STATUSES),
+            )
+        )
+    ).all()
+    total_queue_time = 0.0
+    if queue_rows:  # skip three estimator queries when the queue is empty
+        rates = await get_estimation_rates(db, user.id)
+        total_queue_time = sum_estimated_queue_time(rates, queue_rows)
 
     # Worker stats
     worker_rows = (
@@ -818,8 +855,7 @@ async def get_stats(
     return StatsResponse(
         jobs_by_status=jobs_by_status,
         segments_by_status=segments_by_status,
-        avg_segment_run_time=avg_run_time,
-        total_segments_completed=total_completed,
-        total_video_time=total_video_time,
+        avg_segment_run_time_24h=avg_run_time,
+        total_queue_time=total_queue_time,
         worker_stats=worker_stats,
     )
