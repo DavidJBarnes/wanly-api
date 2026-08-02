@@ -145,3 +145,32 @@ class TestPersistence:
         calls = self._kwargs_for(SEGMENTS_ROUTE, "SegmentClaimResponse")
         assert len(calls) == 1, "expected exactly one claim construction site"
         assert "seed_faceswap" in calls[0]
+
+
+class TestMigrationChain:
+    """A duplicate revision id gives alembic two heads and `upgrade head` fails, which
+    silently blocks every deploy. Both API deploys on 2026-08-02 died this way: this
+    migration was numbered 050, which 050_add_lynx_engine.py already used."""
+
+    def _chain(self):
+        import re, glob, os
+        nodes = {}
+        for f in sorted(glob.glob(str(ROOT / "alembic" / "versions" / "*.py"))):
+            src = open(f).read()
+            rev = re.search(r'^revision(?::[^=]+)? *= *["\'](.+?)["\']', src, re.M)
+            down = re.search(r'^down_revision(?::[^=]+)? *= *(?:["\'](.+?)["\']|None)', src, re.M)
+            if rev:
+                nodes.setdefault(rev.group(1), []).append(
+                    (down.group(1) if down and down.lastindex else None, os.path.basename(f))
+                )
+        return nodes
+
+    def test_no_duplicate_revision_ids(self):
+        dupes = {k: [f for _, f in v] for k, v in self._chain().items() if len(v) > 1}
+        assert not dupes, f"duplicate alembic revision ids will break `upgrade head`: {dupes}"
+
+    def test_exactly_one_head(self):
+        nodes = self._chain()
+        downs = {d for v in nodes.values() for d, _ in v if d}
+        heads = sorted(set(nodes) - downs)
+        assert len(heads) == 1, f"alembic must have exactly one head, found {heads}"

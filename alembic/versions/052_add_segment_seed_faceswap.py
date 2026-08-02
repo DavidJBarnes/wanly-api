@@ -1,7 +1,7 @@
 """Add seed_faceswap to segments
 
-Revision ID: 050
-Revises: 049
+Revision ID: 052
+Revises: 051
 Create Date: 2026-08-02
 
 Seed re-anchor moves from a global app setting to a per-segment flag.
@@ -17,8 +17,8 @@ The old app_settings row is deleted here; nothing reads it after this revision.
 import sqlalchemy as sa
 from alembic import op
 
-revision = "050"
-down_revision = "049"
+revision = "052"
+down_revision = "051"
 branch_labels = None
 depends_on = None
 
