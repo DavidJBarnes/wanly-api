@@ -23,7 +23,6 @@ _DEFAULTS = {
     "negative_prompt": "",
     "continuation_mode": "traditional",
     "vace_overlap_frames": "12",
-    "seed_faceswap": "false",
 }
 
 
@@ -45,7 +44,6 @@ def _to_response(settings: dict[str, str]) -> AppSettingsResponse:
         negative_prompt=settings["negative_prompt"],
         continuation_mode=settings.get("continuation_mode", "traditional"),
         vace_overlap_frames=int(settings.get("vace_overlap_frames", "12")),
-        seed_faceswap=settings.get("seed_faceswap", "false").strip().lower() in ("1", "true", "on", "yes"),
     )
 
 
