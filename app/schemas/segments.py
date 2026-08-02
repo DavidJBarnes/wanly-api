@@ -17,6 +17,9 @@ class SegmentCreate(BaseModel):
     faceswap_image: Optional[str] = None
     faceswap_faces_order: Optional[str] = None
     faceswap_faces_index: Optional[str] = None
+    # Re-anchor this segment's last frame to the faceswap face before it seeds the next
+    # segment. Uses faceswap_image, so it only has an effect when faceswap is configured.
+    seed_faceswap: bool = False
     negative_prompt: Optional[str] = None
     auto_finalize: bool = False
     transition: Optional[str] = None
@@ -39,6 +42,7 @@ class SegmentResponse(BaseModel):
     faceswap_image: Optional[str]
     faceswap_faces_order: Optional[str]
     faceswap_faces_index: Optional[str]
+    seed_faceswap: bool = False
     negative_prompt: Optional[str] = None
     auto_finalize: bool
     transition: Optional[str]

@@ -198,6 +198,7 @@ async def add_segment(
         faceswap_image=body.faceswap_image,
         faceswap_faces_order=body.faceswap_faces_order,
         faceswap_faces_index=body.faceswap_faces_index,
+        seed_faceswap=body.seed_faceswap,
         negative_prompt=negative_prompt,
         auto_finalize=body.auto_finalize,
         video_preset_id=body.video_preset_id,
@@ -345,19 +346,15 @@ async def claim_next_segment(
     )
     continuation_mode = "vace" if use_vace else "traditional"
 
-    # Seed re-anchor: faceswap this segment's last frame to the canonical identity before it
-    # seeds the next segment. Only when the global setting is on AND a later segment exists
-    # (so single-segment / final segments never pay the extra faceswap round-trip).
-    sf_setting = await db.get(AppSetting, "seed_faceswap")
-    seed_faceswap_on = bool(sf_setting) and sf_setting.value.strip().lower() in ("1", "true", "on", "yes")
-    seed_faceswap = False
-    if seed_faceswap_on:
-        successor_id = await db.scalar(
-            select(Segment.id)
-            .where(Segment.job_id == job.id, Segment.index > segment.index)
-            .limit(1)
-        )
-        seed_faceswap = successor_id is not None
+    # Seed re-anchor: faceswap this segment's last frame to its own faceswap face before the
+    # frame seeds the next segment. Author-set per segment.
+    #
+    # This used to be a global app setting gated on "a later segment already exists". That
+    # gate could never pass: a job is created with segment 0 only and continuations are
+    # appended after it runs, so at claim time there is never a successor. The feature was
+    # dead in every job. No gate now — if the author asked for it, it fires. The cost when
+    # the segment turns out to be last is one wasted still-image faceswap (seconds).
+    seed_faceswap = bool(segment.seed_faceswap)
 
     # Resolve video (sampler) settings: segment's preset -> job's preset -> job's raw params.
     # Live-linked, so editing a preset changes future claims that reference it.
