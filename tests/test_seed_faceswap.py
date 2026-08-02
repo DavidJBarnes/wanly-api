@@ -48,6 +48,25 @@ class TestSchemaContract:
     def test_model_has_the_column(self):
         assert hasattr(Segment, "seed_faceswap")
 
+    def test_seed_only_is_valid_without_whole_video_faceswap(self):
+        """The re-anchor touches ONE frame; requiring the whole clip to be swapped as well
+        would be a different (and much more expensive) feature. The daemon resolves the face
+        from faceswap_image even when faceswap_enabled is False."""
+        seg = SegmentCreate(
+            prompt="x",
+            seed_faceswap=True,
+            faceswap_enabled=False,
+            faceswap_image="s3://wanly-loras/faces/kelly.png",
+        )
+        assert seg.seed_faceswap is True
+        assert seg.faceswap_enabled is False
+        assert seg.faceswap_image == "s3://wanly-loras/faces/kelly.png"
+
+    def test_whole_video_swap_without_seed_reanchor_is_valid(self):
+        """The other direction: swapping the clip does not imply re-anchoring the seed."""
+        seg = SegmentCreate(prompt="x", faceswap_enabled=True, seed_faceswap=False)
+        assert seg.faceswap_enabled is True and seg.seed_faceswap is False
+
 
 class TestGlobalSettingIsGone:
     """One source of truth. A lingering global would silently fight the per-segment value."""
