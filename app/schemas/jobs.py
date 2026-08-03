@@ -142,6 +142,10 @@ class IdentityAggregate(BaseModel):
     # starts (both "healthy") while seg1 sat at 0.544 vs the job's original image.
     min_cos_ref: Optional[float] = None
     min_cos_ref_segment_index: Optional[int] = None
+    # Job trajectory: the first segment's opening frame through the last segment's closing
+    # frame, both against the same ground truth. end - start is the identity the job lost.
+    start_cos_ref: Optional[float] = None
+    end_cos_ref: Optional[float] = None
 
 
 class JobDetailResponse(JobResponse):
