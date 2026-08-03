@@ -511,6 +511,10 @@ async def update_segment(
         segment.identity_yaw_max = body.identity_yaw_max
     if body.identity_metrics is not None:
         segment.identity_metrics = body.identity_metrics
+    if body.identity_start_cos_ref is not None:
+        segment.identity_start_cos_ref = body.identity_start_cos_ref
+    if body.identity_end_cos_ref is not None:
+        segment.identity_end_cos_ref = body.identity_end_cos_ref
     if body.vace_overlap_seconds is not None:
         segment.vace_overlap_seconds = body.vace_overlap_seconds
     if body.lynx_identity_scores is not None:

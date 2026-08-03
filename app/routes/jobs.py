@@ -78,6 +78,11 @@ def _identity_aggregate(segments) -> IdentityAggregate | None:
         key=lambda s: s.identity_mean_cos_ref,
         default=None,
     )
+    ordered = sorted(scored, key=lambda s: s.index)
+    first_with_start = next((s for s in ordered if s.identity_start_cos_ref is not None), None)
+    last_with_end = next(
+        (s for s in reversed(ordered) if s.identity_end_cos_ref is not None), None)
+
     return IdentityAggregate(
         mean_cos=weighted("identity_mean_cos"),
         mean_cos_ref=weighted("identity_mean_cos_ref"),
@@ -89,6 +94,8 @@ def _identity_aggregate(segments) -> IdentityAggregate | None:
         worst_segment_slope=worst.identity_slope if worst else None,
         min_cos_ref=lowest.identity_mean_cos_ref if lowest else None,
         min_cos_ref_segment_index=lowest.index if lowest else None,
+        start_cos_ref=first_with_start.identity_start_cos_ref if first_with_start else None,
+        end_cos_ref=last_with_end.identity_end_cos_ref if last_with_end else None,
     )
 
 

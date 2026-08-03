@@ -58,6 +58,8 @@ class SegmentResponse(BaseModel):
     identity_no_face: Optional[int] = None
     identity_face_px_p50: Optional[float] = None
     identity_yaw_max: Optional[float] = None
+    identity_start_cos_ref: Optional[float] = None
+    identity_end_cos_ref: Optional[float] = None
     identity_metrics: Optional[dict[str, Any]] = None
     reference_frames: Optional[list[str]] = None
     status: str
@@ -257,6 +259,8 @@ class SegmentStatusUpdate(BaseModel):
     identity_no_face: Optional[int] = None
     identity_face_px_p50: Optional[float] = None
     identity_yaw_max: Optional[float] = None
+    identity_start_cos_ref: Optional[float] = None
+    identity_end_cos_ref: Optional[float] = None
     identity_metrics: Optional[dict[str, Any]] = None
     vace_overlap_seconds: Optional[float] = None
     # Lynx identity QA measured by the daemon. Measurement only — no gating.

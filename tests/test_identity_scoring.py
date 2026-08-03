@@ -119,13 +119,15 @@ class TestAggregateMath:
         return ns["_identity_aggregate"]
 
     @staticmethod
-    def _seg(index, frames, mean=None, ref=None, slope=None, no_face=0):
+    def _seg(index, frames, mean=None, ref=None, slope=None, no_face=0,
+             start_ref=None, end_ref=None):
         class S:
             pass
         s = S()
         s.index, s.identity_frames = index, frames
         s.identity_mean_cos, s.identity_mean_cos_ref = mean, ref
         s.identity_slope, s.identity_no_face = slope, no_face
+        s.identity_start_cos_ref, s.identity_end_cos_ref = start_ref, end_ref
         return s
 
     def test_no_scored_segments_returns_none(self):
@@ -197,3 +199,48 @@ class TestCumulativeLowPointIsSurfaced:
         seg = TestAggregateMath._seg
         r = agg([seg(0, 50, mean=0.8, ref=None)])
         assert r.min_cos_ref is None and r.min_cos_ref_segment_index is None
+
+
+class TestJobTrajectory:
+    """David's model: seg0's start frame is ground truth. Every segment is measured against
+    it, and because a continuation begins where the previous ended, the endpoints chain:
+
+        seg0   0.98 -> 0.85    loss 0.13
+        seg1   0.85 -> 0.60    loss 0.25
+        job    0.98 -> 0.60
+
+    A mean over frames cannot express that - a clip sliding 0.95 -> 0.65 averages about the
+    same as one sitting flat at 0.80, and only the first has lost the character.
+    """
+
+    def test_aggregate_exposes_the_job_trajectory(self):
+        assert "start_cos_ref" in IdentityAggregate.model_fields
+        assert "end_cos_ref" in IdentityAggregate.model_fields
+
+    def test_trajectory_spans_first_segment_start_to_last_segment_end(self):
+        agg = TestAggregateMath._load_helper()
+        seg = TestAggregateMath._seg
+        r = agg([
+            seg(0, 177, mean=0.9, ref=0.9, start_ref=0.98, end_ref=0.85),
+            seg(1, 177, mean=0.7, ref=0.7, start_ref=0.85, end_ref=0.60),
+        ])
+        assert r.start_cos_ref == pytest.approx(0.98)
+        assert r.end_cos_ref == pytest.approx(0.60)
+
+    def test_segments_are_ordered_by_index_not_list_order(self):
+        """Segments can arrive in any order; the trajectory must still run 0 -> N."""
+        agg = TestAggregateMath._load_helper()
+        seg = TestAggregateMath._seg
+        r = agg([
+            seg(1, 50, mean=0.7, ref=0.7, start_ref=0.85, end_ref=0.60),
+            seg(0, 50, mean=0.9, ref=0.9, start_ref=0.98, end_ref=0.85),
+        ])
+        assert r.start_cos_ref == pytest.approx(0.98)
+        assert r.end_cos_ref == pytest.approx(0.60)
+
+    def test_missing_endpoints_do_not_break_the_aggregate(self):
+        agg = TestAggregateMath._load_helper()
+        seg = TestAggregateMath._seg
+        r = agg([seg(0, 50, mean=0.8, ref=0.8)])
+        assert r.start_cos_ref is None and r.end_cos_ref is None
+        assert r.mean_cos == pytest.approx(0.8)

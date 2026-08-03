@@ -141,6 +141,10 @@ class Segment(Base):
     identity_no_face = mapped_column(Integer, nullable=True)
     identity_face_px_p50 = mapped_column(Float, nullable=True)
     identity_yaw_max = mapped_column(Float, nullable=True)
+    # First and last frame vs the job's ground truth. Loss across a segment is start - end;
+    # a continuation begins where the previous ended, so these chain across the job.
+    identity_start_cos_ref = mapped_column(Float, nullable=True)
+    identity_end_cos_ref = mapped_column(Float, nullable=True)
     identity_metrics = mapped_column(JSONB, nullable=True)
     # Length (seconds) of the reconstructed lead-in a VACE-continuation segment carries.
     # Stitch trims this off the previous segment's tail so the reconstruction replaces it
