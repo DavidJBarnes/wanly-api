@@ -135,6 +135,13 @@ class IdentityAggregate(BaseModel):
     scored_segments: int = 0
     worst_segment_index: Optional[int] = None
     worst_segment_slope: Optional[float] = None
+    # Lowest per-segment cumulative score in the job, and where it happened. A job can
+    # average well while a late segment has lost the character entirely - each segment is
+    # measured against its OWN start frame, which for a continuation is the previous
+    # segment's already-drifted last frame. Observed: seg0 0.764, seg1 0.785 vs their own
+    # starts (both "healthy") while seg1 sat at 0.544 vs the job's original image.
+    min_cos_ref: Optional[float] = None
+    min_cos_ref_segment_index: Optional[int] = None
 
 
 class JobDetailResponse(JobResponse):

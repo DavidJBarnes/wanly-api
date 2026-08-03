@@ -71,6 +71,13 @@ def _identity_aggregate(segments) -> IdentityAggregate | None:
         key=lambda s: s.identity_slope,
         default=None,
     )
+    # The cumulative low point matters more than the average: a mean over segments hides a
+    # late collapse, which is exactly what a multi-segment job drifts into.
+    lowest = min(
+        (s for s in scored if s.identity_mean_cos_ref is not None),
+        key=lambda s: s.identity_mean_cos_ref,
+        default=None,
+    )
     return IdentityAggregate(
         mean_cos=weighted("identity_mean_cos"),
         mean_cos_ref=weighted("identity_mean_cos_ref"),
@@ -80,6 +87,8 @@ def _identity_aggregate(segments) -> IdentityAggregate | None:
         scored_segments=len(scored),
         worst_segment_index=worst.index if worst else None,
         worst_segment_slope=worst.identity_slope if worst else None,
+        min_cos_ref=lowest.identity_mean_cos_ref if lowest else None,
+        min_cos_ref_segment_index=lowest.index if lowest else None,
     )
 
 
