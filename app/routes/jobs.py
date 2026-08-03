@@ -35,7 +35,7 @@ def _image_ext(filename: str | None) -> str:
 
 def _starting_image_key(user_id: UUID, image_hash: str, ext: str) -> str:
     return f"users/{user_id}/starting_images/{image_hash}{ext}"
-from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
+from app.schemas.jobs import IdentityAggregate, JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
 from app.schemas.segments import SegmentResponse
 from app.stitch import stitch_video
 
@@ -44,6 +44,43 @@ import logging
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+
+def _identity_aggregate(segments) -> IdentityAggregate | None:
+    """Roll per-segment identity scores up to the job.
+
+    Frame-weighted, so a short segment does not carry the same weight as a long one, and it
+    surfaces the worst-drifting segment index - "which segment went wrong" is what you act on,
+    and a blended mean hides exactly that.
+    """
+    scored = [s for s in segments if s.identity_frames]
+    if not scored:
+        return None
+
+    def weighted(attr: str):
+        pairs = [(getattr(s, attr), s.identity_frames) for s in scored
+                 if getattr(s, attr) is not None]
+        if not pairs:
+            return None
+        total = sum(n for _, n in pairs)
+        return sum(v * n for v, n in pairs) / total if total else None
+
+    worst = min(
+        (s for s in scored if s.identity_slope is not None),
+        key=lambda s: s.identity_slope,
+        default=None,
+    )
+    return IdentityAggregate(
+        mean_cos=weighted("identity_mean_cos"),
+        mean_cos_ref=weighted("identity_mean_cos_ref"),
+        slope=weighted("identity_slope"),
+        frames=sum(s.identity_frames or 0 for s in scored),
+        no_face=sum(s.identity_no_face or 0 for s in scored),
+        scored_segments=len(scored),
+        worst_segment_index=worst.index if worst else None,
+        worst_segment_slope=worst.identity_slope if worst else None,
+    )
 
 
 @router.get("/jobs/starting-image-exists")
@@ -491,6 +528,7 @@ async def get_job(
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
     return JobDetailResponse(
+        identity=_identity_aggregate(job.segments),
         id=job.id,
         name=job.name,
         width=job.width,
@@ -649,6 +687,7 @@ async def reopen_job(
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
     return JobDetailResponse(
+        identity=_identity_aggregate(job.segments),
         id=job.id, name=job.name, width=job.width, height=job.height,
         fps=job.fps, seed=job.seed, starting_image=job.starting_image,
         lightx2v_strength_high=job.lightx2v_strength_high,

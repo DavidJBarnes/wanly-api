@@ -130,6 +130,18 @@ class Segment(Base):
     trim_end_frames = mapped_column(Integer, nullable=False, default=0)
     motion_keywords = mapped_column(JSON, nullable=True)
     motion_magnitude = mapped_column(Float, nullable=True)
+    # Identity scoring, measured inline when the segment finishes generating. Two means:
+    # _mean_cos is vs the START FRAME (drift of this generation), _mean_cos_ref is vs the
+    # identity reference (is it the character). Slope separates weak identity from drift.
+    identity_mean_cos = mapped_column(Float, nullable=True)
+    identity_mean_cos_ref = mapped_column(Float, nullable=True)
+    identity_min_cos = mapped_column(Float, nullable=True)
+    identity_slope = mapped_column(Float, nullable=True)
+    identity_frames = mapped_column(Integer, nullable=True)
+    identity_no_face = mapped_column(Integer, nullable=True)
+    identity_face_px_p50 = mapped_column(Float, nullable=True)
+    identity_yaw_max = mapped_column(Float, nullable=True)
+    identity_metrics = mapped_column(JSONB, nullable=True)
     # Length (seconds) of the reconstructed lead-in a VACE-continuation segment carries.
     # Stitch trims this off the previous segment's tail so the reconstruction replaces it
     # seamlessly. NULL for traditional (non-VACE) segments.

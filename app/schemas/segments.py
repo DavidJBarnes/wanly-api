@@ -50,6 +50,15 @@ class SegmentResponse(BaseModel):
     trim_end_frames: int
     motion_keywords: Optional[list[str]] = None
     motion_magnitude: Optional[float] = None
+    identity_mean_cos: Optional[float] = None
+    identity_mean_cos_ref: Optional[float] = None
+    identity_min_cos: Optional[float] = None
+    identity_slope: Optional[float] = None
+    identity_frames: Optional[int] = None
+    identity_no_face: Optional[int] = None
+    identity_face_px_p50: Optional[float] = None
+    identity_yaw_max: Optional[float] = None
+    identity_metrics: Optional[dict[str, Any]] = None
     reference_frames: Optional[list[str]] = None
     status: str
     reprocess_type: Optional[str] = None
@@ -240,6 +249,15 @@ class SegmentStatusUpdate(BaseModel):
     progress_log: Optional[str] = None
     motion_keywords: Optional[list[str]] = None
     motion_magnitude: Optional[float] = None
+    identity_mean_cos: Optional[float] = None
+    identity_mean_cos_ref: Optional[float] = None
+    identity_min_cos: Optional[float] = None
+    identity_slope: Optional[float] = None
+    identity_frames: Optional[int] = None
+    identity_no_face: Optional[int] = None
+    identity_face_px_p50: Optional[float] = None
+    identity_yaw_max: Optional[float] = None
+    identity_metrics: Optional[dict[str, Any]] = None
     vace_overlap_seconds: Optional[float] = None
     # Lynx identity QA measured by the daemon. Measurement only — no gating.
     lynx_identity_scores: Optional[dict[str, Any]] = None
