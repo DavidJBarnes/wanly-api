@@ -161,3 +161,39 @@ class TestAggregateMath:
         r = agg([self._seg(0, 50, mean=0.8, slope=None), self._seg(1, 50, mean=0.6, slope=-0.01)])
         assert r.mean_cos == pytest.approx(0.7, abs=1e-6)
         assert r.slope == pytest.approx(-0.01)
+
+
+class TestCumulativeLowPointIsSurfaced:
+    """The bug this class exists for.
+
+    A real 2-segment job scored 0.764 and 0.785 "vs own start frame" — both green, both
+    read as healthy — while segment 1 sat at 0.544 against the job's original image and was
+    visibly a different person. Each segment is measured from its OWN first frame, and a
+    continuation's first frame is the previous segment's already-drifted last frame. So
+    per-segment scores can rise while cumulative identity collapses.
+
+    The aggregate must therefore expose the cumulative LOW POINT, not just an average.
+    """
+
+    def test_aggregate_exposes_the_cumulative_low_point(self):
+        assert "min_cos_ref" in IdentityAggregate.model_fields
+        assert "min_cos_ref_segment_index" in IdentityAggregate.model_fields
+
+    def test_low_point_is_found_even_when_the_average_looks_fine(self):
+        agg = TestAggregateMath._load_helper()
+        seg = TestAggregateMath._seg
+        r = agg([
+            seg(0, 177, mean=0.764, ref=0.764, slope=-0.0003),
+            seg(1, 177, mean=0.785, ref=0.544, slope=-0.0004),
+        ])
+        # the per-segment means both look healthy and even improve
+        assert r.mean_cos == pytest.approx(0.7745, abs=1e-3)
+        # but the cumulative low point tells the truth, and names the segment
+        assert r.min_cos_ref == pytest.approx(0.544)
+        assert r.min_cos_ref_segment_index == 1
+
+    def test_low_point_is_none_when_no_reference_was_scored(self):
+        agg = TestAggregateMath._load_helper()
+        seg = TestAggregateMath._seg
+        r = agg([seg(0, 50, mean=0.8, ref=None)])
+        assert r.min_cos_ref is None and r.min_cos_ref_segment_index is None
