@@ -120,6 +120,23 @@ class JobListResponse(BaseModel):
     offset: int
 
 
+class IdentityAggregate(BaseModel):
+    """Job-level identity, derived from the per-segment scores rather than re-measuring.
+
+    Frame-weighted so a 20-frame segment does not count the same as a 200-frame one, and it
+    names the worst-drifting segment because "which segment went wrong" is the actionable
+    answer - a blended average hides it.
+    """
+    mean_cos: Optional[float] = None
+    mean_cos_ref: Optional[float] = None
+    slope: Optional[float] = None
+    frames: int = 0
+    no_face: int = 0
+    scored_segments: int = 0
+    worst_segment_index: Optional[int] = None
+    worst_segment_slope: Optional[float] = None
+
+
 class JobDetailResponse(JobResponse):
     segments: list[SegmentResponse]
     videos: list[VideoResponse]
@@ -127,6 +144,7 @@ class JobDetailResponse(JobResponse):
     completed_segment_count: int
     total_run_time: float
     total_video_time: float
+    identity: Optional[IdentityAggregate] = None
 
 
 class JobUpdate(BaseModel):

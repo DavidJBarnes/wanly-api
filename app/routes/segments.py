@@ -491,6 +491,26 @@ async def update_segment(
         segment.motion_keywords = body.motion_keywords
     if body.motion_magnitude is not None:
         segment.motion_magnitude = body.motion_magnitude
+    # Identity scores measured by the daemon at generation time. Measurement only -
+    # never gates status, exactly like motion_magnitude and the Lynx QA scores.
+    if body.identity_mean_cos is not None:
+        segment.identity_mean_cos = body.identity_mean_cos
+    if body.identity_mean_cos_ref is not None:
+        segment.identity_mean_cos_ref = body.identity_mean_cos_ref
+    if body.identity_min_cos is not None:
+        segment.identity_min_cos = body.identity_min_cos
+    if body.identity_slope is not None:
+        segment.identity_slope = body.identity_slope
+    if body.identity_frames is not None:
+        segment.identity_frames = body.identity_frames
+    if body.identity_no_face is not None:
+        segment.identity_no_face = body.identity_no_face
+    if body.identity_face_px_p50 is not None:
+        segment.identity_face_px_p50 = body.identity_face_px_p50
+    if body.identity_yaw_max is not None:
+        segment.identity_yaw_max = body.identity_yaw_max
+    if body.identity_metrics is not None:
+        segment.identity_metrics = body.identity_metrics
     if body.vace_overlap_seconds is not None:
         segment.vace_overlap_seconds = body.vace_overlap_seconds
     if body.lynx_identity_scores is not None:
