@@ -115,6 +115,11 @@ class SegmentClaimResponse(BaseModel):
     faceswap_faces_order: Optional[str]
     faceswap_faces_index: Optional[str]
     initial_reference_image: Optional[str] = None
+    # Identity scoring ground truth: the JOB's starting image, i.e. segment 0's start frame.
+    # Deliberately NOT identity_reference_image - that field is the PainterLongVideo anchor
+    # and is overridable, which would silently swap what "her" means mid-measurement.
+    # Every segment scores against this same frame, so the numbers chain across the job.
+    identity_ground_truth: Optional[str] = None
     motion_keywords: Optional[list[str]] = None
     motion_magnitude: Optional[float] = None
     previous_motion_keywords: Optional[list[str]] = None
