@@ -409,6 +409,9 @@ async def claim_next_segment(
         faceswap_faces_order=segment.faceswap_faces_order,
         faceswap_faces_index=segment.faceswap_faces_index,
         initial_reference_image=job.identity_reference_image or job.starting_image,
+        # Ground truth for identity scoring is always segment 0's start frame. No override:
+        # "her" is defined by where the job began, not by a separate reference image.
+        identity_ground_truth=job.starting_image,
         motion_keywords=segment.motion_keywords,
         previous_motion_keywords=previous_motion_keywords,
         previous_motion_magnitude=previous_motion_magnitude,
