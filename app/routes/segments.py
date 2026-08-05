@@ -19,7 +19,7 @@ from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
 from app.database import get_db
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.helpers import upload_faceswap_image
-from app.models import AppSetting, Job, Lora, Segment, User, Video, VideoSettingsPreset, Wildcard
+from app.models import AppSetting, Job, Lora, Segment, User, Video, VideoSettingsPreset, Wildcard, Worker
 from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
     FramePreview,
@@ -40,6 +40,11 @@ from app.models import Favorite
 from app.stitch import stitch_video
 
 logger = logging.getLogger(__name__)
+
+# A worker heartbeats every 30s (daemon HEARTBEAT_INTERVAL), so 5 minutes is ~10 missed beats -
+# comfortably past a transient network blip, and far short of the 30-minute worst case a
+# legitimate long render can occupy a claim for.
+STALE_HEARTBEAT_MINUTES = 5
 
 # AR hologram work rides a dedicated carrier segment at this sentinel index (far above any
 # real segment count), so the real video segments and the job's finalized status are never
@@ -221,16 +226,38 @@ async def claim_next_segment(
     kind: str = Query(None, description="'gpu' (exclude holograms), 'hologram' (only holograms), or None (any)"),
     db: AsyncSession = Depends(get_db),
 ):
-    # Reset stale segments: claimed/processing for > 30 minutes with no completion
-    stale_cutoff = datetime.now(timezone.utc) - timedelta(minutes=30)
+    # Reclaim work orphaned by a dead worker.
+    #
+    # Two rules, because claimed_at alone cannot tell "20 minutes into a legitimate 5s render"
+    # apart from "the machine lost power 20 minutes ago". It has to wait out the worst case,
+    # so a crash costs 30 minutes of dead air before anything notices.
+    #
+    # Workers heartbeat every 30s, so a dead one is detectable in ~5 minutes with no risk to
+    # live work: a healthy worker mid-render is still heartbeating. The old age rule stays as a
+    # backstop for segments whose worker row is missing or never heartbeated at all.
+    now = datetime.now(timezone.utc)
+    age_cutoff = now - timedelta(minutes=30)
+    heartbeat_cutoff = now - timedelta(minutes=STALE_HEARTBEAT_MINUTES)
+
     stale_result = await db.execute(
-        select(Segment).where(
+        select(Segment, Worker.last_heartbeat)
+        .outerjoin(Worker, Worker.id == Segment.worker_id)
+        .where(
             Segment.status.in_([SegmentStatus.CLAIMED, SegmentStatus.PROCESSING]),
-            Segment.claimed_at < stale_cutoff,
+            Segment.claimed_at.is_not(None),
+            or_(
+                Segment.claimed_at < age_cutoff,
+                Worker.last_heartbeat < heartbeat_cutoff,
+            ),
         )
     )
-    for stale in stale_result.scalars().all():
-        logger.warning("Resetting stale segment %s (status=%s, claimed_at=%s)", stale.id, stale.status, stale.claimed_at)
+    for stale, last_heartbeat in stale_result.all():
+        reason = ("worker heartbeat stale" if last_heartbeat is not None
+                  and last_heartbeat < heartbeat_cutoff else "claimed over 30m ago")
+        logger.warning(
+            "Reclaiming segment %s (status=%s, claimed_at=%s, worker=%s, last_heartbeat=%s): %s",
+            stale.id, stale.status, stale.claimed_at, stale.worker_name, last_heartbeat, reason,
+        )
         stale.status = SegmentStatus.PENDING
         stale.worker_id = None
         stale.worker_name = None
