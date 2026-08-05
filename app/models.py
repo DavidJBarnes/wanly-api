@@ -294,6 +294,10 @@ class VideoSettingsPreset(Base):
     # 1:N LoRAs that constitute this recipe — each {lora_id, high_weight, low_weight} (expert
     # placement). Resolved live at claim time when a job/segment links this preset.
     loras = mapped_column(JSON, nullable=True)
+    # Hidden from the preset PICKER but still readable by id, so historical jobs keep resolving
+    # their config. Presets accumulate fast during experiments; deleting them would destroy the
+    # record of which config produced which result.
+    archived = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     # Default prompt for this recipe. A snapshot default that fills the prompt field at job
     # creation (overridable at submit) — NOT live-linked like loras/sampler params.
     prompt = mapped_column(Text, nullable=True)
