@@ -198,6 +198,8 @@ async def add_segment(
         faceswap_image=body.faceswap_image,
         faceswap_faces_order=body.faceswap_faces_order,
         faceswap_faces_index=body.faceswap_faces_index,
+        faceswap_model=body.faceswap_model,
+        faceswap_pixel_boost=body.faceswap_pixel_boost,
         seed_faceswap=body.seed_faceswap,
         negative_prompt=negative_prompt,
         auto_finalize=body.auto_finalize,
@@ -408,6 +410,8 @@ async def claim_next_segment(
         faceswap_image=segment.faceswap_image,
         faceswap_faces_order=segment.faceswap_faces_order,
         faceswap_faces_index=segment.faceswap_faces_index,
+        faceswap_model=segment.faceswap_model,
+        faceswap_pixel_boost=segment.faceswap_pixel_boost,
         initial_reference_image=job.identity_reference_image or job.starting_image,
         # Ground truth for identity scoring is always segment 0's start frame. No override:
         # "her" is defined by where the job began, not by a separate reference image.
@@ -828,6 +832,8 @@ async def reprocess_segment(
     segment.faceswap_image = effective_image
     segment.faceswap_faces_order = body.faceswap_faces_order
     segment.faceswap_faces_index = body.faceswap_faces_index
+    segment.faceswap_model = body.faceswap_model
+    segment.faceswap_pixel_boost = body.faceswap_pixel_boost
 
     # Reset segment for faceswap-only reprocessing (preserve existing output)
     segment.reprocess_type = "faceswap"

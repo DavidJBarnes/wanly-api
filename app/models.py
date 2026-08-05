@@ -120,6 +120,8 @@ class Segment(Base):
     faceswap_image = mapped_column(Text, nullable=True)
     faceswap_faces_order = mapped_column(Text, nullable=True)
     faceswap_faces_index = mapped_column(Text, nullable=True)
+    faceswap_model = mapped_column(String(64), nullable=True)
+    faceswap_pixel_boost = mapped_column(String(16), nullable=True)
     # Seed re-anchor: faceswap this segment's last frame to the segment's faceswap face
     # before it seeds the next segment. Author-set per segment (no successor gate: the
     # successor does not exist yet when this segment is claimed).
