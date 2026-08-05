@@ -1,6 +1,6 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -24,10 +24,19 @@ _PARAMS = (
 
 @router.get("/video-presets", response_model=list[VideoPresetResponse])
 async def list_video_presets(
+    include_archived: bool = Query(False, description="Include archived presets"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(VideoSettingsPreset).order_by(VideoSettingsPreset.name))
+    """Active presets only by default — this list is what the UI offers for selection.
+
+    Archived ones remain fetchable by id, so every historical job still resolves the exact
+    config it ran with.
+    """
+    stmt = select(VideoSettingsPreset).order_by(VideoSettingsPreset.name)
+    if not include_archived:
+        stmt = stmt.where(VideoSettingsPreset.archived.is_(False))
+    result = await db.execute(stmt)
     return result.scalars().all()
 
 
@@ -71,6 +80,8 @@ async def update_video_preset(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Preset not found")
     if body.name is not None:
         preset.name = body.name
+    if body.archived is not None:
+        preset.archived = body.archived
     for p in _PARAMS:
         v = getattr(body, p)
         if v is not None:

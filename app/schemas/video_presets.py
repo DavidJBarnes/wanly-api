@@ -28,6 +28,7 @@ class VideoPresetCreate(BaseModel):
 
 
 class VideoPresetUpdate(BaseModel):
+    archived: Optional[bool] = None
     name: Optional[str] = None
     lightx2v_strength_high: Optional[float] = None
     lightx2v_strength_low: Optional[float] = None
@@ -44,6 +45,7 @@ class VideoPresetUpdate(BaseModel):
 
 
 class VideoPresetResponse(BaseModel):
+    archived: bool = False
     id: UUID
     name: str
     lightx2v_strength_high: Optional[float] = None
