@@ -17,6 +17,8 @@ class SegmentCreate(BaseModel):
     faceswap_image: Optional[str] = None
     faceswap_faces_order: Optional[str] = None
     faceswap_faces_index: Optional[str] = None
+    faceswap_model: Optional[str] = None
+    faceswap_pixel_boost: Optional[str] = None
     # Re-anchor this segment's last frame to the faceswap face before it seeds the next
     # segment. Uses faceswap_image, so it only has an effect when faceswap is configured.
     seed_faceswap: bool = False
@@ -42,6 +44,8 @@ class SegmentResponse(BaseModel):
     faceswap_image: Optional[str]
     faceswap_faces_order: Optional[str]
     faceswap_faces_index: Optional[str]
+    faceswap_model: Optional[str] = None
+    faceswap_pixel_boost: Optional[str] = None
     seed_faceswap: bool = False
     negative_prompt: Optional[str] = None
     auto_finalize: bool
@@ -114,6 +118,8 @@ class SegmentClaimResponse(BaseModel):
     faceswap_image: Optional[str]
     faceswap_faces_order: Optional[str]
     faceswap_faces_index: Optional[str]
+    faceswap_model: Optional[str] = None
+    faceswap_pixel_boost: Optional[str] = None
     initial_reference_image: Optional[str] = None
     # Identity scoring ground truth: the JOB's starting image, i.e. segment 0's start frame.
     # Deliberately NOT identity_reference_image - that field is the PainterLongVideo anchor
@@ -237,6 +243,8 @@ class SegmentReprocessRequest(BaseModel):
     faceswap_image: Optional[str] = None
     faceswap_faces_order: Optional[str] = None
     faceswap_faces_index: Optional[str] = None
+    faceswap_model: Optional[str] = None
+    faceswap_pixel_boost: Optional[str] = None
 
 
 class HologramRequest(BaseModel):
