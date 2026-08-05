@@ -253,6 +253,8 @@ async def create_job(
         faceswap_image=faceswap_uri if faceswap_uri else seg.faceswap_image,
         faceswap_faces_order=seg.faceswap_faces_order,
         faceswap_faces_index=seg.faceswap_faces_index,
+        faceswap_model=seg.faceswap_model,
+        faceswap_pixel_boost=seg.faceswap_pixel_boost,
         seed_faceswap=seg.seed_faceswap,
         negative_prompt=seg.negative_prompt,
         auto_finalize=seg.auto_finalize,
