@@ -1,0 +1,133 @@
+"""Tests for the RunPod worker launcher (wanly-console#288).
+
+The valuable cases here are the refusals, not the happy path. Launching spends money per hour
+and the failure modes are all "it looked like it worked":
+
+  - no capacity must read as no capacity, not as an opaque RunPod spec error
+  - a missing key must say so rather than 500
+  - the datacenter must stay pinned to the volume's region, because a pod in the wrong region
+    silently runs without the models and re-downloads ~39GB instead of failing
+"""
+
+import httpx
+import pytest
+
+from app import runpod_client
+from app.config import settings
+from app.runpod_client import RunPodError
+
+
+class _Resp:
+    def __init__(self, status=200, payload=None, text=""):
+        self.status_code = status
+        self._payload = payload if payload is not None else {}
+        self.text = text
+
+    @property
+    def is_success(self):
+        return 200 <= self.status_code < 300
+
+    def json(self):
+        return self._payload
+
+
+class _Client:
+    """Stands in for httpx.AsyncClient, recording what was sent."""
+
+    calls: list = []
+
+    def __init__(self, responses):
+        self._responses = responses
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+    async def post(self, url, json=None, headers=None):
+        _Client.calls.append(("POST", url, json, headers))
+        return self._responses.pop(0)
+
+    async def get(self, url, headers=None):
+        _Client.calls.append(("GET", url, None, headers))
+        return self._responses.pop(0)
+
+    async def delete(self, url, headers=None):
+        _Client.calls.append(("DELETE", url, None, headers))
+        return self._responses.pop(0)
+
+
+def _install(monkeypatch, *responses):
+    _Client.calls = []
+    monkeypatch.setattr(settings, "runpod_api_key", "rpa_test")
+    monkeypatch.setattr(settings, "runpod_network_volume_id", "vol_test")
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(list(responses)))
+
+
+def _availability_payload(price):
+    return {"data": {"gpuTypes": [{"lowestPrice": {
+        "uninterruptablePrice": price, "stockStatus": "Low" if price else None}}]}}
+
+
+class TestAvailability:
+    async def test_price_means_available(self, monkeypatch):
+        _install(monkeypatch, _Resp(payload=_availability_payload(0.74)))
+        out = await runpod_client.get_availability()
+        assert out["available"] is True
+        assert out["price_per_hr"] == 0.74
+
+    async def test_no_price_means_no_capacity(self, monkeypatch):
+        """RunPod reports 'no inventory' as a null price, not an error."""
+        _install(monkeypatch, _Resp(payload=_availability_payload(None)))
+        out = await runpod_client.get_availability()
+        assert out["available"] is False
+
+    async def test_rejected_key_says_so(self, monkeypatch):
+        _install(monkeypatch, _Resp(status=401))
+        with pytest.raises(RunPodError, match="401"):
+            await runpod_client.get_availability()
+
+    async def test_missing_key_is_a_clear_message_not_a_crash(self, monkeypatch):
+        monkeypatch.setattr(settings, "runpod_api_key", "")
+        with pytest.raises(RunPodError, match="RUNPOD_API_KEY"):
+            await runpod_client.get_availability()
+
+
+class TestLaunch:
+    async def test_pins_datacenter_volume_and_gpu(self, monkeypatch):
+        """The volume is region-locked. A pod in the wrong datacenter cannot mount it and
+        RunPod does not complain — it just re-downloads ~39GB and runs anyway."""
+        _install(monkeypatch, _Resp(status=201, payload={"id": "pod1", "name": "w"}))
+        await runpod_client.launch_worker("w", {"FRIENDLY_NAME": "w"})
+        _, url, body, _ = _Client.calls[0]
+        assert url.endswith("/pods")
+        assert body["dataCenterIds"] == [settings.runpod_datacenter_id]
+        assert body["networkVolumeId"] == "vol_test"
+        assert body["gpuTypeIds"] == [settings.runpod_gpu_type_id]
+        assert body["cloudType"] == "SECURE"
+
+    async def test_missing_volume_is_a_clear_message(self, monkeypatch):
+        _install(monkeypatch)
+        monkeypatch.setattr(settings, "runpod_network_volume_id", "")
+        with pytest.raises(RunPodError, match="RUNPOD_NETWORK_VOLUME_ID"):
+            await runpod_client.launch_worker("w", {})
+
+    async def test_runpod_error_prose_is_passed_through(self, monkeypatch):
+        """Their wording distinguishes no-stock from a bad spec; ours would not."""
+        _install(monkeypatch, _Resp(status=400, payload={"error": "no instances available"}))
+        with pytest.raises(RunPodError, match="no instances available"):
+            await runpod_client.launch_worker("w", {})
+
+
+class TestTerminate:
+    async def test_terminate_calls_delete(self, monkeypatch):
+        _install(monkeypatch, _Resp(status=204))
+        await runpod_client.terminate_worker("pod1")
+        method, url, _, _ = _Client.calls[0]
+        assert method == "DELETE" and url.endswith("/pods/pod1")
+
+    async def test_already_gone_is_success(self, monkeypatch):
+        """404 means the pod is in the state the caller asked for."""
+        _install(monkeypatch, _Resp(status=404))
+        await runpod_client.terminate_worker("pod1")
