@@ -5,14 +5,13 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
 from app.config import settings
 from app.database import get_db
-from app.enums import JobStatus
-from app.models import Favorite, ImageMeta, Job
+from app.models import Favorite, ImageMeta, Job, Segment
 from app.schemas.images import ImageTagsUpdate
 from app.s3 import (
     delete_object,
@@ -28,6 +27,60 @@ from app.s3 import (
 router = APIRouter(tags=["images"])
 
 _FOLDER_NAME_RE = re.compile(r"^[a-zA-Z0-9 _-]+$")
+
+# Every column that can hold an s3:// path a user could delete through this router.
+# Job.identity_reference_image is deliberately absent: the daemon writes it into the *jobs*
+# bucket, so it can never be the target of DELETE /images.
+_JOB_IMAGE_COLUMNS = (Job.starting_image, Job.lynx_subject_image)
+_SEGMENT_IMAGE_COLUMNS = (Segment.start_image, Segment.faceswap_image)
+
+
+async def find_image_references(db: AsyncSession, paths: list[str]) -> dict[str, dict[str, list[str]]]:
+    """Map each still-referenced path to the jobs and segments holding it.
+
+    Deleting a referenced image fails silently: nothing breaks until a worker claims the
+    segment weeks later and S3 returns 404, which costs a pickup and shows up as a red
+    segment nowhere near the cause. That makes the check wider than it first looks:
+
+      - segment-level refs count, not just Job.starting_image. The validated identity recipe
+        sets Segment.faceswap_image on every job, so that is the common holder, and it was
+        invisible to the old listing query.
+      - ARCHIVED jobs count. Archiving hides a job from the UI; it does not stop its segments
+        being re-run, so an archived job's images are still live references.
+      - no user filter, since a reference from anyone's job 404s the worker just the same.
+    """
+    if not paths:
+        return {}
+
+    wanted = set(paths)
+    refs: dict[str, dict[str, list[str]]] = {}
+
+    def _hold(path: str | None, kind: str, holder_id) -> None:
+        if not path or path not in wanted:
+            return
+        entry = refs.setdefault(path, {"job_ids": [], "segment_ids": []})
+        if str(holder_id) not in entry[kind]:
+            entry[kind].append(str(holder_id))
+
+    job_rows = await db.execute(
+        select(Job.id, *_JOB_IMAGE_COLUMNS).where(
+            or_(*[col.in_(paths) for col in _JOB_IMAGE_COLUMNS])
+        )
+    )
+    for row in job_rows.all():
+        for value in row[1:]:
+            _hold(value, "job_ids", row[0])
+
+    seg_rows = await db.execute(
+        select(Segment.id, *_SEGMENT_IMAGE_COLUMNS).where(
+            or_(*[col.in_(paths) for col in _SEGMENT_IMAGE_COLUMNS])
+        )
+    )
+    for row in seg_rows.all():
+        for value in row[1:]:
+            _hold(value, "segment_ids", row[0])
+
+    return refs
 
 
 @router.post("/images/upload", dependencies=[Depends(verify_api_key_or_bearer)])
@@ -95,7 +148,6 @@ async def list_folders():
 async def list_folder_images(
     date: str,
     db: AsyncSession = Depends(get_db),
-    user = Depends(get_current_user),
 ):
     """List images in a date folder, with in_use flag indicating if used by any job."""
     bucket = settings.s3_images_bucket
@@ -106,12 +158,9 @@ async def list_folder_images(
     in_use_set: set[str] = set()
     tags_map: dict[str, str] = {}
     if paths:
-        result = await db.execute(
-            select(Job.starting_image)
-            .where(Job.user_id == user.id, Job.starting_image.in_(paths), Job.status != JobStatus.ARCHIVED)
-            .distinct()
-        )
-        in_use_set = {row[0] for row in result.all()}
+        # Same helper the delete endpoint gates on. When these two disagree the UI is the one
+        # that gets believed, which is how referenced images got deleted in the first place.
+        in_use_set = set(await find_image_references(db, paths))
 
         meta_result = await db.execute(
             select(ImageMeta.path, ImageMeta.tags).where(ImageMeta.path.in_(paths))
@@ -178,7 +227,6 @@ async def list_favorite_images(
 
 @router.get("/images/untagged", dependencies=[Depends(get_current_user)])
 async def list_untagged_images(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Return all images across all folders that have no tags — for tagging triage.
@@ -208,12 +256,7 @@ async def list_untagged_images(
         )
         tagged = {row[0] for row in meta_result.all() if row[1] and row[1].strip()}
 
-        in_use_result = await db.execute(
-            select(Job.starting_image)
-            .where(Job.user_id == user.id, Job.starting_image.in_(paths), Job.status != JobStatus.ARCHIVED)
-            .distinct()
-        )
-        in_use_set = {row[0] for row in in_use_result.all()}
+        in_use_set = set(await find_image_references(db, paths))
 
     untagged = [
         {
@@ -254,11 +297,31 @@ async def move_images(body: dict):
 
 
 @router.delete("/images", dependencies=[Depends(get_current_user)])
-async def delete_image(path: str = Query(...)):
-    """Delete a single image by S3 URI."""
+async def delete_image(
+    path: str = Query(...),
+    force: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete a single image by S3 URI, refusing while a job or segment still points at it.
+
+    force=true skips the check for when the deletion is genuinely intended and the resulting
+    dangling reference is accepted.
+    """
     bucket = settings.s3_images_bucket
     if not path.startswith(f"s3://{bucket}/"):
         raise HTTPException(status_code=400, detail="Path must be in the images bucket")
+    if not force:
+        refs = await find_image_references(db, [path])
+        if path in refs:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": "Image is still referenced; pass force=true to delete anyway",
+                    "path": path,
+                    "job_ids": refs[path]["job_ids"],
+                    "segment_ids": refs[path]["segment_ids"],
+                },
+            )
     await asyncio.to_thread(delete_object, path)
     return {"ok": True}
 
