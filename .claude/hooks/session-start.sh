@@ -42,12 +42,12 @@ else
   cd /home/user
 fi
 
-if [ ! -d "wanly-runpod" ]; then
-  echo "  - Cloning wanly-runpod..."
-  git clone https://github.com/DavidJBarnes/wanly-runpod
+if [ ! -d "wanly-gpu-docker" ]; then
+  echo "  - Cloning wanly-gpu-docker..."
+  git clone https://github.com/DavidJBarnes/wanly-gpu-docker
 else
-  echo "  - wanly-runpod already exists, pulling latest changes..."
-  cd wanly-runpod && git pull origin main 2>/dev/null || git pull 2>/dev/null || true
+  echo "  - wanly-gpu-docker already exists, pulling latest changes..."
+  cd wanly-gpu-docker && git pull origin main 2>/dev/null || git pull 2>/dev/null || true
   cd /home/user
 fi
 
@@ -67,4 +67,4 @@ echo "Available repos:"
 echo "  - /home/user/wanly-api"
 echo "  - /home/user/wanly-console"
 echo "  - /home/user/wanly-gpu-daemon"
-echo "  - /home/user/wanly-runpod"
+echo "  - /home/user/wanly-gpu-docker"
