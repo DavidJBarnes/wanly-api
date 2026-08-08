@@ -22,6 +22,7 @@ from app.helpers import upload_faceswap_image
 from app.models import AppSetting, Job, Lora, Segment, User, Video, VideoSettingsPreset, Wildcard, Worker
 from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
+    EXCLUSIVE_TAG_GROUPS,
     OBSERVATION_TAGS,
     SegmentAnnotation,
     FramePreview,
@@ -1350,9 +1351,17 @@ async def annotate_segment(
                 detail=f"Unknown observation tag(s): {', '.join(unknown)}. "
                        f"Allowed: {', '.join(OBSERVATION_TAGS)}",
             )
+        chosen = set(tags)
+        for group in EXCLUSIVE_TAG_GROUPS:
+            clash = sorted(chosen & group)
+            if len(clash) > 1:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Contradictory tags: {', '.join(clash)}. Pick one.",
+                )
         # Deduped and stored in vocabulary order, so two segments tagged the same way produce
         # identical strings and group without normalising at read time.
-        ordered = [t for t in OBSERVATION_TAGS if t in set(tags)]
+        ordered = [t for t in OBSERVATION_TAGS if t in chosen]
         segment.observation_tags = ",".join(ordered) or None
 
     await db.commit()
