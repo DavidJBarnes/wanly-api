@@ -22,6 +22,8 @@ from app.helpers import upload_faceswap_image
 from app.models import AppSetting, Job, Lora, Segment, User, Video, VideoSettingsPreset, Wildcard, Worker
 from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
+    OBSERVATION_TAGS,
+    SegmentAnnotation,
     FramePreview,
     FramePreviewResponse,
     HologramRequest,
@@ -1295,3 +1297,64 @@ async def delete_segment(
         job.status = JobStatus.AWAITING
 
     await db.commit()
+
+
+@router.get("/segments/observation-tags", response_model=list[str],
+            dependencies=[Depends(get_current_user)])
+async def list_observation_tags():
+    """The controlled vocabulary, served rather than hardcoded in the console.
+
+    One source of truth so a tag written by the UI is the same string any later analysis groups
+    on. That grouping is the whole value: "mouth-void" and "mouth void" are two labels.
+    """
+    return OBSERVATION_TAGS
+
+
+@router.patch("/segments/{segment_id}/annotation", response_model=SegmentResponse)
+async def annotate_segment(
+    segment_id: UUID,
+    body: SegmentAnnotation,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Record what a human saw in this segment.
+
+    Deliberately separate from the daemon's PATCH /segments/{id}: that one carries an API key and
+    writes generation state. This is user-authenticated, writes only annotation, and touches
+    nothing generation reads -- an observation must never be able to change output.
+
+    Fields are individually optional so the modal can save a rating without clearing notes, but
+    an explicitly-sent empty value still clears, because "I typed notes by mistake" needs an undo.
+    """
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+
+    fields = body.model_dump(exclude_unset=True)
+
+    if "notes" in fields:
+        segment.notes = (fields["notes"] or "").strip() or None
+    if "rating" in fields:
+        segment.rating = fields["rating"]
+    if "observation_tags" in fields:
+        tags = fields["observation_tags"] or []
+        unknown = [t for t in tags if t not in OBSERVATION_TAGS]
+        if unknown:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Unknown observation tag(s): {', '.join(unknown)}. "
+                       f"Allowed: {', '.join(OBSERVATION_TAGS)}",
+            )
+        # Deduped and stored in vocabulary order, so two segments tagged the same way produce
+        # identical strings and group without normalising at read time.
+        ordered = [t for t in OBSERVATION_TAGS if t in set(tags)]
+        segment.observation_tags = ",".join(ordered) or None
+
+    await db.commit()
+    await db.refresh(segment)
+    return segment

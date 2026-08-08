@@ -28,6 +28,44 @@ class SegmentCreate(BaseModel):
     video_preset_id: Optional[UUID] = None
 
 
+# The vocabulary lives server-side so the console and any analysis agree on the exact strings.
+# Grouping is the entire point of tags; two spellings of the same observation are two labels.
+#
+# Every tag is <location>-<condition>: where you were looking, then what was wrong or right with
+# it. That keeps the chip row scannable by region and makes the set extensible without debate
+# about naming -- a new observation about the eyes is eyes-<something>, not a fresh coinage.
+#
+OBSERVATION_TAGS = [
+    # Face
+    "face-frozen",
+    "face-blurry",
+    "face-expressive",
+    "mouth-void",
+    "teeth-mush",
+    "identity-drift",
+    # Motion, per person. motion_magnitude is whole-frame Farneback optical flow: it sums every
+    # moving pixel, so a lively woman with a static man scores identically to the reverse. The
+    # metric cannot separate them even in principle, which makes these the ONLY per-person
+    # motion data obtainable.
+    "him-static",
+    "her-static",
+    "him-strong",
+    "her-strong",
+    # Body
+    "anatomy-break",
+]
+
+
+class SegmentAnnotation(BaseModel):
+    """What a human saw. Never read by generation."""
+
+    notes: Optional[str] = Field(None, max_length=4000)
+    rating: Optional[int] = Field(None, ge=1, le=5, description="Overall, 1-5")
+    # Sent as a list and stored comma separated; validated against OBSERVATION_TAGS so a typo
+    # cannot quietly create a ninth tag that groups with nothing.
+    observation_tags: Optional[list[str]] = None
+
+
 class SegmentResponse(BaseModel):
     id: UUID
     job_id: UUID
@@ -50,6 +88,9 @@ class SegmentResponse(BaseModel):
     negative_prompt: Optional[str] = None
     auto_finalize: bool
     transition: Optional[str]
+    notes: Optional[str] = None
+    rating: Optional[int] = None
+    observation_tags: Optional[str] = None
     trim_start_frames: int
     trim_end_frames: int
     motion_keywords: Optional[list[str]] = None
@@ -217,6 +258,9 @@ class SegmentClipResponse(BaseModel):
 
 
 class SegmentTrimUpdate(BaseModel):
+    notes: Optional[str] = None
+    rating: Optional[int] = None
+    observation_tags: Optional[str] = None
     trim_start_frames: int = Field(ge=0)
     trim_end_frames: int = Field(ge=0)
 
