@@ -58,19 +58,16 @@ OBSERVATION_TAGS = [
     "pace-right",
     "pace-fast",
     # Body mechanics -- the single largest quality differentiator observed so far, and one no
-    # metric can see: two bodies rocking TOGETHER generate enormous whole-frame optical flow
+    # metric can see: two bodies moving as ONE UNIT generate enormous whole-frame optical flow
     # while being the wrong motion entirely. The 5-rated segment scored 0.545 and a 3-rated one
     # scored 1.162. motion_magnitude measures quantity; these record correctness.
     #
-    # "rocking" is the reviewer's own word for the failure ("they are moving in unison, they
-    # should be smacking together, not rocking") and it is used deliberately: the earlier name,
-    # bodies-unison, described the behaviour without saying it was wrong, where every other tag
-    # puts the judgement in the condition.
-    "bodies-rocking",
-    # The positive is needed for the same reason pace-right is: without it, an untagged segment
-    # is ambiguous between "the bodies impacted properly" and "I did not judge the mechanics" --
-    # and impact is the outcome round 2 is hunting for.
-    "bodies-impact",
+    # The axis is TRAVEL: he withdraws and re-enters, so the bodies separate and rejoin along an
+    # axis. What fails is not that they "rock" -- that is only how the failure looks from outside
+    # -- it is that they stay joined and there is no relative displacement between them. Naming
+    # both ends for travel keeps the judgement on the thing being judged.
+    "bodies-locked",
+    "bodies-inout",
     "anatomy-break",
 ]
 
@@ -82,7 +79,7 @@ EXCLUSIVE_TAG_GROUPS = [
     {"pace-slow", "pace-right", "pace-fast"},
     {"him-static", "him-strong"},
     {"her-static", "her-strong"},
-    {"bodies-rocking", "bodies-impact"},
+    {"bodies-locked", "bodies-inout"},
 ]
 
 

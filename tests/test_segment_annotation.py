@@ -108,22 +108,20 @@ class TestContradictoryTags:
 
 
 class TestBodyMechanics:
-    def test_the_condition_carries_the_judgement(self):
-        # bodies-unison described the behaviour without saying it was wrong, unlike every other
-        # tag. "rocking" is the reviewer's own word for the failure and reads as a defect.
-        assert "bodies-rocking" in OBSERVATION_TAGS
-        assert "bodies-unison" not in OBSERVATION_TAGS
+    def test_both_ends_name_the_same_axis(self):
+        # The axis is TRAVEL: he withdraws and re-enters. "rocking" described how the failure
+        # looks from outside rather than what is missing, and "impact" named the collision rather
+        # than the displacement that produces it. Both ends now name travel.
+        assert "bodies-locked" in OBSERVATION_TAGS
+        assert "bodies-inout" in OBSERVATION_TAGS
+        for retired in ("bodies-rocking", "bodies-impact", "bodies-unison"):
+            assert retired not in OBSERVATION_TAGS
 
-    def test_impact_is_labelled_too(self):
-        # Same reason pace-right exists: without it, untagged is ambiguous between "the bodies
-        # impacted properly" and "I did not judge the mechanics".
-        assert "bodies-impact" in OBSERVATION_TAGS
+    def test_travel_ends_are_mutually_exclusive(self):
+        assert {"bodies-locked", "bodies-inout"} in EXCLUSIVE_TAG_GROUPS
 
-    def test_rocking_and_impact_are_mutually_exclusive(self):
-        assert {"bodies-rocking", "bodies-impact"} in EXCLUSIVE_TAG_GROUPS
-
-    def test_rocking_is_not_exclusive_with_strong_motion(self):
+    def test_locked_is_not_exclusive_with_strong_motion(self):
         # Both people CAN be moving strongly and still be moving wrongly -- that is exactly the
         # observed case. Making these exclusive would force a choice that misdescribes it.
         for group in EXCLUSIVE_TAG_GROUPS:
-            assert not {"bodies-rocking", "him-strong"} <= group
+            assert not {"bodies-locked", "him-strong"} <= group
