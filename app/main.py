@@ -10,7 +10,7 @@ from slowapi.errors import RateLimitExceeded
 from app.config import settings
 from app.heartbeat_monitor import heartbeat_monitor
 from app.limiter import limiter
-from app.routes import app_settings, auth, faceswap, favorites, files, images, jobs, loras, runpod, segments, tags, video_presets, videos, wildcards, workers
+from app.routes import app_settings, auth, faceswap, favorites, files, images, jobs, loras, runpod, segments, stats, tags, video_presets, videos, wildcards, workers
 
 logger = logging.getLogger(__name__)
 
@@ -66,3 +66,4 @@ app.include_router(wildcards.router)
 app.include_router(video_presets.router)
 app.include_router(workers.router)
 app.include_router(runpod.router)
+app.include_router(stats.router)
