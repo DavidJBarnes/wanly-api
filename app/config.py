@@ -41,6 +41,13 @@ class Settings(BaseSettings):
     runpod_network_volume_id: str = ""
     runpod_datacenter_id: str = ""
     runpod_gpu_type_id: str = "NVIDIA GeForce RTX 4090"
+    # GPUs the launcher offers, comma separated. The 4090 is preferred but community 4090s are
+    # frequently unplaceable — RunPod matches a host and then reports "this machine does not have
+    # the resources", because the community fleet is largely partially committed. The 3090 is the
+    # fallback that does place: slower per segment, but roughly 2/3 the price and actually
+    # obtainable. Anything listed here must be verified against our image; the 5090 is
+    # deliberately absent because the workflow does not run on it.
+    runpod_gpu_type_ids: str = "NVIDIA GeForce RTX 4090,NVIDIA GeForce RTX 3090"
     runpod_image: str = "davidjbarnes/wanly-gpu-docker:latest"
     runpod_container_disk_gb: int = 30
     runpod_volume_mount_path: str = "/workspace"

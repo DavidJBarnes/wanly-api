@@ -175,3 +175,88 @@ class TestAvailabilityFollowsTheConfiguredCloud:
         _, _, body, _ = _Client.calls[0]
         assert body["variables"]["secure"] is True
         assert body["variables"]["dc"] == "EU-RO-1"
+
+
+class TestGpuSelection:
+    """Choosing between GPUs (wanly-console#286 follow-up, 2026-08-08).
+
+    Measured that day: community 4090 returned "this machine does not have the resources" on
+    every on-demand create for over an hour, while community 3090 and the identical 4090 spec as
+    interruptible both placed on the first try. So the fleet was not empty -- the 4090 hosts were
+    all partially committed. Being able to ask for a 3090 instead is the difference between
+    working and waiting.
+    """
+
+    def test_offers_the_configured_list(self, monkeypatch):
+        monkeypatch.setattr(settings, "runpod_gpu_type_ids", "GPU A,GPU B")
+        monkeypatch.setattr(settings, "runpod_gpu_type_id", "GPU A")
+        assert runpod_client.selectable_gpus() == ["GPU A", "GPU B"]
+
+    def test_default_is_always_offered_even_if_absent_from_the_list(self, monkeypatch):
+        # Otherwise a typo in the list silently removes the GPU every launch defaults to, and
+        # the dialog offers everything except the one it is about to use.
+        monkeypatch.setattr(settings, "runpod_gpu_type_ids", "GPU B")
+        monkeypatch.setattr(settings, "runpod_gpu_type_id", "GPU A")
+        assert runpod_client.selectable_gpus() == ["GPU A", "GPU B"]
+
+    def test_blank_entries_are_dropped(self, monkeypatch):
+        monkeypatch.setattr(settings, "runpod_gpu_type_ids", "GPU A, ,GPU B,")
+        monkeypatch.setattr(settings, "runpod_gpu_type_id", "GPU A")
+        assert runpod_client.selectable_gpus() == ["GPU A", "GPU B"]
+
+    @pytest.mark.asyncio
+    async def test_launch_asks_for_the_requested_gpu(self, monkeypatch):
+        _install(monkeypatch, _Resp(200, {"id": "pod1", "name": "w"}))
+        await runpod_client.launch_worker("w", {}, "NVIDIA GeForce RTX 3090")
+        spec = _Client.calls[0][2]
+        assert spec["gpuTypeIds"] == ["NVIDIA GeForce RTX 3090"]
+
+    @pytest.mark.asyncio
+    async def test_launch_falls_back_to_the_configured_default(self, monkeypatch):
+        _install(monkeypatch, _Resp(200, {"id": "pod1", "name": "w"}))
+        monkeypatch.setattr(settings, "runpod_gpu_type_id", "NVIDIA GeForce RTX 4090")
+        await runpod_client.launch_worker("w", {}, None)
+        assert _Client.calls[0][2]["gpuTypeIds"] == ["NVIDIA GeForce RTX 4090"]
+
+    @pytest.mark.asyncio
+    async def test_availability_asks_about_the_requested_gpu(self, monkeypatch):
+        _install(monkeypatch, _Resp(200, _availability_payload(0.22)))
+        result = await runpod_client.get_availability("NVIDIA GeForce RTX 3090")
+        assert _Client.calls[0][2]["variables"]["gpu"] == "NVIDIA GeForce RTX 3090"
+        assert result["gpu_type_id"] == "NVIDIA GeForce RTX 3090"
+
+
+class TestPlacementFailureWording:
+    """RunPod says two different things in the same 500 and the difference is the diagnosis.
+
+    Passing its prose through unexplained is what sent a user into dozens of blind retries
+    against a request that could not succeed.
+    """
+
+    def test_fit_failure_says_retry_or_switch_gpu(self):
+        msg = runpod_client.explain_placement_failure(
+            "create pod: This machine does not have the resources to deploy your pod."
+        )
+        assert "different GPU" in msg
+        # Must NOT claim there is no stock -- that is the other error, and acting on it (waiting)
+        # is exactly the wrong response to a fit failure.
+        assert "no stock" not in msg.lower()
+
+    def test_no_stock_says_waiting_will_not_help_yet(self):
+        msg = runpod_client.explain_placement_failure(
+            "create pod: There are no instances currently available"
+        )
+        assert "no stock" in msg.lower()
+        assert "retrying will not help" in msg.lower()
+
+    def test_unrecognised_errors_pass_through_untouched(self):
+        assert runpod_client.explain_placement_failure("something else") == "something else"
+
+    @pytest.mark.asyncio
+    async def test_launch_failure_is_explained_not_just_relayed(self, monkeypatch):
+        _install(monkeypatch, _Resp(
+            500, {"error": "create pod: This machine does not have the resources to deploy your pod"}
+        ))
+        with pytest.raises(RunPodError) as e:
+            await runpod_client.launch_worker("w", {})
+        assert "different GPU" in str(e.value)

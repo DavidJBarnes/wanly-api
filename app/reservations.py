@@ -87,10 +87,19 @@ def decide(
 # what RunPod actually returns for capacity.
 _CAPACITY_PHRASES = (
     "no instances available",
+    "no instances currently available",
     "no longer any instances available",
     "not enough free gpu",
     "out of capacity",
     "no capacity",
+    # RunPod's other placement failure, and the one that is easiest to misread. It means a host
+    # WAS matched and could not fit the pod, not that the fleet is empty -- measured 2026-08-08,
+    # when community 4090 returned this on every on-demand create while the identical spec
+    # succeeded as interruptible. Retryable for the same reason: it is about a moment's headroom
+    # on one machine, and the next attempt draws a different machine. It reached the right
+    # verdict by falling through to the unknown-error default before; naming it makes that
+    # deliberate rather than lucky, and keeps it right if the default ever changes.
+    "does not have the resources",
 )
 
 

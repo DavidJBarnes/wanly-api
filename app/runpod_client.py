@@ -33,6 +33,20 @@ def _is_secure() -> bool:
     return settings.runpod_cloud_type.upper() == "SECURE"
 
 
+def selectable_gpus() -> list[str]:
+    """The GPUs the launcher may be asked for, in preference order.
+
+    An allowlist rather than "whatever the caller sends": a GPU is only usable if our image runs
+    on it, and the 5090 is the standing counter-example. Letting the browser name an arbitrary
+    gpuTypeId would make an unsupported pod one typo away.
+    """
+    names = [g.strip() for g in settings.runpod_gpu_type_ids.split(",") if g.strip()]
+    # The configured default is always offered, even if it was left out of the list.
+    if settings.runpod_gpu_type_id and settings.runpod_gpu_type_id not in names:
+        names.insert(0, settings.runpod_gpu_type_id)
+    return names
+
+
 def _headers() -> dict:
     if not settings.runpod_api_key:
         raise RunPodError(
@@ -41,16 +55,21 @@ def _headers() -> dict:
     return {"Authorization": f"Bearer {settings.runpod_api_key}"}
 
 
-async def get_availability() -> dict:
-    """Stock and price for the configured GPU in the configured datacenter.
+async def get_availability(gpu_type_id: str | None = None) -> dict:
+    """Price and stock band for a GPU in the configured datacenter.
 
     Returns {"available": bool, "price": float|None, "stock": str|None, ...}.
 
-    Availability genuinely flaps — sampling one GPU/DC pair ten times over a few minutes has
-    returned stock in some samples and nothing in others. So this is a point-in-time answer and
-    a launch can still fail afterwards; it exists to give the user a useful "no capacity right
-    now" instead of an opaque failure.
+    IMPORTANT: `available` means "RunPod quotes a price for this GPU here", which is NOT the same
+    as "a pod can be placed". Measured 2026-08-08: community 4090 reported available=True,
+    stock="Low" continuously while every single create failed with "this machine does not have
+    the resources". lowestPrice knows nothing about whether any individual host has room. So
+    treat this as a cheap negative signal — a False is a reliable no, a True is not a yes.
+
+    Availability also genuinely flaps: sampling one GPU/DC pair ten times over a few minutes has
+    returned stock in some samples and nothing in others.
     """
+    gpu = gpu_type_id or settings.runpod_gpu_type_id
     # dataCenterId is omitted entirely when nothing is pinned. Passing null narrows the query
     # to "datacenters with no id", which reports no capacity anywhere — the failure would look
     # exactly like being out of stock.
@@ -67,7 +86,7 @@ async def get_availability() -> dict:
         }
         """
         variables = {
-            "gpu": settings.runpod_gpu_type_id,
+            "gpu": gpu,
             "secure": _is_secure(),
             "dc": settings.runpod_datacenter_id,
         }
@@ -83,7 +102,7 @@ async def get_availability() -> dict:
           }
         }
         """
-        variables = {"gpu": settings.runpod_gpu_type_id, "secure": _is_secure()}
+        variables = {"gpu": gpu, "secure": _is_secure()}
 
     payload = {"query": query, "variables": variables}
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
@@ -97,7 +116,7 @@ async def get_availability() -> dict:
     lowest = (types[0].get("lowestPrice") or {}) if types else {}
     price = lowest.get("uninterruptablePrice")
     return {
-        "gpu_type_id": settings.runpod_gpu_type_id,
+        "gpu_type_id": gpu,
         "datacenter_id": settings.runpod_datacenter_id or "any",
         "cloud_type": settings.runpod_cloud_type,
         # No price means no inventory for this GPU in this datacenter right now.
@@ -107,18 +126,21 @@ async def get_availability() -> dict:
     }
 
 
-async def launch_worker(name: str, env: dict[str, str]) -> dict:
+async def launch_worker(name: str, env: dict[str, str], gpu_type_id: str | None = None) -> dict:
     """Create a pod, attached to the configured network volume.
 
     On community cloud there is no volume and no datacenter pin, so the pod lands wherever there
     is capacity and stages its own models. When a volume IS configured, the datacenter must be
     pinned to match it: a pod in the wrong region cannot mount it, and RunPod does not fail
     loudly about that — it just runs without the models and re-downloads ~39GB.
+
+    gpu_type_id picks between the GPUs in selectable_gpus(); None uses the configured default.
+    The caller is responsible for having validated it against that allowlist.
     """
     spec = {
         "name": name,
         "imageName": settings.runpod_image,
-        "gpuTypeIds": [settings.runpod_gpu_type_id],
+        "gpuTypeIds": [gpu_type_id or settings.runpod_gpu_type_id],
         "gpuCount": 1,
         "cloudType": settings.runpod_cloud_type,
         "containerDiskInGb": settings.runpod_container_disk_gb,
@@ -195,11 +217,44 @@ def _readable_error(resp: httpx.Response) -> str:
         body = resp.json()
     except Exception:
         return f"RunPod returned {resp.status_code}: {resp.text[:200]}"
+    raw = ""
     if isinstance(body, dict):
         for key in ("error", "message", "detail"):
             value = body.get(key)
             if isinstance(value, str) and value:
-                return value
+                raw = value
+                break
             if isinstance(value, dict) and value.get("message"):
-                return str(value["message"])
-    return f"RunPod returned {resp.status_code}: {str(body)[:200]}"
+                raw = str(value["message"])
+                break
+    if not raw:
+        return f"RunPod returned {resp.status_code}: {str(body)[:200]}"
+    return explain_placement_failure(raw)
+
+
+# RunPod says two very different things in the same 500, and the difference is the whole
+# diagnosis. Measured directly: on community, an A5000 request returns "no instances currently
+# available" while a 4090 returns "does not have the resources" -- and the identical 4090 spec
+# succeeds as interruptible. So the 4090 message means a host WAS matched and could not fit an
+# on-demand reservation, not that the fleet is empty. Passing RunPod's wording through
+# unexplained sent a user into dozens of blind retries against a request that could not succeed.
+_NO_STOCK = "no instances currently available"
+_NO_FIT = "does not have the resources"
+
+
+def explain_placement_failure(message: str) -> str:
+    """Turn RunPod's two placement errors into something that says what to do next."""
+    low = message.lower()
+    if _NO_FIT in low:
+        return (
+            f"{message.strip().rstrip('.')}. RunPod found a matching host but could not fit the "
+            "pod on it — on community cloud the fleet is largely partially committed, so this is "
+            "typical for in-demand GPUs and is not a spec problem. Retrying can work; picking a "
+            "different GPU usually does."
+        )
+    if _NO_STOCK in low:
+        return (
+            f"{message.strip().rstrip('.')}. There is genuinely no stock for this GPU on this "
+            "cloud right now — unlike a fit failure, retrying will not help until stock returns."
+        )
+    return message
