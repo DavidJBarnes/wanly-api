@@ -36,8 +36,13 @@ class TestCoreCases:
     def test_capacity_inside_the_window_launches(self):
         assert _decide(available=True).action is Action.LAUNCH
 
-    def test_no_capacity_inside_the_window_waits(self):
-        assert _decide(available=False).action is Action.WAIT
+    def test_no_price_quoted_still_attempts(self):
+        # The price check is advice, not a gate. Measured 2026-08-08 it is wrong in BOTH
+        # directions: community 4090 reported available through an hour of total failure, and
+        # the 3090 reported NO PRICE minutes after a 3090 pod placed on the first try. A live
+        # reservation then sat at attempts=0 and expired without ever calling RunPod. A
+        # reservation that will not try is not a reservation.
+        assert _decide(available=False).action is Action.LAUNCH
 
     def test_no_capacity_past_the_deadline_expires(self):
         assert _decide(available=False, now=LATER).action is Action.EXPIRE
@@ -76,9 +81,13 @@ class TestErrorHandling:
         assert d.action is Action.ABORT
         assert "401" in d.reason
 
-    def test_a_capacity_error_keeps_waiting(self):
+    def test_a_capacity_error_keeps_the_reservation_alive(self):
+        # The point is that it does not ABORT -- a transient capacity failure must not kill a
+        # window the user is still inside. Since the price check no longer gates, "alive" now
+        # means it tries again rather than idles.
         d = _decide(last_error=RuntimeError("no instances available"), available=False)
-        assert d.action is Action.WAIT
+        assert d.action is not Action.ABORT
+        assert d.action is Action.LAUNCH
 
 
 class TestErrorClassification:
