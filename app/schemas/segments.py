@@ -57,12 +57,20 @@ OBSERVATION_TAGS = [
     "pace-slow",
     "pace-right",
     "pace-fast",
-    # Body mechanics. bodies-unison is the single largest quality differentiator observed so far
-    # and no metric can see it: two bodies rocking together generate ENORMOUS whole-frame optical
-    # flow while being the wrong motion entirely. The 5-rated segment scored 0.545 and a 3-rated
-    # one scored 1.162. motion_magnitude measures quantity; this tag is the only record of
-    # correctness.
-    "bodies-unison",
+    # Body mechanics -- the single largest quality differentiator observed so far, and one no
+    # metric can see: two bodies rocking TOGETHER generate enormous whole-frame optical flow
+    # while being the wrong motion entirely. The 5-rated segment scored 0.545 and a 3-rated one
+    # scored 1.162. motion_magnitude measures quantity; these record correctness.
+    #
+    # "rocking" is the reviewer's own word for the failure ("they are moving in unison, they
+    # should be smacking together, not rocking") and it is used deliberately: the earlier name,
+    # bodies-unison, described the behaviour without saying it was wrong, where every other tag
+    # puts the judgement in the condition.
+    "bodies-rocking",
+    # The positive is needed for the same reason pace-right is: without it, an untagged segment
+    # is ambiguous between "the bodies impacted properly" and "I did not judge the mechanics" --
+    # and impact is the outcome round 2 is hunting for.
+    "bodies-impact",
     "anatomy-break",
 ]
 
@@ -74,6 +82,7 @@ EXCLUSIVE_TAG_GROUPS = [
     {"pace-slow", "pace-right", "pace-fast"},
     {"him-static", "him-strong"},
     {"her-static", "her-strong"},
+    {"bodies-rocking", "bodies-impact"},
 ]
 
 
