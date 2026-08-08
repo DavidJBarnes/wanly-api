@@ -8,6 +8,20 @@ permissions:
   id-token: write
   contents: read
 
+# One deploy at a time. The steps are already idempotent -- they stop and remove the container
+# before starting it -- but two runs interleaving defeats that: both remove, both start, and the
+# second gets "the container name /wanly-api is already in use". Seen 2026-08-08 when two PRs
+# merged nineteen seconds apart, and the failure is worse than a red build. Whichever run loses
+# the race is arbitrary, so a close pair can leave the OLDER image running while CI reports
+# success on the newer commit -- stale code with no signal that anything went wrong.
+#
+# cancel-in-progress is false on purpose. Cancelling a deploy mid-flight can leave the host with
+# no container at all, having already removed the previous one. Queueing costs a few minutes and
+# still converges on the newest commit, because a third run supersedes the one waiting.
+concurrency:
+  group: deploy-api
+  cancel-in-progress: false
+
 env:
   AWS_REGION: us-west-2
   ECR_REPOSITORY: wanly-api
