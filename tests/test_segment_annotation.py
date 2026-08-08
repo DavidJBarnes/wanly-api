@@ -108,15 +108,22 @@ class TestContradictoryTags:
 
 
 class TestBodyMechanics:
-    def test_unison_is_labelled(self):
-        # The largest observed quality differentiator, and invisible to every metric: two bodies
-        # rocking together produce enormous whole-frame optical flow while being the wrong motion.
-        # A 5-rated segment scored 0.545; a 3-rated one scored 1.162. Without this tag the
-        # distinction survives only in free text and cannot be aggregated.
-        assert "bodies-unison" in OBSERVATION_TAGS
+    def test_the_condition_carries_the_judgement(self):
+        # bodies-unison described the behaviour without saying it was wrong, unlike every other
+        # tag. "rocking" is the reviewer's own word for the failure and reads as a defect.
+        assert "bodies-rocking" in OBSERVATION_TAGS
+        assert "bodies-unison" not in OBSERVATION_TAGS
 
-    def test_unison_is_not_exclusive_with_strong_motion(self):
+    def test_impact_is_labelled_too(self):
+        # Same reason pace-right exists: without it, untagged is ambiguous between "the bodies
+        # impacted properly" and "I did not judge the mechanics".
+        assert "bodies-impact" in OBSERVATION_TAGS
+
+    def test_rocking_and_impact_are_mutually_exclusive(self):
+        assert {"bodies-rocking", "bodies-impact"} in EXCLUSIVE_TAG_GROUPS
+
+    def test_rocking_is_not_exclusive_with_strong_motion(self):
         # Both people CAN be moving strongly and still be moving wrongly -- that is exactly the
         # observed case. Making these exclusive would force a choice that misdescribes it.
         for group in EXCLUSIVE_TAG_GROUPS:
-            assert not {"bodies-unison", "him-strong"} <= group
+            assert not {"bodies-rocking", "him-strong"} <= group
