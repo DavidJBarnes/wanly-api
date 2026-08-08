@@ -1,26 +1,112 @@
+"""Pricing a segment: how long is this one going to take to run?
+
+The number feeds the queue ETA in the console, so the failure that matters is not imprecision,
+it is confidence about a shape or a GPU the estimate was never drawn from. Everything here was
+fitted against the 3280 completed segments in production rather than reasoned about, and the
+measurements are recorded next to the constants they justify so a future change has something to
+argue with.
+
+Shape of the model. Run time is a per-shape rate multiplied by the segment's duration raised to
+DURATION_EXPONENT. The obvious alternative - a fixed per-segment overhead plus a per-second
+sampling rate, on the theory that decode, RIFE, stitch, faceswap and identity scoring cost the
+same whatever the length - does not survive contact with the data, twice over. Fitting a shared
+intercept across the eight shapes that have been run at more than one duration puts it at -326s
+(bootstrap 95% CI -423 to -217), so the sign is wrong, and it buys an R2 of 0.8864 against 0.8820
+for the zero-intercept fit. Parsing the phase timestamps out of progress_log on 2341 segments
+says why: the post-sampling tail is a median 41s, only 9.2% of run time, and it is not fixed -
+at 1056x720 it runs 28s / 59s / 81s for 1.5s / 3s / 5s segments, because the work in it is
+per-frame too. There is a genuinely fixed cost, the setup before ComfyUI is handed the job, and
+it is a median 3 seconds. Nothing worth modelling.
+"""
+
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
-from sqlalchemy import func, select
+from sqlalchemy import Float, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import SegmentStatus
 from app.models import Job, Segment
 
+# Run time grows faster than duration because attention over the video tokens does. Measured on
+# the one shape with real leverage, 1056x720 at 3s (n=41) and 5s (n=102): the ComfyUI execution
+# ran 812s against 1666s, a 2.05x cost for a 1.67x duration, which is an exponent of 1.41; the
+# 1.5s runs give 1.38 by the same arithmetic. Backtesting the estimator against every segment it
+# had history for, the exponent cuts median absolute error on non-5s segments from 17.5% to 4.5%
+# (p90 23.0% to 7.4%) and leaves the 5s case untouched, since the rate is fitted the same way it
+# is applied.
+DURATION_EXPONENT = 1.4
 
-async def get_estimation_rates(
-    db: AsyncSession, user_id: UUID
-) -> dict:
-    """Compute average run-time-per-second rates from completed segments.
+# Only recent runs. Model, sampler and step count all drift, and a rate learned in February is
+# describing a different pipeline. Backtesting says this is the single largest win available
+# here: 30 days over all history moves median absolute error from 16.9% to 14.3% and p90 from
+# 51.5% to 43.1%. 60 and 90 day windows both come out worse (14.5%/49.4% and 15.7%/52.6%).
+WINDOW_DAYS = 30
 
-    Returns dict with:
-      - rates: {(width, height, fps): rate} — config-level
-      - worker_rates: {(width, height, fps, worker_name): rate} — worker+config
-      - global_rate: float | None — ungrouped fallback
+# How many runs before a group is allowed to speak for itself. One observation produces a
+# confident-looking rate from what might be a stall. Three is the measured sweet spot - at one
+# sample median error is 13.9% but p90 is 45.4%, at five it is 14.7%/41.6%, and three sits at
+# 14.3%/43.1% while sending fewer shapes down to the fallback.
+MIN_SAMPLES = 3
+
+# The pixel law needs enough shapes to have a slope worth trusting rather than two points and a
+# ruler.
+MIN_PIXEL_LAW_SHAPES = 5
+
+
+@dataclass(frozen=True)
+class PixelLaw:
+    """rate = exp(intercept) * pixels ** slope, plus the pixel range it was fitted over."""
+
+    slope: float
+    intercept: float
+    shapes: int
+    min_pixels: int
+    max_pixels: int
+
+    def rate(self, pixels: int) -> float:
+        # Clamped to the fitted range. The slope is only stable-ish: across rolling 30 day
+        # windows of the corpus it wanders between 0.71 and 1.51 (median 1.05, and 1.67 right
+        # now, because the last month has been a narrow band of 307k to 922k pixel shapes).
+        # Interpolating inside the measured band with a slope like that is fine; extrapolating a
+        # long way outside it compounds the error, so a shape twice as large as anything ever
+        # run gets priced as the largest thing ever run. That reads low, which is the failure
+        # this module keeps choosing.
+        bounded = min(max(pixels, self.min_pixels), self.max_pixels)
+        return math.exp(self.intercept + self.slope * math.log(bounded))
+
+
+@dataclass(frozen=True)
+class Estimate:
+    """A priced segment and where the price came from.
+
+    `source` and `samples` exist so a caller can tell "measured on this GPU at this shape, 40
+    times" from "extrapolated from other shapes because we have never run this one", which are
+    the same float and very different claims.
     """
-    run_time_expr = (
-        func.extract("epoch", Segment.completed_at)
-        - func.extract("epoch", Segment.claimed_at)
-    )
+
+    seconds: float
+    source: str
+    samples: int
+
+
+async def get_estimation_rates(db: AsyncSession, user_id: UUID) -> dict:
+    """Fit the estimator against this user's recent completed segments.
+
+    Returns a dict with:
+      - shape_rates: {(width, height, fps): (rate, samples)} pooled across GPUs
+      - gpu_rates: {(width, height, fps, gpu_name): (rate, samples)}
+      - gpu_factors: {gpu_name: multiplier against the pooled rate}
+      - pixel_law: PixelLaw | None - rate as a function of the shape's pixel count
+    """
+    elapsed = func.extract("epoch", Segment.completed_at - Segment.claimed_at).cast(Float)
+    rate = elapsed / func.power(Segment.duration_seconds, DURATION_EXPONENT)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=WINDOW_DAYS)
+
     base = (
         select()
         .select_from(Segment)
@@ -30,75 +116,158 @@ async def get_estimation_rates(
             Segment.status == SegmentStatus.COMPLETED,
             Segment.claimed_at.isnot(None),
             Segment.completed_at.isnot(None),
+            Segment.completed_at >= cutoff,
             Segment.duration_seconds > 0,
         )
     )
 
-    # 1. Config-level rates
-    config_result = await db.execute(
-        base.add_columns(
-            Job.width,
-            Job.height,
-            Job.fps,
-            func.avg(run_time_expr / Segment.duration_seconds),
-        ).group_by(Job.width, Job.height, Job.fps)
-    )
-    rates = {}
-    for row in config_result.all():
-        w, h, fps, avg_rate = row
-        if avg_rate is not None:
-            rates[(w, h, fps)] = float(avg_rate)
+    # Median, not mean, matching the stats endpoint (wanly-console#287) so the two views cannot
+    # disagree about the same segments. Honesty about what it buys: on median absolute error the
+    # mean is actually the better predictor (12.9% against 14.3%), because the run-time
+    # distribution is right skewed and the mean leans into that. The median wins where it was
+    # meant to, in the tail - p90 43.1% against 44.5% - and one stalled run cannot move it at
+    # all, which is the property being paid for.
+    median_rate = func.percentile_cont(0.5).within_group(rate)
 
-    # 2. Worker-level rates
-    worker_result = await db.execute(
-        base.add_columns(
-            Job.width,
-            Job.height,
-            Job.fps,
-            Segment.worker_name,
-            func.avg(run_time_expr / Segment.duration_seconds),
+    shape_result = await db.execute(
+        base.add_columns(Job.width, Job.height, Job.fps, median_rate, func.count()).group_by(
+            Job.width, Job.height, Job.fps
         )
-        .where(Segment.worker_name.isnot(None))
-        .group_by(Job.width, Job.height, Job.fps, Segment.worker_name)
     )
-    worker_rates = {}
-    for row in worker_result.all():
-        w, h, fps, worker, avg_rate = row
-        if avg_rate is not None:
-            worker_rates[(w, h, fps, worker)] = float(avg_rate)
+    shape_rates: dict[tuple, tuple[float, int]] = {}
+    for width, height, fps, value, samples in shape_result.all():
+        if value is not None and value > 0:
+            shape_rates[(width, height, fps)] = (float(value), samples)
 
-    # 3. Global fallback
-    global_result = await db.execute(
-        base.add_columns(func.avg(run_time_expr / Segment.duration_seconds))
+    # Keyed on gpu_name, not worker_name. A RunPod worker's row is deleted when the pod drains
+    # and its name is never reused, so every rate learned from a pod used to die with it; the GPU
+    # is what determines speed and is snapshotted onto the segment. Note this tier can only fire
+    # for a segment already claimed - a pending one has no GPU yet - which is correct: the right
+    # price for work nobody has picked up is the pooled rate across whatever might pick it up.
+    gpu_result = await db.execute(
+        base.add_columns(
+            Job.width, Job.height, Job.fps, Segment.gpu_name, median_rate, func.count()
+        )
+        .where(Segment.gpu_name.isnot(None))
+        .group_by(Job.width, Job.height, Job.fps, Segment.gpu_name)
     )
-    global_rate_val = global_result.scalar_one_or_none()
-    global_rate = float(global_rate_val) if global_rate_val is not None else None
+    gpu_rates: dict[tuple, tuple[float, int]] = {}
+    for width, height, fps, gpu_name, value, samples in gpu_result.all():
+        if value is not None and value > 0:
+            gpu_rates[(width, height, fps, gpu_name)] = (float(value), samples)
 
     return {
-        "rates": rates,
-        "worker_rates": worker_rates,
-        "global_rate": global_rate,
+        "shape_rates": shape_rates,
+        "gpu_rates": gpu_rates,
+        "gpu_factors": _gpu_factors(shape_rates, gpu_rates),
+        "pixel_law": _fit_pixel_law(shape_rates),
     }
 
 
-def sum_estimated_queue_time(rates: dict, segments) -> float:
-    """Total estimated seconds for a set of queued segments.
+def _gpu_factors(shape_rates: dict, gpu_rates: dict) -> dict[str, float]:
+    """How much faster or slower each GPU is than the pool, measured rather than guessed.
 
-    Each row is (width, height, fps, duration_seconds, worker_name).
-
-    A segment the estimator cannot price — no completed run at that config and no global
-    rate to fall back on — contributes nothing rather than a guess. That makes the total
-    read low on a cold database instead of confidently wrong, which is the safer failure
-    for a number used to decide whether there is time to queue more work.
+    This is what lets a GPU with no history at a shape still be priced better than the pool
+    average: take the shape's pooled rate and scale it. The ticket estimated the 3090 to 4090 gap
+    at roughly 2x from a single pair of runs; across the shapes where both have been measured it
+    is 0.658 at 1056x720 and 0.777 at 960x720, so nearer 1.4x. That is the sort of correction
+    that only shows up once the ratio is computed instead of eyeballed.
     """
-    total = 0.0
-    for width, height, fps, duration_seconds, worker_name in segments:
-        if not duration_seconds:
+    ratios: dict[str, list[float]] = {}
+    for (width, height, fps, gpu_name), (gpu_rate, samples) in gpu_rates.items():
+        if samples < MIN_SAMPLES:
             continue
-        est = estimate_segment_time(rates, width, height, fps, duration_seconds, worker_name)
-        if est:
-            total += est
-    return round(total, 1)
+        pooled = shape_rates.get((width, height, fps))
+        if pooled and pooled[1] >= MIN_SAMPLES and pooled[0] > 0:
+            ratios.setdefault(gpu_name, []).append(gpu_rate / pooled[0])
+    return {gpu_name: _median(values) for gpu_name, values in ratios.items() if values}
+
+
+def _fit_pixel_law(shape_rates: dict) -> PixelLaw | None:
+    """Fit log(rate) = intercept + slope * log(pixels) across the shapes that have been run.
+
+    This replaces the old global average as the last resort, and it is not a small difference.
+    On exactly the segments that reach the fallback - a shape with no history of its own, which
+    is when the user has least of their own information - the pixel law lands at 22.3% median
+    absolute error against 38.7% for a flat global rate, and 53.1% at p90 against 75.8%. Fitted
+    over the whole corpus the slope is 1.02, so run time is close to linear in pixel count, which
+    is the reassuring part: the fallback is following a real relationship rather than smearing
+    480p and 720p together and calling the result an estimate.
+    """
+    points = [
+        (math.log(width * height), math.log(value), samples)
+        for (width, height, _fps), (value, samples) in shape_rates.items()
+        if samples >= MIN_SAMPLES and width and height and value > 0
+    ]
+    if len(points) < MIN_PIXEL_LAW_SHAPES:
+        return None
+
+    # Weighted by sample count so a shape run 650 times outvotes one run four times.
+    weight = sum(n for _, _, n in points)
+    mean_x = sum(x * n for x, _, n in points) / weight
+    mean_y = sum(y * n for _, y, n in points) / weight
+    variance = sum(n * (x - mean_x) ** 2 for x, _, n in points)
+    if variance <= 0:  # every shape has the same pixel count, so there is no slope to find
+        return None
+    slope = sum(n * (x - mean_x) * (y - mean_y) for x, y, n in points) / variance
+    return PixelLaw(
+        slope=slope,
+        intercept=mean_y - slope * mean_x,
+        shapes=len(points),
+        min_pixels=round(math.exp(min(x for x, _, _ in points))),
+        max_pixels=round(math.exp(max(x for x, _, _ in points))),
+    )
+
+
+def _median(values: list[float]) -> float:
+    ordered = sorted(values)
+    middle = len(ordered) // 2
+    if len(ordered) % 2:
+        return ordered[middle]
+    return (ordered[middle - 1] + ordered[middle]) / 2
+
+
+def estimate_segment(
+    rates: dict,
+    width: int,
+    height: int,
+    fps: int,
+    duration_seconds: float,
+    gpu_name: str | None = None,
+) -> Estimate | None:
+    """Price one segment, most specific evidence first.
+
+    GPU at this shape, then the shape pooled across GPUs (scaled by how fast this GPU runs, when
+    that is known), then extrapolated along the pixel law, then nothing. There is deliberately no
+    global-average tier: a single number covering 704x480 at 329s and 720x1056 at 1774s is not a
+    weak estimate, it is a wrong one, and it was being served precisely when the shape was new.
+    """
+    if not duration_seconds or duration_seconds <= 0:
+        return None
+
+    scaled_duration = duration_seconds**DURATION_EXPONENT
+
+    if gpu_name:
+        measured = rates["gpu_rates"].get((width, height, fps, gpu_name))
+        if measured and measured[1] >= MIN_SAMPLES:
+            return Estimate(round(measured[0] * scaled_duration, 1), "gpu", measured[1])
+
+    pooled = rates["shape_rates"].get((width, height, fps))
+    if pooled and pooled[1] >= MIN_SAMPLES:
+        factor = rates["gpu_factors"].get(gpu_name) if gpu_name else None
+        if factor:
+            seconds = pooled[0] * factor * scaled_duration
+            return Estimate(round(seconds, 1), "gpu_scaled", pooled[1])
+        return Estimate(round(pooled[0] * scaled_duration, 1), "shape", pooled[1])
+
+    law = rates["pixel_law"]
+    if law and width and height:
+        # samples is the number of shapes the law was fitted from, not runs at this shape, of
+        # which there are none. Anything reading it should be reading `source` too.
+        seconds = law.rate(width * height) * scaled_duration
+        return Estimate(round(seconds, 1), "pixel_law", law.shapes)
+
+    return None
 
 
 def estimate_segment_time(
@@ -107,24 +276,27 @@ def estimate_segment_time(
     height: int,
     fps: int,
     duration_seconds: float,
-    worker_name: str | None = None,
+    gpu_name: str | None = None,
 ) -> float | None:
-    """Estimate run time in seconds using best available rate.
+    """Estimated run time in seconds, or None when there is nothing to base one on."""
+    estimate = estimate_segment(rates, width, height, fps, duration_seconds, gpu_name)
+    return estimate.seconds if estimate else None
 
-    Priority: worker+config → config → global → None
+
+def sum_estimated_queue_time(rates: dict, segments) -> float:
+    """Total estimated seconds for a set of queued segments.
+
+    Each row is (width, height, fps, duration_seconds, gpu_name).
+
+    A segment the estimator cannot price contributes nothing rather than a guess. That makes the
+    total read low on a cold database instead of confidently wrong, which is the safer failure
+    for a number used to decide whether there is time to queue more work.
     """
-    rate = None
-
-    if worker_name:
-        rate = rates["worker_rates"].get((width, height, fps, worker_name))
-
-    if rate is None:
-        rate = rates["rates"].get((width, height, fps))
-
-    if rate is None:
-        rate = rates["global_rate"]
-
-    if rate is None:
-        return None
-
-    return round(rate * duration_seconds, 1)
+    total = 0.0
+    for width, height, fps, duration_seconds, gpu_name in segments:
+        if not duration_seconds:
+            continue
+        est = estimate_segment_time(rates, width, height, fps, duration_seconds, gpu_name)
+        if est:
+            total += est
+    return round(total, 1)

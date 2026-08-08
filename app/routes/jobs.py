@@ -398,7 +398,7 @@ async def list_jobs(
             select(
                 Segment.job_id,
                 Segment.duration_seconds,
-                Segment.worker_name,
+                Segment.gpu_name,
             )
             .where(
                 Segment.job_id.in_(active_job_ids),
@@ -409,12 +409,12 @@ async def list_jobs(
         if active_segs:
             rates = await get_estimation_rates(db, user.id)
             for row in active_segs:
-                seg_job_id, seg_dur, seg_worker = row
+                seg_job_id, seg_dur, seg_gpu = row
                 job_obj = next((j for j in active_jobs if j.id == seg_job_id), None)
                 if job_obj:
                     est = estimate_segment_time(
                         rates, job_obj.width, job_obj.height, job_obj.fps,
-                        seg_dur, seg_worker,
+                        seg_dur, seg_gpu,
                     )
                     est_map[seg_job_id] = est
 
@@ -536,7 +536,7 @@ async def get_job(
             if s.status in (SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING):
                 est = estimate_segment_time(
                     rates, job.width, job.height, job.fps,
-                    s.duration_seconds, s.worker_name,
+                    s.duration_seconds, s.gpu_name,
                 )
                 sr.estimated_run_time = est
                 if job_est is None:
@@ -695,7 +695,7 @@ async def reopen_job(
             if s.status in (SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING):
                 est = estimate_segment_time(
                     rates, job.width, job.height, job.fps,
-                    s.duration_seconds, s.worker_name,
+                    s.duration_seconds, s.gpu_name,
                 )
                 sr.estimated_run_time = est
                 if job_est is None:
@@ -864,7 +864,7 @@ async def get_stats(
     queue_rows = (
         await db.execute(
             select(
-                Job.width, Job.height, Job.fps, Segment.duration_seconds, Segment.worker_name
+                Job.width, Job.height, Job.fps, Segment.duration_seconds, Segment.gpu_name
             )
             .join(Job, Segment.job_id == Job.id)
             .where(
