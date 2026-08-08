@@ -23,8 +23,17 @@ class TestVocabulary:
     def test_carries_positive_labels_too(self):
         # Rating is one all-in number, so per-axis signal has to come from somewhere. Positive
         # tags are what let "the motion was good but the mouth was a void" survive as data.
-        for tag in ("good-motion", "good-expression", "good-detail"):
+        for tag in ("good-motion-her", "good-expression", "good-detail"):
             assert tag in OBSERVATION_TAGS
+
+    def test_motion_is_labelled_per_person(self):
+        # motion_magnitude is whole-frame optical flow -- it sums every moving pixel, so a lively
+        # woman with a static man scores the same as the reverse. The metric cannot tell them
+        # apart even in principle, so these tags are the only per-person motion data obtainable.
+        for tag in ("good-motion-him", "good-motion-her",
+                    "weak-motion-him", "weak-motion-her"):
+            assert tag in OBSERVATION_TAGS
+        assert "good-motion" not in OBSERVATION_TAGS
 
     def test_no_duplicates(self):
         assert len(OBSERVATION_TAGS) == len(set(OBSERVATION_TAGS))
@@ -53,7 +62,7 @@ class TestTagOrdering:
     def test_storage_order_is_vocabulary_order_not_input_order(self):
         # Two segments tagged the same way must produce identical strings, or grouping needs
         # normalising at read time and every later analysis has to remember to do it.
-        chosen = {"good-motion", "mouth-void"}
+        chosen = {"good-motion-her", "mouth-void"}
         ordered = [t for t in OBSERVATION_TAGS if t in chosen]
-        reversed_input = {"mouth-void", "good-motion"}
+        reversed_input = {"mouth-void", "good-motion-her"}
         assert ordered == [t for t in OBSERVATION_TAGS if t in reversed_input]
