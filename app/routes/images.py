@@ -361,6 +361,30 @@ async def update_image_tags(
     return {"path": path, "tags": tags_val}
 
 
+def search_pattern(q: str) -> str:
+    """The LIKE pattern for a user's query, with their wildcards neutralised.
+
+    "%" and "_" are LIKE wildcards and filenames are full of both, so a query for "a_b" must not
+    silently match "axb", and "100%" must not become match-everything. The backslash is escaped
+    first, or escaping the wildcards would itself be re-escaped.
+    """
+    safe = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{safe}%"
+
+
+def search_clause(q: str):
+    """Match a query against tags OR filename.
+
+    A disjunction, not a conjunction: an untagged image has NULL tags, and requiring both would
+    leave it permanently unfindable -- which is the case this exists for.
+    """
+    pattern = search_pattern(q)
+    return or_(
+        ImageMeta.tags.ilike(pattern, escape="\\"),
+        ImageMeta.path.ilike(pattern, escape="\\"),
+    )
+
+
 @router.get("/images/search", dependencies=[Depends(get_current_user)])
 async def search_images(
     q: str = Query(..., min_length=1, max_length=500),
@@ -369,18 +393,23 @@ async def search_images(
     db: AsyncSession = Depends(get_db),
     user = Depends(get_current_user),
 ):
-    """Search images across all folders by tags (case-insensitive partial match)."""
-    safe = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    pattern = f"%{safe}%"
+    """Search images across all folders by tag or filename (case-insensitive partial match).
 
-    count_q = select(func.count()).select_from(ImageMeta).where(
-        ImageMeta.tags.ilike(pattern, escape="\\")
-    )
+    Path is matched as well as tags because the filename is often the only handle a user has.
+    Images arrive named like "00111-1696092597-swapped.png", get referenced by that name in job
+    configs, notes and conversations, and are spread across dated folders -- so "which folder was
+    00111 in" was unanswerable from the UI, and an untagged image was unfindable by any means at
+    all. Matching the path also makes a folder name a usable query, which is a free side effect
+    of storing the full key.
+    """
+    matches = search_clause(q)
+
+    count_q = select(func.count()).select_from(ImageMeta).where(matches)
     total = (await db.execute(count_q)).scalar() or 0
 
     meta_q = (
         select(ImageMeta)
-        .where(ImageMeta.tags.ilike(pattern, escape="\\"))
+        .where(matches)
         .order_by(ImageMeta.updated_at.desc())
         .offset(offset)
         .limit(limit)
