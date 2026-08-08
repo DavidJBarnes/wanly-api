@@ -76,9 +76,24 @@ def decide(
     if now >= expires_at:
         return Decision(Action.EXPIRE, "window closed")
 
-    if available:
-        return Decision(Action.LAUNCH, "capacity available")
-    return Decision(Action.WAIT, "no capacity yet")
+    # Attempt regardless of what the price check said. It is advice, not a gate.
+    #
+    # `available` comes from gpuTypes.lowestPrice, which answers "is this GPU sold here" — a
+    # different question from "will a host accept this pod", and measured 2026-08-08 it is wrong
+    # in BOTH directions. Community 4090 reported available/"Low" through an hour in which every
+    # create failed. Minutes after a 3090 pod placed on the first try, the 3090 reported no price
+    # at all — and a live 3090 reservation then sat at attempts=0, never calling RunPod once,
+    # because this branch believed it.
+    #
+    # Gating on it is worst precisely here. A reservation exists to keep trying; refusing to try
+    # on an unreliable signal makes it do nothing for hours and then report "expired without
+    # capacity", which reads as "RunPod had none" when the truth is "we never asked". The create
+    # call is the only honest test, its failures are classified by is_capacity_error(), and the
+    # window is what bounds the cost.
+    return Decision(
+        Action.LAUNCH,
+        "capacity available" if available else "no price quoted; attempting anyway",
+    )
 
 
 # RunPod reports "no inventory" as prose in a 4xx, not as a distinct code, so the retry/abort
