@@ -375,6 +375,11 @@ class GpuReservation(Base):
     # so "get me a 4090 and drain it after 3 jobs" is a bounded instruction where "get me a
     # 4090" is open-ended spend.
     drain_after_jobs = mapped_column(Integer, nullable=True)
+    # Which GPU to wait for. NULL means the server default, which is what every reservation
+    # created before this column existed was waiting for. It matters more than at launch time:
+    # a reservation polls unattended for up to 12 hours, and a 4090 that cannot be placed would
+    # burn the entire window while a 3090 would have been had in minutes.
+    gpu_type_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     pod_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     error: Mapped[str | None] = mapped_column(String(500), nullable=True)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

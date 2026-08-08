@@ -102,3 +102,29 @@ class TestErrorClassification:
     def test_unknown_errors_are_retried_within_the_window(self):
         """The window bounds the damage; wrongly aborting loses a reservation outright."""
         assert is_capacity_error(RuntimeError("something nobody has seen before")) is True
+
+
+class TestPlacementErrorsAreRetryable:
+    """Both of RunPod's placement failures must keep a reservation alive.
+
+    Measured 2026-08-08: community 4090 answered "this machine does not have the resources" on
+    every on-demand create while a 3090 placed instantly. That message means a host WAS matched
+    and could not fit the pod -- a different machine next attempt may well fit it. Aborting on it
+    would kill a reservation that was about to succeed.
+
+    Both previously reached the right verdict only by falling through to the unknown-error
+    default. These pin it, so a future change to that default cannot silently invert them.
+    """
+
+    def test_fit_failure_is_capacity_not_fatal(self):
+        assert is_capacity_error(
+            Exception("create pod: This machine does not have the resources to deploy your pod")
+        )
+
+    def test_no_instances_currently_available_is_capacity(self):
+        assert is_capacity_error(Exception("create pod: There are no instances currently available"))
+
+    def test_a_revoked_key_is_still_fatal(self):
+        # The guard that matters: these phrases must not have widened the retryable set so far
+        # that a credential failure gets retried for the whole window.
+        assert not is_capacity_error(Exception("RunPod rejected the API key (401)."))

@@ -5,6 +5,7 @@ terminate pods and delete volumes — and there is no launch-only scope, so it m
 handed to the browser.
 """
 
+import asyncio
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -23,6 +24,7 @@ from app.schemas.reservations import ReservationCreate, ReservationResponse
 from app.runpod_client import RunPodError
 from app.schemas.runpod import (
     RunPodAvailability,
+    RunPodGpuOption,
     RunPodLaunchRequest,
     RunPodWorker,
 )
@@ -36,12 +38,61 @@ _NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9 ._-]{0,48}$")
 
 @router.get("/runpod/availability", response_model=RunPodAvailability,
             dependencies=[Depends(get_current_user)])
-async def runpod_availability():
-    """Is the configured GPU purchasable in the configured datacenter right now?"""
+async def runpod_availability(gpu_type_id: str | None = None):
+    """Is this GPU priced in the configured datacenter right now?
+
+    Note this is not the same question as "can a pod be placed" — see get_availability().
+    """
+    if gpu_type_id:
+        _validate_gpu(gpu_type_id)
     try:
-        return await runpod_client.get_availability()
+        return await runpod_client.get_availability(gpu_type_id)
     except RunPodError as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.get("/runpod/gpu-options", response_model=list[RunPodGpuOption],
+            dependencies=[Depends(get_current_user)])
+async def runpod_gpu_options():
+    """The GPUs the launcher offers, each with live price and stock.
+
+    Priced concurrently: one round trip each, and with only a handful of options the serial
+    version would visibly stall the dialog for no reason. A lookup that fails is reported as an
+    option with an error rather than dropped — an absent 4090 would read as "not supported",
+    which is a different and wrong message.
+    """
+    gpus = runpod_client.selectable_gpus()
+    results = await asyncio.gather(
+        *(runpod_client.get_availability(g) for g in gpus), return_exceptions=True
+    )
+    options = []
+    for gpu, result in zip(gpus, results):
+        if isinstance(result, Exception):
+            options.append({
+                "gpu_type_id": gpu,
+                "is_default": gpu == settings.runpod_gpu_type_id,
+                "available": False,
+                "error": str(result),
+            })
+        else:
+            options.append({**result, "is_default": gpu == settings.runpod_gpu_type_id})
+    return options
+
+
+def _validate_gpu(gpu_type_id: str) -> str:
+    """Reject any GPU not on the server's allowlist.
+
+    The 5090 is the reason this is not a pass-through: it is purchasable on community and our
+    workflow does not run on it, so an unvalidated field would let the browser buy a pod that
+    cannot do the work.
+    """
+    allowed = runpod_client.selectable_gpus()
+    if gpu_type_id not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported GPU {gpu_type_id!r}. Choose one of: {', '.join(allowed)}.",
+        )
+    return gpu_type_id
 
 
 @router.get("/runpod/workers", response_model=list[RunPodWorker],
@@ -64,11 +115,17 @@ async def launch_runpod_worker(body: RunPodLaunchRequest):
             detail="Name must be 1-49 chars: letters, numbers, spaces, dot, dash, underscore.",
         )
 
-    # Check stock first so "no 4090s right now" reads as exactly that, instead of surfacing as
-    # a RunPod spec error. This is best-effort — availability flaps, so the launch below can
-    # still fail — but it turns the common case into a useful message.
+    gpu = _validate_gpu(body.gpu_type_id) if body.gpu_type_id else settings.runpod_gpu_type_id
+
+    # Check price first so a GPU RunPod does not sell here fails fast and legibly.
+    #
+    # Only a NEGATIVE result blocks. A positive one is not permission to launch: community 4090
+    # reported available=True / stock="Low" for an hour while every create failed, because
+    # lowestPrice answers "is this GPU sold here", not "will a host take this pod". Treating the
+    # positive as a green light was harmless; what hurt was having no path past it, so the
+    # placement failure never got a chance to produce its own, far more specific message.
     try:
-        availability = await runpod_client.get_availability()
+        availability = await runpod_client.get_availability(gpu)
     except RunPodError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -87,9 +144,9 @@ async def launch_runpod_worker(body: RunPodLaunchRequest):
         raise HTTPException(
             status_code=503,
             detail=(
-                f"No {settings.runpod_gpu_type_id} capacity {where} "
-                f"({settings.runpod_cloud_type.lower()} cloud) right now.{why} Try again "
-                f"shortly — availability changes minute to minute."
+                f"RunPod does not currently price {gpu} {where} "
+                f"({settings.runpod_cloud_type.lower()} cloud).{why} Try again "
+                f"shortly, or pick a different GPU — availability changes minute to minute."
             ),
         )
 
@@ -106,7 +163,7 @@ async def launch_runpod_worker(body: RunPodLaunchRequest):
         env["RUNPOD_API_KEY"] = settings.runpod_api_key
 
     try:
-        return await runpod_client.launch_worker(name, env)
+        return await runpod_client.launch_worker(name, env, gpu)
     except RunPodError as e:
         raise HTTPException(status_code=503, detail=str(e))
 
@@ -177,6 +234,7 @@ async def create_reservation(body: ReservationCreate, db: AsyncSession = Depends
         status=ReservationStatus.PENDING,
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=body.minutes),
         drain_after_jobs=body.drain_after_jobs,
+        gpu_type_id=_validate_gpu(body.gpu_type_id) if body.gpu_type_id else None,
     )
     db.add(reservation)
     await db.commit()

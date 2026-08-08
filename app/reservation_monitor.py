@@ -45,19 +45,23 @@ async def run_once() -> None:
         if not pending:
             return
 
-        # One availability check for the whole pass. Every reservation targets the same GPU in
-        # the same datacenter, because the network volume is region-locked — so asking once per
-        # reservation would only multiply the requests.
-        try:
-            availability = await runpod_client.get_availability()
-            available = bool(availability.get("available"))
-            probe_error = None
-        except Exception as e:  # noqa: BLE001 - classified by decide()
-            available = False
-            probe_error = e
+        # One availability check per DISTINCT GPU, not one for the whole pass. Reservations can
+        # now target different GPUs, and they genuinely differ: community 4090 and 3090 have
+        # independent stock, and the 4090 is the one that goes unplaceable. Sharing a single
+        # answer across them would launch a 3090 reservation on the 4090's availability, or
+        # strand it on the 4090's absence.
+        wanted = {r.gpu_type_id for r in pending}
+        probes: dict[str | None, tuple[bool, Exception | None]] = {}
+        for gpu in wanted:
+            try:
+                availability = await runpod_client.get_availability(gpu)
+                probes[gpu] = (bool(availability.get("available")), None)
+            except Exception as e:  # noqa: BLE001 - classified by decide()
+                probes[gpu] = (False, e)
 
         now = datetime.now(timezone.utc)
         for reservation in pending:
+            available, probe_error = probes[reservation.gpu_type_id]
             decision = decide(
                 status=reservation.status,
                 expires_at=reservation.expires_at,
@@ -115,7 +119,7 @@ async def _apply(session, reservation: GpuReservation, decision, now) -> None:
         env["RUNPOD_API_KEY"] = settings.runpod_api_key
 
     try:
-        pod = await runpod_client.launch_worker(reservation.name, env)
+        pod = await runpod_client.launch_worker(reservation.name, env, reservation.gpu_type_id)
     except Exception as e:  # noqa: BLE001
         # Release the claim so the window can still be used — unless the error is fatal, which
         # decide() will catch on the next pass and turn into an abort.

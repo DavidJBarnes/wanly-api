@@ -12,6 +12,8 @@ class ReservationCreate(BaseModel):
     # Optional, and the reason it exists here rather than at launch: a reservation can fire
     # unattended, so a drain policy is what turns "get me a 4090" into a bounded instruction.
     drain_after_jobs: int | None = Field(default=None, ge=1, le=100)
+    # None means the server default. Validated against the same allowlist the launcher uses.
+    gpu_type_id: str | None = None
 
 
 class ReservationResponse(BaseModel):
@@ -20,6 +22,7 @@ class ReservationResponse(BaseModel):
     status: str
     expires_at: datetime
     drain_after_jobs: int | None = None
+    gpu_type_id: str | None = None
     pod_id: str | None = None
     error: str | None = None
     attempts: int
