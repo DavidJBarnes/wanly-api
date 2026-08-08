@@ -13,9 +13,17 @@ class RunPodAvailability(BaseModel):
 class RunPodWorker(BaseModel):
     id: str
     name: str | None = None
+    # What we asked RunPod for. Not the same as what is running -- see runtime_ready.
     status: str | None = None
     cost_per_hr: float | None = None
     gpu_type_id: str | None = None
+    created_at: str | None = None
+    # False means the pod is rented and billing but its container is not up. A pod can sit like
+    # this indefinitely; it is the difference between "still booting" and "never going to boot".
+    runtime_ready: bool = False
+    # Zero on a running pod means the host never attached a GPU, which is fatal and immediate --
+    # torch sees no devices and ComfyUI dies on import.
+    gpu_count: int = 0
 
 
 class RunPodGpuOption(BaseModel):

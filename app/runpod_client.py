@@ -194,6 +194,19 @@ async def list_workers() -> list[dict]:
             "status": p.get("desiredStatus"),
             "cost_per_hr": p.get("costPerHr"),
             "gpu_type_id": (p.get("machine") or {}).get("gpuTypeId"),
+            "created_at": p.get("createdAt"),
+            # Whether the container is actually up, as distinct from the pod being rented.
+            #
+            # Measured 2026-08-08: a pod reported desiredStatus RUNNING for eighteen minutes with
+            # runtime {} and gpus None, billing the whole time. Inside it, torch reported "CUDA
+            # unknown error ... setting the available devices to be zero" -- the host took the
+            # rental and never attached a card. The Workers page showed it as "Starting" with a
+            # spinner, indistinguishable from a healthy pod staging models, and the only way to
+            # find out was having the RunPod console open.
+            #
+            # desiredStatus is what we ASKED for. This is what happened.
+            "runtime_ready": bool(p.get("runtime")),
+            "gpu_count": len(p.get("gpus") or []),
         }
         for p in pods
     ]
