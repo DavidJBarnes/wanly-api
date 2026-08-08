@@ -50,6 +50,13 @@ class Settings(BaseSettings):
     runpod_gpu_type_ids: str = "NVIDIA GeForce RTX 4090,NVIDIA GeForce RTX 3090"
     runpod_image: str = "davidjbarnes/wanly-gpu-docker:latest"
     runpod_container_disk_gb: int = 30
+    # Disk mounted at runpod_volume_mount_path. REQUIRED without a network volume: the models are
+    # ~37GB (two 13.3GB experts, a 6.7GB text encoder, CLIP vision, VAE, LoRAs, FaceFusion) and
+    # download_models.sh puts them in /workspace. Setting volumeMountPath WITHOUT this allocates
+    # no volume at all, so /workspace silently lands on the 30GB container disk and staging dies
+    # partway with "No space left on device". 0 disables (correct only when a network volume
+    # supplies the mount instead).
+    runpod_volume_gb: int = 60
     runpod_volume_mount_path: str = "/workspace"
     # What the launched worker is told to poll. Must be reachable FROM RunPod, so it cannot be
     # localhost even though this server is the thing being pointed at.

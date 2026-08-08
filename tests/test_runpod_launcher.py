@@ -121,6 +121,9 @@ class TestLaunch:
         assert body["cloudType"] == "COMMUNITY"
         assert "networkVolumeId" not in body
         assert "dataCenterIds" not in body
+        # ...but it MUST still get a disk. Without a network volume this is the only thing that
+        # makes volumeMountPath mean anything.
+        assert body["volumeInGb"] == settings.runpod_volume_gb
 
     async def test_runpod_error_prose_is_passed_through(self, monkeypatch):
         """Their wording distinguishes no-stock from a bad spec; ours would not."""
@@ -260,3 +263,47 @@ class TestPlacementFailureWording:
         with pytest.raises(RunPodError) as e:
             await runpod_client.launch_worker("w", {})
         assert "different GPU" in str(e.value)
+
+
+class TestPodHasSomewhereToPutTheModels:
+    """A pod without a volume dies during staging, not at create time.
+
+    Reported 2026-08-08 from a live community pod: "No space left on device (os error 28)".
+    The spec set volumeMountPath=/workspace but never volumeInGb, so RunPod allocated NO volume
+    and /workspace fell back onto the 30GB container disk. download_models.sh pulls ~37GB there
+    (two 13.3GB experts, a 6.7GB text encoder, CLIP vision, VAE, LoRAs, FaceFusion). It cannot fit.
+
+    It had always worked before because a network volume supplied the mount. Terminating that
+    volume removed the storage and nothing replaced it. Create still succeeded, which is why
+    probing placement did not catch it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_community_pod_gets_a_volume_big_enough_for_the_models(self, monkeypatch):
+        _install(monkeypatch, _Resp(status=201, payload={"id": "pod1"}))
+        monkeypatch.setattr(settings, "runpod_cloud_type", "COMMUNITY")
+        monkeypatch.setattr(settings, "runpod_network_volume_id", "")
+        await runpod_client.launch_worker("w", {})
+        body = _Client.calls[0][2]
+        assert body["volumeMountPath"] == settings.runpod_volume_mount_path
+        # 37GB of models plus room to generate into. A mount path with no volume behind it is
+        # the exact bug this guards.
+        assert body["volumeInGb"] >= 45
+
+    @pytest.mark.asyncio
+    async def test_a_network_volume_replaces_the_pod_disk_rather_than_adding_one(self, monkeypatch):
+        # Paying for both would be waste, and the models live on the network volume already.
+        _install(monkeypatch, _Resp(status=201, payload={"id": "pod1"}))
+        monkeypatch.setattr(settings, "runpod_network_volume_id", "vol_test")
+        await runpod_client.launch_worker("w", {})
+        body = _Client.calls[0][2]
+        assert body["networkVolumeId"] == "vol_test"
+        assert "volumeInGb" not in body
+
+    @pytest.mark.asyncio
+    async def test_zero_disables_it_for_the_network_volume_case(self, monkeypatch):
+        _install(monkeypatch, _Resp(status=201, payload={"id": "pod1"}))
+        monkeypatch.setattr(settings, "runpod_network_volume_id", "")
+        monkeypatch.setattr(settings, "runpod_volume_gb", 0)
+        await runpod_client.launch_worker("w", {})
+        assert "volumeInGb" not in _Client.calls[0][2]

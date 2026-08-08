@@ -151,8 +151,13 @@ async def launch_worker(name: str, env: dict[str, str], gpu_type_id: str | None 
     # Only sent when configured. Community cloud supports neither, and a network volume is
     # region-locked — so pinning a datacenter is meaningful only when there is a volume to sit
     # beside. Sending either on community would be rejected or silently ignored.
+    # A network volume supplies the mount when configured; otherwise the pod needs its own disk.
+    # Sending neither leaves volumeMountPath pointing at the container disk, which is not big
+    # enough for the model set and fails during staging rather than at create time.
     if settings.runpod_network_volume_id:
         spec["networkVolumeId"] = settings.runpod_network_volume_id
+    elif settings.runpod_volume_gb:
+        spec["volumeInGb"] = settings.runpod_volume_gb
     if settings.runpod_datacenter_id:
         spec["dataCenterIds"] = [settings.runpod_datacenter_id]
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
