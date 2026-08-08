@@ -31,24 +31,28 @@ class SegmentCreate(BaseModel):
 # The vocabulary lives server-side so the console and any analysis agree on the exact strings.
 # Grouping is the entire point of tags; two spellings of the same observation are two labels.
 #
-# Motion is split by person deliberately. motion_magnitude is whole-frame Farneback optical flow:
-# it sums every moving pixel, so a lively woman with a static man scores identically to the
-# reverse. The metric cannot separate them even in principle, which makes these tags the ONLY
-# source of per-person motion data we will ever have.
+# Every tag is <location>-<condition>: where you were looking, then what was wrong or right with
+# it. That keeps the chip row scannable by region and makes the set extensible without debate
+# about naming -- a new observation about the eyes is eyes-<something>, not a fresh coinage.
+#
 OBSERVATION_TAGS = [
-    # Defects
+    # Face
+    "face-frozen",
+    "face-blurry",
+    "face-expressive",
     "mouth-void",
     "teeth-mush",
-    "frozen-face",
-    "blurry-face",
     "identity-drift",
-    "weak-motion-him",
-    "weak-motion-her",
-    # Positives -- rating is one all-in number, so per-axis signal has to live here.
-    "good-expression",
-    "good-motion-him",
-    "good-motion-her",
-    "good-detail",
+    # Motion, per person. motion_magnitude is whole-frame Farneback optical flow: it sums every
+    # moving pixel, so a lively woman with a static man scores identically to the reverse. The
+    # metric cannot separate them even in principle, which makes these the ONLY per-person
+    # motion data obtainable.
+    "him-static",
+    "her-static",
+    "him-strong",
+    "her-strong",
+    # Body
+    "anatomy-break",
 ]
 
 

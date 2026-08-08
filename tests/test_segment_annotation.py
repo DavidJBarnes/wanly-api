@@ -17,26 +17,33 @@ class TestVocabulary:
     def test_covers_the_artifacts_actually_observed(self):
         # Named from real reports, not invented: the open-mouth failure was described as
         # "blank/black space mouth" with "messy teeth and lips".
-        for tag in ("mouth-void", "teeth-mush", "frozen-face"):
+        for tag in ("mouth-void", "teeth-mush", "face-frozen"):
             assert tag in OBSERVATION_TAGS
 
     def test_carries_positive_labels_too(self):
         # Rating is one all-in number, so per-axis signal has to come from somewhere. Positive
         # tags are what let "the motion was good but the mouth was a void" survive as data.
-        for tag in ("good-motion-her", "good-expression", "good-detail"):
+        for tag in ("her-strong", "face-expressive"):
             assert tag in OBSERVATION_TAGS
 
     def test_motion_is_labelled_per_person(self):
         # motion_magnitude is whole-frame optical flow -- it sums every moving pixel, so a lively
         # woman with a static man scores the same as the reverse. The metric cannot tell them
         # apart even in principle, so these tags are the only per-person motion data obtainable.
-        for tag in ("good-motion-him", "good-motion-her",
-                    "weak-motion-him", "weak-motion-her"):
+        for tag in ("him-strong", "her-strong", "him-static", "her-static"):
             assert tag in OBSERVATION_TAGS
-        assert "good-motion" not in OBSERVATION_TAGS
 
     def test_no_duplicates(self):
         assert len(OBSERVATION_TAGS) == len(set(OBSERVATION_TAGS))
+
+    def test_every_tag_follows_location_condition(self):
+        # The scheme is what keeps the set extensible without renaming debates: a new observation
+        # about the eyes is eyes-<something>. A tag that does not split cannot be grouped by
+        # region, which is how the chip row is laid out and how analysis will slice it.
+        for tag in OBSERVATION_TAGS:
+            location, _, condition = tag.partition("-")
+            assert location and condition, f"{tag} is not <location>-<condition>"
+            assert tag.islower() and " " not in tag
 
 
 class TestAnnotationSchema:
@@ -62,7 +69,7 @@ class TestTagOrdering:
     def test_storage_order_is_vocabulary_order_not_input_order(self):
         # Two segments tagged the same way must produce identical strings, or grouping needs
         # normalising at read time and every later analysis has to remember to do it.
-        chosen = {"good-motion-her", "mouth-void"}
+        chosen = {"her-strong", "mouth-void"}
         ordered = [t for t in OBSERVATION_TAGS if t in chosen]
-        reversed_input = {"mouth-void", "good-motion-her"}
+        reversed_input = {"mouth-void", "her-strong"}
         assert ordered == [t for t in OBSERVATION_TAGS if t in reversed_input]
