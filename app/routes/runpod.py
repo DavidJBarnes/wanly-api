@@ -73,12 +73,22 @@ async def launch_runpod_worker(body: RunPodLaunchRequest):
         raise HTTPException(status_code=503, detail=str(e))
 
     if not availability["available"]:
+        where = (
+            f"in {settings.runpod_datacenter_id}"
+            if settings.runpod_datacenter_id
+            else "on any datacenter"
+        )
+        why = (
+            " The datacenter is pinned because the network volume holding the models is "
+            "region-locked to it."
+            if settings.runpod_datacenter_id
+            else ""
+        )
         raise HTTPException(
             status_code=503,
             detail=(
-                f"No {settings.runpod_gpu_type_id} capacity in "
-                f"{settings.runpod_datacenter_id} right now. The datacenter is pinned because "
-                f"the network volume holding the models is region-locked to it. Try again "
+                f"No {settings.runpod_gpu_type_id} capacity {where} "
+                f"({settings.runpod_cloud_type.lower()} cloud) right now.{why} Try again "
                 f"shortly — availability changes minute to minute."
             ),
         )

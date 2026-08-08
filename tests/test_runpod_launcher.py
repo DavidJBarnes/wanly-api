@@ -62,6 +62,8 @@ def _install(monkeypatch, *responses):
     _Client.calls = []
     monkeypatch.setattr(settings, "runpod_api_key", "rpa_test")
     monkeypatch.setattr(settings, "runpod_network_volume_id", "vol_test")
+    monkeypatch.setattr(settings, "runpod_cloud_type", "SECURE")
+    monkeypatch.setattr(settings, "runpod_datacenter_id", "EU-RO-1")
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kw: _Client(list(responses)))
 
 
@@ -107,11 +109,18 @@ class TestLaunch:
         assert body["gpuTypeIds"] == [settings.runpod_gpu_type_id]
         assert body["cloudType"] == "SECURE"
 
-    async def test_missing_volume_is_a_clear_message(self, monkeypatch):
-        _install(monkeypatch)
+    async def test_community_sends_no_volume_or_datacenter(self, monkeypatch):
+        """Community cloud supports neither. Sending them is rejected or silently ignored, and
+        a datacenter pin only means anything when there is a volume to sit beside."""
+        _install(monkeypatch, _Resp(status=201, payload={"id": "pod1"}))
+        monkeypatch.setattr(settings, "runpod_cloud_type", "COMMUNITY")
         monkeypatch.setattr(settings, "runpod_network_volume_id", "")
-        with pytest.raises(RunPodError, match="RUNPOD_NETWORK_VOLUME_ID"):
-            await runpod_client.launch_worker("w", {})
+        monkeypatch.setattr(settings, "runpod_datacenter_id", "")
+        await runpod_client.launch_worker("w", {})
+        _, _, body, _ = _Client.calls[0]
+        assert body["cloudType"] == "COMMUNITY"
+        assert "networkVolumeId" not in body
+        assert "dataCenterIds" not in body
 
     async def test_runpod_error_prose_is_passed_through(self, monkeypatch):
         """Their wording distinguishes no-stock from a bad spec; ours would not."""
@@ -131,3 +140,38 @@ class TestTerminate:
         """404 means the pod is in the state the caller asked for."""
         _install(monkeypatch, _Resp(status=404))
         await runpod_client.terminate_worker("pod1")
+
+
+class TestAvailabilityFollowsTheConfiguredCloud:
+    """Asking the wrong cloud reports the wrong answer, and the two differ by 2x in price and
+    wildly in stock: community 4090 was purchasable in 6/6 samples while secure showed 0/7
+    earlier the same evening."""
+
+    async def test_community_queries_community(self, monkeypatch):
+        _install(monkeypatch, _Resp(payload=_availability_payload(0.34)))
+        monkeypatch.setattr(settings, "runpod_cloud_type", "COMMUNITY")
+        monkeypatch.setattr(settings, "runpod_datacenter_id", "")
+        out = await runpod_client.get_availability()
+        _, _, body, _ = _Client.calls[0]
+        assert body["variables"]["secure"] is False
+        assert out["price_per_hr"] == 0.34
+
+    async def test_no_datacenter_is_omitted_not_sent_as_null(self, monkeypatch):
+        """Passing dataCenterId: null narrows the query to datacenters with no id, which reports
+        no capacity anywhere — indistinguishable from being genuinely out of stock."""
+        _install(monkeypatch, _Resp(payload=_availability_payload(0.34)))
+        monkeypatch.setattr(settings, "runpod_cloud_type", "COMMUNITY")
+        monkeypatch.setattr(settings, "runpod_datacenter_id", "")
+        await runpod_client.get_availability()
+        _, _, body, _ = _Client.calls[0]
+        assert "dc" not in body["variables"]
+        assert "dataCenterId" not in body["query"]
+
+    async def test_secure_with_a_datacenter_still_pins_it(self, monkeypatch):
+        _install(monkeypatch, _Resp(payload=_availability_payload(0.74)))
+        monkeypatch.setattr(settings, "runpod_cloud_type", "SECURE")
+        monkeypatch.setattr(settings, "runpod_datacenter_id", "EU-RO-1")
+        await runpod_client.get_availability()
+        _, _, body, _ = _Client.calls[0]
+        assert body["variables"]["secure"] is True
+        assert body["variables"]["dc"] == "EU-RO-1"
