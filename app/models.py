@@ -348,3 +348,37 @@ class Worker(Base):
     a1111: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)
     drain_after_jobs: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+
+class GpuReservation(Base):
+    """A standing request to launch a worker as soon as a GPU frees up.
+
+    Persisted rather than held in memory, for two reasons that are not stylistic: the browser
+    tab that created it will be closed, and the API container is recreated on every deploy. A
+    reservation that dies on deploy is worse than no feature, because it dies invisibly — the
+    user is still waiting for a worker that nobody is going to launch.
+    """
+
+    __tablename__ = "gpu_reservations"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Becomes both the pod name and the worker's FRIENDLY_NAME, so the Workers page can join
+    # them without a second identifier.
+    name: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Optional, and more important here than at launch time: a reservation can fire unattended,
+    # so "get me a 4090 and drain it after 3 jobs" is a bounded instruction where "get me a
+    # 4090" is open-ended spend.
+    drain_after_jobs = mapped_column(Integer, nullable=True)
+    pod_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    error: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
