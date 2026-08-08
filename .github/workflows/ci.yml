@@ -26,6 +26,10 @@ jobs:
     env:
       DATABASE_URL: postgresql+asyncpg://test:test@localhost/test
       JWT_SECRET: ci-test-secret-key
+      # Database-backed tests skip when no postgres is reachable, so the suite still runs on a
+      # laptop. In CI a skip is indistinguishable from a pass, which is how untested rules
+      # survive — so here they must run or fail.
+      REQUIRE_DB: "1"
 
     steps:
       - uses: actions/checkout@v4
