@@ -10,7 +10,7 @@ So the valuable property is that tags GROUP. A vocabulary that admits near-misse
 
 import pytest
 
-from app.schemas.segments import OBSERVATION_TAGS, SegmentAnnotation
+from app.schemas.segments import EXCLUSIVE_TAG_GROUPS, OBSERVATION_TAGS, SegmentAnnotation
 
 
 class TestVocabulary:
@@ -73,3 +73,35 @@ class TestTagOrdering:
         ordered = [t for t in OBSERVATION_TAGS if t in chosen]
         reversed_input = {"mouth-void", "her-strong"}
         assert ordered == [t for t in OBSERVATION_TAGS if t in reversed_input]
+
+
+class TestPace:
+    def test_pace_has_an_explicit_middle(self):
+        # Every other axis can leave "fine" implicit by being untagged. Pace cannot: with only
+        # fast and slow, an untagged segment is ambiguous between "the pace was right" and "I
+        # did not judge the pace", and those are different data.
+        for tag in ("pace-slow", "pace-right", "pace-fast"):
+            assert tag in OBSERVATION_TAGS
+
+
+class TestContradictoryTags:
+    """Tags exist to be ground truth, so a contradictory label is worse than a missing one --
+    it quietly poisons whatever it is later used to validate."""
+
+    def test_pace_values_are_mutually_exclusive(self):
+        group = next(g for g in EXCLUSIVE_TAG_GROUPS if "pace-fast" in g)
+        assert {"pace-slow", "pace-right", "pace-fast"} == group
+
+    def test_a_person_cannot_be_static_and_strong(self):
+        assert {"him-static", "him-strong"} in EXCLUSIVE_TAG_GROUPS
+        assert {"her-static", "her-strong"} in EXCLUSIVE_TAG_GROUPS
+
+    def test_compatible_face_tags_are_not_restricted(self):
+        # A face can be blurry AND frozen. Over-constraining would lose real observations.
+        for group in EXCLUSIVE_TAG_GROUPS:
+            assert not {"face-blurry", "face-frozen"} <= group
+
+    def test_every_exclusive_member_is_in_the_vocabulary(self):
+        for group in EXCLUSIVE_TAG_GROUPS:
+            for tag in group:
+                assert tag in OBSERVATION_TAGS

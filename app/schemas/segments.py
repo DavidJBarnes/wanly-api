@@ -51,8 +51,24 @@ OBSERVATION_TAGS = [
     "her-static",
     "him-strong",
     "her-strong",
+    # Pace. Unlike every other axis, the middle value has to be explicit: with only fast/slow,
+    # an untagged segment is ambiguous between "the pace was fine" and "I did not judge the
+    # pace", and those are different data.
+    "pace-slow",
+    "pace-right",
+    "pace-fast",
     # Body
     "anatomy-break",
+]
+
+# Sets whose members contradict each other. A segment cannot be both too fast and too slow, and
+# a man cannot be both static and thrusting strongly. Rejecting these server-side matters because
+# the tags exist to be ground truth -- a contradictory label is worse than a missing one, since
+# it quietly poisons whatever it is later used to validate.
+EXCLUSIVE_TAG_GROUPS = [
+    {"pace-slow", "pace-right", "pace-fast"},
+    {"him-static", "him-strong"},
+    {"her-static", "her-strong"},
 ]
 
 
