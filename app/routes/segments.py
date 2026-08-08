@@ -311,6 +311,13 @@ async def claim_next_segment(
     segment.worker_name = worker_name
     segment.claimed_at = now
 
+    # Snapshot the GPU now, not at read time. Worker rows are deleted on deregister — every
+    # RunPod pod takes its row with it when it drains — so a later join would silently lose the
+    # hardware for every segment a since-terminated pod ran.
+    claiming_worker = await db.get(Worker, worker_id)
+    if claiming_worker and claiming_worker.gpu_stats:
+        segment.gpu_name = claiming_worker.gpu_stats.get("gpu_name")
+
     job = await db.get(Job, segment.job_id)
     if job.status == JobStatus.PENDING:
         job.status = JobStatus.PROCESSING

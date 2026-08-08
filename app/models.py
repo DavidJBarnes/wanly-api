@@ -191,6 +191,9 @@ class Segment(Base):
     status = mapped_column(String(20), nullable=False, default=SegmentStatus.PENDING)
     worker_id = mapped_column(UUID(as_uuid=True), nullable=True)
     worker_name = mapped_column(String(255), nullable=True)
+    # Snapshotted at claim time. Worker rows vanish when a pod deregisters, so joining to
+    # workers later would lose every segment a since-terminated pod ran.
+    gpu_name = mapped_column(String(100), nullable=True)
     output_path = mapped_column(Text, nullable=True)
     last_frame_path = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
