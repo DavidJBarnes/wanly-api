@@ -105,3 +105,18 @@ class TestContradictoryTags:
         for group in EXCLUSIVE_TAG_GROUPS:
             for tag in group:
                 assert tag in OBSERVATION_TAGS
+
+
+class TestBodyMechanics:
+    def test_unison_is_labelled(self):
+        # The largest observed quality differentiator, and invisible to every metric: two bodies
+        # rocking together produce enormous whole-frame optical flow while being the wrong motion.
+        # A 5-rated segment scored 0.545; a 3-rated one scored 1.162. Without this tag the
+        # distinction survives only in free text and cannot be aggregated.
+        assert "bodies-unison" in OBSERVATION_TAGS
+
+    def test_unison_is_not_exclusive_with_strong_motion(self):
+        # Both people CAN be moving strongly and still be moving wrongly -- that is exactly the
+        # observed case. Making these exclusive would force a choice that misdescribes it.
+        for group in EXCLUSIVE_TAG_GROUPS:
+            assert not {"bodies-unison", "him-strong"} <= group
