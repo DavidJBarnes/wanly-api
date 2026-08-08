@@ -57,7 +57,12 @@ OBSERVATION_TAGS = [
     "pace-slow",
     "pace-right",
     "pace-fast",
-    # Body
+    # Body mechanics. bodies-unison is the single largest quality differentiator observed so far
+    # and no metric can see it: two bodies rocking together generate ENORMOUS whole-frame optical
+    # flow while being the wrong motion entirely. The 5-rated segment scored 0.545 and a 3-rated
+    # one scored 1.162. motion_magnitude measures quantity; this tag is the only record of
+    # correctness.
+    "bodies-unison",
     "anatomy-break",
 ]
 
