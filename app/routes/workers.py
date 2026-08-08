@@ -52,9 +52,36 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
             comfyui_running=body.comfyui_running,
         )
         db.add(worker)
+
+    # A reservation may have asked for a drain policy up front. Apply it the moment the worker
+    # it was waiting for appears.
+    #
+    # It has to happen here rather than at launch: the pod exists minutes before the worker
+    # registers, and drain_after_jobs lives on the worker row, which does not exist until now.
+    # Without this a reservation made at 11pm produces a worker that runs until someone notices
+    # — which is the whole thing the option was added to prevent.
+    await _apply_reserved_drain(db, worker)
+
     await db.commit()
     await db.refresh(worker)
     return worker
+
+
+async def _apply_reserved_drain(db: AsyncSession, worker: Worker) -> None:
+    from app.models import GpuReservation
+
+    result = await db.execute(
+        select(GpuReservation).where(
+            GpuReservation.name == worker.friendly_name,
+            GpuReservation.drain_after_jobs.isnot(None),
+            GpuReservation.status == "launched",
+        )
+    )
+    reservation = result.scalars().first()
+    # Only set it on a fresh registration. Overwriting an existing countdown would restart it
+    # every time the worker re-registers, which on a container restart means it never drains.
+    if reservation and worker.drain_after_jobs is None and worker.status != "draining":
+        worker.drain_after_jobs = reservation.drain_after_jobs
 
 
 @router.delete("/workers/{worker_id}", status_code=204, dependencies=[Depends(verify_api_key_or_bearer)])

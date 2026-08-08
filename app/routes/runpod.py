@@ -6,12 +6,20 @@ handed to the browser.
 """
 
 import re
+import uuid
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import runpod_client
 from app.auth import get_current_user
 from app.config import settings
+from app.database import get_db
+from app.models import GpuReservation
+from app.reservations import ReservationStatus
+from app.schemas.reservations import ReservationCreate, ReservationResponse
 from app.runpod_client import RunPodError
 from app.schemas.runpod import (
     RunPodAvailability,
@@ -106,3 +114,77 @@ async def terminate_runpod_worker(pod_id: str):
         await runpod_client.terminate_worker(pod_id)
     except RunPodError as e:
         raise HTTPException(status_code=503, detail=str(e))
+
+
+@router.get("/runpod/reservations", response_model=list[ReservationResponse],
+            dependencies=[Depends(get_current_user)])
+async def list_reservations(db: AsyncSession = Depends(get_db)):
+    """Reservations that are still waiting, newest first.
+
+    Terminal ones are not returned: the point of this list is "what is still going to spend
+    money", and a wall of expired rows buries that.
+    """
+    rows = (
+        await db.execute(
+            select(GpuReservation)
+            .where(GpuReservation.status == ReservationStatus.PENDING)
+            .order_by(GpuReservation.created_at.desc())
+        )
+    ).scalars().all()
+    return rows
+
+
+@router.post("/runpod/reservations", response_model=ReservationResponse, status_code=201,
+             dependencies=[Depends(get_current_user)])
+async def create_reservation(body: ReservationCreate, db: AsyncSession = Depends(get_db)):
+    """Keep trying to launch a worker until one is available or the window closes."""
+    name = (body.name or "").strip()
+    if not _NAME_RE.match(name):
+        raise HTTPException(
+            status_code=400,
+            detail="Name must be 1-49 chars: letters, numbers, spaces, dot, dash, underscore.",
+        )
+
+    # One pending reservation per name, or two of them race to launch pods that would both try
+    # to register as the same worker.
+    existing = (
+        await db.execute(
+            select(GpuReservation).where(
+                GpuReservation.name == name,
+                GpuReservation.status == ReservationStatus.PENDING,
+            )
+        )
+    ).scalar_one_or_none()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail=f"A reservation named '{name}' is already waiting.",
+        )
+
+    reservation = GpuReservation(
+        id=uuid.uuid4(),
+        name=name,
+        status=ReservationStatus.PENDING,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=body.minutes),
+        drain_after_jobs=body.drain_after_jobs,
+    )
+    db.add(reservation)
+    await db.commit()
+    await db.refresh(reservation)
+    return reservation
+
+
+@router.delete("/runpod/reservations/{reservation_id}", status_code=204,
+               dependencies=[Depends(get_current_user)])
+async def cancel_reservation(reservation_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """Cancel a pending reservation.
+
+    Does not touch a pod that has already launched — by then it is a worker, and the Workers
+    page is where a worker is stopped.
+    """
+    reservation = await db.get(GpuReservation, reservation_id)
+    if not reservation:
+        raise HTTPException(status_code=404, detail="Reservation not found")
+    if reservation.status == ReservationStatus.PENDING:
+        reservation.status = ReservationStatus.CANCELLED
+        await db.commit()
