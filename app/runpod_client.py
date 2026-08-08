@@ -29,6 +29,10 @@ class RunPodError(RuntimeError):
     """A RunPod call failed in a way worth showing the user."""
 
 
+def _is_secure() -> bool:
+    return settings.runpod_cloud_type.upper() == "SECURE"
+
+
 def _headers() -> dict:
     if not settings.runpod_api_key:
         raise RunPodError(
@@ -47,26 +51,41 @@ async def get_availability() -> dict:
     a launch can still fail afterwards; it exists to give the user a useful "no capacity right
     now" instead of an opaque failure.
     """
-    query = """
-    query ($gpu: String, $dc: String) {
-      gpuTypes(input: {id: $gpu}) {
-        id
-        displayName
-        memoryInGb
-        lowestPrice(input: {gpuCount: 1, secureCloud: true, dataCenterId: $dc}) {
-          uninterruptablePrice
-          stockStatus
+    # dataCenterId is omitted entirely when nothing is pinned. Passing null narrows the query
+    # to "datacenters with no id", which reports no capacity anywhere — the failure would look
+    # exactly like being out of stock.
+    if settings.runpod_datacenter_id:
+        query = """
+        query ($gpu: String, $secure: Boolean, $dc: String) {
+          gpuTypes(input: {id: $gpu}) {
+            id
+            lowestPrice(input: {gpuCount: 1, secureCloud: $secure, dataCenterId: $dc}) {
+              uninterruptablePrice
+              stockStatus
+            }
+          }
         }
-      }
-    }
-    """
-    payload = {
-        "query": query,
-        "variables": {
+        """
+        variables = {
             "gpu": settings.runpod_gpu_type_id,
+            "secure": _is_secure(),
             "dc": settings.runpod_datacenter_id,
-        },
-    }
+        }
+    else:
+        query = """
+        query ($gpu: String, $secure: Boolean) {
+          gpuTypes(input: {id: $gpu}) {
+            id
+            lowestPrice(input: {gpuCount: 1, secureCloud: $secure}) {
+              uninterruptablePrice
+              stockStatus
+            }
+          }
+        }
+        """
+        variables = {"gpu": settings.runpod_gpu_type_id, "secure": _is_secure()}
+
+    payload = {"query": query, "variables": variables}
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.post(GRAPHQL, json=payload, headers=_headers())
     if resp.status_code == 401:
@@ -79,7 +98,8 @@ async def get_availability() -> dict:
     price = lowest.get("uninterruptablePrice")
     return {
         "gpu_type_id": settings.runpod_gpu_type_id,
-        "datacenter_id": settings.runpod_datacenter_id,
+        "datacenter_id": settings.runpod_datacenter_id or "any",
+        "cloud_type": settings.runpod_cloud_type,
         # No price means no inventory for this GPU in this datacenter right now.
         "available": price is not None,
         "price_per_hr": price,
@@ -90,28 +110,29 @@ async def get_availability() -> dict:
 async def launch_worker(name: str, env: dict[str, str]) -> dict:
     """Create a pod, attached to the configured network volume.
 
-    The volume is region-locked, which is why the datacenter is pinned rather than chosen: a
-    pod in the wrong datacenter cannot mount it, and RunPod does not fail loudly about that —
-    it just runs without the models and re-downloads ~39GB.
+    On community cloud there is no volume and no datacenter pin, so the pod lands wherever there
+    is capacity and stages its own models. When a volume IS configured, the datacenter must be
+    pinned to match it: a pod in the wrong region cannot mount it, and RunPod does not fail
+    loudly about that — it just runs without the models and re-downloads ~39GB.
     """
-    if not settings.runpod_network_volume_id:
-        raise RunPodError(
-            "RunPod is not configured on this server (RUNPOD_NETWORK_VOLUME_ID is unset)."
-        )
-
     spec = {
         "name": name,
         "imageName": settings.runpod_image,
         "gpuTypeIds": [settings.runpod_gpu_type_id],
         "gpuCount": 1,
-        "cloudType": "SECURE",
-        "dataCenterIds": [settings.runpod_datacenter_id],
-        "networkVolumeId": settings.runpod_network_volume_id,
+        "cloudType": settings.runpod_cloud_type,
         "containerDiskInGb": settings.runpod_container_disk_gb,
         "volumeMountPath": settings.runpod_volume_mount_path,
         "ports": ["8188/http", "22/tcp"],
         "env": env,
     }
+    # Only sent when configured. Community cloud supports neither, and a network volume is
+    # region-locked — so pinning a datacenter is meaningful only when there is a volume to sit
+    # beside. Sending either on community would be rejected or silently ignored.
+    if settings.runpod_network_volume_id:
+        spec["networkVolumeId"] = settings.runpod_network_volume_id
+    if settings.runpod_datacenter_id:
+        spec["dataCenterIds"] = [settings.runpod_datacenter_id]
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         resp = await client.post(f"{REST}/pods", json=spec, headers=_headers())
 

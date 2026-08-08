@@ -22,13 +22,24 @@ class Settings(BaseSettings):
     # key, which can also terminate pods and volumes. There is no launch-only scope, so it must
     # never reach the client.
     #
-    # Defaults are the measured-best configuration, not arbitrary. 4090 because 3090 secure
-    # inventory is transient (present in one sample, gone the next) and could not be honoured.
-    # EU-RO-1 because network volumes are region-locked and it had 4090 capacity in 10/10
-    # samples, while every US storage-capable datacenter had 0-1/10.
+    # Community 4090, no network volume — decided 2026-08-08 on measured cost.
+    #
+    # Per 720p segment: community 4090 $0.104, secure 4090 + volume $0.226, community 3090
+    # $0.109. Community 4090 is the same price per segment as a 3090 while being ~1.6x faster
+    # (1098s vs 1781s), and it drops the volume's $7/mo. Secure never breaks even: it is cheaper
+    # only on boot (2 min vs 13), which one segment of runtime repays.
+    #
+    # The trade is that community cannot mount a network volume, so every pod re-downloads ~39GB
+    # (~13 min, ~$0.07). Worth it when a pod stays up for several segments; not when launching
+    # repeatedly for one.
+    #
+    # All three are settings rather than constants so switching back is config, not a deploy.
+    # Empty volume id and empty datacenter mean "do not pin" — required for community, which has
+    # neither.
     runpod_api_key: str = ""
+    runpod_cloud_type: str = "COMMUNITY"
     runpod_network_volume_id: str = ""
-    runpod_datacenter_id: str = "EU-RO-1"
+    runpod_datacenter_id: str = ""
     runpod_gpu_type_id: str = "NVIDIA GeForce RTX 4090"
     runpod_image: str = "davidjbarnes/wanly-gpu-docker:latest"
     runpod_container_disk_gb: int = 30
