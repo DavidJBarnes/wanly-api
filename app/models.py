@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, SmallInteger, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -128,6 +128,14 @@ class Segment(Base):
     seed_faceswap = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     auto_finalize = mapped_column(Boolean, nullable=False, default=False)
     transition = mapped_column(String(20), nullable=True, default=None)
+    # Human observation. The metrics cannot rank quality -- expression rewards the mouth-gape
+    # artifact it should penalise -- so what a person saw is primary evidence, not a footnote.
+    # None of these three are read by generation; annotation must never change output.
+    notes = mapped_column(Text, nullable=True)
+    rating = mapped_column(SmallInteger, nullable=True)
+    # Controlled vocabulary, comma separated. Free-form would drift ("mouth void" vs "black
+    # mouth") and stop grouping, which destroys the only thing these are for.
+    observation_tags = mapped_column(String(500), nullable=True)
     trim_start_frames = mapped_column(Integer, nullable=False, default=0)
     trim_end_frames = mapped_column(Integer, nullable=False, default=0)
     motion_keywords = mapped_column(JSON, nullable=True)
