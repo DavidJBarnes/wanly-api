@@ -341,6 +341,10 @@ class Worker(Base):
     ip_address: Mapped[str] = mapped_column(String(45), nullable=False)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="online-idle")
     comfyui_running: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Set by workers running on RunPod. NULL for the 3090 and anything else self-hosted.
+    # Pairing pods to workers by name only worked for launcher-created pods; this is the
+    # identifier both sides actually agree on.
+    runpod_pod_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     last_heartbeat: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
     registered_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
     gpu_stats: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)

@@ -40,6 +40,9 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
         worker.hostname = body.hostname
         worker.ip_address = body.ip_address
         worker.comfyui_running = body.comfyui_running
+        # Re-registering after a container restart can land on a new pod id.
+        if body.runpod_pod_id:
+            worker.runpod_pod_id = body.runpod_pod_id
         worker.status, worker.drain_after_jobs = reregistered_drain_state(
             worker.status, worker.drain_after_jobs
         )
@@ -50,6 +53,7 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
             hostname=body.hostname,
             ip_address=body.ip_address,
             comfyui_running=body.comfyui_running,
+            runpod_pod_id=body.runpod_pod_id,
         )
         db.add(worker)
 

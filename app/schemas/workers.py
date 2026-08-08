@@ -10,10 +10,13 @@ class WorkerRegister(BaseModel):
     hostname: str
     ip_address: str
     comfyui_running: bool = False
+    # Optional: only RunPod workers have one, and older daemons do not send it.
+    runpod_pod_id: str | None = None
 
 
 class WorkerHeartbeat(BaseModel):
     comfyui_running: bool
+    runpod_pod_id: str | None = None
     gpu_stats: dict[str, Any] | None = None
     sd_scripts: dict[str, Any] | None = None
     a1111: dict[str, Any] | None = None
