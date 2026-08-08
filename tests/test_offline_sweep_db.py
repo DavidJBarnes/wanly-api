@@ -93,3 +93,46 @@ class TestOfflineSweepBehaviour:
         """The outer transaction is rolled back, so every test sees only what it created."""
         names = (await db.execute(select(Worker.friendly_name))).scalars().all()
         assert names == [], f"leaked rows from a previous test: {names}"
+
+
+class TestWorkerReportsPodId:
+    """A worker on RunPod must be pairable with its pod (wanly-console#291 follow-up).
+
+    Pairing on name only worked for pods created by the console launcher, which sets the pod
+    name and FRIENDLY_NAME to the same value. A pod launched from the RunPod template gets an
+    auto-generated name while its worker registers as runpod-<pod id>, so the two never matched
+    and the pod showed as "Starting" forever beside the worker it had already become.
+    """
+
+    async def test_pod_id_round_trips(self, db):
+        from app.models import Worker
+
+        w = Worker(
+            friendly_name="runpod-abc123",
+            hostname="h",
+            ip_address="127.0.0.1",
+            runpod_pod_id="abc123",
+        )
+        db.add(w)
+        await db.flush()
+
+        from sqlalchemy import select
+
+        got = (
+            await db.execute(select(Worker.runpod_pod_id).where(Worker.id == w.id))
+        ).scalar_one()
+        assert got == "abc123"
+
+    async def test_self_hosted_workers_have_none(self, db):
+        """The 3090 is not a pod. NULL must be a normal, expected value."""
+        from sqlalchemy import select
+
+        from app.models import Worker
+
+        w = Worker(friendly_name="3090.zero", hostname="h", ip_address="127.0.0.1")
+        db.add(w)
+        await db.flush()
+        got = (
+            await db.execute(select(Worker.runpod_pod_id).where(Worker.id == w.id))
+        ).scalar_one()
+        assert got is None
