@@ -41,6 +41,12 @@ OBSERVATION_TAGS = [
     "face-blurry",
     "face-expressive",
     "mouth-void",
+    # Repetitive rather than absent: the same open-close cycle looping for the whole segment,
+    # "goldfish mouth". Distinct from face-frozen (no movement) and mouth-void (the gaping black
+    # space), and worth its own label because it inflates the expression metric rather than
+    # depressing it -- sustained large landmark displacement is exactly what that metric rewards,
+    # which makes this the third artifact it scores as a success.
+    "mouth-looping",
     "teeth-mush",
     "identity-drift",
     # Motion, per person. motion_magnitude is whole-frame Farneback optical flow: it sums every
