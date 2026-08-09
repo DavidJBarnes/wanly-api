@@ -99,6 +99,28 @@ class SegmentAnnotation(BaseModel):
     observation_tags: Optional[list[str]] = None
 
 
+class SegmentPromptUpdate(BaseModel):
+    """Change what a segment will generate, before it starts.
+
+    The prompt is a SNAPSHOT taken at job creation -- unlike loras and sampler settings, which
+    resolve live from the preset at claim time. That asymmetry is deliberate (a queued job should
+    not silently change what it depicts) but it left no way to correct a queued batch after
+    improving the preset, short of deleting and recreating every job.
+    """
+
+    # Either supply the text directly...
+    prompt: Optional[str] = Field(None, min_length=1, max_length=8000)
+    # ...or re-take the snapshot from the segment's linked preset, which is the common case after
+    # editing that preset.
+    from_preset: bool = False
+
+    @model_validator(mode="after")
+    def exactly_one_source(self):
+        if bool(self.prompt) == self.from_preset:
+            raise ValueError("Supply either prompt or from_preset=true, not both or neither")
+        return self
+
+
 class SegmentResponse(BaseModel):
     id: UUID
     job_id: UUID

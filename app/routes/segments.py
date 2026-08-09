@@ -25,6 +25,7 @@ from app.schemas.segments import (
     EXCLUSIVE_TAG_GROUPS,
     OBSERVATION_TAGS,
     SegmentAnnotation,
+    SegmentPromptUpdate,
     FramePreview,
     FramePreviewResponse,
     HologramRequest,
@@ -626,6 +627,65 @@ async def update_segment_transition(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid transition: {transition}")
 
     segment.transition = transition
+    await db.commit()
+    await db.refresh(segment)
+    return segment
+
+
+@router.patch("/segments/{segment_id}/prompt", response_model=SegmentResponse)
+async def update_segment_prompt(
+    segment_id: UUID,
+    body: SegmentPromptUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Change a queued segment's prompt, or re-take it from its preset.
+
+    Only while the segment has not been claimed. Once a worker holds it the prompt has already
+    been sent to ComfyUI, so editing would change the record without changing the output -- the
+    worst outcome, because the row would then describe something the video is not.
+
+    Wildcards are resolved here exactly as they are at creation. Skipping that would make an
+    edited prompt behave differently from an identical one typed into the create dialog, and
+    `<face>` would reach the model as literal text.
+    """
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+
+    if segment.status != SegmentStatus.PENDING or segment.worker_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Segment is {segment.status} and cannot be edited. A prompt can only be changed "
+                "before a worker claims it; after that the change would not reach the video."
+            ),
+        )
+
+    if body.from_preset:
+        if not segment.video_preset_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="This segment is not linked to a preset, so there is nothing to re-take.",
+            )
+        preset = await db.get(VideoSettingsPreset, segment.video_preset_id)
+        if preset is None or not preset.prompt:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="The linked preset has no prompt to copy.",
+            )
+        source = preset.prompt
+    else:
+        source = body.prompt
+
+    resolved, template = await _resolve_wildcards(db, source)
+    segment.prompt = resolved
+    segment.prompt_template = template
     await db.commit()
     await db.refresh(segment)
     return segment
