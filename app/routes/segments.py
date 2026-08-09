@@ -1276,6 +1276,52 @@ async def cancel_segment(
     return segment
 
 
+@router.post("/segments/{segment_id}/discard", response_model=SegmentResponse)
+async def discard_segment(
+    segment_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Take a segment out of the video without losing what was recorded about it.
+
+    Deleting destroys the row, and with it the rating, tags and notes. That was tolerable when a
+    segment was only output; it is not now that annotations are the primary evidence in every
+    experiment. A bad segment is frequently the MOST informative one, and discarding the
+    observation in order to get it out of the cut is exactly backwards.
+
+    The row keeps its index, so the record reads as "the discarded version of segment 2" and a
+    regenerated segment can take the same position. The unique constraint is partial for that
+    reason -- see migration 063.
+
+    Output files are deliberately NOT removed. The clip is the evidence behind the rating; a note
+    saying "mouth loops for the whole segment" is worth much less if the segment cannot be
+    rewatched.
+    """
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+    if segment.discarded:
+        return segment
+    if segment.status not in (SegmentStatus.FAILED, SegmentStatus.COMPLETED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Only failed or completed segments can be discarded (current: "
+                f"'{segment.status}'). Cancel a running segment first."
+            ),
+        )
+
+    segment.discarded = True
+    await db.commit()
+    await db.refresh(segment)
+    return segment
+
+
 @router.delete("/segments/{segment_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_segment(
     segment_id: UUID,
