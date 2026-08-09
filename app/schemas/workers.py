@@ -34,6 +34,22 @@ class WorkerDrain(BaseModel):
     after_jobs: int | None = None
 
 
+class QueueHealthResponse(BaseModel):
+    """Work waiting versus workers able to take it.
+
+    `stalled` requires BOTH halves: queued work with a busy worker is a queue doing its job, and
+    no workers with an empty queue is a quiet night. An alarm on either alone fires constantly
+    and then gets ignored.
+    """
+
+    pending_segments: int
+    live_workers: int
+    stalled: bool
+    last_worker_seen: datetime | None = None
+    # Pre-rendered so every surface phrases an outage identically.
+    summary: str = ""
+
+
 class WorkerResponse(BaseModel):
     id: uuid.UUID
     friendly_name: str
