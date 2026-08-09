@@ -33,6 +33,12 @@ class TestVocabulary:
         for tag in ("him-strong", "her-strong", "him-static", "her-static"):
             assert tag in OBSERVATION_TAGS
 
+    def test_repetition_is_distinguishable_from_absence(self):
+        # "goldfish mouth" -- the same cycle looping all segment -- is neither a frozen face nor
+        # a gaping one, and it inflates the expression metric instead of depressing it.
+        for tag in ("mouth-looping", "face-frozen", "mouth-void"):
+            assert tag in OBSERVATION_TAGS
+
     def test_no_duplicates(self):
         assert len(OBSERVATION_TAGS) == len(set(OBSERVATION_TAGS))
 
