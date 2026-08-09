@@ -143,6 +143,8 @@ class SegmentResponse(BaseModel):
     negative_prompt: Optional[str] = None
     auto_finalize: bool
     transition: Optional[str]
+    # Soft-deleted: kept for its rating, tags and notes, excluded from the video.
+    discarded: bool = False
     notes: Optional[str] = None
     rating: Optional[int] = None
     observation_tags: Optional[str] = None
@@ -313,6 +315,8 @@ class SegmentClipResponse(BaseModel):
 
 
 class SegmentTrimUpdate(BaseModel):
+    # Soft-deleted: kept for its rating, tags and notes, excluded from the video.
+    discarded: bool = False
     notes: Optional[str] = None
     rating: Optional[int] = None
     observation_tags: Optional[str] = None

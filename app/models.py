@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, SmallInteger, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, SmallInteger, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -100,7 +100,11 @@ class Job(Base):
 class Segment(Base):
     __tablename__ = "segments"
     __table_args__ = (
-        UniqueConstraint("job_id", "index", name="uq_segments_job_index"),
+        # PARTIAL: live rows only. A discarded segment keeps its index so the record reads
+        # correctly, and its replacement takes the same position in the video -- otherwise the
+        # regenerated segment would have to be appended and would play out of order.
+        Index("uq_segments_job_index_live", "job_id", "index",
+              unique=True, postgresql_where=text("NOT discarded")),
         Index("ix_segments_job_id", "job_id"),
         Index("ix_segments_status", "status"),
     )
@@ -108,6 +112,10 @@ class Segment(Base):
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     job_id = mapped_column(UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
     index = mapped_column(Integer, nullable=False)
+    # Soft delete. The row and its rating, tags and notes survive; the video does not include it.
+    # A bad segment is often the most informative one, so discarding the observation to get it out
+    # of the cut is exactly backwards.
+    discarded = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     prompt = mapped_column(Text, nullable=False)
     prompt_template = mapped_column(Text, nullable=True)
     duration_seconds = mapped_column(Float, nullable=False, default=5.0)

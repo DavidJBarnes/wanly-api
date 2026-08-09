@@ -319,10 +319,18 @@ async def list_jobs(
     counts_map: dict[UUID, tuple[int, int]] = {}
     if job_ids:
         counts_result = await db.execute(
+            # Progress excludes discarded segments from BOTH halves. A job whose only bad
+            # segment was discarded should read 4/4, not 5/5 with one of them not in the video.
+            #
+            # Run-time totals elsewhere deliberately still INCLUDE discarded work: the GPU time
+            # was genuinely spent, and hiding it would understate what a job cost.
             select(
                 Segment.job_id,
-                func.count().label("total"),
-                func.count(case((Segment.status == SegmentStatus.COMPLETED, 1))).label("completed"),
+                func.count(case((Segment.discarded.is_(False), 1))).label("total"),
+                func.count(case(
+                    ((Segment.status == SegmentStatus.COMPLETED)
+                     & Segment.discarded.is_(False), 1)
+                )).label("completed"),
             )
             .where(Segment.job_id.in_(job_ids))
             .group_by(Segment.job_id)

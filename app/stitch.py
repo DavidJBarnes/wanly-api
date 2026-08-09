@@ -172,10 +172,16 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
             job.status = JobStatus.FINALIZING
             await db.commit()
 
-            # Fetch completed segments ordered by index
+            # Completed and NOT discarded, ordered by index. Discarded segments keep their
+            # status and their index -- the row is a record, not a deletion -- so the filter has
+            # to be explicit or the segment being removed still ends up in the cut.
             result = await db.execute(
                 select(Segment)
-                .where(Segment.job_id == job_id, Segment.status == SegmentStatus.COMPLETED)
+                .where(
+                    Segment.job_id == job_id,
+                    Segment.status == SegmentStatus.COMPLETED,
+                    Segment.discarded.is_(False),
+                )
                 .order_by(Segment.index)
             )
             segments = result.scalars().all()
