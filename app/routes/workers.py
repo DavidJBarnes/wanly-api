@@ -2,13 +2,15 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import verify_api_key, verify_api_key_or_bearer
 from app.database import get_db
-from app.models import Worker
-from app.schemas.workers import WorkerDrain, WorkerHeartbeat, WorkerRegister, WorkerRename, WorkerResponse, WorkerStatusUpdate
+from app.enums import JobStatus, SegmentStatus
+from app.models import Job, Segment, Worker
+from app.queue_health import assess
+from app.schemas.workers import QueueHealthResponse, WorkerDrain, WorkerHeartbeat, WorkerRegister, WorkerRename, WorkerResponse, WorkerStatusUpdate
 
 router = APIRouter()
 
@@ -220,6 +222,40 @@ async def list_workers(
         stmt = stmt.where(Worker.status == status)
     result = await db.execute(stmt)
     return result.scalars().all()
+
+
+@router.get("/queue-health", response_model=QueueHealthResponse,
+            dependencies=[Depends(verify_api_key_or_bearer)])
+async def queue_health(db: AsyncSession = Depends(get_db)):
+    """Is there queued work with nobody to do it?
+
+    Cheap enough to poll from any page. Counts only segments whose JOB is also live -- an
+    archived job's segments are unclaimable by design and would otherwise raise a permanent
+    false alarm (see #177).
+    """
+    pending = (await db.execute(
+        select(func.count())
+        .select_from(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(
+            Segment.status == SegmentStatus.PENDING,
+            Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
+        )
+    )).scalar() or 0
+
+    rows = (await db.execute(select(Worker.status, Worker.last_heartbeat))).all()
+    health = assess(
+        pending_segments=pending,
+        worker_statuses=[r[0] for r in rows],
+        last_worker_seen=max((r[1] for r in rows), default=None),
+    )
+    return QueueHealthResponse(
+        pending_segments=health.pending_segments,
+        live_workers=health.live_workers,
+        stalled=health.stalled,
+        last_worker_seen=health.last_worker_seen,
+        summary=health.summary,
+    )
 
 
 @router.get("/workers/{worker_id}", response_model=WorkerResponse, dependencies=[Depends(verify_api_key_or_bearer)])
