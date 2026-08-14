@@ -1332,6 +1332,14 @@ async def reroll_first_segment(
             ),
         )
 
+    # Stamp the outgoing take with the seed it actually ran on, if it was relying on the
+    # derivation. NULL means "derive from the job", which is unambiguous while a job has one take
+    # and stops being so the moment it has several: the archive exists to answer "which seed gave
+    # me that one", and an archived clip whose seed has to be recomputed from context is a worse
+    # answer than a recorded number. Same value the worker used -- this records it, it does not
+    # change it.
+    if old.seed is None:
+        old.seed = (job.seed + old.index) % (2**63 - 1)
     old.discarded = True
 
     fresh = Segment(

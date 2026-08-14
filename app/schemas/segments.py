@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class SegmentCreate(BaseModel):
@@ -125,10 +125,25 @@ class SegmentResponse(BaseModel):
     id: UUID
     job_id: UUID
     index: int
-    # NULL means "derived from the job" (job.seed + index), which is every segment that was never
-    # explicitly re-rolled. Present so the console can show which seed produced which take —
-    # the question the segment archive exists to answer.
-    seed: Optional[int] = None
+    # A STRING, not a number, and the type is the point.
+    #
+    # Seeds are identifiers: their only use is being read off the screen and used again. They are
+    # stored as BigInteger and 95% of existing jobs (1,645 of 1,724, measured 2026-08-14) have a
+    # seed above 2**53, which is the largest integer JSON survives intact — every browser silently
+    # rounds anything larger. Sent as a number, the seed displayed beside a clip would not be the
+    # seed that generated it, and nothing anywhere would report a problem. Sent as a string it is
+    # exact for every value, and no client does arithmetic on it anyway.
+    #
+    # NULL means "derived from the job" (job.seed + index) — a segment that never asked for a
+    # particular seed. Archiving a take stamps the derived value in, so anything in the archive
+    # carries its own answer.
+    seed: Optional[str] = None
+
+    @field_validator("seed", mode="before")
+    @classmethod
+    def _seed_to_string(cls, v: object) -> Optional[str]:
+        """The column is an integer; the wire format is not."""
+        return None if v is None else str(v)
     prompt: str
     prompt_template: Optional[str]
     duration_seconds: float
