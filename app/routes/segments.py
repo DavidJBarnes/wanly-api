@@ -17,6 +17,7 @@ from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
 from app.database import get_db
+from app.seeds import new_seed
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.helpers import upload_faceswap_image
 from app.models import AppSetting, Job, Lora, Segment, User, Video, VideoSettingsPreset, Wildcard, Worker
@@ -470,10 +471,13 @@ async def claim_next_segment(
         width=job.width,
         height=job.height,
         fps=job.fps,
-        # Per-segment seed = job.seed + index: seg0 stays exactly job.seed (reproducible),
-        # later segments get decorrelated noise so they don't repeat the same motion pattern.
-        # Whole job still reproduces identically from job.seed. Modulo keeps it in range.
-        seed=(job.seed + segment.index) % (2**63 - 1),
+        # An explicit segment seed wins; otherwise derive it as job.seed + index, which keeps
+        # seg0 exactly job.seed (so the whole job still reproduces from that one number) and
+        # decorrelates later segments so they don't repeat the same motion pattern.
+        #
+        # A segment only carries its own seed when it needed one the derivation cannot express --
+        # today, a re-rolled segment 0, which must change seed without changing position.
+        seed=segment.seed if segment.seed is not None else (job.seed + segment.index) % (2**63 - 1),
         continuation_mode=continuation_mode,
         previous_output_path=prev_output_path if use_vace else None,
         vace_overlap_frames=vace_overlap,
@@ -1268,6 +1272,100 @@ async def cancel_segment(
     await db.commit()
     await db.refresh(segment)
     return segment
+
+
+@router.post("/jobs/{job_id}/reroll", response_model=SegmentResponse)
+async def reroll_first_segment(
+    job_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Archive segment 0 and queue a fresh one, identical except for the seed.
+
+    This is the "show me another take" button. Everything that defines the shot -- prompt, LoRAs,
+    preset, start image, faceswap, duration -- is copied verbatim so that the seed is the ONLY
+    thing that differs and the two takes are actually comparable. A wildcard prompt is copied
+    already-resolved for the same reason: re-rolling the wildcards as well would change two
+    variables at once and make the comparison worth nothing.
+
+    The old take is discarded, not deleted. It keeps its video, rating, tags and notes, and it
+    keeps them under its own seed -- which is why segments have a seed column at all. Rolling
+    repeatedly is the point of this endpoint, so an archive that relabelled every previous take
+    with the newest seed would destroy exactly the record it exists to accumulate.
+
+    Only offered while the job is a single live segment. Once there is a segment 1, segment 0 is
+    the thing it continues from, and replacing it would orphan every successor that was generated
+    from its last frame.
+
+    Trim, transition, rating, notes and observation tags are deliberately NOT copied: they
+    describe the take being archived, not the one about to be generated.
+    """
+    result = await db.execute(
+        select(Job)
+        .where(Job.id == job_id, Job.user_id == user.id)
+        .options(selectinload(Job.segments))
+    )
+    job = result.scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    # Live segments only. After a re-roll the job holds a discarded segment 0 beside the new one,
+    # and rolling again has to stay available -- that is the whole workflow.
+    live = [s for s in job.segments if not s.discarded]
+    if len(live) != 1 or live[0].index != 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Re-roll only applies to a job with a single segment. This job has "
+                f"{len(live)} live segments; a later segment continues from segment 0's last "
+                "frame, so replacing it would orphan them."
+            ),
+        )
+
+    old = live[0]
+    if old.status not in (SegmentStatus.FAILED, SegmentStatus.COMPLETED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Segment 0 is '{old.status}'. Cancel it before re-rolling — otherwise the "
+                "worker finishes generating a take that has already been archived."
+            ),
+        )
+
+    old.discarded = True
+
+    fresh = Segment(
+        job_id=job.id,
+        index=0,
+        seed=new_seed(),
+        prompt=old.prompt,
+        prompt_template=old.prompt_template,
+        duration_seconds=old.duration_seconds,
+        speed=old.speed,
+        start_image=old.start_image,
+        loras=old.loras,
+        faceswap_enabled=old.faceswap_enabled,
+        faceswap_method=old.faceswap_method,
+        faceswap_source_type=old.faceswap_source_type,
+        faceswap_image=old.faceswap_image,
+        faceswap_faces_order=old.faceswap_faces_order,
+        faceswap_faces_index=old.faceswap_faces_index,
+        faceswap_model=old.faceswap_model,
+        faceswap_pixel_boost=old.faceswap_pixel_boost,
+        seed_faceswap=old.seed_faceswap,
+        negative_prompt=old.negative_prompt,
+        auto_finalize=old.auto_finalize,
+        video_preset_id=old.video_preset_id,
+    )
+    db.add(fresh)
+
+    # Back to pending or nothing claims it. The job may well be 'awaiting' (segment 0 finished
+    # and it is waiting on a decision) or 'failed'.
+    job.status = JobStatus.PENDING
+
+    await db.commit()
+    await db.refresh(fresh)
+    return fresh
 
 
 @router.post("/segments/{segment_id}/discard", response_model=SegmentResponse)

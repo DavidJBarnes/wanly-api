@@ -125,6 +125,10 @@ class SegmentResponse(BaseModel):
     id: UUID
     job_id: UUID
     index: int
+    # NULL means "derived from the job" (job.seed + index), which is every segment that was never
+    # explicitly re-rolled. Present so the console can show which seed produced which take —
+    # the question the segment archive exists to answer.
+    seed: Optional[int] = None
     prompt: str
     prompt_template: Optional[str]
     duration_seconds: float

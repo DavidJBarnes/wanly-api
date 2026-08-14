@@ -18,6 +18,7 @@ from app.auth import get_current_user
 from app.config import settings
 from app.database import get_db
 from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStatus
+from app.seeds import new_seed
 from app.estimation import estimate_segment_time, get_estimation_rates, sum_estimated_queue_time
 from app.helpers import upload_faceswap_image
 from app.models import Job, Lora, Segment, User, Video
@@ -135,7 +136,16 @@ async def create_job(
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid JSON in data field: {e}")
 
-    seed = body.seed if body.seed is not None else random.randint(0, 2**63 - 1)
+    # Drawn below 2**53, the largest integer JavaScript represents exactly.
+    #
+    # The seed is displayed on the job page and can be typed back into this dialog to reproduce a
+    # job — that round trip is the only reason to show it. Above 2**53 the browser silently rounds
+    # it, so the number on screen is NOT the number that generated the video and reproducing from
+    # it quietly produces something else. Drawing from the full BigInteger range made that near
+    # certain rather than rare: only about one seed in a thousand landed low enough to survive.
+    #
+    # Jobs created before this keep their large seeds; nothing can recover what those displayed.
+    seed = body.seed if body.seed is not None else new_seed()
 
     # New jobs go to bottom of queue
     max_priority_result = await db.execute(
