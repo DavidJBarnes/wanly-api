@@ -1369,10 +1369,28 @@ async def reroll_first_segment(
         old.seed = (job.seed + old.index) % (2**63 - 1)
     old.discarded = True
 
+    # The job's seed becomes the new take's seed, and the new take derives from it like any
+    # other segment.
+    #
+    # There is one live take, so there should be one answer to "what seed is this?" — and it
+    # belongs on the job, where the header shows it and the create dialog accepts it back. The
+    # alternative, a job seed frozen at whatever the first take used, means the number on the job
+    # and the number that generated what is on screen disagree from the first re-roll onward.
+    #
+    # This is only safe because the outgoing take was just stamped above: the seed being replaced
+    # here is still recorded, on the row it actually produced. Overwriting job.seed WITHOUT that
+    # would relabel the archived clip with a seed that never generated it.
+    #
+    # Re-roll requires a single live segment, so nothing else is deriving from the old value.
+    job.seed = new_seed()
+
     fresh = Segment(
         job_id=job.id,
         index=0,
-        seed=new_seed(),
+        # NULL: derive from the job like every other segment. The job seed WAS just set to this
+        # take's seed, so a second copy on the segment would be the same number in two places,
+        # free to drift.
+        seed=None,
         prompt=old.prompt,
         prompt_template=old.prompt_template,
         duration_seconds=old.duration_seconds,
