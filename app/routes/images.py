@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, not_, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
@@ -365,59 +365,115 @@ def search_pattern(q: str) -> str:
     """The LIKE pattern for a user's query, with their wildcards neutralised.
 
     "%" and "_" are LIKE wildcards and filenames are full of both, so a query for "a_b" must not
-    silently match "axb", and "100%" must not become match-everything. The backslash is escaped
-    first, or escaping the wildcards would itself be re-escaped.
+    silently match "axb", and "100%" must not become match-everything.
     """
-    safe = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-    return f"%{safe}%"
+    return f"%{_like_escape(q)}%"
 
 
-def search_clause(q: str):
-    """Match a query against tags OR filename.
+def _like_escape(s: str) -> str:
+    """Neutralise LIKE metacharacters. Backslash first, or escaping the wildcards would itself
+    be re-escaped."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
-    A disjunction, not a conjunction: an untagged image has NULL tags, and requiring both would
-    leave it permanently unfindable -- which is the case this exists for.
+
+def path_clause(q: str):
+    """Match the S3 key as a substring.
+
+    Fragment matching is right here and wrong for tags. Images arrive named
+    "00111-1696092597-swapped.png" and get referred to by that number in job configs and notes,
+    so "which folder was 00111 in" has to be answerable -- and a partially remembered filename is
+    the only handle there is. Tags have exact controls of their own, so they no longer share this.
     """
-    pattern = search_pattern(q)
-    return or_(
-        ImageMeta.tags.ilike(pattern, escape="\\"),
-        ImageMeta.path.ilike(pattern, escape="\\"),
+    return ImageMeta.path.ilike(search_pattern(q), escape="\\")
+
+
+def normalise_tag(tag: str) -> str:
+    """Fold a tag to its comparison form: case- and space-insensitive.
+
+    Spaces come out because the vocabulary contains "Big dick" and the stored string is joined
+    with ", " -- inconsistent spacing around the commas is the norm, not the exception.
+    """
+    return tag.strip().lower().replace(" ", "")
+
+
+def tag_clause(tag: str):
+    """Match one WHOLE tag inside the comma-joined tags string.
+
+    Tags are stored as one text blob ("Kelly, Missionary"), so a substring match cannot tell
+    where one tag ends and the next begins. Measured on production 2026-08-14, that is not a
+    corner case: `%kelly%` matched 2,057 of 2,788 images -- 74% of the repo -- because it also
+    caught KellyYoung (1,019), KellyBangs (140) and KellyTeacher (76). Exact Kelly is 824.
+
+    Wrapping both sides in commas is what makes the boundaries real: ",kelly," cannot match
+    inside ",kellyyoung,". concat() rather than || because it is null-safe, so an untagged row
+    simply fails to match instead of poisoning the expression.
+    """
+    pattern = f"%,{_like_escape(normalise_tag(tag))},%"
+    return func.concat(",", func.replace(func.lower(ImageMeta.tags), " ", ""), ",").like(
+        pattern, escape="\\"
     )
+
+
+def image_filter(q: str | None, tags: list[str], exclude: list[str]) -> list:
+    """Every criterion ANDs. Returns clauses for .where(*clauses).
+
+    Strict conjunction, deliberately: each pill narrows. Two subject pills therefore mean "both
+    tags on one image", which is usually empty and is the honest answer -- there is no OR, so
+    "the Kelly family" is two searches rather than one. That is the agreed v1 semantic.
+    """
+    clauses = [tag_clause(t) for t in tags if t.strip()]
+    # NULL tags make NOT LIKE null, which would silently drop untagged images from every
+    # excluded search. They have nothing to exclude, so they pass.
+    clauses += [
+        or_(ImageMeta.tags.is_(None), not_(tag_clause(t)))
+        for t in exclude
+        if t.strip()
+    ]
+    if q and q.strip():
+        clauses.append(path_clause(q.strip()))
+    return clauses
 
 
 @router.get("/images/search", dependencies=[Depends(get_current_user)])
 async def search_images(
-    q: str = Query(..., min_length=1, max_length=500),
+    q: str | None = Query(None, max_length=500),
+    tags: list[str] = Query(default_factory=list),
+    exclude: list[str] = Query(default_factory=list),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
     user = Depends(get_current_user),
 ):
-    """Search images across all folders by tag or filename (case-insensitive partial match).
+    """Find images by whole tags (AND) and/or a filename fragment.
 
-    Path is matched as well as tags because the filename is often the only handle a user has.
-    Images arrive named like "00111-1696092597-swapped.png", get referenced by that name in job
-    configs, notes and conversations, and are spread across dated folders -- so "which folder was
-    00111 in" was unanswerable from the UI, and an untagged image was unfindable by any means at
-    all. Matching the path also makes a folder name a usable query, which is a free side effect
-    of storing the full key.
+    Two controls with two different jobs. `tags` and `exclude` match a tag in full, so Kelly
+    stops dragging in KellyYoung; `q` matches the S3 key as a substring, because a half-recalled
+    filename is often the only handle there is, and it is the only way an untagged image can be
+    found at all.
+
+    Everything given ANDs. `tags=Kelly&tags=Missionary` is the 102 images carrying both, not the
+    2,057 that a substring search for "kelly" used to return.
     """
-    matches = search_clause(q)
+    clauses = image_filter(q, tags, exclude)
+    if not clauses:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide q, or at least one tag — an unfiltered search is the folder listing.",
+        )
 
-    count_q = select(func.count()).select_from(ImageMeta).where(matches)
+    count_q = select(func.count()).select_from(ImageMeta).where(*clauses)
     total = (await db.execute(count_q)).scalar() or 0
 
     meta_q = (
         select(ImageMeta)
-        .where(matches)
+        .where(*clauses)
         .order_by(ImageMeta.updated_at.desc())
         .offset(offset)
         .limit(limit)
     )
     meta_rows = (await db.execute(meta_q)).scalars().all()
 
-    async def _meta(meta: ImageMeta) -> dict:
-        bucket = settings.s3_images_bucket
+    async def _meta(meta: ImageMeta) -> dict | None:
         obj = await asyncio.to_thread(head_object, meta.path)
         if not obj:
             return None
@@ -431,13 +487,56 @@ async def search_images(
             "tags": meta.tags,
         }
 
-    items = []
-    for row in meta_rows:
-        item = await _meta(row)
-        if item:
-            items.append(item)
+    # Concurrently, because this is the page's real cost. Each row needs one S3 HEAD, and a
+    # sequential await per row made a 50-result page 50 serial round trips -- far more than the
+    # query itself takes over 2,788 rows.
+    results = await asyncio.gather(*(_meta(row) for row in meta_rows))
+    items = [item for item in results if item]
 
     return {"items": items, "total": total, "limit": limit, "offset": offset}
+
+
+@router.get("/images/tag-counts", dependencies=[Depends(get_current_user)])
+async def image_tag_counts(
+    q: str | None = Query(None, max_length=500),
+    tags: list[str] = Query(default_factory=list),
+    exclude: list[str] = Query(default_factory=list),
+    db: AsyncSession = Depends(get_db),
+    user = Depends(get_current_user),
+):
+    """Every tag in use, with how many images carry it under the CURRENT filter.
+
+    Counts are what make the filter navigable rather than a guessing game: with Kelly selected,
+    the remaining tags show what actually exists inside that set, so a dead end is visible before
+    it is clicked instead of after.
+
+    Derived from what is used, not from the title_tags vocabulary. Tagging is meant to be
+    controlled, but production has drifted -- 11 tags in use are not in the vocabulary, including
+    kellyteacher on 76 images. Driving the pills from the vocabulary would make those 76 images
+    unreachable. It also surfaces the fat-fingers (`pusy`, `cowgirlowgirl`, one image each) with
+    their counts, which is the first step to cleaning them up.
+    """
+    clauses = image_filter(q, tags, exclude)
+
+    # unnest in a LATERAL rather than the target list: a set-returning function in the select
+    # list cannot then be grouped by.
+    tag_rows = (
+        func.unnest(func.string_to_array(ImageMeta.tags, ","))
+        .table_valued("tag")
+        .render_derived(name="t")
+    )
+    tag_expr = func.lower(func.btrim(tag_rows.c.tag))
+
+    stmt = (
+        select(tag_expr.label("tag"), func.count().label("count"))
+        .select_from(ImageMeta)
+        .join(tag_rows, true())
+        .where(*clauses, tag_expr != "")
+        .group_by(tag_expr)
+        .order_by(func.count().desc(), tag_expr)
+    )
+    rows = (await db.execute(stmt)).all()
+    return {"items": [{"tag": r.tag, "count": r.count} for r in rows]}
 
 
 _CONTENT_TYPES = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}
