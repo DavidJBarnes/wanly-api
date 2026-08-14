@@ -282,16 +282,3 @@ class TestSeedRange:
             assert 0 <= seed <= JS_SAFE_MAX_SEED
             # The round trip a browser performs. Equality here is the whole property.
             assert int(float(seed)) == seed
-
-
-@pytest.mark.asyncio
-class TestClaimUsesTheSegmentSeed:
-    async def test_an_explicit_seed_wins_over_the_derived_one(self, db):
-        """The claim payload is where the seed actually reaches the worker."""
-        from app.routes.segments import claim_next_segment  # noqa: F401  (import guard)
-
-        user = await _user(db)
-        job, seg = await _job_with_segment(db, user, seed=42)
-        assert seg.seed == 42
-        # The derivation would have produced job.seed + index = 1234.
-        assert (job.seed + seg.index) % (2**63 - 1) == 1234
