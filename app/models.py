@@ -116,6 +116,27 @@ class Segment(Base):
     # A bad segment is often the most informative one, so discarding the observation to get it out
     # of the cut is exactly backwards.
     discarded = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    # The noise seed this segment generates with, when it has one of its own.
+    #
+    # NULL is the normal case and means "derive it", which is how every segment worked before
+    # this column existed: the claim endpoint computes (job.seed + index), so segment 0 is exactly
+    # job.seed and the whole job reproduces from that one number. Existing rows are all NULL and
+    # behave exactly as they always did — this column is additive, never backfilled.
+    #
+    # It is set when a segment needs a seed that is NOT a function of its position, which today
+    # means re-rolling segment 0 to see a different take of the same prompt. Without a per-segment
+    # seed the only way to re-roll would be to overwrite job.seed, and that silently rewrites
+    # history: the archived clip keeps its video and its rating while the number that produced it
+    # is replaced by the number that produced its replacement. That is the worst possible thing to
+    # lose here, because seed is the dominant variable in what a take actually looks like —
+    # expression in particular is seed-driven far more than it is LoRA-driven — so "which seed was
+    # that one?" is the question the whole archive exists to answer.
+    #
+    # Written in the JS-safe integer range (< 2^53) rather than Postgres' full BigInteger range.
+    # A seed only has value if it can be read off the screen and used again, and JSON numbers
+    # above 2^53 are silently rounded by every browser, so a larger seed would display and
+    # round-trip as a DIFFERENT number than the one that generated the video.
+    seed = mapped_column(BigInteger, nullable=True)
     prompt = mapped_column(Text, nullable=False)
     prompt_template = mapped_column(Text, nullable=True)
     duration_seconds = mapped_column(Float, nullable=False, default=5.0)
