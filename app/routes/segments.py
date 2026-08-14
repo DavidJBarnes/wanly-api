@@ -274,14 +274,21 @@ async def claim_next_segment(
     #   kind="hologram" -> CPU-only reprocess carriers: holograms + smashcut (claimable even on
     #                      FINALIZED/FINALIZING jobs)
     #   kind=None       -> either (legacy combined behavior)
+    #
+    # Every branch excludes discarded segments. Status alone does not: a discarded segment keeps
+    # the status it was discarded in, and retrying a failed one puts it back to PENDING — at
+    # which point the worker regenerates a take the operator has already archived, silently
+    # spending GPU time on a clip nobody asked for.
     if kind == "hologram":
         where = (
             Segment.status == SegmentStatus.PENDING,
+            Segment.discarded.is_(False),
             Segment.reprocess_type.in_(_CPU_REPROCESS_TYPES),
         )
     elif kind == "gpu":
         where = (
             Segment.status == SegmentStatus.PENDING,
+            Segment.discarded.is_(False),
             Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
             # real generations (reprocess_type NULL) + GPU reprocess (faceswap); exclude CPU carriers.
             # NULL NOT IN (...) is NULL (excludes), so OR the NULL case in explicitly.
@@ -293,6 +300,7 @@ async def claim_next_segment(
     else:
         where = (
             Segment.status == SegmentStatus.PENDING,
+            Segment.discarded.is_(False),
             or_(
                 Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
                 Segment.reprocess_type.in_(_CPU_REPROCESS_TYPES),
@@ -861,6 +869,14 @@ async def retry_segment(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Only failed segments can be retried (current: '{segment.status}')",
+        )
+    # Retrying an archived take asks for a clip that was deliberately thrown away. Claiming
+    # already refuses to hand one out, so without this the retry would look like it worked and
+    # then sit PENDING forever.
+    if segment.discarded:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This take was discarded. Restore it before retrying, or re-roll instead.",
         )
 
     segment.status = SegmentStatus.PENDING
