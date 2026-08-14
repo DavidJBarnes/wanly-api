@@ -167,6 +167,17 @@ class Segment(Base):
     observation_tags = mapped_column(String(500), nullable=True)
     trim_start_frames = mapped_column(Integer, nullable=False, default=0)
     trim_end_frames = mapped_column(Integer, nullable=False, default=0)
+    # "Re-roll until": the rule this take was generated under, judged by the API when the take
+    # completes. Metric is one of identity/expression/motion/detail; the comparison is >= against
+    # the MEAN of the matching series in identity_metrics — the same number the console's chips
+    # show, so the value that gates is the value the user can read off the screen. A take that
+    # misses the rule is archived and re-rolled again automatically, capped by the
+    # "max_rerolls_per_job" app setting. reroll_count is this take's position in its chain
+    # (1 = the user-initiated roll). NULL throughout means "no rule" — every plain re-roll, and
+    # every take that predates the feature.
+    reroll_rule_metric = mapped_column(String(16), nullable=True)
+    reroll_rule_threshold = mapped_column(Float, nullable=True)
+    reroll_count = mapped_column(Integer, nullable=True)
     motion_magnitude = mapped_column(Float, nullable=True)
     # Identity scoring, measured inline when the segment finishes generating. Two means:
     # _mean_cos is vs the START FRAME (drift of this generation), _mean_cos_ref is vs the
