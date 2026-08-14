@@ -146,7 +146,6 @@ class Segment(Base):
     observation_tags = mapped_column(String(500), nullable=True)
     trim_start_frames = mapped_column(Integer, nullable=False, default=0)
     trim_end_frames = mapped_column(Integer, nullable=False, default=0)
-    motion_keywords = mapped_column(JSON, nullable=True)
     motion_magnitude = mapped_column(Float, nullable=True)
     # Identity scoring, measured inline when the segment finishes generating. Two means:
     # _mean_cos is vs the START FRAME (drift of this generation), _mean_cos_ref is vs the

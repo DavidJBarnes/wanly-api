@@ -150,7 +150,6 @@ class SegmentResponse(BaseModel):
     observation_tags: Optional[str] = None
     trim_start_frames: int
     trim_end_frames: int
-    motion_keywords: Optional[list[str]] = None
     motion_magnitude: Optional[float] = None
     identity_mean_cos: Optional[float] = None
     identity_mean_cos_ref: Optional[float] = None
@@ -224,9 +223,7 @@ class SegmentClaimResponse(BaseModel):
     # and is overridable, which would silently swap what "her" means mid-measurement.
     # Every segment scores against this same frame, so the numbers chain across the job.
     identity_ground_truth: Optional[str] = None
-    motion_keywords: Optional[list[str]] = None
     motion_magnitude: Optional[float] = None
-    previous_motion_keywords: Optional[list[str]] = None
     previous_motion_magnitude: Optional[float] = None
     reference_frames: Optional[list[str]] = None
     lightx2v_strength_high: Optional[float] = None
@@ -365,7 +362,6 @@ class SegmentStatusUpdate(BaseModel):
     last_frame_path: Optional[str] = None
     error_message: Optional[str] = None
     progress_log: Optional[str] = None
-    motion_keywords: Optional[list[str]] = None
     motion_magnitude: Optional[float] = None
     identity_mean_cos: Optional[float] = None
     identity_mean_cos_ref: Optional[float] = None
