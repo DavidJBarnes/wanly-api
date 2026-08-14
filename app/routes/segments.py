@@ -336,9 +336,20 @@ async def claim_next_segment(
         if segment.index == 0:
             resolved_start_image = job.starting_image
         else:
+            # The LIVE segment at the previous index. Index alone stopped identifying one row
+            # when re-rolling arrived: an archived take keeps its index, so a job rolled six
+            # times has seven rows at index 0 and this raised MultipleResultsFound — a 500 on
+            # every claim, which stops the queue dead rather than degrading.
+            #
+            # Live is also the right answer on its own terms: this resolves the frame the next
+            # segment continues from, and a discarded take is not what anything continues from.
             prev_result = await db.execute(
                 select(Segment)
-                .where(Segment.job_id == job.id, Segment.index == segment.index - 1)
+                .where(
+                    Segment.job_id == job.id,
+                    Segment.index == segment.index - 1,
+                    Segment.discarded.is_(False),
+                )
             )
             prev_segment = prev_result.scalar_one_or_none()
             if prev_segment is not None:
