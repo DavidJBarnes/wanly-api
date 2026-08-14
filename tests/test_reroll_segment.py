@@ -118,11 +118,9 @@ class TestReroll:
         resp = await _reroll(db, user, job.id)
 
         assert resp.json()["seed"] is not None
-        # And the job's seed is untouched, so the archived take still reproduces from it.
+        # And the job's seed is untouched.
         await db.refresh(job)
         assert job.seed == 1234
-        await db.refresh(old)
-        assert old.seed is None
 
     async def test_the_seed_stays_inside_the_javascript_safe_range(self, db):
         """A seed above 2**53 displays in the browser as a different number than it is.
@@ -134,7 +132,8 @@ class TestReroll:
         job, _ = await _job_with_segment(db, user)
 
         seed = (await _reroll(db, user, job.id)).json()["seed"]
-        assert 0 <= seed <= 2**53 - 1
+        assert isinstance(seed, str), "seeds go over the wire as strings; see the schema"
+        assert 0 <= int(seed) <= 2**53 - 1
 
     async def test_the_shot_is_copied_so_the_seed_is_the_only_variable(self, db):
         user = await _user(db)
@@ -162,6 +161,42 @@ class TestReroll:
         assert body["notes"] is None
         assert body["trim_start_frames"] == 0
         assert body["output_path"] is None
+
+    async def test_the_archived_take_is_stamped_with_the_seed_it_ran_on(self, db):
+        """A NULL seed means "derive from the job", which stops being unambiguous once a job has
+        several takes. Archiving records the number rather than leaving it to be recomputed."""
+        user = await _user(db)
+        job, old = await _job_with_segment(db, user)
+        assert old.seed is None
+
+        await _reroll(db, user, job.id)
+
+        await db.refresh(old)
+        # Exactly what the worker was handed: job.seed + index.
+        assert old.seed == 1234
+
+    async def test_an_already_stamped_seed_is_not_overwritten(self, db):
+        # Re-rolling a take that was itself a re-roll must not relabel it.
+        user = await _user(db)
+        job, old = await _job_with_segment(db, user, seed=99)
+
+        await _reroll(db, user, job.id)
+
+        await db.refresh(old)
+        assert old.seed == 99
+
+    async def test_a_large_seed_survives_the_wire_exactly(self, db):
+        """95% of existing jobs have a seed above 2**53. As a JSON number it would round."""
+        user = await _user(db)
+        job, old = await _job_with_segment(db, user, seed=9223372036854775801)
+
+        body = (await _reroll(db, user, job.id)).json()
+        assert body["seed"] is not None
+
+        await db.refresh(old)
+        assert old.seed == 9223372036854775801
+        # The value a client reads back has to equal the value stored, digit for digit.
+        assert str(old.seed) == "9223372036854775801"
 
     async def test_the_job_goes_back_to_pending_so_a_worker_claims_it(self, db):
         user = await _user(db)
