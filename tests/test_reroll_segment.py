@@ -111,16 +111,17 @@ class TestReroll:
         assert fresh.discarded is False and fresh.index == 0
         assert fresh.status == SegmentStatus.PENDING
 
-    async def test_the_new_take_carries_its_own_seed(self, db):
+    async def test_the_new_seed_lands_on_the_job_not_the_segment(self, db):
+        # One live take, one seed, and it lives where the header shows it and the create dialog
+        # takes it back. See test_job_seed_follows_live_take.py for the full model.
         user = await _user(db)
         job, old = await _job_with_segment(db, user)
 
         resp = await _reroll(db, user, job.id)
 
-        assert resp.json()["seed"] is not None
-        # And the job's seed is untouched.
+        assert resp.json()["seed"] is None
         await db.refresh(job)
-        assert job.seed == 1234
+        assert job.seed != 1234
 
     async def test_the_seed_stays_inside_the_javascript_safe_range(self, db):
         """A seed above 2**53 displays in the browser as a different number than it is.
@@ -131,9 +132,10 @@ class TestReroll:
         user = await _user(db)
         job, _ = await _job_with_segment(db, user)
 
-        seed = (await _reroll(db, user, job.id)).json()["seed"]
-        assert isinstance(seed, str), "seeds go over the wire as strings; see the schema"
-        assert 0 <= int(seed) <= 2**53 - 1
+        await _reroll(db, user, job.id)
+
+        await db.refresh(job)
+        assert 0 <= job.seed <= 2**53 - 1
 
     async def test_the_shot_is_copied_so_the_seed_is_the_only_variable(self, db):
         user = await _user(db)
@@ -190,8 +192,7 @@ class TestReroll:
         user = await _user(db)
         job, old = await _job_with_segment(db, user, seed=9223372036854775801)
 
-        body = (await _reroll(db, user, job.id)).json()
-        assert body["seed"] is not None
+        await _reroll(db, user, job.id)
 
         await db.refresh(old)
         assert old.seed == 9223372036854775801
