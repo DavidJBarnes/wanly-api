@@ -329,7 +329,6 @@ async def claim_next_segment(
     # Resolve start_image
     resolved_start_image = segment.start_image
     previous_segment = None
-    previous_motion_keywords = None
     previous_motion_magnitude = None
     reference_frames = []
     if resolved_start_image is None:
@@ -344,7 +343,6 @@ async def claim_next_segment(
             if prev_segment is not None:
                 resolved_start_image = prev_segment.last_frame_path
                 previous_segment = prev_segment
-                previous_motion_keywords = prev_segment.motion_keywords
                 previous_motion_magnitude = prev_segment.motion_magnitude
                 if prev_segment.reference_frames:
                     reference_frames = prev_segment.reference_frames.copy()
@@ -454,8 +452,6 @@ async def claim_next_segment(
         # Ground truth for identity scoring is always segment 0's start frame. No override:
         # "her" is defined by where the job began, not by a separate reference image.
         identity_ground_truth=job.starting_image,
-        motion_keywords=segment.motion_keywords,
-        previous_motion_keywords=previous_motion_keywords,
         previous_motion_magnitude=previous_motion_magnitude,
         reference_frames=reference_frames if reference_frames else None,
         lightx2v_strength_high=vsettings.lightx2v_strength_high,
@@ -532,8 +528,6 @@ async def update_segment(
         segment.error_message = body.error_message
     if body.progress_log is not None:
         segment.progress_log = body.progress_log
-    if body.motion_keywords is not None:
-        segment.motion_keywords = body.motion_keywords
     if body.motion_magnitude is not None:
         segment.motion_magnitude = body.motion_magnitude
     # Identity scores measured by the daemon at generation time. Measurement only -
