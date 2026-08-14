@@ -16,6 +16,9 @@ class AppSettingsResponse(BaseModel):
     # or "vace" (video-conditioned continuation). vace_overlap_frames = kept tail length.
     continuation_mode: str = "traditional"
     vace_overlap_frames: int = 12
+    # "Re-roll until": how many takes a rule-driven re-roll chain may generate per job
+    # before it gives up and sits idle (the user-initiated roll counts as the first).
+    max_rerolls_per_job: int = 3
     # Seed re-anchor: faceswap each continuation segment's last frame to the canonical
     # identity before it seeds the next segment (only fires when a successor exists).
 
@@ -31,3 +34,4 @@ class AppSettingsUpdate(BaseModel):
     negative_prompt: Optional[str] = None
     continuation_mode: Optional[str] = None
     vace_overlap_frames: Optional[int] = None
+    max_rerolls_per_job: Optional[int] = None

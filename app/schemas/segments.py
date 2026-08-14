@@ -169,6 +169,9 @@ class SegmentResponse(BaseModel):
     observation_tags: Optional[str] = None
     trim_start_frames: int
     trim_end_frames: int
+    reroll_rule_metric: Optional[str] = None
+    reroll_rule_threshold: Optional[float] = None
+    reroll_count: Optional[int] = None
     motion_magnitude: Optional[float] = None
     identity_mean_cos: Optional[float] = None
     identity_mean_cos_ref: Optional[float] = None
@@ -373,6 +376,16 @@ class HologramRequest(BaseModel):
     key_color: Optional[str] = None
     flavor: Optional[str] = None  # "2d_matte" (default) or "2.5d_depth"
     depth_scale_m: Optional[float] = None  # 2.5d relief depth in meters (clamped 0.03..0.60)
+
+
+class RerollRequest(BaseModel):
+    """Optional rule for POST /jobs/{id}/reroll. Omitted entirely = plain one-shot re-roll.
+
+    The comparison is >= by design (per #342); only the metric and the bar are chosen.
+    """
+
+    rule_metric: Optional[str] = None  # identity | expression | motion | detail
+    rule_threshold: Optional[float] = None
 
 
 class SegmentStatusUpdate(BaseModel):
