@@ -12,7 +12,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import or_, select, text
+from sqlalchemy import and_, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -49,8 +49,8 @@ from app.stitch import stitch_video
 logger = logging.getLogger(__name__)
 
 # A worker heartbeats every 30s (daemon HEARTBEAT_INTERVAL), so 5 minutes is ~10 missed beats -
-# comfortably past a transient network blip, and far short of the 30-minute worst case a
-# legitimate long render can occupy a claim for.
+# comfortably past a transient network blip. Renders themselves have no upper bound (60fps jobs
+# run 40+ minutes); a claim is held for as long as its worker keeps heartbeating.
 STALE_HEARTBEAT_MINUTES = 5
 
 # AR hologram work rides a dedicated carrier segment at this sentinel index (far above any
@@ -235,13 +235,14 @@ async def claim_next_segment(
 ):
     # Reclaim work orphaned by a dead worker.
     #
-    # Two rules, because claimed_at alone cannot tell "20 minutes into a legitimate 5s render"
-    # apart from "the machine lost power 20 minutes ago". It has to wait out the worst case,
-    # so a crash costs 30 minutes of dead air before anything notices.
+    # The heartbeat is the authority on dead-vs-alive: workers beat every 30s, so a dead one is
+    # detectable in ~5 minutes, and a worker that IS heartbeating keeps its claim no matter how
+    # long the render runs. The age rule applies only when there is no heartbeat to consult —
+    # the worker row is gone (RunPod pods delete theirs on drain; a claim can outlive its row).
     #
-    # Workers heartbeat every 30s, so a dead one is detectable in ~5 minutes with no risk to
-    # live work: a healthy worker mid-render is still heartbeating. The old age rule stays as a
-    # backstop for segments whose worker row is missing or never heartbeated at all.
+    # The age rule must never apply to a live worker. When it did, every render longer than 30
+    # minutes was stolen mid-flight by the other GPU's poll, both GPUs converged on rendering
+    # the same segment, and fleet throughput silently dropped to one GPU (2026-08-15).
     now = datetime.now(timezone.utc)
     age_cutoff = now - timedelta(minutes=30)
     heartbeat_cutoff = now - timedelta(minutes=STALE_HEARTBEAT_MINUTES)
@@ -253,14 +254,16 @@ async def claim_next_segment(
             Segment.status.in_([SegmentStatus.CLAIMED, SegmentStatus.PROCESSING]),
             Segment.claimed_at.is_not(None),
             or_(
-                Segment.claimed_at < age_cutoff,
                 Worker.last_heartbeat < heartbeat_cutoff,
+                # last_heartbeat is NOT NULL on the workers table, so "no heartbeat to
+                # consult" is exactly "the worker row is gone" (outerjoin came up empty).
+                and_(Segment.claimed_at < age_cutoff, Worker.id.is_(None)),
             ),
         )
     )
     for stale, last_heartbeat in stale_result.all():
         reason = ("worker heartbeat stale" if last_heartbeat is not None
-                  and last_heartbeat < heartbeat_cutoff else "claimed over 30m ago")
+                  else "worker row gone and claimed over 30m ago")
         logger.warning(
             "Reclaiming segment %s (status=%s, claimed_at=%s, worker=%s, last_heartbeat=%s): %s",
             stale.id, stale.status, stale.claimed_at, stale.worker_name, last_heartbeat, reason,

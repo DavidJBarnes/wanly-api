@@ -255,6 +255,16 @@ class TestKindRouting:
         assert (await _claim(db, kind="gpu")).json() is None
 
 
+async def _worker(db, *, heartbeat_ago_minutes=0) -> Worker:
+    worker = Worker(
+        friendly_name="other-gpu", hostname="h", ip_address="10.0.0.2",
+        last_heartbeat=datetime.now(timezone.utc) - timedelta(minutes=heartbeat_ago_minutes),
+    )
+    db.add(worker)
+    await db.flush()
+    return worker
+
+
 @pytest.mark.asyncio
 class TestStaleReclaim:
     async def test_work_orphaned_by_a_dead_worker_comes_back(self, db):
@@ -272,6 +282,40 @@ class TestStaleReclaim:
         assert body is not None and body["id"] == str(stale.id)
         await db.refresh(stale)
         assert stale.worker_id == WORKER_ID
+
+    async def test_a_live_workers_long_render_is_not_stolen(self, db):
+        """The 2026-08-15 incident: renders crossed 30 minutes and the age rule handed every
+        in-flight segment to the other GPU's poll. Both GPUs then rendered the same segment,
+        which from the outside looked like 'only one GPU ever works the queue'."""
+        other = await _worker(db)  # heartbeating right now, mid-render
+        other_id = other.id
+        job = await _job(db, status=JobStatus.PROCESSING)
+        held = await _segment(db, job, 0, status=SegmentStatus.PROCESSING)
+        held.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=45)
+        held.worker_id = other_id
+        await db.flush()
+
+        body = (await _claim(db)).json()
+
+        assert body is None
+        await db.refresh(held)
+        assert held.worker_id == other_id
+        assert held.status == SegmentStatus.PROCESSING
+
+    async def test_a_worker_that_stopped_heartbeating_loses_its_claim(self, db):
+        # The heartbeat rule needs no 30-minute wait: ~10 missed beats is already proof of death.
+        dead = await _worker(db, heartbeat_ago_minutes=10)
+        job = await _job(db, status=JobStatus.PROCESSING)
+        held = await _segment(db, job, 0, status=SegmentStatus.PROCESSING)
+        held.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=6)
+        held.worker_id = dead.id
+        await db.flush()
+
+        body = (await _claim(db)).json()
+
+        assert body is not None and body["id"] == str(held.id)
+        await db.refresh(held)
+        assert held.worker_id == WORKER_ID
 
 
 @pytest.mark.asyncio
