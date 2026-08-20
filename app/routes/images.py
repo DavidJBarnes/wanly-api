@@ -13,6 +13,8 @@ from app.config import settings
 from app.database import get_db
 from app.models import Favorite, ImageMeta, Job, Segment
 from app.schemas.images import ImageTagsUpdate
+from app.tag_filter import like_escape
+from app.tag_filter import tag_clause as _tag_clause
 from app.s3 import (
     delete_object,
     download_bytes,
@@ -367,13 +369,7 @@ def search_pattern(q: str) -> str:
     "%" and "_" are LIKE wildcards and filenames are full of both, so a query for "a_b" must not
     silently match "axb", and "100%" must not become match-everything.
     """
-    return f"%{_like_escape(q)}%"
-
-
-def _like_escape(s: str) -> str:
-    """Neutralise LIKE metacharacters. Backslash first, or escaping the wildcards would itself
-    be re-escaped."""
-    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{like_escape(q)}%"
 
 
 def path_clause(q: str):
@@ -387,31 +383,14 @@ def path_clause(q: str):
     return ImageMeta.path.ilike(search_pattern(q), escape="\\")
 
 
-def normalise_tag(tag: str) -> str:
-    """Fold a tag to its comparison form: case- and space-insensitive.
-
-    Spaces come out because the vocabulary contains "Big dick" and the stored string is joined
-    with ", " -- inconsistent spacing around the commas is the norm, not the exception.
-    """
-    return tag.strip().lower().replace(" ", "")
-
-
 def tag_clause(tag: str):
-    """Match one WHOLE tag inside the comma-joined tags string.
+    """Match one WHOLE tag inside an image's comma-joined tags string.
 
-    Tags are stored as one text blob ("Kelly, Missionary"), so a substring match cannot tell
-    where one tag ends and the next begins. Measured on production 2026-08-14, that is not a
-    corner case: `%kelly%` matched 2,057 of 2,788 images -- 74% of the repo -- because it also
-    caught KellyYoung (1,019), KellyBangs (140) and KellyTeacher (76). Exact Kelly is 824.
-
-    Wrapping both sides in commas is what makes the boundaries real: ",kelly," cannot match
-    inside ",kellyyoung,". concat() rather than || because it is null-safe, so an untagged row
-    simply fails to match instead of poisoning the expression.
+    Measured on production 2026-08-14, boundaries are the whole point: `%kelly%` matched 2,057 of
+    2,788 images -- 74% of the repo -- because it also caught KellyYoung (1,019), KellyBangs (140)
+    and KellyTeacher (76). Exact Kelly is 824. Jobs share the implementation via `app.tag_filter`.
     """
-    pattern = f"%,{_like_escape(normalise_tag(tag))},%"
-    return func.concat(",", func.replace(func.lower(ImageMeta.tags), " ", ""), ",").like(
-        pattern, escape="\\"
-    )
+    return _tag_clause(ImageMeta.tags, tag)
 
 
 def image_filter(q: str | None, tags: list[str], exclude: list[str]) -> list:
