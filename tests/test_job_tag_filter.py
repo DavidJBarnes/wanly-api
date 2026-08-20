@@ -179,3 +179,40 @@ class TestTagCountsEndpoint:
         # through. This is the regression guard for the declaration order.
         user = await TestJobFilter()._seed(db)
         assert "ar" in await self._counts(db, user, status="finalized")
+
+
+@pytest.mark.asyncio
+class TestListJobsEndpoint:
+    """`GET /jobs?tags=` from the outside — the console sends repeated keys.
+
+    Worth an endpoint test rather than only exercising `job_filter`: a `tags` list that does not
+    bind arrives as an absent filter, and an unfiltered list looks like a working page rather
+    than a broken one.
+    """
+
+    async def _get(self, db, user, params):
+        app.dependency_overrides[get_db] = lambda: db
+        app.dependency_overrides[get_current_user] = lambda: user
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                res = await client.get("/jobs", params=params)
+            assert res.status_code == 200, res.text
+            return {j["name"] for j in res.json()["items"]}
+        finally:
+            app.dependency_overrides.clear()
+
+    async def test_a_repeated_tags_key_filters_rather_than_being_dropped(self, db):
+        user = await TestJobFilter()._seed(db)
+        assert await self._get(db, user, [("status", "finalized"), ("tags", "ar")]) == {
+            "driveway ar tier1",
+        }
+
+    async def test_two_repeated_tags_keys_and(self, db):
+        user = await TestJobFilter()._seed(db)
+        params = [("status", "finalized,pending"), ("tags", "ar"), ("tags", "depth")]
+        assert await self._get(db, user, params) == {"ar depth test"}
+
+    async def test_no_tags_returns_the_unfiltered_page(self, db):
+        user = await TestJobFilter()._seed(db)
+        assert len(await self._get(db, user, [("status", "finalized")])) == 5
