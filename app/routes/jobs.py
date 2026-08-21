@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -24,6 +24,7 @@ from app.helpers import upload_faceswap_image
 from app.models import Job, Lora, Segment, User, Video
 from app.routes.segments import _resolve_loras, _resolve_wildcards
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
+from app.tag_filter import like_escape, tag_clause
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -276,6 +277,52 @@ async def create_job(
     return job
 
 
+def job_filter(
+    *,
+    user_id: UUID,
+    status_filter: str | None = None,
+    name: str | None = None,
+    search: str | None = None,
+    tags: list[str] | None = None,
+    starred: bool | None = None,
+) -> list:
+    """Every criterion ANDs. Returns clauses for .where(*clauses).
+
+    Two controls with two different jobs, the same split the image repo settled on. `tags`
+    matches a tag in FULL, so the AR pill returns AR videos and not every job whose name happens
+    to contain "ar"; `q` matches the job NAME as a fragment, because a half-remembered name is
+    often the only handle there is.
+
+    `q` also matches a whole tag, so typing a tag name still finds it -- but it no longer matches
+    tags by substring, which is what made searching "AR" return jobs tagged `argentina` or
+    `starlight` (#353).
+
+    Tag pills are strictly conjunctive: each one narrows, so two pills mean "both tags on one
+    job". There is no OR.
+    """
+    clauses = [Job.user_id == user_id]
+    if starred:
+        clauses.append(Job.config_starred.is_(True))
+    if name:
+        clauses.append(Job.name.ilike(f"%{like_escape(name)}%", escape="\\"))
+    if search and search.strip():
+        clauses.append(
+            or_(
+                Job.name.ilike(f"%{like_escape(search.strip())}%", escape="\\"),
+                tag_clause(Job.tags, search),
+            )
+        )
+    clauses += [tag_clause(Job.tags, t) for t in (tags or []) if t.strip()]
+    if status_filter:
+        statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
+        clauses.append(Job.status.in_(statuses))
+    elif not starred:
+        # Starred = "successful configs" and those are usually finalized jobs, so the
+        # star filter must see all statuses; only hide finalized/archived otherwise.
+        clauses.append(Job.status.notin_([JobStatus.FINALIZED, JobStatus.FINALIZING, JobStatus.ARCHIVED]))
+    return clauses
+
+
 @router.get("/jobs", response_model=JobListResponse)
 async def list_jobs(
     limit: int = Query(50, ge=1, le=200),
@@ -283,33 +330,22 @@ async def list_jobs(
     status_filter: str | None = Query(None, alias="status"),
     sort: str = Query("created_at_desc"),
     name: str | None = Query(None, min_length=1, max_length=255, description="Filter jobs by name (case-insensitive partial match)"),
-    search: str | None = Query(None, min_length=1, max_length=255, alias="q", description="Search jobs by name or tags (case-insensitive partial match)"),
+    search: str | None = Query(None, min_length=1, max_length=255, alias="q", description="Search jobs by name (partial) or by a whole tag"),
+    tags: list[str] = Query(default_factory=list, description="Only jobs carrying ALL of these tags, matched in full"),
     starred: bool | None = Query(None, description="Only jobs flagged as successful configs"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    base = select(Job).where(Job.user_id == user.id)
-    if starred:
-        base = base.where(Job.config_starred.is_(True))
-    if name:
-        safe = name.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        base = base.where(Job.name.ilike(f"%{safe}%", escape="\\"))
-    if search:
-        safe = search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-        pattern = f"%{safe}%"
-        base = base.where(
-            or_(
-                Job.name.ilike(pattern, escape="\\"),
-                Job.tags.ilike(pattern, escape="\\"),
-            )
+    base = select(Job).where(
+        *job_filter(
+            user_id=user.id,
+            status_filter=status_filter,
+            name=name,
+            search=search,
+            tags=tags,
+            starred=starred,
         )
-    if status_filter:
-        statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
-        base = base.where(Job.status.in_(statuses))
-    elif not starred:
-        # Starred = "successful configs" and those are usually finalized jobs, so the
-        # star filter must see all statuses; only hide finalized/archived otherwise.
-        base = base.where(Job.status.notin_([JobStatus.FINALIZED, JobStatus.FINALIZING, JobStatus.ARCHIVED]))
+    )
 
     total_result = await db.execute(select(func.count()).select_from(base.subquery()))
     total = total_result.scalar_one()
@@ -487,6 +523,58 @@ async def list_jobs(
         )
 
     return JobListResponse(items=response_items, total=total, limit=limit, offset=offset)
+
+
+@router.get("/jobs/tag-counts")
+async def job_tag_counts(
+    status_filter: str | None = Query(None, alias="status"),
+    search: str | None = Query(None, min_length=1, max_length=255, alias="q"),
+    tags: list[str] = Query(default_factory=list),
+    starred: bool | None = Query(None),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every tag in use, with how many jobs carry it under the CURRENT filter.
+
+    Counts scoped to the filter are what make the pills navigable rather than a guessing game:
+    with `kelly` selected, the tags left standing are the ones that actually co-occur with it, so
+    a dead end is visible before it is clicked instead of after. A selected tag always survives
+    its own filter (its count is the result count), so it can be clicked off again.
+
+    Driven by what is USED, not by the title_tags vocabulary -- the image repo learned that the
+    hard way, where 11 in-use tags were absent from the vocabulary and pills built from it would
+    have stranded them.
+
+    Declared above `/jobs/{job_id}` on purpose: that route takes a UUID, so a path reaching it
+    first would 422 rather than fall through.
+    """
+    clauses = job_filter(
+        user_id=user.id,
+        status_filter=status_filter,
+        search=search,
+        tags=tags,
+        starred=starred,
+    )
+
+    # unnest in a LATERAL rather than the target list: a set-returning function in the select
+    # list cannot then be grouped by.
+    tag_rows = (
+        func.unnest(func.string_to_array(Job.tags, ","))
+        .table_valued("tag")
+        .render_derived(name="t")
+    )
+    tag_expr = func.lower(func.btrim(tag_rows.c.tag))
+
+    stmt = (
+        select(tag_expr.label("tag"), func.count().label("count"))
+        .select_from(Job)
+        .join(tag_rows, true())
+        .where(*clauses, tag_expr != "")
+        .group_by(tag_expr)
+        .order_by(func.count().desc(), tag_expr)
+    )
+    rows = (await db.execute(stmt)).all()
+    return {"items": [{"tag": r.tag, "count": r.count} for r in rows]}
 
 
 @router.put("/jobs/reorder", response_model=list[JobResponse])

@@ -18,7 +18,8 @@ import pytest
 from sqlalchemy import func, select
 
 from app.models import ImageMeta
-from app.routes.images import image_filter, normalise_tag, search_pattern
+from app.routes.images import image_filter, search_pattern
+from app.tag_filter import normalise_tag
 
 
 class TestSearchPattern:
