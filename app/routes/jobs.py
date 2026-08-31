@@ -20,7 +20,6 @@ from app.database import get_db
 from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStatus
 from app.seeds import new_seed
 from app.estimation import estimate_segment_time, get_estimation_rates, sum_estimated_queue_time
-from app.helpers import upload_faceswap_image
 from app.models import Job, Segment, User, Video
 from app.routes.segments import _resolve_wildcards
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
@@ -77,7 +76,6 @@ async def starting_image_exists(
 async def create_job(
     data: str = Form(...),
     starting_image: UploadFile | None = File(None),
-    faceswap_image: UploadFile | None = File(None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -182,11 +180,6 @@ async def create_job(
     if job.generation_engine == "lynx" and not job.lynx_subject_image:
         job.lynx_subject_image = job.starting_image
 
-    # Upload faceswap image to S3 if provided
-    faceswap_uri = None
-    if faceswap_image is not None:
-        faceswap_uri = await upload_faceswap_image(faceswap_image, job.id)
-
     seg = body.first_segment
     resolved_prompt, prompt_template = await _resolve_wildcards(db, seg.prompt)
     segment = Segment(
@@ -197,15 +190,6 @@ async def create_job(
         duration_seconds=seg.duration_seconds,
         speed=seg.speed,
         start_image=seg.start_image,
-        faceswap_enabled=seg.faceswap_enabled,
-        faceswap_method=seg.faceswap_method,
-        faceswap_source_type=seg.faceswap_source_type,
-        faceswap_image=faceswap_uri if faceswap_uri else seg.faceswap_image,
-        faceswap_faces_order=seg.faceswap_faces_order,
-        faceswap_faces_index=seg.faceswap_faces_index,
-        faceswap_model=seg.faceswap_model,
-        faceswap_pixel_boost=seg.faceswap_pixel_boost,
-        seed_faceswap=seg.seed_faceswap,
         negative_prompt=seg.negative_prompt,
         ltx_recipe=seg.ltx_recipe,
         auto_finalize=seg.auto_finalize,
@@ -374,7 +358,6 @@ async def list_jobs(
                 segment_count=seg_total,
                 completed_segment_count=seg_completed,
                 estimated_run_time=est_map.get(j.id),
-                faceswap_enabled=faceswap_map.get(j.id, False),
                 # Lynx engine fields. These responses are hand-built, so anything not
                 # listed here is silently dropped by Pydantic even though it is on the schema.
                 generation_engine=j.generation_engine,

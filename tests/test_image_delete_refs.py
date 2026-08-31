@@ -91,10 +91,10 @@ class TestDeleteRefusesReferencedImages:
         app.dependency_overrides.clear()
 
     @pytest.mark.asyncio
-    async def test_segment_faceswap_reference_returns_409(self):
+    async def test_segment_start_image_reference_returns_409(self):
         """The identity recipe puts a face on every job's segments, and no job row mentions it —
         this is the reference the old Job.starting_image-only check could never see."""
-        segment = Segment(id=uuid.uuid4(), prompt="x", faceswap_image=FACE)
+        segment = Segment(id=uuid.uuid4(), prompt="x", start_image=FACE)
         _override(_FakeSession(segments=[segment]))
 
         resp, deleter = await _delete(FACE)
@@ -132,7 +132,7 @@ class TestDeleteRefusesReferencedImages:
         """The point of the 409 body is to say what to fix; a bare "in use" leaves you hunting."""
         job = Job(id=uuid.uuid4(), name="j", width=832, height=480, fps=16, seed=1,
                   starting_image=FACE, status=JobStatus.PENDING)
-        segment = Segment(id=uuid.uuid4(), prompt="x", faceswap_image=FACE)
+        segment = Segment(id=uuid.uuid4(), prompt="x", start_image=FACE)
         _override(_FakeSession(jobs=[job], segments=[segment]))
 
         resp, _ = await _delete(FACE)
@@ -143,7 +143,7 @@ class TestDeleteRefusesReferencedImages:
 
     @pytest.mark.asyncio
     async def test_force_deletes_a_referenced_image(self):
-        segment = Segment(id=uuid.uuid4(), prompt="x", faceswap_image=FACE)
+        segment = Segment(id=uuid.uuid4(), prompt="x", start_image=FACE)
         _override(_FakeSession(segments=[segment]))
 
         resp, deleter = await _delete(FACE, force="true")
@@ -157,7 +157,7 @@ class TestDeleteRefusesReferencedImages:
         are not holders."""
         job = Job(id=uuid.uuid4(), name="j", width=832, height=480, fps=16, seed=1,
                   starting_image=START, status=JobStatus.PENDING)
-        segment = Segment(id=uuid.uuid4(), prompt="x", faceswap_image=FACE)
+        segment = Segment(id=uuid.uuid4(), prompt="x", start_image=FACE)
         _override(_FakeSession(jobs=[job], segments=[segment]))
 
         resp, deleter = await _delete(LOOSE)
@@ -186,7 +186,7 @@ class TestListingAgreesWithDelete:
     async def test_faceswap_only_reference_reads_as_in_use(self):
         from httpx import ASGITransport, AsyncClient
 
-        segment = Segment(id=uuid.uuid4(), prompt="x", faceswap_image=FACE)
+        segment = Segment(id=uuid.uuid4(), prompt="x", start_image=FACE)
         _override(_FakeSession(segments=[segment]))
 
         objects = [

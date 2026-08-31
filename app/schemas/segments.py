@@ -10,17 +10,8 @@ class SegmentCreate(BaseModel):
     duration_seconds: float = 5.0
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
     start_image: Optional[str] = None
-    faceswap_enabled: bool = False
-    faceswap_method: Optional[str] = None
-    faceswap_source_type: Optional[str] = None
-    faceswap_image: Optional[str] = None
-    faceswap_faces_order: Optional[str] = None
-    faceswap_faces_index: Optional[str] = None
-    faceswap_model: Optional[str] = None
-    faceswap_pixel_boost: Optional[str] = None
     # Re-anchor this segment's last frame to the faceswap face before it seeds the next
     # segment. Uses faceswap_image, so it only has an effect when faceswap is configured.
-    seed_faceswap: bool = False
     negative_prompt: Optional[str] = None
     # LTX recipe render: which validated (character, pose) configuration this segment ran,
     # plus any of its defaults the user overrode and the resolved graph hash. NULL means
@@ -153,15 +144,6 @@ class SegmentResponse(BaseModel):
     duration_seconds: float
     speed: float
     start_image: Optional[str]
-    faceswap_enabled: bool
-    faceswap_method: Optional[str]
-    faceswap_source_type: Optional[str]
-    faceswap_image: Optional[str]
-    faceswap_faces_order: Optional[str]
-    faceswap_faces_index: Optional[str]
-    faceswap_model: Optional[str] = None
-    faceswap_pixel_boost: Optional[str] = None
-    seed_faceswap: bool = False
     negative_prompt: Optional[str] = None
     # LTX recipe render: which validated (character, pose) configuration this segment ran,
     # plus any of its defaults the user overrode and the resolved graph hash. NULL means
@@ -220,14 +202,6 @@ class SegmentClaimResponse(BaseModel):
     duration_seconds: float
     speed: float
     start_image: Optional[str]
-    faceswap_enabled: bool
-    faceswap_method: Optional[str]
-    faceswap_source_type: Optional[str]
-    faceswap_image: Optional[str]
-    faceswap_faces_order: Optional[str]
-    faceswap_faces_index: Optional[str]
-    faceswap_model: Optional[str] = None
-    faceswap_pixel_boost: Optional[str] = None
     reference_frames: Optional[list[str]] = None
     negative_prompt: Optional[str] = None
     # LTX recipe render: which validated (character, pose) configuration this segment ran,
@@ -247,7 +221,6 @@ class SegmentClaimResponse(BaseModel):
     vace_overlap_frames: int = 12
     # Seed re-anchor: faceswap this segment's last frame to the canonical identity before it
     # seeds the next segment (resolved API-side: setting on AND a successor segment exists).
-    seed_faceswap: bool = False
     # AR hologram (reprocess_type="ar_hologram"): the source is the job's finalized stitched
     # video (not this carrier segment's own output); params drive the daemon matte + manifest.
     hologram_source_path: Optional[str] = None
@@ -327,17 +300,6 @@ class FramePreviewResponse(BaseModel):
     total_frames: int
     fps: float
     frames: list[FramePreview]
-
-
-class SegmentReprocessRequest(BaseModel):
-    faceswap_enabled: bool = True
-    faceswap_method: Optional[str] = None
-    faceswap_source_type: Optional[str] = None
-    faceswap_image: Optional[str] = None
-    faceswap_faces_order: Optional[str] = None
-    faceswap_faces_index: Optional[str] = None
-    faceswap_model: Optional[str] = None
-    faceswap_pixel_boost: Optional[str] = None
 
 
 class HologramRequest(BaseModel):

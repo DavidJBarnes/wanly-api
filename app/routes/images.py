@@ -34,7 +34,7 @@ _FOLDER_NAME_RE = re.compile(r"^[a-zA-Z0-9 _-]+$")
 # Job.identity_reference_image is deliberately absent: the daemon writes it into the *jobs*
 # bucket, so it can never be the target of DELETE /images.
 _JOB_IMAGE_COLUMNS = (Job.starting_image, Job.lynx_subject_image)
-_SEGMENT_IMAGE_COLUMNS = (Segment.start_image, Segment.faceswap_image)
+_SEGMENT_IMAGE_COLUMNS = (Segment.start_image,)
 
 
 async def find_image_references(db: AsyncSession, paths: list[str]) -> dict[str, dict[str, list[str]]]:
