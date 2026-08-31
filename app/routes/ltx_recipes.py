@@ -1,111 +1,194 @@
-"""The LTX recipe book: import the sheet, serve the book.
+"""LTX characters and recipes: CRUD, plus the assembled book the Storyboard page reads.
 
-wanly-api owns the book (migration 070). The console reads recipes from here, and a claim
-carries the RESOLVED recipe rather than a name for the engine to look up — an engine that
-cannot look a recipe up cannot look up a stale one.
+Recipes are DATA. The POC authored them in an .ods — a test harness that became load-bearing,
+complete with guards built around it ("never regenerate the sheet") rather than replacing it.
+They are rows now.
+
+The schema encodes what was measured rather than what was assumed. Across all 24 seeded
+recipes only `char_lora` and `prompt` varied; everything else had exactly one value and lives
+once in the global stack. Storing a global value 24 times is how it silently stops being
+global — one row gets edited, nothing complains, and two recipes that should be identical
+are not.
 """
 
-import hashlib
 import logging
+import uuid
+from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user
 from app.database import get_db
-from app.ltx_sheet import SheetError, book_sha256, parse_sheet
-from app.models import LtxRecipeBook, User
+from app.ltx_stack import LTX_STACK
+from app.models import LtxCharacter, LtxRecipe, User
+from app.schemas.ltx import (
+    LtxCharacterCreate,
+    LtxCharacterResponse,
+    LtxRecipeCreate,
+    LtxRecipeResponse,
+    LtxRecipeUpdate,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# The sheet is a few hundred KB of XML in a zip. Anything far larger is not a recipe sheet,
-# and refusing early beats unzipping it to find out.
-MAX_SHEET_BYTES = 8 * 1024 * 1024
+
+async def _character(db: AsyncSession, character_id: uuid.UUID) -> LtxCharacter:
+    c = await db.get(LtxCharacter, character_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail="Character not found")
+    return c
 
 
 @router.get("/recipes")
-async def get_recipes(
+async def get_recipe_book(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """The recipe book, in the shape the console already reads.
+    """Everything the Storyboard page needs, in one call.
 
-    404 rather than an empty book when nothing has been imported: an empty book and a missing
-    one look identical downstream, and "the dropdowns are empty" should not be the first sign
-    that no sheet was ever uploaded.
+    Assembled rather than stored: characters, their recipes, and the one global stack. The
+    stack is returned alongside so the page can SHOW what a recipe pins without each recipe
+    carrying a copy of it.
     """
-    row = (await db.execute(select(LtxRecipeBook).where(LtxRecipeBook.id == 1))).scalar_one_or_none()
-    if row is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No recipe book has been imported. POST the sheet to /recipes/import.",
+    rows = (
+        await db.execute(
+            select(LtxCharacter).options(selectinload(LtxCharacter.recipes))
+            .order_by(LtxCharacter.name)
         )
-    book = dict(row.book)
-    # Provenance travels with the book so a render can be tied back to the exact sheet that
-    # produced it, without a second call.
-    book["book_sha256"] = row.book_sha256
-    book["imported_at"] = row.imported_at.isoformat() if row.imported_at else None
-    return book
+    ).scalars().all()
 
-
-@router.post("/recipes/import")
-async def import_recipes(
-    file: UploadFile = File(...),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Upload the hand-authored .ods and replace the book.
-
-    Parsing happens HERE rather than in a script that writes a file, so there is exactly one
-    parser and exactly one copy. Two copies of recipes.json once shipped a 16-render batch
-    against stale prompts.
-
-    The sheet itself is never written back. It is authored by hand, and regenerating it from
-    code once silently overwrote a hand-edited prompt.
-    """
-    raw = await file.read()
-    if not raw:
-        raise HTTPException(status_code=400, detail="empty upload")
-    if len(raw) > MAX_SHEET_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"sheet is {len(raw)} bytes, over the {MAX_SHEET_BYTES} limit",
-        )
-    try:
-        book = parse_sheet(raw)
-    except SheetError as e:
-        # The sheet is hand-authored, so a parse failure is usually a human edit rather than a
-        # corrupt file. Say what was wrong, not just that something was.
-        raise HTTPException(status_code=422, detail=str(e)) from e
-
-    new_hash = book_sha256(book)
-    row = (await db.execute(select(LtxRecipeBook).where(LtxRecipeBook.id == 1))).scalar_one_or_none()
-    previous = row.book_sha256 if row else None
-
-    if row is None:
-        row = LtxRecipeBook(id=1)
-        db.add(row)
-    row.book = book
-    row.book_sha256 = new_hash
-    row.source_sha256 = hashlib.sha256(raw).hexdigest()
-    row.source_filename = file.filename
-    await db.commit()
-    await db.refresh(row)
-
-    characters = {c: len(v.get("recipes", {})) for c, v in book.get("characters", {}).items()}
-    logger.info(
-        "recipe book imported from %s: %s, book_sha256 %s (was %s)",
-        file.filename, characters, new_hash[:16], (previous or "none")[:16],
-    )
-    # `changed` is the useful bit: re-saving the sheet with no edits changes the file bytes
-    # but not the book, and the caller should be able to tell those apart.
     return {
-        "characters": characters,
-        "definitions": len(book.get("definitions", {})),
-        "book_sha256": new_hash,
-        "previous_book_sha256": previous,
-        "changed": previous != new_hash,
-        "imported_at": row.imported_at.isoformat() if row.imported_at else None,
+        "stack": LTX_STACK,
+        "characters": [
+            {
+                "id": str(c.id),
+                "name": c.name,
+                "char_lora": c.char_lora,
+                "strength_stage_1": c.strength_stage_1,
+                "strength_stage_2": c.strength_stage_2,
+                "recipes": [
+                    {
+                        "id": str(r.id),
+                        "name": r.name,
+                        "prompt": r.prompt,
+                        "negative_prompt": r.negative_prompt or LTX_STACK["negative"],
+                        "frames": r.frames or LTX_STACK["frames"],
+                        "validated": r.validated,
+                    }
+                    for r in c.recipes
+                ],
+            }
+            for c in rows
+        ],
     }
+
+
+@router.post("/ltx/characters", response_model=LtxCharacterResponse, status_code=201)
+async def create_character(
+    body: LtxCharacterCreate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    c = LtxCharacter(**body.model_dump())
+    db.add(c)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=f"Character {body.name!r} already exists")
+    await db.refresh(c)
+    return c
+
+
+@router.get("/ltx/characters", response_model=list[LtxCharacterResponse])
+async def list_characters(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    rows = (await db.execute(select(LtxCharacter).order_by(LtxCharacter.name))).scalars().all()
+    return list(rows)
+
+
+@router.delete("/ltx/characters/{character_id}", status_code=204)
+async def delete_character(
+    character_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Deletes the character and its recipes (FK cascade).
+
+    Renders already produced are untouched: a segment records what it ran in its own
+    ltx_recipe blob, so history does not depend on the recipe still existing.
+    """
+    await db.delete(await _character(db, character_id))
+    await db.commit()
+
+
+@router.post("/ltx/characters/{character_id}/recipes",
+             response_model=LtxRecipeResponse, status_code=201)
+async def create_recipe(
+    character_id: uuid.UUID,
+    body: LtxRecipeCreate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _character(db, character_id)
+    r = LtxRecipe(character_id=character_id, **body.model_dump())
+    db.add(r)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Recipe {body.name!r} already exists for this character",
+        )
+    await db.refresh(r)
+    return r
+
+
+@router.patch("/ltx/recipes/{recipe_id}", response_model=LtxRecipeResponse)
+async def update_recipe(
+    recipe_id: uuid.UUID,
+    body: LtxRecipeUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Edit a recipe.
+
+    Editing the prompt is editing the recipe — there is no separate "is this still the
+    validated one" state to keep in sync, because `validated` is a field the author sets
+    when they have watched it. Changing the prompt does NOT silently clear it: that would
+    be the system overruling a human's judgement about their own edit.
+    """
+    r = await db.get(LtxRecipe, recipe_id)
+    if r is None:
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    for k, v in body.model_dump(exclude_unset=True).items():
+        setattr(r, k, v)
+    r.updated_at = datetime.now(timezone.utc)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="A recipe with that name already exists")
+    await db.refresh(r)
+    return r
+
+
+@router.delete("/ltx/recipes/{recipe_id}", status_code=204)
+async def delete_recipe(
+    recipe_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    r = await db.get(LtxRecipe, recipe_id)
+    if r is None:
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    await db.delete(r)
+    await db.commit()
