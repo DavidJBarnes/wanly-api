@@ -23,6 +23,10 @@ class SegmentCreate(BaseModel):
     # segment. Uses faceswap_image, so it only has an effect when faceswap is configured.
     seed_faceswap: bool = False
     negative_prompt: Optional[str] = None
+    # LTX recipe render: which validated (character, pose) configuration this segment ran,
+    # plus any of its defaults the user overrode and the resolved graph hash. NULL means
+    # "not a recipe render". See Segment.ltx_recipe for why this is one field and not a dozen.
+    ltx_recipe: Optional[dict[str, Any]] = None
     auto_finalize: bool = False
     transition: Optional[str] = None
     video_preset_id: Optional[UUID] = None
@@ -160,6 +164,10 @@ class SegmentResponse(BaseModel):
     faceswap_pixel_boost: Optional[str] = None
     seed_faceswap: bool = False
     negative_prompt: Optional[str] = None
+    # LTX recipe render: which validated (character, pose) configuration this segment ran,
+    # plus any of its defaults the user overrode and the resolved graph hash. NULL means
+    # "not a recipe render". See Segment.ltx_recipe for why this is one field and not a dozen.
+    ltx_recipe: Optional[dict[str, Any]] = None
     auto_finalize: bool
     transition: Optional[str]
     # Soft-deleted: kept for its rating, tags and notes, excluded from the video.
@@ -258,6 +266,10 @@ class SegmentClaimResponse(BaseModel):
     sampler_name: Optional[str] = None
     scheduler: Optional[str] = None
     negative_prompt: Optional[str] = None
+    # LTX recipe render: which validated (character, pose) configuration this segment ran,
+    # plus any of its defaults the user overrode and the resolved graph hash. NULL means
+    # "not a recipe render". See Segment.ltx_recipe for why this is one field and not a dozen.
+    ltx_recipe: Optional[dict[str, Any]] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None
     width: int

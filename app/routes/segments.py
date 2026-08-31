@@ -214,6 +214,7 @@ async def add_segment(
         faceswap_pixel_boost=body.faceswap_pixel_boost,
         seed_faceswap=body.seed_faceswap,
         negative_prompt=negative_prompt,
+        ltx_recipe=body.ltx_recipe,
         auto_finalize=body.auto_finalize,
         video_preset_id=body.video_preset_id,
     )
@@ -489,6 +490,10 @@ async def claim_next_segment(
         sampler_name=sampler_name,
         scheduler=scheduler,
         negative_prompt=negative_prompt,
+        # Passed through verbatim. The engine must never look a recipe up for itself: an
+        # engine that cannot look one up cannot look up a STALE one, which is the failure
+        # this shape exists to make impossible (see wanly-api#207).
+        ltx_recipe=segment.ltx_recipe,
         reprocess_type=segment.reprocess_type,
         output_path=segment.output_path,
         seed_faceswap=seed_faceswap,

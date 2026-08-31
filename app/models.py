@@ -222,6 +222,19 @@ class Segment(Base):
     #  "frames_sampled": n, "frames_with_face": n}
     lynx_identity_scores = mapped_column(JSON, nullable=True)
     negative_prompt = mapped_column(Text, nullable=True)
+    # LTX recipe render: which validated (character, pose) configuration produced this
+    # segment, and any of its defaults the user overrode. One JSONB rather than a column
+    # per parameter, because across sixteen validated recipes every field except the
+    # character LoRA and the prompt had exactly ONE distinct value — a recipe is
+    # (character LoRA, prompt) and the rest is one global configuration.
+    #
+    # graph_sha256 is the regression trail: a recipe is value patches on a pinned graph, so
+    # the hash of the resolved graph detects any change to shared state that alters a recipe,
+    # at no GPU cost. It is what makes a render provably the configuration that was signed
+    # off rather than one that merely claims to be.
+    #
+    # NULL means "not an LTX recipe render" — every WAN segment, and any free-form LTX one.
+    ltx_recipe = mapped_column(JSONB, nullable=True)
     reprocess_type = mapped_column(String(20), nullable=True)
     # Foundry smashcut carrier (reprocess_type="smashcut_concat"): ordered list of source clip
     # output_paths to concatenate + the transition style ("seamless" | "black").

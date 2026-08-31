@@ -43,3 +43,36 @@ def test_the_two_new_tunables_specifically_round_trip():
     from_jobs = _kwargs_passed_to_segment("app/routes/jobs.py")
     assert "faceswap_model" in from_jobs
     assert "faceswap_pixel_boost" in from_jobs
+
+
+def test_job_creation_persists_ltx_recipe():
+    """A recipe render creates its job and segment 0 in one call, so this is THE path it uses.
+
+    Dropped here, the segment would generate with the daemon's defaults instead of the
+    validated recipe -- and would look fine, because a plausible clip comes back either way.
+    The graph hash recorded against it would then describe a configuration that never ran.
+    """
+    from_jobs = _kwargs_passed_to_segment("app/routes/jobs.py")
+    assert "ltx_recipe" in from_jobs, "first_segment silently drops ltx_recipe"
+
+
+def test_every_client_supplied_segment_field_is_wired_into_both_paths():
+    """The general form of the two tests above.
+
+    Both previous failures were the same shape -- a field added to the append path and not to
+    job creation -- caught only after the fact, and only because someone queried the row. The
+    faceswap guard was written for one family of fields and the ltx one for a single field;
+    neither would catch the NEXT field added. This does.
+
+    A field that legitimately never comes from the client on segment 0 goes in
+    _NOT_CLIENT_SUPPLIED above, which makes the exemption a deliberate, reviewable line rather
+    than a silent omission.
+    """
+    from_jobs = _kwargs_passed_to_segment("app/routes/jobs.py")
+    from_segments = _kwargs_passed_to_segment("app/routes/segments.py")
+    client_fields = set(SegmentCreate.model_fields) - _NOT_CLIENT_SUPPLIED
+    missing = (client_fields & from_segments) - from_jobs
+    assert not missing, (
+        "fields wired into the append path but not job creation: "
+        f"{sorted(missing)} -- segment 0 would silently drop them"
+    )
