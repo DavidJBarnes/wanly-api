@@ -51,11 +51,8 @@ async def _job_with_segment(db, user, **segment_kwargs) -> tuple[Job, Segment]:
         prompt_template="she {verb}",
         duration_seconds=5.0,
         speed=1.0,
-        loras=[{"lora_id": "abc", "high_weight": 1.0, "low_weight": 0.0}],
-        faceswap_enabled=True,
-        faceswap_image="s3://b/face.png",
         negative_prompt="blurry",
-        video_preset_id=None,
+        ltx_recipe={"name": "Missionary Side", "character": "k3lly2026"},
         status=SegmentStatus.COMPLETED,
         output_path="s3://b/out.mp4",
         rating=4,
@@ -146,10 +143,10 @@ class TestReroll:
         assert body["prompt"] == old.prompt  # resolved, NOT re-rolled through the wildcards
         assert body["prompt_template"] == old.prompt_template
         assert body["duration_seconds"] == old.duration_seconds
-        assert body["loras"] == old.loras
-        assert body["faceswap_enabled"] is True
-        assert body["faceswap_image"] == old.faceswap_image
         assert body["negative_prompt"] == old.negative_prompt
+        # The recipe IS the shot under LTX. #218 shipped because a re-rolled take had lost
+        # it and rendered free-form, so this is the assertion that guards that fix.
+        assert body["ltx_recipe"] == old.ltx_recipe
 
     async def test_the_annotations_of_the_old_take_are_not_copied(self, db):
         # Rating, notes and trims describe the take being archived. Carrying them over would
