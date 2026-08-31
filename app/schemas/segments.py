@@ -53,7 +53,8 @@ OBSERVATION_TAGS = [
     "mouth-looping",
     "teeth-mush",
     "identity-drift",
-    # Motion, per person. motion_magnitude is whole-frame Farneback optical flow: it sums every
+    # Motion, per person. motion_magnitude WAS whole-frame Farneback optical flow (removed in
+    # #151, and this is part of why): it summed every
     # moving pixel, so a lively woman with a static man scores identically to the reverse. The
     # metric cannot separate them even in principle, which makes these the ONLY per-person
     # motion data obtainable.
@@ -70,7 +71,8 @@ OBSERVATION_TAGS = [
     # Body mechanics -- the single largest quality differentiator observed so far, and one no
     # metric can see: two bodies moving as ONE UNIT generate enormous whole-frame optical flow
     # while being the wrong motion entirely. The 5-rated segment scored 0.545 and a 3-rated one
-    # scored 1.162. motion_magnitude measures quantity; these record correctness.
+    # scored 1.162. The metric measured quantity; these record correctness, which is why
+    # they outlived it.
     #
     # The axis is TRAVEL: he withdraws and re-enters, so the bodies separate and rejoin along an
     # axis. What fails is not that they "rock" -- that is only how the failure looks from outside
@@ -177,21 +179,6 @@ class SegmentResponse(BaseModel):
     observation_tags: Optional[str] = None
     trim_start_frames: int
     trim_end_frames: int
-    reroll_rule_metric: Optional[str] = None
-    reroll_rule_threshold: Optional[float] = None
-    reroll_count: Optional[int] = None
-    motion_magnitude: Optional[float] = None
-    identity_mean_cos: Optional[float] = None
-    identity_mean_cos_ref: Optional[float] = None
-    identity_min_cos: Optional[float] = None
-    identity_slope: Optional[float] = None
-    identity_frames: Optional[int] = None
-    identity_no_face: Optional[int] = None
-    identity_face_px_p50: Optional[float] = None
-    identity_yaw_max: Optional[float] = None
-    identity_start_cos_ref: Optional[float] = None
-    identity_end_cos_ref: Optional[float] = None
-    identity_metrics: Optional[dict[str, Any]] = None
     reference_frames: Optional[list[str]] = None
     status: str
     reprocess_type: Optional[str] = None
@@ -206,7 +193,6 @@ class SegmentResponse(BaseModel):
     hologram_manifest_path: Optional[str] = None
     hologram_poster_path: Optional[str] = None
     # Lynx identity QA written by the daemon after a Lynx render (measurement only).
-    lynx_identity_scores: Optional[dict[str, Any]] = None
     created_at: datetime
     claimed_at: Optional[datetime]
     completed_at: Optional[datetime]
@@ -247,14 +233,6 @@ class SegmentClaimResponse(BaseModel):
     faceswap_faces_index: Optional[str]
     faceswap_model: Optional[str] = None
     faceswap_pixel_boost: Optional[str] = None
-    initial_reference_image: Optional[str] = None
-    # Identity scoring ground truth: the JOB's starting image, i.e. segment 0's start frame.
-    # Deliberately NOT identity_reference_image - that field is the PainterLongVideo anchor
-    # and is overridable, which would silently swap what "her" means mid-measurement.
-    # Every segment scores against this same frame, so the numbers chain across the job.
-    identity_ground_truth: Optional[str] = None
-    motion_magnitude: Optional[float] = None
-    previous_motion_magnitude: Optional[float] = None
     reference_frames: Optional[list[str]] = None
     lightx2v_strength_high: Optional[float] = None
     lightx2v_strength_low: Optional[float] = None
@@ -339,7 +317,6 @@ class SegmentClipResponse(BaseModel):
     height: int
     fps: int
     duration_seconds: float
-    motion_magnitude: Optional[float] = None
     favorite: bool = False
 
     model_config = {"from_attributes": True}
@@ -391,13 +368,12 @@ class HologramRequest(BaseModel):
 
 
 class RerollRequest(BaseModel):
-    """Optional rule for POST /jobs/{id}/reroll. Omitted entirely = plain one-shot re-roll.
+    """Body for POST /jobs/{id}/reroll.
 
-    The comparison is >= by design (per #342); only the metric and the bar are chosen.
+    Carried a "re-roll until" rule — a metric and a threshold, judged on completion. The
+    metrics it judged are gone (#151), so a rule would be permanently unevaluable and the
+    fields with it. Kept as a class because the endpoint still accepts an optional body.
     """
-
-    rule_metric: Optional[str] = None  # identity | expression | motion | detail
-    rule_threshold: Optional[float] = None
 
 
 class SegmentStatusUpdate(BaseModel):
@@ -406,18 +382,5 @@ class SegmentStatusUpdate(BaseModel):
     last_frame_path: Optional[str] = None
     error_message: Optional[str] = None
     progress_log: Optional[str] = None
-    motion_magnitude: Optional[float] = None
-    identity_mean_cos: Optional[float] = None
-    identity_mean_cos_ref: Optional[float] = None
-    identity_min_cos: Optional[float] = None
-    identity_slope: Optional[float] = None
-    identity_frames: Optional[int] = None
-    identity_no_face: Optional[int] = None
-    identity_face_px_p50: Optional[float] = None
-    identity_yaw_max: Optional[float] = None
-    identity_start_cos_ref: Optional[float] = None
-    identity_end_cos_ref: Optional[float] = None
-    identity_metrics: Optional[dict[str, Any]] = None
     vace_overlap_seconds: Optional[float] = None
     # Lynx identity QA measured by the daemon. Measurement only — no gating.
-    lynx_identity_scores: Optional[dict[str, Any]] = None

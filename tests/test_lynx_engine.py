@@ -38,16 +38,17 @@ LYNX_JOB_FIELDS = [
 ROOT = Path(__file__).resolve().parent.parent
 
 
+# lynx_identity_scores was removed with identity scoring (#151) — it was the same measurement
+# under another name, written by a Lynx render and read by nothing that still exists. The rest
+# of the Lynx engine is still here and retires separately.
+
+
 class TestJobModel:
     @pytest.mark.parametrize("field", LYNX_JOB_FIELDS)
     def test_column_exists_and_is_nullable(self, field):
         """Nullable is the contract: NULL means 'use the daemon's settings default'."""
         column = Job.__table__.columns[field]
         assert column.nullable is True
-
-    def test_segment_carries_identity_scores(self):
-        assert Segment.__table__.columns["lynx_identity_scores"].nullable is True
-
 
 class TestJobCreateSchema:
     def test_lynx_fields_default_to_none(self):
@@ -97,25 +98,6 @@ class TestResponseSchemas:
     def test_claim_response_declares_field(self, field):
         """The daemon builds the graph from these, so the claim must carry them."""
         assert field in SegmentClaimResponse.model_fields
-
-    def test_identity_scores_are_a_result_not_a_claim_input(self):
-        # Written by the daemon on completion, read back on the segment...
-        assert "lynx_identity_scores" in SegmentStatusUpdate.model_fields
-        assert "lynx_identity_scores" in SegmentResponse.model_fields
-        # ...but they cannot exist at claim time.
-        assert "lynx_identity_scores" not in SegmentClaimResponse.model_fields
-
-    def test_status_update_accepts_scores_payload(self):
-        payload = {
-            "scores": [0.61, 0.58], "mean": 0.595, "min": 0.58, "max": 0.61,
-            "frames_sampled": 5, "frames_with_face": 2,
-        }
-        body = SegmentStatusUpdate(status="completed", lynx_identity_scores=payload)
-        assert body.lynx_identity_scores == payload
-
-    def test_status_update_scores_default_none(self):
-        assert SegmentStatusUpdate(status="completed").lynx_identity_scores is None
-
 
 class TestHandBuiltResponses:
     """JobResponse/JobDetailResponse are built field-by-field in app/routes/jobs.py.
