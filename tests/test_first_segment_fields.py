@@ -16,14 +16,31 @@ from app.schemas.segments import SegmentCreate
 
 
 def _kwargs_passed_to_segment(source_file: str) -> set[str]:
-    """Every kwarg any Segment(...) call in the file passes."""
-    tree = ast.parse(Path(source_file).read_text())
+    """Every kwarg any Segment(...) call in the file passes, unioned."""
     names: set[str] = set()
-    for node in ast.walk(tree):
-        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-                and node.func.id == "Segment"):
-            names |= {kw.arg for kw in node.keywords if kw.arg}
+    for _, kwargs in _segment_construction_sites(source_file):
+        names |= kwargs
     return names
+
+
+def _segment_construction_sites(source_file: str) -> list[tuple[str, set[str]]]:
+    """(enclosing function, kwargs) for every Segment(...) construction in the file.
+
+    PER SITE, not unioned over the file. Unioning is how the ltx_recipe bug got through: the
+    re-roll builds a Segment in the same module as the append path, so `ltx_recipe` appearing
+    in one made the whole file look correct while a re-rolled take silently lost its recipe
+    and rendered free-form.
+    """
+    tree = ast.parse(Path(source_file).read_text())
+    sites: list[tuple[str, set[str]]] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for node in ast.walk(fn):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "Segment"):
+                sites.append((fn.name, {kw.arg for kw in node.keywords if kw.arg}))
+    return sites
 
 
 # Fields that legitimately never come from the client on segment 0.
@@ -76,3 +93,41 @@ def test_every_client_supplied_segment_field_is_wired_into_both_paths():
         "fields wired into the append path but not job creation: "
         f"{sorted(missing)} -- segment 0 would silently drop them"
     )
+
+
+# What a segment IS, as opposed to what happened to it. Every construction of a Segment has to
+# carry these or the thing it builds is a different shot.
+_SHOT_DEFINING = {"prompt", "ltx_recipe"}
+
+# Sites that legitimately do not, each with its reason. Both are CARRIERS — a segment row used
+# to hang reprocess work off a job, at a sentinel index far above any real segment. They render
+# nothing, so there is no shot for a recipe to define.
+#
+# The list is the point: an exemption has to be argued for here rather than happening by
+# omission, which is exactly how _roll_new_take lost ltx_recipe.
+_EXEMPT: dict[str, set[str]] = {
+    "make_hologram": {"ltx_recipe"},    # AR hologram carrier, index 1000
+    "create_smashcut": {"ltx_recipe"},  # ffmpeg concat carrier, index 2000
+}
+
+
+def test_every_segment_construction_carries_what_defines_the_shot():
+    """Checked PER SITE, because there are three and they drift independently.
+
+    add_segment, job creation's segment 0, and _roll_new_take. The last one lost `ltx_recipe`
+    for the whole time the column existed: a re-rolled LTX take came back with no character
+    LoRA, no trigger and no per-stage strengths — a different shot, which is the exact
+    opposite of what a re-roll is for. It went unnoticed because the previous version of this
+    test unioned kwargs across a FILE, and _roll_new_take shares a module with add_segment.
+    """
+    sites = (
+        _segment_construction_sites("app/routes/segments.py")
+        + _segment_construction_sites("app/routes/jobs.py")
+    )
+    assert len(sites) >= 3, f"expected at least 3 construction sites, found {len(sites)}"
+    for fn_name, kwargs in sites:
+        missing = (_SHOT_DEFINING - kwargs) - _EXEMPT.get(fn_name, set())
+        assert not missing, (
+            f"{fn_name}() builds a Segment without {sorted(missing)} — the take it creates "
+            f"is a different shot from the one it is meant to reproduce"
+        )

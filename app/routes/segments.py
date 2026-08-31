@@ -1196,7 +1196,6 @@ def _roll_new_take(job: Job, old: Segment) -> Segment:
         duration_seconds=old.duration_seconds,
         speed=old.speed,
         start_image=old.start_image,
-        loras=old.loras,
         faceswap_enabled=old.faceswap_enabled,
         faceswap_method=old.faceswap_method,
         faceswap_source_type=old.faceswap_source_type,
@@ -1207,6 +1206,10 @@ def _roll_new_take(job: Job, old: Segment) -> Segment:
         faceswap_pixel_boost=old.faceswap_pixel_boost,
         seed_faceswap=old.seed_faceswap,
         negative_prompt=old.negative_prompt,
+        # The recipe is what the take IS. Without it a re-rolled LTX segment renders free-form
+        # — no character LoRA, no trigger, no per-stage strengths — and comes back looking like
+        # a different shot, which is the opposite of a re-roll's entire purpose.
+        ltx_recipe=old.ltx_recipe,
         auto_finalize=old.auto_finalize,
     )
 
