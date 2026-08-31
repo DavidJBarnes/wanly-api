@@ -451,3 +451,24 @@ class GpuReservation(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+
+class LtxRecipeBook(Base):
+    """The parsed LTX recipe sheet. One row — see migration 070 for why the API owns it.
+
+    The console reads recipes from here, and a claim carries the RESOLVED recipe rather than a
+    name for the engine to look up. That is what makes stale-recipe drift structurally
+    impossible instead of something a check has to notice.
+    """
+    __tablename__ = "ltx_recipe_book"
+
+    id = mapped_column(Integer, primary_key=True)
+    book = mapped_column(JSONB, nullable=False)
+    # Over the parsed content. This is the one that matters: re-saving the sheet with no edits
+    # changes the file bytes but not the book.
+    book_sha256 = mapped_column(String(64), nullable=False)
+    # Over the uploaded .ods bytes, so "did this exact file get imported" is answerable.
+    source_sha256 = mapped_column(String(64), nullable=False)
+    source_filename = mapped_column(Text, nullable=True)
+    imported_at = mapped_column(DateTime(timezone=True), nullable=False,
+                                server_default=text("now()"))
