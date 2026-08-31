@@ -26,6 +26,7 @@ from app.ltx_stack import LTX_STACK
 from app.models import LtxCharacter, LtxRecipe, User
 from app.schemas.ltx import (
     LtxCharacterCreate,
+    LtxCharacterUpdate,
     LtxCharacterResponse,
     LtxRecipeCreate,
     LtxRecipeResponse,
@@ -144,16 +145,46 @@ async def list_characters(
     return list(rows)
 
 
+@router.patch("/ltx/characters/{character_id}", response_model=LtxCharacterResponse)
+async def update_character(
+    character_id: uuid.UUID,
+    body: LtxCharacterUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Edit a character.
+
+    Without this the only way to correct a strength or a trigger typo was delete and
+    recreate, which is a worse trade than it looks: the character's id changes, and a
+    per-stage strength is exactly the field someone tunes repeatedly.
+    """
+    c = await _character(db, character_id)
+    for k, v in body.model_dump(exclude_unset=True).items():
+        setattr(c, k, v)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="A character with that name already exists")
+    await db.refresh(c)
+    return c
+
+
 @router.delete("/ltx/characters/{character_id}", status_code=204)
 async def delete_character(
     character_id: uuid.UUID,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Deletes the character and its recipes (FK cascade).
+    """Deletes the character. Poses are NOT touched.
 
-    Renders already produced are untouched: a segment records what it ran in its own
-    ltx_recipe blob, so history does not depend on the recipe still existing.
+    The docstring here used to claim it cascaded to "its recipes". That was true of the
+    old per-character shape and false since #212: `ltx_recipes` has no character_id and
+    no relationship to this table, because a pose belongs to every character. Deleting a
+    character removes one LoRA + trigger pairing and nothing else.
+
+    Renders already produced are untouched either way: a segment records what it ran in
+    its own ltx_recipe blob, so history does not depend on the recipe still existing.
     """
     await db.delete(await _character(db, character_id))
     await db.commit()

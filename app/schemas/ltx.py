@@ -29,6 +29,22 @@ class LtxCharacterResponse(BaseModel):
     strength_stage_2: float
 
 
+class LtxCharacterUpdate(BaseModel):
+    """Every field optional: a PATCH that only moves a strength must not restate the LoRA.
+
+    `trigger` does NOT re-default to the name here, unlike create. On create an absent
+    trigger means "no opinion", and the name is the best guess. On update an absent trigger
+    means "leave it alone", and quietly rewriting it to the new name would silently change
+    every pose's rendered prompt as a side effect of a rename.
+    """
+
+    name: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    char_lora: Optional[str] = Field(default=None, min_length=1)
+    trigger: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    strength_stage_1: Optional[float] = Field(default=None, ge=0)
+    strength_stage_2: Optional[float] = Field(default=None, ge=0)
+
+
 class LtxRecipeCreate(BaseModel):
     """A pose. Character-agnostic: the prompt carries <TRIGGER>, not a name."""
 
