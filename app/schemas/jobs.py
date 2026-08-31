@@ -62,7 +62,6 @@ class JobResponse(BaseModel):
     seed: int
     starting_image: Optional[str]
     priority: int
-    config_starred: bool = False
     status: str
     segment_count: int = 0
     completed_segment_count: int = 0
@@ -115,7 +114,6 @@ class JobUpdate(BaseModel):
     name: Optional[str] = None
     status: Optional[str] = None
     tags: Optional[str] = Field(None, max_length=500, description="Comma-separated tags")
-    config_starred: Optional[bool] = Field(None, description="Flag this job's config as a successful one")
 
 
 class WorkerStatsItem(BaseModel):

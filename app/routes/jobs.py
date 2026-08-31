@@ -223,7 +223,6 @@ def job_filter(
     name: str | None = None,
     search: str | None = None,
     tags: list[str] | None = None,
-    starred: bool | None = None,
 ) -> list:
     """Every criterion ANDs. Returns clauses for .where(*clauses).
 
@@ -240,8 +239,6 @@ def job_filter(
     job". There is no OR.
     """
     clauses = [Job.user_id == user_id]
-    if starred:
-        clauses.append(Job.config_starred.is_(True))
     if name:
         clauses.append(Job.name.ilike(f"%{like_escape(name)}%", escape="\\"))
     if search and search.strip():
@@ -255,9 +252,7 @@ def job_filter(
     if status_filter:
         statuses = [s.strip() for s in status_filter.split(",") if s.strip()]
         clauses.append(Job.status.in_(statuses))
-    elif not starred:
-        # Starred = "successful configs" and those are usually finalized jobs, so the
-        # star filter must see all statuses; only hide finalized/archived otherwise.
+    else:
         clauses.append(Job.status.notin_([JobStatus.FINALIZED, JobStatus.FINALIZING, JobStatus.ARCHIVED]))
     return clauses
 
@@ -271,7 +266,6 @@ async def list_jobs(
     name: str | None = Query(None, min_length=1, max_length=255, description="Filter jobs by name (case-insensitive partial match)"),
     search: str | None = Query(None, min_length=1, max_length=255, alias="q", description="Search jobs by name (partial) or by a whole tag"),
     tags: list[str] = Query(default_factory=list, description="Only jobs carrying ALL of these tags, matched in full"),
-    starred: bool | None = Query(None, description="Only jobs flagged as successful configs"),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -282,7 +276,6 @@ async def list_jobs(
             name=name,
             search=search,
             tags=tags,
-            starred=starred,
         )
     )
 
@@ -377,7 +370,6 @@ async def list_jobs(
                 seed=j.seed,
                 starting_image=j.starting_image,
                 priority=j.priority,
-                config_starred=j.config_starred,
                 status=j.status,
                 segment_count=seg_total,
                 completed_segment_count=seg_completed,
@@ -414,7 +406,6 @@ async def job_tag_counts(
     status_filter: str | None = Query(None, alias="status"),
     search: str | None = Query(None, min_length=1, max_length=255, alias="q"),
     tags: list[str] = Query(default_factory=list),
-    starred: bool | None = Query(None),
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -437,7 +428,6 @@ async def job_tag_counts(
         status_filter=status_filter,
         search=search,
         tags=tags,
-        starred=starred,
     )
 
     # unnest in a LATERAL rather than the target list: a set-returning function in the select
@@ -562,7 +552,6 @@ async def get_job(
         lynx_scheduler=job.lynx_scheduler,
         lynx_distill_strength=job.lynx_distill_strength,
         priority=job.priority,
-        config_starred=job.config_starred,
         status=job.status,
         tags=job.tags,
         estimated_run_time=job_est,
@@ -597,12 +586,6 @@ async def update_job(
 
     if body.tags is not None:
         job.tags = body.tags
-
-    if body.config_starred is not None:
-        job.config_starred = body.config_starred
-
-    if body.video_preset_id is not None:
-        job.video_preset_id = body.video_preset_id
 
     if body.status is not None:
         allowed = JOB_VALID_TRANSITIONS.get(job.status, set())

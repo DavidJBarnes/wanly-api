@@ -44,7 +44,6 @@ class Job(Base):
     # Optional link to a named video-settings preset (job default). Live: the 7 sampler values
     # are read from the preset at claim time. NULL -> use this job's raw params above.
     priority = mapped_column(Integer, nullable=False, default=0)
-    config_starred = mapped_column(Boolean, nullable=False, default=False)
     # Per-job continuation-mode override ("traditional"|"vace"); NULL -> global app setting.
     continuation_mode = mapped_column(String(20), nullable=True)
     # === Lynx identity-preserving engine (ByteDance Lynx on Wan2.1 T2V-14B) ===
