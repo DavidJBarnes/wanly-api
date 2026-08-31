@@ -16,6 +16,7 @@ import pytest
 from app import estimation
 from app.estimation import (
     DURATION_EXPONENT,
+    DURATION_EXPONENT,
     MIN_SAMPLES,
     Estimate,
     PixelLaw,
@@ -103,23 +104,38 @@ class TestNoGlobalAverage:
 
 
 class TestDurationModel:
-    def test_run_time_grows_faster_than_duration(self):
-        """Measured at 1056x720: 812s of sampling at 3s against 1666s at 5s, a 2.05x cost for a
-        1.67x duration. A per-second rate would price the 5s segment 18% low."""
+    def test_run_time_is_linear_in_duration(self):
+        """DURATION_EXPONENT is 1.0, and that is a neutral prior rather than a measurement.
+
+        It was 1.4, fitted on WAN 2.2 at 1056x720: 812s of sampling at 3s against 1666s at 5s, a
+        2.05x cost for a 1.67x duration. That described WAN's two-pass sampler and does not
+        transfer — and every LTX render is a fixed 241 frames, so duration barely varies and a
+        superlinear term has almost nothing to act on.
+
+        This test now pins the honest position, not a curve nobody has measured. When LTX
+        history exists across more than one duration, re-fit and change this deliberately.
+        """
         r = rates(shape={SHAPE: (100.0, 40)})
         three = estimate_segment_time(r, *SHAPE, 3.0, None)
         five = estimate_segment_time(r, *SHAPE, 5.0, None)
-        assert five / three > 5.0 / 3.0
+        assert five / three == pytest.approx(5.0 / 3.0)
 
     def test_there_is_no_fixed_overhead_term(self):
         """Fitting a shared intercept across the eight shapes with more than one duration puts it
-        at -326s, so a fixed post-sampling tail is not just unsupported, the sign is wrong."""
+        at -326s, so a fixed post-sampling tail is not just unsupported, the sign is wrong.
+
+        That finding is about the SHAPE of the model, not about WAN's exponent, so it survives.
+        Asserted as proportionality rather than against an absolute tolerance, which is what
+        makes it independent of whatever DURATION_EXPONENT happens to be.
+        """
         r = rates(shape={SHAPE: (100.0, 40)})
         assert estimate_segment_time(r, *SHAPE, 0.5, None) < estimate_segment_time(
             r, *SHAPE, 1.0, None
         )
-        # Doubling the duration from zero-ish must not converge on a constant.
-        assert estimate_segment_time(r, *SHAPE, 0.001, None) == pytest.approx(0.0, abs=0.05)
+        # Halving the duration must halve the estimate. An intercept would leave a residue.
+        half = estimate_segment_time(r, *SHAPE, 1.0, None)
+        whole = estimate_segment_time(r, *SHAPE, 2.0, None)
+        assert half / whole == pytest.approx(0.5 ** DURATION_EXPONENT)
 
     @pytest.mark.parametrize("duration", [0, 0.0, None, -1.0])
     def test_impossible_durations_are_not_priced(self, duration):
