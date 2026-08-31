@@ -21,8 +21,8 @@ from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStat
 from app.seeds import new_seed
 from app.estimation import estimate_segment_time, get_estimation_rates, sum_estimated_queue_time
 from app.helpers import upload_faceswap_image
-from app.models import Job, Lora, Segment, User, Video
-from app.routes.segments import _resolve_loras, _resolve_wildcards
+from app.models import Job, Segment, User, Video
+from app.routes.segments import _resolve_wildcards
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
 from app.tag_filter import like_escape, tag_clause
 
@@ -110,14 +110,6 @@ async def create_job(
         height=body.height,
         fps=body.fps,
         seed=seed,
-        lightx2v_strength_high=body.lightx2v_strength_high,
-        lightx2v_strength_low=body.lightx2v_strength_low,
-        cfg_high=body.cfg_high,
-        cfg_low=body.cfg_low,
-        steps_total=body.steps_total,
-        high_noise_steps=body.high_noise_steps,
-        flow_shift=body.flow_shift,
-        video_preset_id=body.video_preset_id,
         continuation_mode=body.continuation_mode,
         # Lynx engine selection + tunables. All optional: None -> daemon settings default.
         generation_engine=body.generation_engine,
@@ -196,7 +188,6 @@ async def create_job(
         faceswap_uri = await upload_faceswap_image(faceswap_image, job.id)
 
     seg = body.first_segment
-    resolved_loras = await _resolve_loras(db, seg.loras)
     resolved_prompt, prompt_template = await _resolve_wildcards(db, seg.prompt)
     segment = Segment(
         job_id=job.id,
@@ -206,7 +197,6 @@ async def create_job(
         duration_seconds=seg.duration_seconds,
         speed=seg.speed,
         start_image=seg.start_image,
-        loras=resolved_loras,
         faceswap_enabled=seg.faceswap_enabled,
         faceswap_method=seg.faceswap_method,
         faceswap_source_type=seg.faceswap_source_type,
@@ -219,7 +209,6 @@ async def create_job(
         negative_prompt=seg.negative_prompt,
         ltx_recipe=seg.ltx_recipe,
         auto_finalize=seg.auto_finalize,
-        video_preset_id=seg.video_preset_id,
     )
     db.add(segment)
     await db.commit()
@@ -345,53 +334,6 @@ async def list_jobs(
         for row in faceswap_result.all():
             faceswap_map[row[0]] = bool(row[1])
 
-    # Aggregate distinct LoRAs (with weights) per job from its segment configs, resolving names.
-    loras_map: dict[UUID, list[dict]] = {}
-    if job_ids:
-        seg_loras_result = await db.execute(
-            select(Segment.job_id, Segment.loras)
-            .where(Segment.job_id.in_(job_ids), Segment.loras.isnot(None))
-        )
-        raw_buckets: dict[UUID, dict] = {}
-        referenced_ids: set[UUID] = set()
-        for seg_job_id, seg_loras in seg_loras_result.all():
-            if not seg_loras:
-                continue
-            bucket = raw_buckets.setdefault(seg_job_id, {})
-            for lora in seg_loras:
-                key = (
-                    lora.get("lora_id"),
-                    lora.get("high_file"),
-                    lora.get("low_file"),
-                    lora.get("high_weight"),
-                    lora.get("low_weight"),
-                )
-                bucket[key] = lora
-                lid = lora.get("lora_id")
-                if lid:
-                    try:
-                        referenced_ids.add(UUID(str(lid)))
-                    except (ValueError, TypeError):
-                        pass
-        name_map: dict[str, str] = {}
-        if referenced_ids:
-            name_result = await db.execute(
-                select(Lora.id, Lora.name).where(Lora.id.in_(referenced_ids))
-            )
-            name_map = {str(r[0]): r[1] for r in name_result.all()}
-        for seg_job_id, bucket in raw_buckets.items():
-            loras_map[seg_job_id] = [
-                {
-                    "lora_id": lora.get("lora_id"),
-                    "name": name_map.get(str(lora.get("lora_id"))),
-                    "high_file": lora.get("high_file"),
-                    "low_file": lora.get("low_file"),
-                    "high_weight": lora.get("high_weight"),
-                    "low_weight": lora.get("low_weight"),
-                }
-                for lora in bucket.values()
-            ]
-
     # Fetch active segment info for estimation
     active_statuses = {SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING}
     active_jobs = [j for j in items if j.status in (JobStatus.PENDING, JobStatus.PROCESSING)]
@@ -434,13 +376,6 @@ async def list_jobs(
                 fps=j.fps,
                 seed=j.seed,
                 starting_image=j.starting_image,
-                lightx2v_strength_high=j.lightx2v_strength_high,
-                lightx2v_strength_low=j.lightx2v_strength_low,
-                cfg_high=j.cfg_high,
-                cfg_low=j.cfg_low,
-                steps_total=j.steps_total,
-                high_noise_steps=j.high_noise_steps,
-                flow_shift=j.flow_shift,
                 priority=j.priority,
                 config_starred=j.config_starred,
                 status=j.status,
@@ -448,7 +383,6 @@ async def list_jobs(
                 completed_segment_count=seg_completed,
                 estimated_run_time=est_map.get(j.id),
                 faceswap_enabled=faceswap_map.get(j.id, False),
-                loras=loras_map.get(j.id, []),
                 # Lynx engine fields. These responses are hand-built, so anything not
                 # listed here is silently dropped by Pydantic even though it is on the schema.
                 generation_engine=j.generation_engine,
@@ -609,14 +543,6 @@ async def get_job(
         fps=job.fps,
         seed=job.seed,
         starting_image=job.starting_image,
-        lightx2v_strength_high=job.lightx2v_strength_high,
-        lightx2v_strength_low=job.lightx2v_strength_low,
-        cfg_high=job.cfg_high,
-        cfg_low=job.cfg_low,
-        steps_total=job.steps_total,
-        high_noise_steps=job.high_noise_steps,
-        flow_shift=job.flow_shift,
-        video_preset_id=job.video_preset_id,
         continuation_mode=job.continuation_mode,
         # Lynx engine fields. These responses are hand-built, so anything not
         # listed here is silently dropped by Pydantic even though it is on the schema.
@@ -761,11 +687,6 @@ async def reopen_job(
     return JobDetailResponse(
         id=job.id, name=job.name, width=job.width, height=job.height,
         fps=job.fps, seed=job.seed, starting_image=job.starting_image,
-        lightx2v_strength_high=job.lightx2v_strength_high,
-        lightx2v_strength_low=job.lightx2v_strength_low,
-        cfg_high=job.cfg_high, cfg_low=job.cfg_low,
-        steps_total=job.steps_total, high_noise_steps=job.high_noise_steps, flow_shift=job.flow_shift,
-        video_preset_id=job.video_preset_id, continuation_mode=job.continuation_mode,
         # Lynx engine fields. These responses are hand-built, so anything not
         # listed here is silently dropped by Pydantic even though it is on the schema.
         generation_engine=job.generation_engine,

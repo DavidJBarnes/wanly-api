@@ -10,7 +10,6 @@ class SegmentCreate(BaseModel):
     duration_seconds: float = 5.0
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
     start_image: Optional[str] = None
-    loras: Optional[list[Any]] = None
     faceswap_enabled: bool = False
     faceswap_method: Optional[str] = None
     faceswap_source_type: Optional[str] = None
@@ -29,7 +28,6 @@ class SegmentCreate(BaseModel):
     ltx_recipe: Optional[dict[str, Any]] = None
     auto_finalize: bool = False
     transition: Optional[str] = None
-    video_preset_id: Optional[UUID] = None
 
 
 # The vocabulary lives server-side so the console and any analysis agree on the exact strings.
@@ -155,7 +153,6 @@ class SegmentResponse(BaseModel):
     duration_seconds: float
     speed: float
     start_image: Optional[str]
-    loras: Optional[list[Any]]
     faceswap_enabled: bool
     faceswap_method: Optional[str]
     faceswap_source_type: Optional[str]
@@ -182,7 +179,6 @@ class SegmentResponse(BaseModel):
     reference_frames: Optional[list[str]] = None
     status: str
     reprocess_type: Optional[str] = None
-    video_preset_id: Optional[UUID] = None
     worker_id: Optional[UUID]
     worker_name: Optional[str]
     output_path: Optional[str]
@@ -224,7 +220,6 @@ class SegmentClaimResponse(BaseModel):
     duration_seconds: float
     speed: float
     start_image: Optional[str]
-    loras: Optional[list[Any]]
     faceswap_enabled: bool
     faceswap_method: Optional[str]
     faceswap_source_type: Optional[str]
@@ -234,15 +229,6 @@ class SegmentClaimResponse(BaseModel):
     faceswap_model: Optional[str] = None
     faceswap_pixel_boost: Optional[str] = None
     reference_frames: Optional[list[str]] = None
-    lightx2v_strength_high: Optional[float] = None
-    lightx2v_strength_low: Optional[float] = None
-    cfg_high: Optional[float] = None
-    cfg_low: Optional[float] = None
-    steps_total: Optional[int] = None
-    high_noise_steps: Optional[int] = None
-    flow_shift: Optional[float] = None
-    sampler_name: Optional[str] = None
-    scheduler: Optional[str] = None
     negative_prompt: Optional[str] = None
     # LTX recipe render: which validated (character, pose) configuration this segment ran,
     # plus any of its defaults the user overrode and the resolved graph hash. NULL means
@@ -330,10 +316,6 @@ class SegmentTrimUpdate(BaseModel):
     observation_tags: Optional[str] = None
     trim_start_frames: int = Field(ge=0)
     trim_end_frames: int = Field(ge=0)
-
-
-class SegmentVideoPresetUpdate(BaseModel):
-    video_preset_id: Optional[UUID] = None
 
 
 class FramePreview(BaseModel):

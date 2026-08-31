@@ -41,18 +41,8 @@ class Job(Base):
     seed = mapped_column(BigInteger, nullable=False)
     starting_image = mapped_column(Text, nullable=True)
     starting_image_hash = mapped_column(String(64), nullable=True, index=True)
-    lightx2v_strength_high = mapped_column(Float, nullable=True)
-    lightx2v_strength_low = mapped_column(Float, nullable=True)
-    cfg_high = mapped_column(Float, nullable=True)
-    cfg_low = mapped_column(Float, nullable=True)
-    steps_total = mapped_column(Integer, nullable=True)
-    high_noise_steps = mapped_column(Integer, nullable=True)
-    flow_shift = mapped_column(Float, nullable=True)
     # Optional link to a named video-settings preset (job default). Live: the 7 sampler values
     # are read from the preset at claim time. NULL -> use this job's raw params above.
-    video_preset_id = mapped_column(
-        UUID(as_uuid=True), ForeignKey("video_settings_presets.id", ondelete="SET NULL"), nullable=True
-    )
     priority = mapped_column(Integer, nullable=False, default=0)
     config_starred = mapped_column(Boolean, nullable=False, default=False)
     # Per-job continuation-mode override ("traditional"|"vace"); NULL -> global app setting.
@@ -139,7 +129,6 @@ class Segment(Base):
     duration_seconds = mapped_column(Float, nullable=False, default=5.0)
     speed = mapped_column(Float, nullable=False, default=1.0)
     start_image = mapped_column(Text, nullable=True)
-    loras = mapped_column(JSON, nullable=True)
     faceswap_enabled = mapped_column(Boolean, nullable=False, default=False)
     faceswap_method = mapped_column(String(20), nullable=True)
     faceswap_source_type = mapped_column(String(20), nullable=True)
@@ -208,9 +197,6 @@ class Segment(Base):
     # from Segment.speed above, which is a generation-time motion-density knob.
     smashcut_clip_speeds = mapped_column(JSON, nullable=True)
     # Per-segment video-settings override (live link). Takes precedence over the job's preset.
-    video_preset_id = mapped_column(
-        UUID(as_uuid=True), ForeignKey("video_settings_presets.id", ondelete="SET NULL"), nullable=True
-    )
     status = mapped_column(String(20), nullable=False, default=SegmentStatus.PENDING)
     worker_id = mapped_column(UUID(as_uuid=True), nullable=True)
     worker_name = mapped_column(String(255), nullable=True)
@@ -247,26 +233,6 @@ class Video(Base):
     job = relationship("Job", back_populates="videos")
 
 
-class Lora(Base):
-    __tablename__ = "loras"
-
-    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = mapped_column(String(255), nullable=False)
-    description = mapped_column(Text, nullable=True)
-    trigger_words = mapped_column(Text, nullable=True)
-    default_prompt = mapped_column(Text, nullable=True)
-    source_url = mapped_column(Text, nullable=True)
-    preview_image = mapped_column(Text, nullable=True)
-    high_file = mapped_column(String(255), nullable=True)
-    high_s3_uri = mapped_column(Text, nullable=True)
-    low_file = mapped_column(String(255), nullable=True)
-    low_s3_uri = mapped_column(Text, nullable=True)
-    default_high_weight = mapped_column(Float, nullable=False, default=1.0)
-    default_low_weight = mapped_column(Float, nullable=False, default=1.0)
-    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
-    updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-
-
 class TitleTag(Base):
     __tablename__ = "title_tags"
     __table_args__ = (
@@ -296,40 +262,6 @@ class AppSetting(Base):
 
     key = mapped_column(String(255), primary_key=True)
     value = mapped_column(Text, nullable=False)
-    updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
-
-
-class VideoSettingsPreset(Base):
-    """A named bundle of the 7 sampler params, selectable per-job and per-segment (live link)."""
-
-    __tablename__ = "video_settings_presets"
-
-    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    name = mapped_column(String(255), unique=True, nullable=False)
-    lightx2v_strength_high = mapped_column(Float, nullable=True)
-    lightx2v_strength_low = mapped_column(Float, nullable=True)
-    cfg_high = mapped_column(Float, nullable=True)
-    cfg_low = mapped_column(Float, nullable=True)
-    steps_total = mapped_column(Integer, nullable=True)
-    high_noise_steps = mapped_column(Integer, nullable=True)
-    flow_shift = mapped_column(Float, nullable=True)
-    # Sampler algorithm + scheduler (NULL -> daemon default euler/simple). Only the scheduler
-    # applies on the VACE path (its sampler node has no sampler_name).
-    sampler_name = mapped_column(String(40), nullable=True)
-    scheduler = mapped_column(String(40), nullable=True)
-    # 1:N LoRAs that constitute this recipe — each {lora_id, high_weight, low_weight} (expert
-    # placement). Resolved live at claim time when a job/segment links this preset.
-    loras = mapped_column(JSON, nullable=True)
-    # Hidden from the preset PICKER but still readable by id, so historical jobs keep resolving
-    # their config. Presets accumulate fast during experiments; deleting them would destroy the
-    # record of which config produced which result.
-    archived = mapped_column(Boolean, nullable=False, default=False, server_default="false")
-    # Default prompt for this recipe. A snapshot default that fills the prompt field at job
-    # creation (overridable at submit) — NOT live-linked like loras/sampler params.
-    prompt = mapped_column(Text, nullable=True)
-    # Free-form notes about this recipe (what it's for, gotchas). Not used by generation.
-    notes = mapped_column(Text, nullable=True)
-    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 

@@ -11,13 +11,6 @@ class TestAppSettingsSchemas:
     def test_response_includes_negative_prompt(self):
         """AppSettingsResponse must include negative_prompt as a string."""
         resp = AppSettingsResponse(
-            cfg_high=1.0,
-            cfg_low=1.0,
-            lightx2v_strength_high=2.0,
-            lightx2v_strength_low=1.0,
-            steps_total=4,
-            high_noise_steps=2,
-            flow_shift=5.0,
             negative_prompt="bad quality, blurry",
         )
         assert resp.negative_prompt == "bad quality, blurry"
@@ -26,10 +19,6 @@ class TestAppSettingsSchemas:
         """AppSettingsResponse should fail without negative_prompt."""
         with pytest.raises(Exception):
             AppSettingsResponse(
-                cfg_high=1.0,
-                cfg_low=1.0,
-                lightx2v_strength_high=2.0,
-                lightx2v_strength_low=1.0,
             )
 
     def test_update_negative_prompt_optional(self):
@@ -43,11 +32,14 @@ class TestAppSettingsSchemas:
         assert update.negative_prompt == "ugly, deformed"
 
     def test_update_negative_prompt_excluded_when_none(self):
-        """exclude_none should drop negative_prompt when not set."""
-        update = AppSettingsUpdate(cfg_high=1.5)
-        dumped = update.model_dump(exclude_none=True)
-        assert "negative_prompt" not in dumped
-        assert dumped["cfg_high"] == 1.5
+        """exclude_none should drop negative_prompt when not set.
+
+        negative_prompt is now the ONLY app setting — the WAN sampler defaults it used to sit
+        beside went with video presets (#363), so this asserts an empty dump rather than a
+        surviving sibling field.
+        """
+        update = AppSettingsUpdate()
+        assert update.model_dump(exclude_none=True) == {}
 
     def test_update_negative_prompt_included_when_set(self):
         """exclude_none should keep negative_prompt when explicitly set."""
@@ -70,30 +62,15 @@ class TestToResponse:
         from app.routes.app_settings import _to_response
 
         settings = {
-            "cfg_high": "1.5",
-            "cfg_low": "1.0",
-            "lightx2v_strength_high": "2.0",
-            "lightx2v_strength_low": "1.0",
-            "steps_total": "4",
-            "high_noise_steps": "2",
-            "flow_shift": "5",
             "negative_prompt": "ugly, blurry",
         }
         resp = _to_response(settings)
         assert resp.negative_prompt == "ugly, blurry"
-        assert resp.cfg_high == 1.5
 
     def test_to_response_empty_negative_prompt(self):
         from app.routes.app_settings import _to_response
 
         settings = {
-            "cfg_high": "1",
-            "cfg_low": "1",
-            "lightx2v_strength_high": "2.0",
-            "lightx2v_strength_low": "1.0",
-            "steps_total": "4",
-            "high_noise_steps": "2",
-            "flow_shift": "5",
             "negative_prompt": "",
         }
         resp = _to_response(settings)

@@ -18,14 +18,6 @@ class JobCreate(BaseModel):
     height: int
     fps: int
     seed: Optional[int] = None
-    lightx2v_strength_high: Optional[float] = None
-    lightx2v_strength_low: Optional[float] = None
-    cfg_high: Optional[float] = None
-    cfg_low: Optional[float] = None
-    steps_total: Optional[int] = None
-    high_noise_steps: Optional[int] = None
-    flow_shift: Optional[float] = None
-    video_preset_id: Optional[UUID] = None
     continuation_mode: Optional[str] = None  # "traditional" | "vace" (NULL -> global default)
     # === Lynx identity-preserving engine ===
     # generation_engine="lynx" routes the job to the Lynx graph builder. Every lynx_*
@@ -69,13 +61,6 @@ class JobResponse(BaseModel):
     fps: int
     seed: int
     starting_image: Optional[str]
-    lightx2v_strength_high: Optional[float]
-    lightx2v_strength_low: Optional[float]
-    cfg_high: Optional[float]
-    cfg_low: Optional[float]
-    steps_total: Optional[int] = None
-    high_noise_steps: Optional[int] = None
-    flow_shift: Optional[float] = None
     priority: int
     config_starred: bool = False
     status: str
@@ -83,9 +68,7 @@ class JobResponse(BaseModel):
     completed_segment_count: int = 0
     estimated_run_time: Optional[float] = None
     faceswap_enabled: bool = False
-    loras: list[JobLoraSummary] = []
     tags: Optional[str] = None
-    video_preset_id: Optional[UUID] = None
     continuation_mode: Optional[str] = None
     # === Lynx identity-preserving engine ===
     # generation_engine="lynx" routes the job to the Lynx graph builder. Every lynx_*
@@ -133,7 +116,6 @@ class JobUpdate(BaseModel):
     status: Optional[str] = None
     tags: Optional[str] = Field(None, max_length=500, description="Comma-separated tags")
     config_starred: Optional[bool] = Field(None, description="Flag this job's config as a successful one")
-    video_preset_id: Optional[UUID] = Field(None, description="Job default video-settings preset")
 
 
 class WorkerStatsItem(BaseModel):
