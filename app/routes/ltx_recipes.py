@@ -19,7 +19,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user
 from app.database import get_db
@@ -44,6 +43,29 @@ async def _character(db: AsyncSession, character_id: uuid.UUID) -> LtxCharacter:
     return c
 
 
+# The placeholder a pose carries and a character's trigger fills.
+#
+# This shares syntax with the wildcard resolver (`<([^<>]+)>` in
+# app/routes/segments.py::_resolve_wildcards), which matters: a Wildcard named TRIGGER would
+# make the resolver substitute a RANDOM option here, and the render would quietly name the
+# wrong character or none at all.
+#
+# Two things close that. The trigger is substituted BEFORE wildcard resolution runs, so a
+# correctly-built prompt never reaches the resolver carrying this. And the name is reserved
+# in the wildcard routes, so the shadowing wildcard cannot be created in the first place.
+TRIGGER_PLACEHOLDER = "<TRIGGER>"
+
+
+def render_prompt(template: str, trigger: str) -> str:
+    """Fill a pose's placeholder with a character's trigger word.
+
+    A template with no placeholder is returned unchanged rather than rejected — a pose whose
+    prompt genuinely does not name the character is unusual but not wrong, and failing here
+    would block a render for a stylistic choice.
+    """
+    return template.replace(TRIGGER_PLACEHOLDER, trigger)
+
+
 @router.get("/recipes")
 async def get_recipe_book(
     user: User = Depends(get_current_user),
@@ -55,35 +77,39 @@ async def get_recipe_book(
     stack is returned alongside so the page can SHOW what a recipe pins without each recipe
     carrying a copy of it.
     """
-    rows = (
-        await db.execute(
-            select(LtxCharacter).options(selectinload(LtxCharacter.recipes))
-            .order_by(LtxCharacter.name)
-        )
-    ).scalars().all()
+    chars = (await db.execute(
+        select(LtxCharacter).order_by(LtxCharacter.name)
+    )).scalars().all()
+    poses = (await db.execute(
+        select(LtxRecipe).order_by(LtxRecipe.name)
+    )).scalars().all()
 
+    # Poses are character-agnostic, so EVERY pose is offered for EVERY character. That is the
+    # point: a new LoRA is never locked out for want of rows in a table — add the character
+    # and all of them work immediately.
     return {
         "stack": LTX_STACK,
+        "poses": [
+            {
+                "id": str(r.id),
+                "name": r.name,
+                "prompt_template": r.prompt_template,
+                "negative_prompt": r.negative_prompt or LTX_STACK["negative"],
+                "frames": r.frames or LTX_STACK["frames"],
+                "validated": r.validated,
+            }
+            for r in poses
+        ],
         "characters": [
             {
                 "id": str(c.id),
                 "name": c.name,
                 "char_lora": c.char_lora,
+                "trigger": c.trigger,
                 "strength_stage_1": c.strength_stage_1,
                 "strength_stage_2": c.strength_stage_2,
-                "recipes": [
-                    {
-                        "id": str(r.id),
-                        "name": r.name,
-                        "prompt": r.prompt,
-                        "negative_prompt": r.negative_prompt or LTX_STACK["negative"],
-                        "frames": r.frames or LTX_STACK["frames"],
-                        "validated": r.validated,
-                    }
-                    for r in c.recipes
-                ],
             }
-            for c in rows
+            for c in chars
         ],
     }
 
@@ -94,7 +120,11 @@ async def create_character(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    c = LtxCharacter(**body.model_dump())
+    data = body.model_dump()
+    # A character without a trigger renders a prompt containing a literal "<TRIGGER>", which
+    # is worse than any default. The name is what all three seeded characters use.
+    data["trigger"] = data.get("trigger") or data["name"]
+    c = LtxCharacter(**data)
     db.add(c)
     try:
         await db.commit()
@@ -129,16 +159,14 @@ async def delete_character(
     await db.commit()
 
 
-@router.post("/ltx/characters/{character_id}/recipes",
-             response_model=LtxRecipeResponse, status_code=201)
+@router.post("/ltx/recipes", response_model=LtxRecipeResponse, status_code=201)
 async def create_recipe(
-    character_id: uuid.UUID,
     body: LtxRecipeCreate,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    await _character(db, character_id)
-    r = LtxRecipe(character_id=character_id, **body.model_dump())
+    """Create a pose. Not attached to a character — every character gets it."""
+    r = LtxRecipe(**body.model_dump())
     db.add(r)
     try:
         await db.commit()
@@ -146,7 +174,7 @@ async def create_recipe(
         await db.rollback()
         raise HTTPException(
             status_code=409,
-            detail=f"Recipe {body.name!r} already exists for this character",
+            detail=f"A pose named {body.name!r} already exists",
         )
     await db.refresh(r)
     return r

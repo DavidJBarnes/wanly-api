@@ -11,6 +11,15 @@ from app.schemas.wildcards import WildcardCreate, WildcardResponse, WildcardUpda
 
 router = APIRouter()
 
+# LTX poses carry <TRIGGER>, which the character's trigger word fills. It shares syntax with
+# wildcards, so a wildcard by this name would make the resolver substitute a RANDOM option --
+# the render would name the wrong character, or none, and nothing would report a problem.
+#
+# The trigger is already substituted before wildcard resolution runs, so this is the second of
+# two guards rather than the only one. Reserving the name means the collision cannot be created
+# by hand in the first place, which is cheaper than reasoning about ordering later.
+RESERVED_WILDCARD_NAMES = {"TRIGGER"}
+
 
 @router.get("/wildcards", response_model=list[WildcardResponse])
 async def list_wildcards(
@@ -27,6 +36,12 @@ async def create_wildcard(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    if body.name.strip().upper() in RESERVED_WILDCARD_NAMES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"'{body.name}' is reserved: LTX poses use <TRIGGER> for the character "
+                   "trigger word, and a wildcard by that name would randomly replace it.",
+        )
     existing = await db.execute(select(Wildcard).where(Wildcard.name == body.name))
     if existing.scalar_one_or_none():
         raise HTTPException(
@@ -63,6 +78,13 @@ async def update_wildcard(
     if wildcard is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Wildcard not found")
     if body.name is not None:
+        # Renaming into the reserved name is the same collision by another route.
+        if body.name.strip().upper() in RESERVED_WILDCARD_NAMES:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"'{body.name}' is reserved: LTX poses use <TRIGGER> for the character "
+                       "trigger word, and a wildcard by that name would randomly replace it.",
+            )
         wildcard.name = body.name
     if body.options is not None:
         wildcard.options = body.options
