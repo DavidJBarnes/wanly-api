@@ -453,22 +453,62 @@ class GpuReservation(Base):
     )
 
 
-class LtxRecipeBook(Base):
-    """The parsed LTX recipe sheet. One row — see migration 070 for why the API owns it.
+class LtxCharacter(Base):
+    """A character: a LoRA and the strengths it runs at.
 
-    The console reads recipes from here, and a claim carries the RESOLVED recipe rather than a
-    name for the engine to look up. That is what makes stale-recipe drift structurally
-    impossible instead of something a check has to notice.
+    "Adding a character costs a LoRA and a trigger swap" — that is the whole model. The
+    strengths sit here rather than globally so a future character can differ, but all three
+    seeded characters share 0.8/1.5.
     """
-    __tablename__ = "ltx_recipe_book"
+    __tablename__ = "ltx_characters"
 
-    id = mapped_column(Integer, primary_key=True)
-    book = mapped_column(JSONB, nullable=False)
-    # Over the parsed content. This is the one that matters: re-saving the sheet with no edits
-    # changes the file bytes but not the book.
-    book_sha256 = mapped_column(String(64), nullable=False)
-    # Over the uploaded .ods bytes, so "did this exact file get imported" is answerable.
-    source_sha256 = mapped_column(String(64), nullable=False)
-    source_filename = mapped_column(Text, nullable=True)
-    imported_at = mapped_column(DateTime(timezone=True), nullable=False,
-                                server_default=text("now()"))
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = mapped_column(String(64), nullable=False, unique=True)
+    char_lora = mapped_column(Text, nullable=False)
+    # Per-stage, never flat. Stage 1 generates at half size from noise; stage 2 refines the
+    # 2x-upscaled latent and is where facial detail resolves. Collapsing them to one number
+    # is a different configuration, not a simplification.
+    strength_stage_1 = mapped_column(Float, nullable=False, server_default="0.8")
+    strength_stage_2 = mapped_column(Float, nullable=False, server_default="1.5")
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    # passive_deletes leaves the cascade to the database, where the FK already declares
+    # ON DELETE CASCADE. Without it the ORM tries to load every child row to delete them
+    # individually — which under asyncpg is a lazy load in the wrong context and raises
+    # MissingGreenlet, so deleting a character failed outright. Found by running it.
+    recipes = relationship("LtxRecipe", back_populates="character",
+                           cascade="all, delete-orphan", passive_deletes=True,
+                           order_by="LtxRecipe.name")
+
+
+class LtxRecipe(Base):
+    """A pose for a character: a prompt, and almost nothing else.
+
+    Measured across all 24 seeded recipes, only char_lora and prompt varied — every other
+    field had exactly one value. Those live once in the global stack (app_settings) rather
+    than being copied per row, because storing a global value 24 times is how it silently
+    stops being global.
+    """
+    __tablename__ = "ltx_recipes"
+    __table_args__ = (
+        UniqueConstraint("character_id", "name", name="uq_ltx_recipe_character_name"),
+        Index("ix_ltx_recipes_character_id", "character_id"),
+    )
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    character_id = mapped_column(UUID(as_uuid=True),
+                                 ForeignKey("ltx_characters.id", ondelete="CASCADE"),
+                                 nullable=False)
+    name = mapped_column(String(128), nullable=False)
+    prompt = mapped_column(Text, nullable=False)
+    # NULL means "the stack's negative" — true of all 24 seeded recipes. The override exists
+    # because a pose might one day need one, not because any does.
+    negative_prompt = mapped_column(Text, nullable=True)
+    frames = mapped_column(Integer, nullable=True)
+    # A human watched it and signed it off. NOT a quality score: the automated metrics have
+    # picked the wrong clip before, more than once.
+    validated = mapped_column(Boolean, nullable=False, server_default="false", default=False)
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = mapped_column(DateTime(timezone=True), nullable=True)
+
+    character = relationship("LtxCharacter", back_populates="recipes")
