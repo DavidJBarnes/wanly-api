@@ -20,7 +20,6 @@ from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
 from app.database import get_db
 from app.seeds import new_seed
 from app.enums import JobStatus, SegmentStatus, VideoStatus
-from app.helpers import upload_faceswap_image
 from app.models import AppSetting, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker
 from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
@@ -35,7 +34,6 @@ from app.schemas.segments import (
     SegmentClaimResponse,
     SegmentClipResponse,
     SegmentCreate,
-    SegmentReprocessRequest,
     SegmentResponse,
     SegmentStatusUpdate,
     SegmentTrimUpdate,
@@ -170,15 +168,6 @@ async def add_segment(
         duration_seconds=body.duration_seconds,
         speed=body.speed,
         start_image=body.start_image,
-        faceswap_enabled=body.faceswap_enabled,
-        faceswap_method=body.faceswap_method,
-        faceswap_source_type=body.faceswap_source_type,
-        faceswap_image=body.faceswap_image,
-        faceswap_faces_order=body.faceswap_faces_order,
-        faceswap_faces_index=body.faceswap_faces_index,
-        faceswap_model=body.faceswap_model,
-        faceswap_pixel_boost=body.faceswap_pixel_boost,
-        seed_faceswap=body.seed_faceswap,
         negative_prompt=negative_prompt,
         ltx_recipe=body.ltx_recipe,
         auto_finalize=body.auto_finalize,
@@ -261,7 +250,7 @@ async def claim_next_segment(
             Segment.status == SegmentStatus.PENDING,
             Segment.discarded.is_(False),
             Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]),
-            # real generations (reprocess_type NULL) + GPU reprocess (faceswap); exclude CPU carriers.
+            # real generations (reprocess_type NULL); exclude the CPU reprocess carriers.
             # NULL NOT IN (...) is NULL (excludes), so OR the NULL case in explicitly.
             or_(
                 Segment.reprocess_type.is_(None),
@@ -373,16 +362,6 @@ async def claim_next_segment(
     )
     continuation_mode = "vace" if use_vace else "traditional"
 
-    # Seed re-anchor: faceswap this segment's last frame to its own faceswap face before the
-    # frame seeds the next segment. Author-set per segment.
-    #
-    # This used to be a global app setting gated on "a later segment already exists". That
-    # gate could never pass: a job is created with segment 0 only and continuations are
-    # appended after it runs, so at claim time there is never a successor. The feature was
-    # dead in every job. No gate now — if the author asked for it, it fires. The cost when
-    # the segment turns out to be last is one wasted still-image faceswap (seconds).
-    seed_faceswap = bool(segment.seed_faceswap)
-
     # AR hologram carrier: the source is the job's finalized stitched video, not this
     # segment's own output. The daemon mattes/packs it into a color+alpha hologram.
     hologram_source_path = None
@@ -411,14 +390,6 @@ async def claim_next_segment(
         duration_seconds=segment.duration_seconds,
         speed=segment.speed,
         start_image=resolved_start_image,
-        faceswap_enabled=segment.faceswap_enabled,
-        faceswap_method=segment.faceswap_method,
-        faceswap_source_type=segment.faceswap_source_type,
-        faceswap_image=segment.faceswap_image,
-        faceswap_faces_order=segment.faceswap_faces_order,
-        faceswap_faces_index=segment.faceswap_faces_index,
-        faceswap_model=segment.faceswap_model,
-        faceswap_pixel_boost=segment.faceswap_pixel_boost,
         reference_frames=reference_frames if reference_frames else None,
         negative_prompt=negative_prompt,
         # Passed through verbatim. The engine must never look a recipe up for itself: an
@@ -427,7 +398,6 @@ async def claim_next_segment(
         ltx_recipe=segment.ltx_recipe,
         reprocess_type=segment.reprocess_type,
         output_path=segment.output_path,
-        seed_faceswap=seed_faceswap,
         width=job.width,
         height=job.height,
         fps=job.fps,
@@ -757,86 +727,6 @@ async def retry_segment(
     return segment
 
 
-@router.post("/segments/{segment_id}/reprocess", response_model=SegmentResponse)
-async def reprocess_segment(
-    segment_id: UUID,
-    data: str = Form(...),
-    faceswap_image: UploadFile | None = File(None),
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    try:
-        body = SegmentReprocessRequest.model_validate_json(data)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid JSON in data field: {e}",
-        )
-
-    result = await db.execute(
-        select(Segment)
-        .join(Job, Segment.job_id == Job.id)
-        .where(Segment.id == segment_id, Job.user_id == user.id)
-    )
-    segment = result.scalar_one_or_none()
-    if segment is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
-    if segment.status != SegmentStatus.COMPLETED:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Only completed segments can be reprocessed (current: '{segment.status}')",
-        )
-
-    job = await db.get(Job, segment.job_id)
-    if job.status == JobStatus.ARCHIVED:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Cannot reprocess segments in an archived job",
-        )
-
-    # Upload faceswap source image if provided
-    faceswap_uri = None
-    if faceswap_image is not None:
-        faceswap_uri = await upload_faceswap_image(
-            faceswap_image, segment.job_id, key_suffix="faceswap_source_reprocess"
-        )
-
-    # Validate faceswap image is resolvable
-    effective_image = faceswap_uri or body.faceswap_image
-    if body.faceswap_enabled and not effective_image and body.faceswap_source_type != "start_frame":
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Faceswap is enabled but no source image was provided",
-        )
-
-    # Update faceswap fields
-    segment.faceswap_enabled = body.faceswap_enabled
-    segment.faceswap_method = body.faceswap_method
-    segment.faceswap_source_type = body.faceswap_source_type
-    segment.faceswap_image = effective_image
-    segment.faceswap_faces_order = body.faceswap_faces_order
-    segment.faceswap_faces_index = body.faceswap_faces_index
-    segment.faceswap_model = body.faceswap_model
-    segment.faceswap_pixel_boost = body.faceswap_pixel_boost
-
-    # Reset segment for faceswap-only reprocessing (preserve existing output)
-    segment.reprocess_type = "faceswap"
-    segment.status = SegmentStatus.PENDING
-    segment.worker_id = None
-    segment.worker_name = None
-    segment.claimed_at = None
-    segment.completed_at = None
-    segment.error_message = None
-    segment.progress_log = None
-
-    # Reset job so daemon picks it up
-    job.status = JobStatus.PENDING
-
-    await db.commit()
-    await db.refresh(segment)
-    return segment
-
-
 @router.post("/jobs/{job_id}/hologram", response_model=SegmentResponse)
 async def make_hologram(
     job_id: UUID,
@@ -954,7 +844,7 @@ async def list_segment_clips(
         Job.user_id == user.id,
         Segment.status == SegmentStatus.COMPLETED,
         Segment.output_path.is_not(None),
-        Segment.reprocess_type.is_(None),          # real generations only, not carriers/faceswap
+        Segment.reprocess_type.is_(None),          # real generations only, not carriers
         Segment.index < HOLOGRAM_CARRIER_INDEX,     # exclude sentinel carriers
     ]
     if width is not None and height is not None:
@@ -1196,15 +1086,6 @@ def _roll_new_take(job: Job, old: Segment) -> Segment:
         duration_seconds=old.duration_seconds,
         speed=old.speed,
         start_image=old.start_image,
-        faceswap_enabled=old.faceswap_enabled,
-        faceswap_method=old.faceswap_method,
-        faceswap_source_type=old.faceswap_source_type,
-        faceswap_image=old.faceswap_image,
-        faceswap_faces_order=old.faceswap_faces_order,
-        faceswap_faces_index=old.faceswap_faces_index,
-        faceswap_model=old.faceswap_model,
-        faceswap_pixel_boost=old.faceswap_pixel_boost,
-        seed_faceswap=old.seed_faceswap,
         negative_prompt=old.negative_prompt,
         # The recipe is what the take IS. Without it a re-rolled LTX segment renders free-form
         # — no character LoRA, no trigger, no per-stage strengths — and comes back looking like
@@ -1229,7 +1110,7 @@ async def reroll_first_segment(
     """Archive segment 0 and queue a fresh one, identical except for the seed.
 
     This is the "show me another take" button. Everything that defines the shot -- prompt, LoRAs,
-    preset, start image, faceswap, duration -- is copied verbatim so that the seed is the ONLY
+    recipe, start image, duration -- is copied verbatim so that the seed is the ONLY
     thing that differs and the two takes are actually comparable. A wildcard prompt is copied
     already-resolved for the same reason: re-rolling the wildcards as well would change two
     variables at once and make the comparison worth nothing.

@@ -30,7 +30,7 @@ async def upload_file(
 ):
     """Upload a file to S3. Optionally scoped to a job_id folder.
 
-    Used by the console to upload starting images, faceswap source images, etc.
+    Used by the console to upload starting images.
     Returns the S3 URI of the uploaded file.
     """
     data = await file.read()

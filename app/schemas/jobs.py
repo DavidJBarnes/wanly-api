@@ -66,7 +66,6 @@ class JobResponse(BaseModel):
     segment_count: int = 0
     completed_segment_count: int = 0
     estimated_run_time: Optional[float] = None
-    faceswap_enabled: bool = False
     tags: Optional[str] = None
     continuation_mode: Optional[str] = None
     # === Lynx identity-preserving engine ===

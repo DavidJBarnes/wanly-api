@@ -128,18 +128,6 @@ class Segment(Base):
     duration_seconds = mapped_column(Float, nullable=False, default=5.0)
     speed = mapped_column(Float, nullable=False, default=1.0)
     start_image = mapped_column(Text, nullable=True)
-    faceswap_enabled = mapped_column(Boolean, nullable=False, default=False)
-    faceswap_method = mapped_column(String(20), nullable=True)
-    faceswap_source_type = mapped_column(String(20), nullable=True)
-    faceswap_image = mapped_column(Text, nullable=True)
-    faceswap_faces_order = mapped_column(Text, nullable=True)
-    faceswap_faces_index = mapped_column(Text, nullable=True)
-    faceswap_model = mapped_column(String(64), nullable=True)
-    faceswap_pixel_boost = mapped_column(String(16), nullable=True)
-    # Seed re-anchor: faceswap this segment's last frame to the segment's faceswap face
-    # before it seeds the next segment. Author-set per segment (no successor gate: the
-    # successor does not exist yet when this segment is claimed).
-    seed_faceswap = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     auto_finalize = mapped_column(Boolean, nullable=False, default=False)
     transition = mapped_column(String(20), nullable=True, default=None)
     # Human observation. The metrics cannot rank quality -- expression rewards the mouth-gape
