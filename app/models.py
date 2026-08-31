@@ -57,9 +57,6 @@ class Job(Base):
     config_starred = mapped_column(Boolean, nullable=False, default=False)
     # Per-job continuation-mode override ("traditional"|"vace"); NULL -> global app setting.
     continuation_mode = mapped_column(String(20), nullable=True)
-    # Canonical identity reference for VACE continuation: a face crop from seg0, set by the daemon
-    # after seg0 completes and fed to every downstream segment's VACE ref_images (anchors identity).
-    identity_reference_image = mapped_column(Text, nullable=True)
     # === Lynx identity-preserving engine (ByteDance Lynx on Wan2.1 T2V-14B) ===
     # generation_engine selects the daemon's graph builder: NULL/"wan22" -> the default
     # 2.2 i2v path, "lynx" -> build_lynx_workflow. Lynx is a different base model family,
@@ -167,34 +164,6 @@ class Segment(Base):
     observation_tags = mapped_column(String(500), nullable=True)
     trim_start_frames = mapped_column(Integer, nullable=False, default=0)
     trim_end_frames = mapped_column(Integer, nullable=False, default=0)
-    # "Re-roll until": the rule this take was generated under, judged by the API when the take
-    # completes. Metric is one of identity/expression/motion/detail; the comparison is >= against
-    # the MEAN of the matching series in identity_metrics — the same number the console's chips
-    # show, so the value that gates is the value the user can read off the screen. A take that
-    # misses the rule is archived and re-rolled again automatically, capped by the
-    # "max_rerolls_per_job" app setting. reroll_count is this take's position in its chain
-    # (1 = the user-initiated roll). NULL throughout means "no rule" — every plain re-roll, and
-    # every take that predates the feature.
-    reroll_rule_metric = mapped_column(String(16), nullable=True)
-    reroll_rule_threshold = mapped_column(Float, nullable=True)
-    reroll_count = mapped_column(Integer, nullable=True)
-    motion_magnitude = mapped_column(Float, nullable=True)
-    # Identity scoring, measured inline when the segment finishes generating. Two means:
-    # _mean_cos is vs the START FRAME (drift of this generation), _mean_cos_ref is vs the
-    # identity reference (is it the character). Slope separates weak identity from drift.
-    identity_mean_cos = mapped_column(Float, nullable=True)
-    identity_mean_cos_ref = mapped_column(Float, nullable=True)
-    identity_min_cos = mapped_column(Float, nullable=True)
-    identity_slope = mapped_column(Float, nullable=True)
-    identity_frames = mapped_column(Integer, nullable=True)
-    identity_no_face = mapped_column(Integer, nullable=True)
-    identity_face_px_p50 = mapped_column(Float, nullable=True)
-    identity_yaw_max = mapped_column(Float, nullable=True)
-    # First and last frame vs the job's ground truth. Loss across a segment is start - end;
-    # a continuation begins where the previous ended, so these chain across the job.
-    identity_start_cos_ref = mapped_column(Float, nullable=True)
-    identity_end_cos_ref = mapped_column(Float, nullable=True)
-    identity_metrics = mapped_column(JSONB, nullable=True)
     # Length (seconds) of the reconstructed lead-in a VACE-continuation segment carries.
     # Stitch trims this off the previous segment's tail so the reconstruction replaces it
     # seamlessly. NULL for traditional (non-VACE) segments.
@@ -215,12 +184,6 @@ class Segment(Base):
     hologram_manifest_path = mapped_column(Text, nullable=True)
     hologram_poster_path = mapped_column(Text, nullable=True)
     reference_frames = mapped_column(JSON, nullable=True)
-    # Lynx identity QA, written by the daemon after a Lynx render: per-frame cosine
-    # similarities of sampled output frames against the subject, plus summary stats.
-    # Measurement only — nothing gates on it. Shape:
-    # {"scores": [...], "mean": f, "min": f, "max": f,
-    #  "frames_sampled": n, "frames_with_face": n}
-    lynx_identity_scores = mapped_column(JSON, nullable=True)
     negative_prompt = mapped_column(Text, nullable=True)
     # LTX recipe render: which validated (character, pose) configuration produced this
     # segment, and any of its defaults the user overrode. One JSONB rather than a column

@@ -371,7 +371,6 @@ async def claim_next_segment(
     # Resolve start_image
     resolved_start_image = segment.start_image
     previous_segment = None
-    previous_motion_magnitude = None
     reference_frames = []
     if resolved_start_image is None:
         if segment.index == 0:
@@ -396,7 +395,6 @@ async def claim_next_segment(
             if prev_segment is not None:
                 resolved_start_image = prev_segment.last_frame_path
                 previous_segment = prev_segment
-                previous_motion_magnitude = prev_segment.motion_magnitude
                 if prev_segment.reference_frames:
                     reference_frames = prev_segment.reference_frames.copy()
                 if prev_segment.last_frame_path and prev_segment.last_frame_path not in reference_frames:
@@ -501,11 +499,6 @@ async def claim_next_segment(
         faceswap_faces_index=segment.faceswap_faces_index,
         faceswap_model=segment.faceswap_model,
         faceswap_pixel_boost=segment.faceswap_pixel_boost,
-        initial_reference_image=job.identity_reference_image or job.starting_image,
-        # Ground truth for identity scoring is always segment 0's start frame. No override:
-        # "her" is defined by where the job began, not by a separate reference image.
-        identity_ground_truth=job.starting_image,
-        previous_motion_magnitude=previous_motion_magnitude,
         reference_frames=reference_frames if reference_frames else None,
         lightx2v_strength_high=vsettings.lightx2v_strength_high,
         lightx2v_strength_low=vsettings.lightx2v_strength_low,
@@ -588,62 +581,6 @@ async def update_segment(
         segment.error_message = body.error_message
     if body.progress_log is not None:
         segment.progress_log = body.progress_log
-    if body.motion_magnitude is not None:
-        segment.motion_magnitude = body.motion_magnitude
-    # Identity scores measured by the daemon at generation time. Measurement only -
-    # never gates status, exactly like motion_magnitude and the Lynx QA scores.
-    if body.identity_mean_cos is not None:
-        segment.identity_mean_cos = body.identity_mean_cos
-    if body.identity_mean_cos_ref is not None:
-        segment.identity_mean_cos_ref = body.identity_mean_cos_ref
-    if body.identity_min_cos is not None:
-        segment.identity_min_cos = body.identity_min_cos
-    if body.identity_slope is not None:
-        segment.identity_slope = body.identity_slope
-    if body.identity_frames is not None:
-        segment.identity_frames = body.identity_frames
-    if body.identity_no_face is not None:
-        segment.identity_no_face = body.identity_no_face
-    if body.identity_face_px_p50 is not None:
-        segment.identity_face_px_p50 = body.identity_face_px_p50
-    if body.identity_yaw_max is not None:
-        segment.identity_yaw_max = body.identity_yaw_max
-    if body.identity_metrics is not None:
-        segment.identity_metrics = body.identity_metrics
-    if body.identity_start_cos_ref is not None:
-        segment.identity_start_cos_ref = body.identity_start_cos_ref
-    if body.identity_end_cos_ref is not None:
-        segment.identity_end_cos_ref = body.identity_end_cos_ref
-    if body.vace_overlap_seconds is not None:
-        segment.vace_overlap_seconds = body.vace_overlap_seconds
-    if body.lynx_identity_scores is not None:
-        # Identity QA is measurement only — persisted so the ip/ref calibration can be
-        # argued from numbers later. Never affects segment status.
-        segment.lynx_identity_scores = body.lynx_identity_scores
-        logger.info(
-            "segment %s lynx identity QA: mean=%s min=%s max=%s (%s/%s frames with a face)",
-            segment.id,
-            body.lynx_identity_scores.get("mean"),
-            body.lynx_identity_scores.get("min"),
-            body.lynx_identity_scores.get("max"),
-            body.lynx_identity_scores.get("frames_with_face"),
-            body.lynx_identity_scores.get("frames_sampled"),
-        )
-
-    await db.flush()
-
-    # "Re-roll until": judge a completed take against its rule now, while the metrics ride the
-    # same PATCH (the daemon uploads output first — which flips status to COMPLETED — then sends
-    # this PATCH with status + scores together). If the take misses, this archives it and adds a
-    # fresh pending segment-0, which the status block below then counts as active — so the job
-    # stays PENDING instead of falling to AWAITING/FINALIZED. auto_finalize composes for free:
-    # the job finalizes only once a take clears the rule (or the chain gives up).
-    if (
-        body.status == SegmentStatus.COMPLETED
-        and segment.reroll_rule_metric is not None
-        and not segment.discarded
-    ):
-        await _judge_reroll_rule(db, segment)
 
     # Check if job needs status update. Hologram carriers are exempt — they don't affect the
     # source job's status (a failed hologram must not flip a finalized job to FAILED).
@@ -1175,7 +1112,6 @@ async def list_segment_clips(
             height=job.height,
             fps=job.fps,
             duration_seconds=seg.duration_seconds,
-            motion_magnitude=seg.motion_magnitude,
             favorite=str(seg.id) in fav_ids,
         )
         for seg, job in rows
@@ -1351,49 +1287,11 @@ async def cancel_segment(
     return segment
 
 
-# --- "Re-roll until" (#342) --------------------------------------------------------------------
-#
-# A re-roll may carry a rule: one of the four quality axes and a threshold, judged >= when the
-# take finishes generating. The rule gates on the MEAN of the matching per-frame series in
-# identity_metrics — the same number the console's metric chips display — so what drives the loop
-# is exactly the value the user can read off the screen. The nearby scalar columns
-# (identity_mean_cos_ref, motion_magnitude) are close cousins but not the displayed number, and
-# two subtly different values behind one decision is how trust in a metric dies.
-REROLL_RULE_SERIES = {
-    "identity": "series",
-    "expression": "series_expression",
-    "motion": "series_motion",
-    "detail": "series_detail",
-}
+def _roll_new_take(job: Job, old: Segment) -> Segment:
+    """Archive `old` and build its replacement.
 
-# Mirrors the console's MIN_POINTS: below this the chip doesn't render, so the user could never
-# see the number that gated. An unevaluable rule stops the loop instead of burning GPU blind.
-REROLL_RULE_MIN_POINTS = 8
-
-DEFAULT_MAX_REROLLS = 3
-
-
-def _reroll_rule_mean(metrics: dict | None, metric: str) -> float | None:
-    series = (metrics or {}).get(REROLL_RULE_SERIES[metric])
-    if not isinstance(series, list):
-        return None
-    values = [v for v in series if isinstance(v, (int, float)) and math.isfinite(v)]
-    if len(values) < REROLL_RULE_MIN_POINTS:
-        return None
-    return sum(values) / len(values)
-
-
-def _roll_new_take(
-    job: Job,
-    old: Segment,
-    *,
-    rule_metric: str | None = None,
-    rule_threshold: float | None = None,
-    reroll_count: int | None = None,
-) -> Segment:
-    """Archive `old` and build its replacement — the mechanics shared by a user-initiated
-    re-roll and an automatic rule-driven one. The caller adds the returned segment to the
-    session; commit is the caller's too.
+    Was shared by a user-initiated re-roll and an automatic rule-driven one; the rule-driven
+    path is gone with the metrics it judged (#151), so this now serves the button only.
 
     Stamp the outgoing take with the seed it actually ran on, if it was relying on the
     derivation. NULL means "derive from the job", which is unambiguous while a job has one take
@@ -1436,84 +1334,12 @@ def _roll_new_take(
         negative_prompt=old.negative_prompt,
         auto_finalize=old.auto_finalize,
         video_preset_id=old.video_preset_id,
-        reroll_rule_metric=rule_metric,
-        reroll_rule_threshold=rule_threshold,
-        reroll_count=reroll_count,
     )
 
     # Back to pending or nothing claims it. The job may well be 'awaiting' (segment 0 finished
     # and it is waiting on a decision) or 'failed'.
     job.status = JobStatus.PENDING
     return fresh
-
-
-async def _judge_reroll_rule(db: AsyncSession, segment: Segment) -> None:
-    """Judge a freshly completed take against the rule it was generated under.
-
-    Called from the completion PATCH, while the metrics are in hand. Three quiet exits — rule
-    met, cap reached, rule unevaluable — all leave the take live and the job to fall through to
-    AWAITING exactly as if no rule existed ("sit idle", per the ticket). Only a measured miss
-    with budget remaining rolls again.
-
-    A failed generation never reaches here (judged on COMPLETED only): a crash is not a metric
-    miss, and looping on one would burn the whole budget re-running a broken setup.
-    """
-    metric = segment.reroll_rule_metric
-    threshold = segment.reroll_rule_threshold
-    used = segment.reroll_count or 1
-
-    mean = _reroll_rule_mean(segment.identity_metrics, metric)
-    if mean is None:
-        logger.warning(
-            "segment %s: re-roll rule %s >= %s is unevaluable (no %s series in metrics) — sitting idle",
-            segment.id, metric, threshold, REROLL_RULE_SERIES[metric],
-        )
-        return
-    if mean >= threshold:
-        logger.info(
-            "segment %s: re-roll rule met — %s %.3f >= %.3f on take %d",
-            segment.id, metric, mean, threshold, used,
-        )
-        return
-
-    setting = await db.get(AppSetting, "max_rerolls_per_job")
-    try:
-        cap = int(setting.value) if setting else DEFAULT_MAX_REROLLS
-    except (TypeError, ValueError):
-        cap = DEFAULT_MAX_REROLLS
-    if used >= cap:
-        logger.info(
-            "segment %s: re-roll rule missed (%s %.3f < %.3f) but the cap of %d takes is spent — sitting idle",
-            segment.id, metric, mean, threshold, cap,
-        )
-        return
-
-    # Same gate as the endpoint: re-roll only while this take is the job's single live segment.
-    # It is by construction — a rule only ever rides a segment-0 take — but a successor added
-    # while this take was generating would be orphaned by an automatic roll, so verify.
-    job = await db.get(Job, segment.job_id)
-    others = await db.execute(
-        select(Segment.id).where(
-            Segment.job_id == job.id,
-            Segment.id != segment.id,
-            Segment.discarded.is_(False),
-        )
-    )
-    if others.first() is not None:
-        logger.warning(
-            "segment %s: re-roll rule missed but the job has other live segments — sitting idle",
-            segment.id,
-        )
-        return
-
-    fresh = _roll_new_take(
-        job, segment, rule_metric=metric, rule_threshold=threshold, reroll_count=used + 1,
-    )
-    db.add(fresh)
-    logger.info(
-        "segment %s: re-roll rule missed — %s %.3f < %.3f, rolling take %d/%d",
-        segment.id, metric, mean, threshold, used + 1, cap,
-    )
 
 
 @router.post("/jobs/{job_id}/reroll", response_model=SegmentResponse)
@@ -1543,30 +1369,11 @@ async def reroll_first_segment(
     Trim, transition, rating, notes and observation tags are deliberately NOT copied: they
     describe the take being archived, not the one about to be generated.
 
-    Optionally carries a "re-roll until" rule (metric + threshold, judged >= on completion).
-    A take that misses its rule is archived and re-rolled again automatically, up to the
-    max_rerolls_per_job app setting; see _judge_reroll_rule.
+    The "re-roll until" rule is gone with the metrics it judged (#151) — it compared a
+    threshold against the mean of an identity or motion series, and nothing produces those
+    now. A rule would have been permanently unevaluable, which the old code degraded to by
+    logging "sitting idle" rather than failing. Rolling a take by hand is unaffected.
     """
-    rule_metric = body.rule_metric if body else None
-    rule_threshold = body.rule_threshold if body else None
-    if rule_metric is not None:
-        if rule_metric not in REROLL_RULE_SERIES:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unknown re-roll rule metric '{rule_metric}'. "
-                       f"One of: {', '.join(REROLL_RULE_SERIES)}.",
-            )
-        if rule_threshold is None or not math.isfinite(rule_threshold):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="A re-roll rule needs a finite threshold.",
-            )
-    elif rule_threshold is not None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="rule_threshold given without rule_metric.",
-        )
-
     result = await db.execute(
         select(Job)
         .where(Job.id == job_id, Job.user_id == user.id)
@@ -1599,14 +1406,7 @@ async def reroll_first_segment(
             ),
         )
 
-    fresh = _roll_new_take(
-        job,
-        old,
-        rule_metric=rule_metric,
-        rule_threshold=rule_threshold,
-        # The user-initiated roll is the first take charged against the cap.
-        reroll_count=1 if rule_metric is not None else None,
-    )
+    fresh = _roll_new_take(job, old)
     db.add(fresh)
 
     await db.commit()

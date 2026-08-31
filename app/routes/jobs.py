@@ -37,7 +37,7 @@ def _image_ext(filename: str | None) -> str:
 
 def _starting_image_key(user_id: UUID, image_hash: str, ext: str) -> str:
     return f"users/{user_id}/starting_images/{image_hash}{ext}"
-from app.schemas.jobs import IdentityAggregate, JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
+from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
 from app.schemas.segments import SegmentResponse
 from app.stitch import stitch_video
 
@@ -48,57 +48,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-
-def _identity_aggregate(segments) -> IdentityAggregate | None:
-    """Roll per-segment identity scores up to the job.
-
-    Frame-weighted, so a short segment does not carry the same weight as a long one, and it
-    surfaces the worst-drifting segment index - "which segment went wrong" is what you act on,
-    and a blended mean hides exactly that.
-    """
-    scored = [s for s in segments if s.identity_frames]
-    if not scored:
-        return None
-
-    def weighted(attr: str):
-        pairs = [(getattr(s, attr), s.identity_frames) for s in scored
-                 if getattr(s, attr) is not None]
-        if not pairs:
-            return None
-        total = sum(n for _, n in pairs)
-        return sum(v * n for v, n in pairs) / total if total else None
-
-    worst = min(
-        (s for s in scored if s.identity_slope is not None),
-        key=lambda s: s.identity_slope,
-        default=None,
-    )
-    # The cumulative low point matters more than the average: a mean over segments hides a
-    # late collapse, which is exactly what a multi-segment job drifts into.
-    lowest = min(
-        (s for s in scored if s.identity_mean_cos_ref is not None),
-        key=lambda s: s.identity_mean_cos_ref,
-        default=None,
-    )
-    ordered = sorted(scored, key=lambda s: s.index)
-    first_with_start = next((s for s in ordered if s.identity_start_cos_ref is not None), None)
-    last_with_end = next(
-        (s for s in reversed(ordered) if s.identity_end_cos_ref is not None), None)
-
-    return IdentityAggregate(
-        mean_cos=weighted("identity_mean_cos"),
-        mean_cos_ref=weighted("identity_mean_cos_ref"),
-        slope=weighted("identity_slope"),
-        frames=sum(s.identity_frames or 0 for s in scored),
-        no_face=sum(s.identity_no_face or 0 for s in scored),
-        scored_segments=len(scored),
-        worst_segment_index=worst.index if worst else None,
-        worst_segment_slope=worst.identity_slope if worst else None,
-        min_cos_ref=lowest.identity_mean_cos_ref if lowest else None,
-        min_cos_ref_segment_index=lowest.index if lowest else None,
-        start_cos_ref=first_with_start.identity_start_cos_ref if first_with_start else None,
-        end_cos_ref=last_with_end.identity_end_cos_ref if last_with_end else None,
-    )
 
 
 @router.get("/jobs/starting-image-exists")
@@ -653,7 +602,6 @@ async def get_job(
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
     return JobDetailResponse(
-        identity=_identity_aggregate(job.segments),
         id=job.id,
         name=job.name,
         width=job.width,
@@ -670,7 +618,6 @@ async def get_job(
         flow_shift=job.flow_shift,
         video_preset_id=job.video_preset_id,
         continuation_mode=job.continuation_mode,
-        identity_reference_image=job.identity_reference_image,
         # Lynx engine fields. These responses are hand-built, so anything not
         # listed here is silently dropped by Pydantic even though it is on the schema.
         generation_engine=job.generation_engine,
@@ -812,7 +759,6 @@ async def reopen_job(
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
     return JobDetailResponse(
-        identity=_identity_aggregate(job.segments),
         id=job.id, name=job.name, width=job.width, height=job.height,
         fps=job.fps, seed=job.seed, starting_image=job.starting_image,
         lightx2v_strength_high=job.lightx2v_strength_high,
@@ -820,7 +766,6 @@ async def reopen_job(
         cfg_high=job.cfg_high, cfg_low=job.cfg_low,
         steps_total=job.steps_total, high_noise_steps=job.high_noise_steps, flow_shift=job.flow_shift,
         video_preset_id=job.video_preset_id, continuation_mode=job.continuation_mode,
-        identity_reference_image=job.identity_reference_image,
         # Lynx engine fields. These responses are hand-built, so anything not
         # listed here is silently dropped by Pydantic even though it is on the schema.
         generation_engine=job.generation_engine,

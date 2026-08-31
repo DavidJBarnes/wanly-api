@@ -106,7 +106,6 @@ class JobResponse(BaseModel):
     lynx_shift: Optional[float] = None
     lynx_scheduler: Optional[str] = None
     lynx_distill_strength: Optional[float] = None
-    identity_reference_image: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -120,34 +119,6 @@ class JobListResponse(BaseModel):
     offset: int
 
 
-class IdentityAggregate(BaseModel):
-    """Job-level identity, derived from the per-segment scores rather than re-measuring.
-
-    Frame-weighted so a 20-frame segment does not count the same as a 200-frame one, and it
-    names the worst-drifting segment because "which segment went wrong" is the actionable
-    answer - a blended average hides it.
-    """
-    mean_cos: Optional[float] = None
-    mean_cos_ref: Optional[float] = None
-    slope: Optional[float] = None
-    frames: int = 0
-    no_face: int = 0
-    scored_segments: int = 0
-    worst_segment_index: Optional[int] = None
-    worst_segment_slope: Optional[float] = None
-    # Lowest per-segment cumulative score in the job, and where it happened. A job can
-    # average well while a late segment has lost the character entirely - each segment is
-    # measured against its OWN start frame, which for a continuation is the previous
-    # segment's already-drifted last frame. Observed: seg0 0.764, seg1 0.785 vs their own
-    # starts (both "healthy") while seg1 sat at 0.544 vs the job's original image.
-    min_cos_ref: Optional[float] = None
-    min_cos_ref_segment_index: Optional[int] = None
-    # Job trajectory: the first segment's opening frame through the last segment's closing
-    # frame, both against the same ground truth. end - start is the identity the job lost.
-    start_cos_ref: Optional[float] = None
-    end_cos_ref: Optional[float] = None
-
-
 class JobDetailResponse(JobResponse):
     segments: list[SegmentResponse]
     videos: list[VideoResponse]
@@ -155,7 +126,6 @@ class JobDetailResponse(JobResponse):
     completed_segment_count: int
     total_run_time: float
     total_video_time: float
-    identity: Optional[IdentityAggregate] = None
 
 
 class JobUpdate(BaseModel):
