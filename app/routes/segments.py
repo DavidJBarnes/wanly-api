@@ -21,7 +21,7 @@ from app.database import get_db
 from app.seeds import new_seed
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.helpers import upload_faceswap_image
-from app.models import AppSetting, Job, Lora, LtxCharacter, Segment, User, Video, VideoSettingsPreset, Wildcard, Worker
+from app.models import AppSetting, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker
 from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
     EXCLUSIVE_TAG_GROUPS,
@@ -39,7 +39,6 @@ from app.schemas.segments import (
     SegmentResponse,
     SegmentStatusUpdate,
     SegmentTrimUpdate,
-    SegmentVideoPresetUpdate,
     SmashcutRequest,
     WorkerSegmentResponse,
 )
@@ -67,64 +66,6 @@ SMASHCUT_CARRIER_INDEX = 2000
 _CPU_REPROCESS_TYPES = ("ar_hologram", "smashcut_concat")
 
 router = APIRouter()
-
-
-async def _resolve_loras(db: AsyncSession, loras_input: list | None) -> list | None:
-    """Resolve lora_id references to full file info for daemon consumption."""
-    if not loras_input:
-        return loras_input
-    resolved = []
-    for item in loras_input:
-        if not isinstance(item, dict):
-            resolved.append(item)
-            continue
-        lora_id = item.get("lora_id")
-        if lora_id:
-            lora = await db.get(Lora, UUID(lora_id))
-            if lora is None:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"LoRA not found: {lora_id}",
-                )
-            resolved.append({
-                "lora_id": str(lora.id),
-                "high_file": lora.high_file,
-                "high_s3_uri": lora.high_s3_uri,
-                "high_weight": item.get("high_weight", lora.default_high_weight),
-                "low_file": lora.low_file,
-                "low_s3_uri": lora.low_s3_uri,
-                "low_weight": item.get("low_weight", lora.default_low_weight),
-            })
-        else:
-            # Backward compat: raw filename format
-            resolved.append(item)
-    return resolved
-
-
-async def _resolve_trigger(db: AsyncSession, prompt: str, ltx_recipe: dict | None) -> str:
-    """Fill a pose's <TRIGGER> with the character's trigger word.
-
-    Runs BEFORE _resolve_wildcards, and that order is the safeguard: <TRIGGER> shares syntax
-    with wildcards, so a Wildcard named TRIGGER would otherwise substitute a random option and
-    the render would quietly name the wrong character. Doing it first means the resolver never
-    sees the placeholder. (The name is also reserved in the wildcard routes, so both ends are
-    covered.)
-
-    The console normally substitutes at creation time; this catches a prompt that reaches the
-    API still carrying the placeholder — an edited prompt, or any caller that is not the
-    console.
-    """
-    if "<TRIGGER>" not in prompt:
-        return prompt
-    name = (ltx_recipe or {}).get("character")
-    if not name:
-        # Leave it. Rendering the literal text "<TRIGGER>" is bad, but silently dropping the
-        # token that anchors the character LoRA is worse and much harder to notice.
-        return prompt
-    row = (await db.execute(
-        select(LtxCharacter).where(LtxCharacter.name == name)
-    )).scalar_one_or_none()
-    return prompt.replace("<TRIGGER>", row.trigger) if row else prompt
 
 
 async def _resolve_wildcards(db: AsyncSession, prompt: str) -> tuple[str, str | None]:
@@ -211,7 +152,6 @@ async def add_segment(
 
     next_index = max((s.index for s in job.segments), default=-1) + 1
 
-    resolved_loras = await _resolve_loras(db, body.loras)
     prompt = await _resolve_trigger(db, body.prompt, body.ltx_recipe)
     resolved_prompt, prompt_template = await _resolve_wildcards(db, prompt)
 
@@ -230,7 +170,6 @@ async def add_segment(
         duration_seconds=body.duration_seconds,
         speed=body.speed,
         start_image=body.start_image,
-        loras=resolved_loras,
         faceswap_enabled=body.faceswap_enabled,
         faceswap_method=body.faceswap_method,
         faceswap_source_type=body.faceswap_source_type,
@@ -243,7 +182,6 @@ async def add_segment(
         negative_prompt=negative_prompt,
         ltx_recipe=body.ltx_recipe,
         auto_finalize=body.auto_finalize,
-        video_preset_id=body.video_preset_id,
     )
     db.add(segment)
 
@@ -445,23 +383,6 @@ async def claim_next_segment(
     # the segment turns out to be last is one wasted still-image faceswap (seconds).
     seed_faceswap = bool(segment.seed_faceswap)
 
-    # Resolve video (sampler) settings: segment's preset -> job's preset -> job's raw params.
-    # Live-linked, so editing a preset changes future claims that reference it.
-    vp_id = segment.video_preset_id or job.video_preset_id
-    vsettings = job
-    effective_loras = segment.loras
-    if vp_id is not None:
-        preset = await db.get(VideoSettingsPreset, vp_id)
-        if preset is not None:
-            vsettings = preset
-            # A full-recipe preset owns its LoRAs (resolved live); a sampler-only preset
-            # leaves the segment's own LoRAs untouched.
-            if preset.loras:
-                effective_loras = await _resolve_loras(db, preset.loras)
-    # Sampler/scheduler only come from a preset (empty -> daemon default euler/simple).
-    sampler_name = getattr(vsettings, "sampler_name", None) or None
-    scheduler = getattr(vsettings, "scheduler", None) or None
-
     # AR hologram carrier: the source is the job's finalized stitched video, not this
     # segment's own output. The daemon mattes/packs it into a color+alpha hologram.
     hologram_source_path = None
@@ -490,7 +411,6 @@ async def claim_next_segment(
         duration_seconds=segment.duration_seconds,
         speed=segment.speed,
         start_image=resolved_start_image,
-        loras=effective_loras,
         faceswap_enabled=segment.faceswap_enabled,
         faceswap_method=segment.faceswap_method,
         faceswap_source_type=segment.faceswap_source_type,
@@ -500,15 +420,6 @@ async def claim_next_segment(
         faceswap_model=segment.faceswap_model,
         faceswap_pixel_boost=segment.faceswap_pixel_boost,
         reference_frames=reference_frames if reference_frames else None,
-        lightx2v_strength_high=vsettings.lightx2v_strength_high,
-        lightx2v_strength_low=vsettings.lightx2v_strength_low,
-        cfg_high=vsettings.cfg_high,
-        cfg_low=vsettings.cfg_low,
-        steps_total=vsettings.steps_total,
-        high_noise_steps=vsettings.high_noise_steps,
-        flow_shift=vsettings.flow_shift,
-        sampler_name=sampler_name,
-        scheduler=scheduler,
         negative_prompt=negative_prompt,
         # Passed through verbatim. The engine must never look a recipe up for itself: an
         # engine that cannot look one up cannot look up a STALE one, which is the failure
@@ -671,21 +582,7 @@ async def update_segment_prompt(
             ),
         )
 
-    if body.from_preset:
-        if not segment.video_preset_id:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="This segment is not linked to a preset, so there is nothing to re-take.",
-            )
-        preset = await db.get(VideoSettingsPreset, segment.video_preset_id)
-        if preset is None or not preset.prompt:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="The linked preset has no prompt to copy.",
-            )
-        source = preset.prompt
-    else:
-        source = body.prompt
+    source = body.prompt
 
     resolved, template = await _resolve_wildcards(db, source)
     segment.prompt = resolved
@@ -721,28 +618,6 @@ async def update_segment_trim(
 
     segment.trim_start_frames = body.trim_start_frames
     segment.trim_end_frames = body.trim_end_frames
-    await db.commit()
-    await db.refresh(segment)
-    return segment
-
-
-@router.patch("/segments/{segment_id}/video-preset", response_model=SegmentResponse)
-async def update_segment_video_preset(
-    segment_id: UUID,
-    body: SegmentVideoPresetUpdate,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Set/clear a segment's video-settings preset override (applies to the next claim)."""
-    result = await db.execute(
-        select(Segment)
-        .join(Job, Segment.job_id == Job.id)
-        .where(Segment.id == segment_id, Job.user_id == user.id)
-    )
-    segment = result.scalar_one_or_none()
-    if segment is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
-    segment.video_preset_id = body.video_preset_id
     await db.commit()
     await db.refresh(segment)
     return segment
@@ -1333,7 +1208,6 @@ def _roll_new_take(job: Job, old: Segment) -> Segment:
         seed_faceswap=old.seed_faceswap,
         negative_prompt=old.negative_prompt,
         auto_finalize=old.auto_finalize,
-        video_preset_id=old.video_preset_id,
     )
 
     # Back to pending or nothing claims it. The job may well be 'awaiting' (segment 0 finished
