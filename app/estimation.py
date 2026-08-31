@@ -32,14 +32,25 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.enums import SegmentStatus
 from app.models import Job, Segment
 
-# Run time grows faster than duration because attention over the video tokens does. Measured on
-# the one shape with real leverage, 1056x720 at 3s (n=41) and 5s (n=102): the ComfyUI execution
-# ran 812s against 1666s, a 2.05x cost for a 1.67x duration, which is an exponent of 1.41; the
-# 1.5s runs give 1.38 by the same arithmetic. Backtesting the estimator against every segment it
-# had history for, the exponent cuts median absolute error on non-5s segments from 17.5% to 4.5%
-# (p90 23.0% to 7.4%) and leaves the 5s case untouched, since the rate is fitted the same way it
-# is applied.
-DURATION_EXPONENT = 1.4
+# Linear in duration. NOT fitted — this is a neutral prior, and saying so is the point.
+#
+# It was 1.4, fitted on WAN 2.2: run time grew faster than duration because attention over the
+# video tokens did, measured at 1056x720 on 3s (n=41) against 5s (n=102), 812s against 1666s.
+# That number described WAN, and it is not transferable. Two reasons:
+#
+#   1. Every LTX render is a fixed 241 frames. Duration barely varies, so a superlinear term
+#      has almost nothing to act on and the exponent is being asked a question the data does
+#      not pose.
+#   2. The WAN measurement was taken on a two-pass sampler with a high/low model split. LTX
+#      samples differently. Carrying the constant across would be assuming the shape of a curve
+#      from a pipeline that no longer runs.
+#
+# 1.0 makes the rate plain seconds-per-second, which is the honest position while there is no
+# LTX history to fit against: wrong in a way that is obvious and neutral, rather than wrong in a
+# way that looks measured. Re-fit it once LTX segments have accumulated across more than one
+# duration — and if they never do, because 241 frames stays fixed, then the right answer is to
+# drop the duration term entirely rather than to pick a number for it.
+DURATION_EXPONENT = 1.0
 
 # Only recent runs. Model, sampler and step count all drift, and a rate learned in February is
 # describing a different pipeline. Backtesting says this is the single largest win available
@@ -193,6 +204,17 @@ def _fit_pixel_law(shape_rates: dict) -> PixelLaw | None:
     over the whole corpus the slope is 1.02, so run time is close to linear in pixel count, which
     is the reassuring part: the fallback is following a real relationship rather than smearing
     480p and 720p together and calling the result an estimate.
+
+    Those figures are WAN 2.2's, and they are kept because they are the argument for the SHAPE
+    of this fallback - a pixel law rather than a flat average - which is not engine-specific.
+    The slope and intercept are not: they are re-fitted on every call from whatever shapes are
+    in the window, so once the window holds LTX segments the fallback describes LTX. Nothing
+    here needs changing for that to happen; it needed only that the WAN rates stop being in the
+    window, which is what clearing the history does.
+
+    Until at least MIN_PIXEL_LAW_SHAPES LTX shapes have MIN_SAMPLES runs each, this returns
+    None and callers get no estimate. That is the correct answer to "how long will this take"
+    when nothing comparable has been run yet.
     """
     points = [
         (math.log(width * height), math.log(value), samples)
