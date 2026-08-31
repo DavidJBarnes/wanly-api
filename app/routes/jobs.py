@@ -268,6 +268,7 @@ async def create_job(
         faceswap_pixel_boost=seg.faceswap_pixel_boost,
         seed_faceswap=seg.seed_faceswap,
         negative_prompt=seg.negative_prompt,
+        ltx_recipe=seg.ltx_recipe,
         auto_finalize=seg.auto_finalize,
         video_preset_id=seg.video_preset_id,
     )
