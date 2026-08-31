@@ -21,7 +21,7 @@ from app.database import get_db
 from app.seeds import new_seed
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.helpers import upload_faceswap_image
-from app.models import AppSetting, Job, Lora, Segment, User, Video, VideoSettingsPreset, Wildcard, Worker
+from app.models import AppSetting, Job, Lora, LtxCharacter, Segment, User, Video, VideoSettingsPreset, Wildcard, Worker
 from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
     EXCLUSIVE_TAG_GROUPS,
@@ -99,6 +99,32 @@ async def _resolve_loras(db: AsyncSession, loras_input: list | None) -> list | N
             # Backward compat: raw filename format
             resolved.append(item)
     return resolved
+
+
+async def _resolve_trigger(db: AsyncSession, prompt: str, ltx_recipe: dict | None) -> str:
+    """Fill a pose's <TRIGGER> with the character's trigger word.
+
+    Runs BEFORE _resolve_wildcards, and that order is the safeguard: <TRIGGER> shares syntax
+    with wildcards, so a Wildcard named TRIGGER would otherwise substitute a random option and
+    the render would quietly name the wrong character. Doing it first means the resolver never
+    sees the placeholder. (The name is also reserved in the wildcard routes, so both ends are
+    covered.)
+
+    The console normally substitutes at creation time; this catches a prompt that reaches the
+    API still carrying the placeholder — an edited prompt, or any caller that is not the
+    console.
+    """
+    if "<TRIGGER>" not in prompt:
+        return prompt
+    name = (ltx_recipe or {}).get("character")
+    if not name:
+        # Leave it. Rendering the literal text "<TRIGGER>" is bad, but silently dropping the
+        # token that anchors the character LoRA is worse and much harder to notice.
+        return prompt
+    row = (await db.execute(
+        select(LtxCharacter).where(LtxCharacter.name == name)
+    )).scalar_one_or_none()
+    return prompt.replace("<TRIGGER>", row.trigger) if row else prompt
 
 
 async def _resolve_wildcards(db: AsyncSession, prompt: str) -> tuple[str, str | None]:
@@ -186,7 +212,8 @@ async def add_segment(
     next_index = max((s.index for s in job.segments), default=-1) + 1
 
     resolved_loras = await _resolve_loras(db, body.loras)
-    resolved_prompt, prompt_template = await _resolve_wildcards(db, body.prompt)
+    prompt = await _resolve_trigger(db, body.prompt, body.ltx_recipe)
+    resolved_prompt, prompt_template = await _resolve_wildcards(db, prompt)
 
     # Inherit negative_prompt from prior segment if not explicitly set.
     # Segments are eagerly loaded and ordered by index via the relationship,

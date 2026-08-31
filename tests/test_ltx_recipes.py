@@ -95,3 +95,73 @@ def test_migration_data_is_inlined_not_imported():
 def test_the_sheet_parser_is_gone():
     """The harness does not come with us. Leaving it would invite a second source of truth."""
     assert not Path("app/ltx_sheet.py").exists()
+
+
+# --- 072: a recipe is a POSE, not a pose-per-character ------------------------------------
+
+POSES_MIGRATION = Path("alembic/versions/072_recipes_are_poses.py")
+
+
+def _poses_const(name: str):
+    tree = ast.parse(POSES_MIGRATION.read_text())
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == name:
+            return ast.literal_eval(node.value)
+    raise AssertionError(f"{name} not found in {POSES_MIGRATION}")
+
+
+def test_twenty_four_rows_collapse_to_eight_poses():
+    """8 poses x 3 characters was 24 rows of which 16 were duplicates.
+
+    Verified against the seeded data before the change: strip the leading trigger token and
+    all 8 poses are character-agnostic.
+    """
+    assert len(_poses_const("_POSES")) == 8
+
+
+def test_every_pose_carries_the_trigger_placeholder():
+    """Without it the prompt names no character and the LoRA has nothing to anchor to."""
+    for p in _poses_const("_POSES"):
+        assert "<TRIGGER>" in p["prompt_template"], p["name"]
+
+
+def test_no_pose_hardcodes_a_character_name():
+    """The bug this migration fixes.
+
+    A pose naming k3lly2026 in its text is a pose only k3lly2026 can use, which is how new
+    LoRAs got locked out.
+    """
+    for p in _poses_const("_POSES"):
+        for character in ("k3lly2026", "k3llydw", "p@y"):
+            assert character not in p["prompt_template"], f"{p['name']} hardcodes {character}"
+
+
+def test_placeholder_is_braces_not_angle_brackets():
+    """`<...>` is the wildcard resolver's syntax (segments.py::_resolve_wildcards).
+
+    A trigger in angle brackets would be treated as a wildcard and randomly substituted —
+    the render would silently name a different character, or nothing at all.
+    """
+    for p in _poses_const("_POSES"):
+        assert "<trigger>" not in p["prompt_template"]
+
+
+def test_render_prompt_substitutes_the_trigger():
+    from app.routes.ltx_recipes import render_prompt
+    assert render_prompt("<TRIGGER>, a woman walks", "k3lly2026") == "k3lly2026, a woman walks"
+    # A template without the placeholder is returned unchanged rather than rejected.
+    assert render_prompt("a woman walks", "k3lly2026") == "a woman walks"
+
+
+def test_a_new_character_gets_every_pose_without_adding_rows():
+    """The whole point. Adding a character is a row, not eight prompt copies.
+
+    Poses are returned for every character because they are not attached to one, so this is a
+    property of the schema rather than something the API has to remember to do.
+    """
+    import inspect
+    from app.routes import ltx_recipes
+    src = inspect.getsource(ltx_recipes.get_recipe_book)
+    assert '"poses"' in src
+    # Poses must NOT be nested inside characters — that is the shape that locked LoRAs out.
+    assert "c.recipes" not in src

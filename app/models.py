@@ -465,6 +465,10 @@ class LtxCharacter(Base):
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = mapped_column(String(64), nullable=False, unique=True)
     char_lora = mapped_column(Text, nullable=False)
+    # The token that fills a pose's <TRIGGER> placeholder. "Adding a character costs a LoRA
+    # and a trigger swap" — this is the trigger half, and it is why a new LoRA is never
+    # locked out: every pose works for it the moment the row exists.
+    trigger = mapped_column(String(64), nullable=False)
     # Per-stage, never flat. Stage 1 generates at half size from noise; stage 2 refines the
     # 2x-upscaled latent and is where facial detail resolves. Collapsing them to one number
     # is a different configuration, not a simplification.
@@ -476,39 +480,36 @@ class LtxCharacter(Base):
     # ON DELETE CASCADE. Without it the ORM tries to load every child row to delete them
     # individually — which under asyncpg is a lazy load in the wrong context and raises
     # MissingGreenlet, so deleting a character failed outright. Found by running it.
-    recipes = relationship("LtxRecipe", back_populates="character",
-                           cascade="all, delete-orphan", passive_deletes=True,
-                           order_by="LtxRecipe.name")
 
 
 class LtxRecipe(Base):
-    """A pose for a character: a prompt, and almost nothing else.
+    """A POSE. Not a pose-per-character.
 
-    Measured across all 24 seeded recipes, only char_lora and prompt varied — every other
-    field had exactly one value. Those live once in the global stack (app_settings) rather
-    than being copied per row, because storing a global value 24 times is how it silently
-    stops being global.
+    Recipes are not LoRA-specific and never were: strip the leading trigger token and all 8
+    seeded poses are character-agnostic. Storing them per character locked new LoRAs out —
+    a character with no rows had no recipes — and let three copies of one prompt drift apart,
+    which two of them already had.
+
+    The prompt carries a <TRIGGER> placeholder that the character's own trigger word fills.
     """
     __tablename__ = "ltx_recipes"
     __table_args__ = (
-        UniqueConstraint("character_id", "name", name="uq_ltx_recipe_character_name"),
-        Index("ix_ltx_recipes_character_id", "character_id"),
+        UniqueConstraint("name", name="uq_ltx_recipe_name"),
     )
 
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    character_id = mapped_column(UUID(as_uuid=True),
-                                 ForeignKey("ltx_characters.id", ondelete="CASCADE"),
-                                 nullable=False)
     name = mapped_column(String(128), nullable=False)
-    prompt = mapped_column(Text, nullable=False)
+    # Contains <TRIGGER>, filled with the character's trigger word. Substituted BEFORE
+    # wildcard resolution, and the name is reserved in the wildcard routes, so the resolver
+    # can never treat it as a wildcard and swap in something random.
+    prompt_template = mapped_column(Text, nullable=False)
     # NULL means "the stack's negative" — true of all 24 seeded recipes. The override exists
     # because a pose might one day need one, not because any does.
     negative_prompt = mapped_column(Text, nullable=True)
     frames = mapped_column(Integer, nullable=True)
-    # A human watched it and signed it off. NOT a quality score: the automated metrics have
-    # picked the wrong clip before, more than once.
+    # The POSE is proven: this prompt produces what it claims. Whether a given CHARACTER
+    # renders well is a property of its LoRA, and segment ratings already record that.
+    # NOT a quality score: the automated metrics have picked the wrong clip before.
     validated = mapped_column(Boolean, nullable=False, server_default="false", default=False)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), nullable=True)
-
-    character = relationship("LtxCharacter", back_populates="recipes")
