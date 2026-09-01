@@ -1,32 +1,18 @@
-"""Tests for the dashboard's Total Queue Time.
+"""Tests for the dashboard's Total Queue Time sum.
 
 The number answers "is there room to queue more work", so the failure that matters is a
 confident overestimate. An unpriceable segment therefore contributes nothing rather than a
 fallback guess, and the total reads low on a cold database instead of wrong.
-
-It is now a WAIT rather than a sum: divided by the workers able to claim, and discounted by
-what an in-flight segment has already rendered. These cases all use one worker and unstarted
-segments, so they keep testing the pricing itself; the drain behaviour is covered in
-test_queue_drain_estimate.py.
 
 Pure logic — no HTTP, no database, matching the house style.
 """
 
 import pytest
 
-import datetime as dt
+from app.estimation import DURATION_EXPONENT, sum_estimated_queue_time
 
-from app.estimation import DURATION_EXPONENT, estimate_queue_drain_seconds
-
-# (width, height, fps, duration_seconds, gpu_name, status, claimed_at)
-ROW = (720, 1056, 30, 4.0, "NVIDIA GeForce RTX 3090", "pending", None)
-
-NOW = dt.datetime(2026, 9, 1, 12, 0, tzinfo=dt.timezone.utc)
-
-
-def sum_estimated_queue_time(rates_, rows):
-    """One worker, nothing started: the historical meaning of this number."""
-    return estimate_queue_drain_seconds(rates_, rows, 1, NOW)
+# (width, height, fps, duration_seconds, gpu_name)
+ROW = (720, 1056, 30, 4.0, "NVIDIA GeForce RTX 3090")
 
 # Run time is rate * duration ** DURATION_EXPONENT, so the tests state the rate they want and
 # let this do the arithmetic rather than hard-coding numbers that move when the exponent does.
@@ -56,7 +42,7 @@ class TestSumming:
         """A 720p and a 1080p segment must not be priced with the same rate."""
         r = rates(shape={(720, 1056, 30): (2.0, 10), (1056, 720, 30): (5.0, 10)})
         total = sum_estimated_queue_time(
-            r, [(720, 1056, 30, 4.0, None, "pending", None), (1056, 720, 30, 4.0, None, "pending", None)]
+            r, [(720, 1056, 30, 4.0, None), (1056, 720, 30, 4.0, None)]
         )
         assert total == pytest.approx(7.0 * SCALED_4S, abs=0.2)
 
@@ -69,14 +55,14 @@ class TestUnpriceableSegments:
     def test_priceable_segments_still_count_when_others_cannot_be_priced(self):
         """One unknown shape must not zero out the whole total."""
         r = rates(shape={(720, 1056, 30): (2.0, 10)})
-        total = sum_estimated_queue_time(r, [ROW, (9999, 9999, 30, 4.0, None, "pending", None)])
+        total = sum_estimated_queue_time(r, [ROW, (9999, 9999, 30, 4.0, None)])
         assert total == pytest.approx(2.0 * SCALED_4S, abs=0.2)
 
     @pytest.mark.parametrize("duration", [0, 0.0, None])
     def test_segments_with_no_duration_are_skipped(self, duration):
         """duration_seconds is nullable; rate * None would raise rather than degrade."""
         r = rates(shape={(720, 1056, 30): (2.0, 10)})
-        assert sum_estimated_queue_time(r, [(720, 1056, 30, duration, None, "pending", None)]) == 0.0
+        assert sum_estimated_queue_time(r, [(720, 1056, 30, duration, None)]) == 0.0
 
 
 class TestRateSelection:
@@ -91,6 +77,6 @@ class TestRateSelection:
     def test_unclaimed_segments_use_the_pooled_shape_rate(self):
         """Pending segments have no gpu_name yet - the common case for a deep queue."""
         r = rates(shape={(720, 1056, 30): (2.0, 10)})
-        assert sum_estimated_queue_time(r, [(720, 1056, 30, 4.0, None, "pending", None)]) == pytest.approx(
+        assert sum_estimated_queue_time(r, [(720, 1056, 30, 4.0, None)]) == pytest.approx(
             2.0 * SCALED_4S, abs=0.2
         )
