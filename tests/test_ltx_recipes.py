@@ -165,3 +165,97 @@ def test_a_new_character_gets_every_pose_without_adding_rows():
     assert '"poses"' in src
     # Poses must NOT be nested inside characters — that is the shape that locked LoRAs out.
     assert "c.recipes" not in src
+
+
+# --------------------------------------------------------------------------------------
+# Editing a character (console#361)
+# --------------------------------------------------------------------------------------
+import uuid as _uuid
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from app.auth import get_current_user
+from app.database import get_db
+from app.main import app
+from app.models import LtxCharacter, LtxRecipe, User
+
+
+async def _user(db):
+    u = User(id=_uuid.uuid4(), username=f"u{_uuid.uuid4().hex[:8]}", password_hash="x")
+    db.add(u)
+    await db.flush()
+    return u
+
+
+async def _call(db, user, method, path, **kw):
+    app.dependency_overrides[get_current_user] = lambda: user
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            return await getattr(c, method)(path, **kw)
+    finally:
+        app.dependency_overrides.clear()
+
+
+@pytest.mark.asyncio
+class TestUpdateCharacter:
+    async def test_a_strength_can_be_tuned_without_restating_the_lora(self, db):
+        user = await _user(db)
+        c = LtxCharacter(id=_uuid.uuid4(), name="k9", char_lora="k9_v2", trigger="k9",
+                         strength_stage_1=0.8, strength_stage_2=1.5)
+        db.add(c)
+        await db.flush()
+
+        r = await _call(db, user, "patch", f"/ltx/characters/{c.id}",
+                        json={"strength_stage_2": 1.2})
+
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["strength_stage_2"] == 1.2
+        assert body["strength_stage_1"] == 0.8      # untouched
+        assert body["char_lora"] == "k9_v2"         # untouched
+
+    async def test_a_rename_leaves_the_trigger_alone(self, db):
+        """The trigger is what every pose's prompt renders with.
+
+        On create an absent trigger defaults to the name. Carrying that rule into update
+        would mean renaming a character silently rewrote the text of every pose rendered
+        for it — a side effect nobody asked for, on the one field the LoRA responds to.
+        """
+        user = await _user(db)
+        c = LtxCharacter(id=_uuid.uuid4(), name="old", char_lora="l", trigger="realtrigger",
+                         strength_stage_1=0.8, strength_stage_2=1.5)
+        db.add(c)
+        await db.flush()
+
+        r = await _call(db, user, "patch", f"/ltx/characters/{c.id}", json={"name": "new"})
+
+        assert r.status_code == 200, r.text
+        assert r.json()["name"] == "new"
+        assert r.json()["trigger"] == "realtrigger"
+
+    async def test_deleting_a_character_leaves_the_poses(self, db):
+        """Poses are not owned by a character — that is the whole point of #212.
+
+        The route's docstring claimed a cascade to "its recipes" long after the FK went,
+        which is the kind of thing that stops someone deleting a bad character.
+        """
+        user = await _user(db)
+        c = LtxCharacter(id=_uuid.uuid4(), name="doomed", char_lora="l", trigger="t",
+                         strength_stage_1=0.8, strength_stage_2=1.5)
+        pose = LtxRecipe(id=_uuid.uuid4(), name=f"pose-{_uuid.uuid4().hex[:6]}",
+                         prompt_template="<TRIGGER>, standing", validated=True)
+        db.add_all([c, pose])
+        await db.flush()
+
+        r = await _call(db, user, "delete", f"/ltx/characters/{c.id}")
+
+        assert r.status_code == 204, r.text
+        assert await db.get(LtxRecipe, pose.id) is not None
+
+    async def test_an_unknown_character_is_404_not_500(self, db):
+        user = await _user(db)
+        r = await _call(db, user, "patch", f"/ltx/characters/{_uuid.uuid4()}",
+                        json={"strength_stage_1": 1.0})
+        assert r.status_code == 404
