@@ -1,4 +1,4 @@
-"""Every Model.attribute a route mentions must actually exist on that model.
+"""Every Model.attribute anywhere in app/ must actually exist on that model.
 
 `GET /jobs` returned 500 in production for a day because #219 dropped
 `Segment.faceswap_enabled` from the model and the migration, but left a
@@ -23,7 +23,7 @@ import pytest
 
 from app import models
 
-ROUTES = pathlib.Path(__file__).parent.parent / "app" / "routes"
+APP = pathlib.Path(__file__).parent.parent / "app"
 
 # Mapped classes by name, e.g. {"Segment": Segment, "Job": Job, ...}
 MODELS = {
@@ -45,9 +45,9 @@ def _model_attribute_refs(tree: ast.AST):
 
 
 @pytest.mark.parametrize(
-    "path", sorted(ROUTES.glob("*.py")), ids=lambda p: p.name
+    "path", sorted(APP.rglob("*.py")), ids=lambda p: str(p.relative_to(APP))
 )
-def test_route_only_references_columns_that_exist(path):
+def test_module_only_references_columns_that_exist(path):
     tree = ast.parse(path.read_text(), filename=str(path))
     missing = [
         f"{path.name}:{lineno} {model}.{attr}"
@@ -55,7 +55,7 @@ def test_route_only_references_columns_that_exist(path):
         if not hasattr(MODELS[model], attr)
     ]
     assert not missing, (
-        "route references attributes that no longer exist on the model — a dropped "
+        "module references attributes that no longer exist on the model — a dropped "
         "column left behind will 500 at request time, not at import:\n  "
         + "\n  ".join(missing)
     )
