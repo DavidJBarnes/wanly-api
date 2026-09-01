@@ -44,9 +44,8 @@ async def find_image_references(db: AsyncSession, paths: list[str]) -> dict[str,
     segment weeks later and S3 returns 404, which costs a pickup and shows up as a red
     segment nowhere near the cause. That makes the check wider than it first looks:
 
-      - segment-level refs count, not just Job.starting_image. The validated identity recipe
-        sets Segment.faceswap_image on every job, so that is the common holder, and it was
-        invisible to the old listing query.
+      - segment-level refs count, not just Job.starting_image. A continuation's start frame
+        lives on Segment.start_image, which was invisible to the old listing query.
       - ARCHIVED jobs count. Archiving hides a job from the UI; it does not stop its segments
         being re-run, so an archived job's images are still live references.
       - no user filter, since a reference from anyone's job 404s the worker just the same.
