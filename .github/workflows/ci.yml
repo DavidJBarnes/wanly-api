@@ -37,6 +37,6 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install dependencies
-        run: pip install -r requirements.txt pytest pytest-asyncio
+        run: pip install -r requirements.txt -r requirements-dev.txt pytest pytest-asyncio
       - name: Test
         run: python -m pytest -q
