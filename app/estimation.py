@@ -331,6 +331,7 @@ def estimate_queue_drain_seconds(
     safer failure for a number used to decide whether there is time for more work.
     """
     total = 0.0
+    longest = 0.0
     for width, height, fps, duration_seconds, gpu_name, status, claimed_at in segments:
         if not duration_seconds:
             continue
@@ -342,4 +343,10 @@ def estimate_queue_drain_seconds(
             # ahead, and a negative would silently pay for some other segment's time.
             est = max(0.0, est - (now - claimed_at).total_seconds())
         total += est
-    return round(total / max(1, worker_count), 1)
+        longest = max(longest, est)
+
+    # A segment cannot be split across workers. With fewer segments than workers, dividing
+    # says half a render time for one render — so the wait is never shorter than the longest
+    # single segment left. That is the case that matters right after a pod joins an
+    # almost-empty queue, which is exactly when someone is watching this number.
+    return round(max(total / max(1, worker_count), longest), 1)

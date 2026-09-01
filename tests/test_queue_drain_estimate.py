@@ -64,3 +64,20 @@ class TestDrain:
         # Reads low on a cold database rather than confidently wrong.
         unknown = (None, None, 24, 10.04, None, "pending", None)
         assert estimate_queue_drain_seconds(RATES, [unknown], 1, NOW) == 0.0
+
+    def test_more_workers_than_segments_cannot_beat_one_segment(self):
+        """A segment cannot be split across workers.
+
+        One segment and four workers is still one render: dividing would report a quarter of
+        it. This is the case right after a pod joins an almost-empty queue -- precisely when
+        the number is being watched.
+        """
+        one = estimate_queue_drain_seconds(RATES, [_row()], 1, NOW)
+        many = estimate_queue_drain_seconds(RATES, [_row()], 4, NOW)
+        assert many == one
+
+    def test_workers_still_help_when_there_is_work_for_them(self):
+        rows = [_row() for _ in range(8)]
+        assert estimate_queue_drain_seconds(RATES, rows, 4, NOW) == pytest.approx(
+            estimate_queue_drain_seconds(RATES, rows, 1, NOW) / 4, rel=0.01
+        )
