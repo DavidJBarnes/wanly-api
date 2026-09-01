@@ -206,12 +206,21 @@ class TestSeed:
 
         assert (await _claim(db)).json()["seed"] == 1000
 
-    async def test_a_later_segment_is_decorrelated_by_its_index(self, db):
+    async def test_a_later_segment_inherits_the_jobs_seed_unchanged(self, db):
+        """The seed is LOCKED across a chain: segment 1 runs on the same seed as segment 0.
+
+        This asserted `job.seed + index` until the LTX migration. That was WAN reasoning --
+        WAN drifted, so decorrelating later segments spread the drift around. Under LTX a
+        continuation is meant to look like the same shot continuing, and the seed is the
+        single biggest determinant of how a take looks; expression especially is seed-driven
+        far more than it is LoRA-driven. Varying it per index is exactly the thing that made
+        a continuation look like a different woman.
+        """
         job = await _job(db, seed=1000)
         await _segment(db, job, 0, status=SegmentStatus.COMPLETED, last_frame="s3://b/0.png")
         await _segment(db, job, 1)
 
-        assert (await _claim(db)).json()["seed"] == 1001
+        assert (await _claim(db)).json()["seed"] == 1000
 
     async def test_a_segments_own_seed_wins(self, db):
         # What a re-roll writes: same position, different seed.

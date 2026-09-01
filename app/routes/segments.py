@@ -66,6 +66,32 @@ _CPU_REPROCESS_TYPES = ("ar_hologram", "smashcut_concat")
 router = APIRouter()
 
 
+async def _resolve_trigger(db: AsyncSession, prompt: str, ltx_recipe: dict | None) -> str:
+    """Fill a pose's <TRIGGER> with the character's trigger word.
+
+    Runs BEFORE _resolve_wildcards, and that order is the safeguard: <TRIGGER> shares syntax
+    with wildcards, so a Wildcard named TRIGGER would otherwise substitute a random option and
+    the render would quietly name the wrong character. Doing it first means the resolver never
+    sees the placeholder. (The name is also reserved in the wildcard routes, so both ends are
+    covered.)
+
+    The console normally substitutes at creation time; this catches a prompt that reaches the
+    API still carrying the placeholder — an edited prompt, or any caller that is not the
+    console.
+    """
+    if "<TRIGGER>" not in prompt:
+        return prompt
+    name = (ltx_recipe or {}).get("character")
+    if not name:
+        # Leave it. Rendering the literal text "<TRIGGER>" is bad, but silently dropping the
+        # token that anchors the character LoRA is worse and much harder to notice.
+        return prompt
+    row = (await db.execute(
+        select(LtxCharacter).where(LtxCharacter.name == name)
+    )).scalar_one_or_none()
+    return prompt.replace("<TRIGGER>", row.trigger) if row else prompt
+
+
 async def _resolve_wildcards(db: AsyncSession, prompt: str) -> tuple[str, str | None]:
     """Resolve <wildcard> placeholders in a prompt.
 
@@ -401,13 +427,18 @@ async def claim_next_segment(
         width=job.width,
         height=job.height,
         fps=job.fps,
-        # An explicit segment seed wins; otherwise derive it as job.seed + index, which keeps
-        # seg0 exactly job.seed (so the whole job still reproduces from that one number) and
-        # decorrelates later segments so they don't repeat the same motion pattern.
+        # THE SEED IS LOCKED ACROSS A CHAIN. Every segment of a job runs on the job's seed, so
+        # a continuation inherits the one that produced the segment it continues from.
         #
-        # A segment only carries its own seed when it needed one the derivation cannot express --
-        # today, a re-rolled segment 0, which must change seed without changing position.
-        seed=segment.seed if segment.seed is not None else (job.seed + segment.index) % (2**63 - 1),
+        # It used to be job.seed + index, which decorrelated later segments "so they don't
+        # repeat the same motion pattern". That was WAN reasoning: WAN drifted, and varying the
+        # seed spread the drift around. Under LTX a continuation is meant to look like the same
+        # shot continuing, and the seed is the single biggest determinant of what a take looks
+        # like -- expression especially is seed-driven far more than it is LoRA-driven.
+        #
+        # A segment still carries its own seed when it needs one the job's cannot express: a
+        # re-rolled segment 0, which must change seed without changing position.
+        seed=segment.seed if segment.seed is not None else job.seed,
         continuation_mode=continuation_mode,
         previous_output_path=prev_output_path if use_vace else None,
         vace_overlap_frames=vace_overlap,
