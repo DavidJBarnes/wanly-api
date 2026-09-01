@@ -1283,7 +1283,7 @@ async def delete_segment(
         )
 
     # S3 cleanup
-    for path in [segment.output_path, segment.last_frame_path, segment.faceswap_image]:
+    for path in [segment.output_path, segment.last_frame_path]:
         if path:
             try:
                 await asyncio.to_thread(delete_object, path)

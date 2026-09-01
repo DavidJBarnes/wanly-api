@@ -10,8 +10,6 @@ class SegmentCreate(BaseModel):
     duration_seconds: float = 5.0
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
     start_image: Optional[str] = None
-    # Re-anchor this segment's last frame to the faceswap face before it seeds the next
-    # segment. Uses faceswap_image, so it only has an effect when faceswap is configured.
     negative_prompt: Optional[str] = None
     # LTX recipe render: which validated (character, pose) configuration this segment ran,
     # plus any of its defaults the user overrode and the resolved graph hash. NULL means
