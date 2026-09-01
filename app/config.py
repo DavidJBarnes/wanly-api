@@ -48,14 +48,29 @@ class Settings(BaseSettings):
     # deliberately absent because the workflow does not run on it.
     runpod_gpu_type_ids: str = "NVIDIA GeForce RTX 4090,NVIDIA GeForce RTX 3090"
     runpod_image: str = "davidjbarnes/wanly-gpu-docker:latest"
-    runpod_container_disk_gb: int = 30
-    # Disk mounted at runpod_volume_mount_path. REQUIRED without a network volume: the models are
-    # ~37GB (two 13.3GB experts, a 6.7GB text encoder, CLIP vision, VAE, LoRAs, FaceFusion) and
-    # download_models.sh puts them in /workspace. Setting volumeMountPath WITHOUT this allocates
-    # no volume at all, so /workspace silently lands on the 30GB container disk and staging dies
-    # partway with "No space left on device". 0 disables (correct only when a network volume
-    # supplies the mount instead).
-    runpod_volume_gb: int = 60
+    # Writable container disk. Holds /jobs — every render's graph, keyframe and mp4, roughly
+    # 30-60 MB a piece — plus ComfyUI's scratch. NOT the image, which RunPod accounts for
+    # separately: a pod with a 30 GB container disk reports 30 GB free before anything runs.
+    runpod_container_disk_gb: int = 40
+    # Disk mounted at runpod_volume_mount_path. REQUIRED without a network volume, and it must
+    # fit the LTX 2.3 model set, which download_models.sh stages into /workspace/models:
+    #
+    #   sulphur_dev_bf16.safetensors            43 GB
+    #   gemma_3_12B_it_fp8_scaled.safetensors   13 GB
+    #   ltx-2.3-spatial-upscaler-x2-1.1        950 MB
+    #   sulphur_distill_lora_condsafe          632 MB
+    #                                        ------- ~58 GB, plus character LoRAs at
+    #                                                625 MB each, synced per claim.
+    #
+    # This was 60, sized for the WAN set (~37 GB) it no longer runs. A pod launched at 60 GB
+    # cannot hold 58 GB of models plus LoRAs and dies partway through staging — which is what
+    # happened on the first real pod, 2026-09-01.
+    #
+    # Setting volumeMountPath WITHOUT this allocates no volume at all, so /workspace silently
+    # lands on the container disk. 0 disables (correct only when a network volume supplies the
+    # mount instead) — and a network volume is the better shape for repeat launches, since it
+    # pays the 43 GB checkpoint download once rather than per cold pod.
+    runpod_volume_gb: int = 150
     runpod_volume_mount_path: str = "/workspace"
     # What the launched worker is told to poll. Must be reachable FROM RunPod, so it cannot be
     # localhost even though this server is the thing being pointed at.
