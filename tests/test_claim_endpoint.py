@@ -229,6 +229,29 @@ class TestSeed:
 
         assert (await _claim(db)).json()["seed"] == 150488800771430
 
+    async def test_a_re_roll_changes_the_seed_and_the_chain_follows_the_new_one(self, db):
+        """Re-roll and Next Segment want opposite things from a seed, and both are right.
+
+        A re-roll asks for a DIFFERENT take, so it must change the seed. A continuation asks
+        for the SAME shot carrying on, so it must keep it. Both are served by one field:
+        re-roll sets a new `job.seed`, and everything live derives from that.
+
+        The seed the discarded take ran on is stamped onto it so the archive can answer
+        "which seed gave me that one" -- and that stamped seed must never leak into a
+        continuation, because it produced a take that is no longer in the chain.
+        """
+        job = await _job(db, seed=1000)
+        # what a re-roll leaves behind: the old take stamped and discarded, a new job seed,
+        # and a fresh take deriving from it.
+        await _segment(db, job, 0, seed=1000, status=SegmentStatus.COMPLETED,
+                       discarded=True, last_frame="s3://b/old.png")
+        job.seed = 2000
+        await _segment(db, job, 0, status=SegmentStatus.COMPLETED, last_frame="s3://b/0.png")
+        await _segment(db, job, 1)
+
+        # 2000, not 1000: the continuation follows the take that survived.
+        assert (await _claim(db)).json()["seed"] == 2000
+
     async def test_the_worker_gets_an_integer_not_a_string(self, db):
         # The console's schema sends seeds as strings for display precision. This payload feeds
         # the sampler, and it must not inherit that.

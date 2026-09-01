@@ -427,17 +427,21 @@ async def claim_next_segment(
         width=job.width,
         height=job.height,
         fps=job.fps,
-        # THE SEED IS LOCKED ACROSS A CHAIN. Every segment of a job runs on the job's seed, so
-        # a continuation inherits the one that produced the segment it continues from.
+        # THE SEED IS LOCKED ACROSS A CHAIN. Next Segment must keep the seed -- a
+        # continuation should look like the same shot carrying on, and the seed drives how a
+        # take looks more than anything else. Re-roll must CHANGE it, which is the opposite
+        # requirement and is served elsewhere: _roll_new_take sets a new job.seed, so the
+        # fresh take and every continuation after it inherit that instead.
+        #
+        # job.seed is therefore always the live chain's seed. A segment's own seed is only
+        # ever set on a DISCARDED take, stamped at re-roll time to record what it actually
+        # ran on, and a discarded take is never claimed.
         #
         # It used to be job.seed + index, which decorrelated later segments "so they don't
         # repeat the same motion pattern". That was WAN reasoning: WAN drifted, and varying the
         # seed spread the drift around. Under LTX a continuation is meant to look like the same
         # shot continuing, and the seed is the single biggest determinant of what a take looks
         # like -- expression especially is seed-driven far more than it is LoRA-driven.
-        #
-        # A segment still carries its own seed when it needs one the job's cannot express: a
-        # re-rolled segment 0, which must change seed without changing position.
         seed=segment.seed if segment.seed is not None else job.seed,
         continuation_mode=continuation_mode,
         previous_output_path=prev_output_path if use_vace else None,
@@ -1101,7 +1105,12 @@ def _roll_new_take(job: Job, old: Segment) -> Segment:
     replaced is still recorded, on the row it actually produced. See #199 for the full model.
     """
     if old.seed is None:
-        old.seed = (job.seed + old.index) % (2**63 - 1)
+        # Exactly what the worker ran: the claim hands out job.seed. This said
+        # `(job.seed + old.index) % (2**63 - 1)`, the derivation the claim used before the
+        # seed was locked across a chain. It survived because re-roll only ever acts on
+        # index 0, where the two agree -- so it would have recorded a seed the take never
+        # ran on the first time anyone re-rolled a continuation.
+        old.seed = job.seed
     old.discarded = True
     job.seed = new_seed()
 
