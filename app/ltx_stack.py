@@ -19,6 +19,16 @@ LTX_STACK = {
     'distill_stage_2': 0.6,
     'frames': 241,
     'frame_rate': 24,
+    # A video CRF, not an abstract amount: the conditioning frame is H.264-encoded at this
+    # quality and decoded back (comfy_extras/nodes_lt.py `preprocess`), so the model is
+    # anchored on something that looks like a video frame rather than a pristine still.
+    # 0 bypasses it entirely. Node bounds are 0-100, but x264's real scale is 0-51.
+    #
+    # 18 is what every rated result was produced at. Measured on a 4090 (wanly-gpu-docker#48),
+    # dropping it to 4 cut per-frame divergence ~34% from frame 8 on -- but that was measured
+    # against each clip's own frame 0, which cannot distinguish "holds the anchor" from
+    # "moves less", so the default stays where the results came from until that is settled.
+    'img_compression': 18,
     'steps_stage_1': 20,
     'sigmas_stage_2': '0.85, 0.7250, 0.4219, 0.0',
     'cfg': 3,

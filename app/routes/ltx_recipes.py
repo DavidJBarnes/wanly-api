@@ -97,6 +97,11 @@ async def get_recipe_book(
                 "prompt_template": r.prompt_template,
                 "negative_prompt": r.negative_prompt or LTX_STACK["negative"],
                 "frames": r.frames or LTX_STACK["frames"],
+                # `or` is wrong here and `is None` is right: img_compression 0 is a REAL
+                # setting -- it bypasses the conditioning-frame encode entirely -- and `or`
+                # would silently replace it with the stack default.
+                "img_compression": (r.img_compression if r.img_compression is not None
+                                    else LTX_STACK["img_compression"]),
                 "validated": r.validated,
             }
             for r in poses
