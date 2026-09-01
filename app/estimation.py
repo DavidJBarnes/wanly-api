@@ -305,56 +305,20 @@ def estimate_segment_time(
     return estimate.seconds if estimate else None
 
 
-def estimate_queue_drain_seconds(
-    rates: dict, segments, worker_count: int, now: datetime
-) -> float:
-    """Wall-clock seconds until the queue is empty, not the sum of the work in it.
+def sum_estimated_queue_time(rates: dict, segments) -> float:
+    """Total estimated seconds for a set of queued segments.
 
-    Each row is (width, height, fps, duration_seconds, gpu_name, status, claimed_at).
+    Each row is (width, height, fps, duration_seconds, gpu_name).
 
-    Two corrections to a straight sum, both of which made the old number wrong in the
-    direction that matters:
-
-    WORKERS. The sum is the work; the wait is the work divided by the machines doing it. With
-    one worker the two agree, which is why this was never noticed — and then a pod is launched
-    and the real wait halves while the number does not move. Divided by the workers actually
-    able to claim, floored at one so an empty fleet reports the work rather than infinity.
-
-    WORK ALREADY DONE. A segment being rendered was counted at its full estimate however long
-    it had been running. Measured live: 235s into a 586s render, counted as 586. That is 1% of
-    a long queue and all of a short one -- the last segment at 90% reported ten minutes with
-    one to go, so the number stopped converging on zero exactly when someone was watching it
-    to decide whether to queue more.
-
-    A segment the estimator cannot price still contributes nothing rather than a guess. That
-    makes the total read low on a cold database instead of confidently wrong, which is the
-    safer failure for a number used to decide whether there is time for more work.
+    A segment the estimator cannot price contributes nothing rather than a guess. That makes the
+    total read low on a cold database instead of confidently wrong, which is the safer failure
+    for a number used to decide whether there is time to queue more work.
     """
     total = 0.0
-    longest = 0.0
-    for width, height, fps, duration_seconds, gpu_name, status, claimed_at in segments:
+    for width, height, fps, duration_seconds, gpu_name in segments:
         if not duration_seconds:
             continue
         est = estimate_segment_time(rates, width, height, fps, duration_seconds, gpu_name)
-        if not est:
-            continue
-        if claimed_at is not None:
-            # Assume UTC for a naive timestamp rather than raising. The column is
-            # `timestamp with time zone` and the driver returns aware datetimes, so this
-            # should not happen -- but "should not happen" here means TypeError inside
-            # GET /stats, which takes the whole dashboard down for a number that is
-            # decoration. Every timestamp this system writes is UTC, so the assumption is
-            # the correct one and not a guess.
-            if claimed_at.tzinfo is None:
-                claimed_at = claimed_at.replace(tzinfo=timezone.utc)
-            # Never negative: a segment running longer than its estimate is late, not
-            # ahead, and a negative would silently pay for some other segment's time.
-            est = max(0.0, est - (now - claimed_at).total_seconds())
-        total += est
-        longest = max(longest, est)
-
-    # A segment cannot be split across workers. With fewer segments than workers, dividing
-    # says half a render time for one render — so the wait is never shorter than the longest
-    # single segment left. That is the case that matters right after a pod joins an
-    # almost-empty queue, which is exactly when someone is watching this number.
-    return round(max(total / max(1, worker_count), longest), 1)
+        if est:
+            total += est
+    return round(total, 1)
