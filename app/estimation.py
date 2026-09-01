@@ -305,20 +305,41 @@ def estimate_segment_time(
     return estimate.seconds if estimate else None
 
 
-def sum_estimated_queue_time(rates: dict, segments) -> float:
-    """Total estimated seconds for a set of queued segments.
+def estimate_queue_drain_seconds(
+    rates: dict, segments, worker_count: int, now: datetime
+) -> float:
+    """Wall-clock seconds until the queue is empty, not the sum of the work in it.
 
-    Each row is (width, height, fps, duration_seconds, gpu_name).
+    Each row is (width, height, fps, duration_seconds, gpu_name, status, claimed_at).
 
-    A segment the estimator cannot price contributes nothing rather than a guess. That makes the
-    total read low on a cold database instead of confidently wrong, which is the safer failure
-    for a number used to decide whether there is time to queue more work.
+    Two corrections to a straight sum, both of which made the old number wrong in the
+    direction that matters:
+
+    WORKERS. The sum is the work; the wait is the work divided by the machines doing it. With
+    one worker the two agree, which is why this was never noticed — and then a pod is launched
+    and the real wait halves while the number does not move. Divided by the workers actually
+    able to claim, floored at one so an empty fleet reports the work rather than infinity.
+
+    WORK ALREADY DONE. A segment being rendered was counted at its full estimate however long
+    it had been running. Measured live: 235s into a 586s render, counted as 586. That is 1% of
+    a long queue and all of a short one -- the last segment at 90% reported ten minutes with
+    one to go, so the number stopped converging on zero exactly when someone was watching it
+    to decide whether to queue more.
+
+    A segment the estimator cannot price still contributes nothing rather than a guess. That
+    makes the total read low on a cold database instead of confidently wrong, which is the
+    safer failure for a number used to decide whether there is time for more work.
     """
     total = 0.0
-    for width, height, fps, duration_seconds, gpu_name in segments:
+    for width, height, fps, duration_seconds, gpu_name, status, claimed_at in segments:
         if not duration_seconds:
             continue
         est = estimate_segment_time(rates, width, height, fps, duration_seconds, gpu_name)
-        if est:
-            total += est
-    return round(total, 1)
+        if not est:
+            continue
+        if claimed_at is not None:
+            # Never negative: a segment running longer than its estimate is late, not
+            # ahead, and a negative would silently pay for some other segment's time.
+            est = max(0.0, est - (now - claimed_at).total_seconds())
+        total += est
+    return round(total / max(1, worker_count), 1)

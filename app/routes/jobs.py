@@ -19,7 +19,7 @@ from app.config import settings
 from app.database import get_db
 from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStatus
 from app.seeds import new_seed
-from app.estimation import estimate_segment_time, get_estimation_rates, sum_estimated_queue_time
+from app.estimation import estimate_segment_time, get_estimation_rates, estimate_queue_drain_seconds
 from app.models import Job, Segment, User, Video
 from app.routes.segments import _resolve_wildcards
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
@@ -792,7 +792,10 @@ async def get_stats(
     queue_rows = (
         await db.execute(
             select(
-                Job.width, Job.height, Job.fps, Segment.duration_seconds, Segment.gpu_name
+                Job.width, Job.height, Job.fps, Segment.duration_seconds, Segment.gpu_name,
+                # For the in-flight correction: what has already been rendered is not still
+                # ahead of you.
+                Segment.status, Segment.claimed_at,
             )
             .join(Job, Segment.job_id == Job.id)
             .where(
@@ -805,7 +808,27 @@ async def get_stats(
     total_queue_time = 0.0
     if queue_rows:  # skip three estimator queries when the queue is empty
         rates = await get_estimation_rates(db, user.id)
-        total_queue_time = sum_estimated_queue_time(rates, queue_rows)
+        # Workers that can actually claim. A drained or offline worker will never take a
+        # segment, so counting it would halve a number that is not going to halve.
+        # Heartbeat rather than status alone: a worker that died without saying so still
+        # reads "online-busy" until something reaps it.
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=settings.heartbeat_offline_seconds
+        )
+        worker_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(Worker)
+                .where(
+                    Worker.status.notin_(("offline", "draining")),
+                    Worker.last_heartbeat.isnot(None),
+                    Worker.last_heartbeat >= cutoff,
+                )
+            )
+        ).scalar() or 0
+        total_queue_time = estimate_queue_drain_seconds(
+            rates, queue_rows, worker_count, datetime.now(timezone.utc)
+        )
 
     # Worker stats
     worker_rows = (
