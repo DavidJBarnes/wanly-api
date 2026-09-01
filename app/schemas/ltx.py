@@ -53,6 +53,10 @@ class LtxRecipeCreate(BaseModel):
     # NULL means the global stack's negative, which is true of every seeded recipe.
     negative_prompt: Optional[str] = None
     frames: Optional[int] = Field(default=None, gt=0)
+    # A video CRF for the conditioning frame. NULL uses the stack's value. 0 is meaningful:
+    # it bypasses the encode. Bounded at 51 -- the node accepts 100, but x264's scale ends
+    # at 51 and anything above it is nominal.
+    img_compression: Optional[int] = Field(default=None, ge=0, le=51)
     validated: bool = False
 
 
@@ -61,6 +65,7 @@ class LtxRecipeUpdate(BaseModel):
     prompt_template: Optional[str] = Field(default=None, min_length=1)
     negative_prompt: Optional[str] = None
     frames: Optional[int] = Field(default=None, gt=0)
+    img_compression: Optional[int] = Field(default=None, ge=0, le=51)
     validated: Optional[bool] = None
 
 
@@ -72,6 +77,7 @@ class LtxRecipeResponse(BaseModel):
     prompt_template: str
     negative_prompt: Optional[str]
     frames: Optional[int]
+    img_compression: Optional[int]
     validated: bool
     created_at: datetime
     updated_at: Optional[datetime]
