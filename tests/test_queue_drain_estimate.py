@@ -81,3 +81,13 @@ class TestDrain:
         assert estimate_queue_drain_seconds(RATES, rows, 4, NOW) == pytest.approx(
             estimate_queue_drain_seconds(RATES, rows, 1, NOW) / 4, rel=0.01
         )
+
+    def test_a_naive_claimed_at_does_not_take_the_dashboard_down(self):
+        """The column is timestamptz and the driver returns aware datetimes, so this should
+        not arise — and "should not arise" here meant TypeError inside GET /stats, which is
+        the whole dashboard down for a number that is decoration."""
+        started = (NOW - dt.timedelta(seconds=100)).replace(tzinfo=None)
+        fresh = estimate_queue_drain_seconds(RATES, [_row()], 1, NOW)
+        assert estimate_queue_drain_seconds(
+            RATES, [_row("processing", started)], 1, NOW
+        ) == pytest.approx(fresh - 100, abs=1.0)

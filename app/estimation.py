@@ -339,6 +339,14 @@ def estimate_queue_drain_seconds(
         if not est:
             continue
         if claimed_at is not None:
+            # Assume UTC for a naive timestamp rather than raising. The column is
+            # `timestamp with time zone` and the driver returns aware datetimes, so this
+            # should not happen -- but "should not happen" here means TypeError inside
+            # GET /stats, which takes the whole dashboard down for a number that is
+            # decoration. Every timestamp this system writes is UTC, so the assumption is
+            # the correct one and not a guess.
+            if claimed_at.tzinfo is None:
+                claimed_at = claimed_at.replace(tzinfo=timezone.utc)
             # Never negative: a segment running longer than its estimate is late, not
             # ahead, and a negative would silently pay for some other segment's time.
             est = max(0.0, est - (now - claimed_at).total_seconds())
