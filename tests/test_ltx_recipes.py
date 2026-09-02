@@ -53,9 +53,17 @@ def test_the_global_stack_is_stored_once_not_per_recipe():
     """
     recipe_fields = set(_migration_const("_RECIPES")[0])
     assert recipe_fields == {"character", "name", "prompt", "validated"}
-    for global_only in ("checkpoint", "content_lora", "distill", "cfg", "steps_stage_1"):
+    for global_only in ("checkpoint", "distill", "cfg", "steps_stage_1"):
         assert global_only in LTX_STACK
         assert global_only not in recipe_fields
+
+    # content_lora used to be in that list. It is no longer global-ONLY: a pose can now
+    # override it, because "what is happening" is a property of the pose and one global
+    # cannot say "sfbehind for the from-behind poses and nothing for the rest" (console#395).
+    # It stays in the stack as the DEFAULT, and no seeded recipe carries one — which is the
+    # part that still matters here, and is what keeps every existing pose rendering the same.
+    assert "content_lora" in LTX_STACK
+    assert "content_lora" not in recipe_fields
 
 
 def test_content_lora_is_none_and_that_is_deliberate():

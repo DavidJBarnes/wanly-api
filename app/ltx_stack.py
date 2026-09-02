@@ -14,6 +14,11 @@ NOT app/seeds.py, which is about NOISE seeds. Different sense of the word entire
 LTX_STACK = {
     'checkpoint': 'sulphur_dev_bf16',
     'content_lora': 'none',
+    # What resolve() hardcoded for BOTH stages before content LoRAs became per-pose. Kept as
+    # the default so a pose that names a content LoRA without naming strengths renders at
+    # exactly the value the graph used to apply, rather than at some new number.
+    'content_s1': 0.6,
+    'content_s2': 0.6,
     'distill': 'sulphur_distill_lora_condsafe',
     'distill_stage_1': 0.3,
     'distill_stage_2': 0.6,
