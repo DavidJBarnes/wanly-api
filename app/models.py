@@ -292,6 +292,11 @@ class Worker(Base):
     gpu_stats: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)
     sd_scripts: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)
     a1111: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)
+    # What this worker's LoRA directory held as of its last sync — a cached verdict with a
+    # `synced_at`, not a live check: verifying one LoRA means hashing 650 MB, which a
+    # heartbeat cannot do. NULL means "never reported" (or an older daemon), which is not
+    # the same as an empty inventory and should not render the same way. See daemon#165.
+    loras: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)
     drain_after_jobs: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
