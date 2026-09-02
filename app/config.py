@@ -8,6 +8,12 @@ class Settings(BaseSettings):
     s3_jobs_bucket: str = "wanly-jobs"
     s3_faces_bucket: str = "wanly-faces"
     s3_images_bucket: str = "wanly-images"
+    # Character LoRAs, so a worker can obtain one instead of only rendering on a box that
+    # already has the file. Its own region: the bucket was created in us-east-1 while
+    # everything else here is us-west-2, and a presigned URL signed for the wrong region
+    # fails with SignatureDoesNotMatch — which reads like an auth problem and is not one.
+    s3_loras_bucket: str = "ltx-loras"
+    s3_loras_region: str = "us-east-1"
     aws_region: str = "us-west-2"
     api_key: str = ""
     civitai_api_token: str = ""
