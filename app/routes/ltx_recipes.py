@@ -23,7 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
 from app.s3 import list_bucket
-from app.auth import get_current_user, verify_api_key_or_token
+from app.auth import get_current_user, verify_api_key_or_bearer
 from app.database import get_db
 from app.ltx_stack import LTX_STACK
 from app.models import LtxCharacter, LtxRecipe, User
@@ -123,9 +123,17 @@ async def get_recipe_book(
     }
 
 
-@router.get("/loras", dependencies=[Depends(verify_api_key_or_token)])
+@router.get("/loras", dependencies=[Depends(verify_api_key_or_bearer)])
 async def list_available_loras():
-    """Every character LoRA a worker could fetch, so it can diff against what it holds.
+    """Every character LoRA in the bucket — the worker's sync list AND the console's dropdown.
+
+    Two callers, deliberately one endpoint: what the console offers to pick from is exactly
+    what a worker can actually obtain. A dropdown listing a LoRA no worker can fetch is a
+    job that fails ten minutes into a claimed segment.
+
+    Hence verify_api_key_or_bearer and not verify_api_key_or_token: the worker authenticates
+    with X-API-Key, the console with a Bearer JWT. The _or_token variant accepts a ?token=
+    query param for <img src> media loads and would 401 the console outright.
 
     Exists because workers deliberately carry NO AWS credentials — a rented pod should not
     hold them — and so they cannot list the bucket themselves. They already download through

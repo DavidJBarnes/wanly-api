@@ -52,3 +52,21 @@ def test_a_multipart_etag_is_flagged_rather_than_trusted():
     assert out["single.safetensors"]["multipart"] is False
     assert out["single.safetensors"]["etag"] == "abc123"      # quotes stripped
     assert out["big.safetensors"]["multipart"] is True        # -7 suffix
+
+
+def test_loras_is_reachable_by_both_the_worker_and_the_console():
+    """The dropdown and the sync list are the same endpoint, so both callers must get in.
+
+    verify_api_key_or_token — the near-miss — accepts X-API-Key or a ?token= QUERY PARAM,
+    which exists for <img src> media loads that cannot set headers. The console sends
+    Authorization: Bearer, so that variant would have 401'd the dropdown while the worker
+    kept working: broken for exactly one of the two callers, and only in the browser.
+    """
+    from app.auth import verify_api_key_or_bearer
+    from app.main import app
+
+    route = next(r for r in app.routes if getattr(r, "path", None) == "/loras")
+    deps = [d.call for d in route.dependant.dependencies]
+    assert verify_api_key_or_bearer in deps, (
+        "GET /loras must accept a console Bearer token as well as a worker API key"
+    )
