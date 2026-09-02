@@ -61,11 +61,12 @@ class LtxRecipeCreate(BaseModel):
     # pose that says nothing gets no content LoRA, which is the behaviour every existing
     # pose has today. "none" is also accepted explicitly, to mean "deliberately off".
     content_lora: Optional[str] = Field(default=None, max_length=256)
-    # Per-stage, like the character strengths. Bounded above at 3: LoRA strengths are
-    # nominally 0-1 but are routinely pushed past it (stage 2 runs at 1.5), while anything
-    # beyond 3 is a typo rather than an intention.
-    content_s1: Optional[float] = Field(default=None, ge=0, le=3)
-    content_s2: Optional[float] = Field(default=None, ge=0, le=3)
+    # Per-stage, like the character strengths. Bounded at 2.0 to match the ENGINE's own
+    # bound on these fields (engine/app.py Lora and content_s1/s2). A wider bound here would
+    # accept a value the console could store and then fail at render time with a 422, ten
+    # minutes into a claimed segment -- the validation has to be the tighter of the two.
+    content_s1: Optional[float] = Field(default=None, ge=0, le=2)
+    content_s2: Optional[float] = Field(default=None, ge=0, le=2)
     validated: bool = False
 
 
@@ -76,8 +77,8 @@ class LtxRecipeUpdate(BaseModel):
     frames: Optional[int] = Field(default=None, gt=0)
     img_compression: Optional[int] = Field(default=None, ge=0, le=51)
     content_lora: Optional[str] = Field(default=None, max_length=256)
-    content_s1: Optional[float] = Field(default=None, ge=0, le=3)
-    content_s2: Optional[float] = Field(default=None, ge=0, le=3)
+    content_s1: Optional[float] = Field(default=None, ge=0, le=2)
+    content_s2: Optional[float] = Field(default=None, ge=0, le=2)
     validated: Optional[bool] = None
 
 

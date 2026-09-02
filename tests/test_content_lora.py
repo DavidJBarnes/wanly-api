@@ -96,3 +96,21 @@ def test_the_two_stages_stay_independent():
     """
     out = _resolve(_Pose(content_lora="x", content_s1=0.3, content_s2=1.2))
     assert out["content_s1"] != out["content_s2"]
+
+
+def test_the_api_bound_is_not_looser_than_the_engines():
+    """The engine bounds content_s1/s2 at 2.0 (engine/app.py). This must not exceed it.
+
+    A looser bound here accepts a value the console stores happily and the engine then
+    rejects with a 422 — ten minutes into a claimed segment, not in the dialog. Whichever
+    end is stricter is the real limit, so the two have to agree and this is the one that
+    can drift unnoticed.
+    """
+    from app.schemas.ltx import LtxRecipeCreate, LtxRecipeUpdate
+
+    ENGINE_MAX = 2.0  # engine/app.py: content_s1/content_s2 Field(..., le=2.0)
+    for model in (LtxRecipeCreate, LtxRecipeUpdate):
+        for field in ("content_s1", "content_s2"):
+            meta = model.model_fields[field].metadata
+            le = next(m.le for m in meta if hasattr(m, "le"))
+            assert le <= ENGINE_MAX, f"{model.__name__}.{field} allows {le} > engine {ENGINE_MAX}"
