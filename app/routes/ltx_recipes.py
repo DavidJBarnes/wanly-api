@@ -125,7 +125,13 @@ async def get_recipe_book(
 
 @router.get("/loras", dependencies=[Depends(verify_api_key_or_bearer)])
 async def list_available_loras():
-    """Every character LoRA in the bucket — the worker's sync list AND the console's dropdown.
+    """Every LoRA in the bucket — the worker's sync list AND the console's dropdowns.
+
+    `kind` comes from the key prefix: `character/` are identity LoRAs (which character this
+    is), `content/` are motion/act LoRAs (what is happening), and they are chosen in
+    different places in the console — a character row versus a recipe. A LoRA sitting at the
+    root reports "unfiled" rather than being hidden, because a file nobody can see is worse
+    than one that is merely mis-shelved.
 
     Two callers, deliberately one endpoint: what the console offers to pick from is exactly
     what a worker can actually obtain. A dropdown listing a LoRA no worker can fetch is a
@@ -150,17 +156,25 @@ async def list_available_loras():
     a worker should fall back to size and say so rather than re-downloading forever.
     """
     objs = await asyncio.to_thread(list_bucket, settings.s3_loras_bucket)
-    return [
-        {
-            "name": o["name"],
+    out = []
+    for o in objs:
+        key = o["name"]
+        if not key.endswith(".safetensors"):
+            continue
+        prefix, _, base = key.rpartition("/")
+        out.append({
+            # `name` is the BASENAME, deliberately. It is what a ComfyUI LoraLoader takes and
+            # what ltx_characters.char_lora stores, and neither should have to learn about
+            # how the bucket is organised. The prefix is filing, not identity.
+            "name": base,
+            "kind": prefix or "unfiled",
+            "key": key,
             "size": o["size"],
             "etag": o["etag"],
             "multipart": o["multipart"],
-            "uri": f"s3://{settings.s3_loras_bucket}/{o['name']}",
-        }
-        for o in objs
-        if o["name"].endswith(".safetensors")
-    ]
+            "uri": f"s3://{settings.s3_loras_bucket}/{key}",
+        })
+    return out
 
 
 @router.post("/ltx/characters", response_model=LtxCharacterResponse, status_code=201)
