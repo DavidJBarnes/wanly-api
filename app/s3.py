@@ -10,6 +10,48 @@ logger = logging.getLogger(__name__)
 _client = None
 
 
+def _client_for_bucket(bucket: str):
+    """A client in the right region for this bucket.
+
+    Buckets here are not all in one region: ltx-loras is us-east-1 and the rest are
+    us-west-2. A presigned URL signed by a client in the wrong region is accepted by S3's
+    endpoint and then rejected at use with SignatureDoesNotMatch, so this has to be right
+    at signing time rather than discovered later.
+    """
+    if bucket == settings.s3_loras_bucket:
+        return boto3.client("s3", region_name=settings.s3_loras_region)
+    return _get_client()
+
+
+def list_bucket(bucket: str) -> list[dict]:
+    """Every object in a bucket: key, size, and etag.
+
+    The etag is the md5 of the content for a single-part upload, which is what these are —
+    so it is usable as a content check. A MULTIPART upload has an etag ending in "-<n>"
+    which is NOT an md5 of the whole object; callers must treat that as "cannot compare
+    content" rather than as a hash, or they will re-download it forever.
+    """
+    client = _client_for_bucket(bucket)
+    out: list[dict] = []
+    token = None
+    while True:
+        params = {"Bucket": bucket}
+        if token:
+            params["ContinuationToken"] = token
+        resp = client.list_objects_v2(**params)
+        for o in resp.get("Contents", []):
+            etag = (o.get("ETag") or "").strip('"')
+            out.append({
+                "name": o["Key"],
+                "size": o["Size"],
+                "etag": etag,
+                "multipart": "-" in etag,
+            })
+        if not resp.get("IsTruncated"):
+            return out
+        token = resp.get("NextContinuationToken")
+
+
 def _get_client():
     global _client
     if _client is None:
@@ -213,7 +255,7 @@ def generate_presigned_url(uri: str, expires: int = 21600) -> str:
     cached redirect that points to an expired signature.
     """
     bucket, key = parse_s3_uri(uri)
-    client = _get_client()
+    client = _client_for_bucket(bucket)
     return client.generate_presigned_url(
         "get_object",
         Params={"Bucket": bucket, "Key": key},
