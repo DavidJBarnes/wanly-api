@@ -70,3 +70,39 @@ def test_loras_is_reachable_by_both_the_worker_and_the_console():
     assert verify_api_key_or_bearer in deps, (
         "GET /loras must accept a console Bearer token as well as a worker API key"
     )
+
+
+async def test_a_prefixed_key_reports_its_kind_and_a_bare_name():
+    """`name` must stay the BASENAME even though the key is prefixed.
+
+    A ComfyUI LoraLoader takes `k3lly2026_v2.safetensors` and ltx_characters.char_lora
+    stores the same. Neither knows the bucket has shelves. If `name` carried the prefix,
+    the console would save "character/k3lly2026_v2" into char_lora and every render with
+    that character would fail to find its LoRA.
+    """
+    import app.routes.ltx_recipes as mod
+
+    fake = [
+        {"name": "character/k3lly2026_v2.safetensors", "size": 10, "etag": "a", "multipart": False},
+        {"name": "content/sfbehind_LTX2_3_v0_1.safetensors", "size": 20, "etag": "b", "multipart": False},
+        {"name": "stray.safetensors", "size": 30, "etag": "c", "multipart": False},
+        {"name": "notes.txt", "size": 1, "etag": "d", "multipart": False},
+    ]
+    orig = mod.list_bucket
+    mod.list_bucket = lambda bucket: fake
+    try:
+        out = {o["name"]: o for o in await mod.list_available_loras()}
+    finally:
+        mod.list_bucket = orig
+
+    assert out["k3lly2026_v2.safetensors"]["kind"] == "character"
+    assert out["k3lly2026_v2.safetensors"]["key"] == "character/k3lly2026_v2.safetensors"
+    assert out["k3lly2026_v2.safetensors"]["uri"].endswith("/character/k3lly2026_v2.safetensors")
+    assert out["sfbehind_LTX2_3_v0_1.safetensors"]["kind"] == "content"
+
+    # A LoRA at the root is surfaced as "unfiled", not hidden: a file nobody can see is
+    # worse than one that is merely mis-shelved.
+    assert out["stray.safetensors"]["kind"] == "unfiled"
+
+    # Non-safetensors are not LoRAs.
+    assert "notes.txt" not in out
