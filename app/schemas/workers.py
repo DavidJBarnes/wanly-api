@@ -20,6 +20,9 @@ class WorkerHeartbeat(BaseModel):
     gpu_stats: dict[str, Any] | None = None
     sd_scripts: dict[str, Any] | None = None
     a1111: dict[str, Any] | None = None
+    # Cached LoRA inventory from the worker's last sync. Optional so an older daemon still
+    # heartbeats successfully rather than 422-ing itself out of the pool on upgrade day.
+    loras: dict[str, Any] | None = None
 
 
 class WorkerRename(BaseModel):
@@ -60,6 +63,7 @@ class WorkerResponse(BaseModel):
     gpu_stats: dict[str, Any] | None = None
     sd_scripts: dict[str, Any] | None = None
     a1111: dict[str, Any] | None = None
+    loras: dict[str, Any] | None = None
     drain_after_jobs: int | None = None
     last_heartbeat: datetime
     registered_at: datetime

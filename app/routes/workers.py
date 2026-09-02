@@ -153,6 +153,10 @@ async def heartbeat(
         worker.gpu_stats = body.gpu_stats
     worker.sd_scripts = body.sd_scripts
     worker.a1111 = body.a1111
+    # `is not None`, unlike a1111 above: an older daemon omits this entirely, and writing
+    # None would erase a good inventory every heartbeat during a rolling upgrade.
+    if body.loras is not None:
+        worker.loras = body.loras
     if worker.status == "offline":
         worker.status = "online-idle"
     # If sd-scripts is actively training, worker can't be idle
