@@ -321,10 +321,18 @@ class TestStaleReclaim:
         which from the outside looked like 'only one GPU ever works the queue'."""
         other = await _worker(db)  # heartbeating right now, mid-render
         other_id = other.id
+        # A worker that is really rendering reports online-busy — the daemon sets it on
+        # receiving the claim, before it starts — and its segment has progress written
+        # within seconds. The fixture used to leave both at their defaults (idle, empty),
+        # which is indistinguishable from a claim whose response was lost, and is the exact
+        # state wanly-api#242 reclaims. Modelled faithfully here so this guard tests the
+        # incident it was written for rather than passing by omission.
+        other.status = "online-busy"
         job = await _job(db, status=JobStatus.PROCESSING)
         held = await _segment(db, job, 0, status=SegmentStatus.PROCESSING)
         held.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=45)
         held.worker_id = other_id
+        held.progress_log = "[4/6] ltx-engine: Processing"
         await db.flush()
 
         body = (await _claim(db)).json()
@@ -333,6 +341,73 @@ class TestStaleReclaim:
         await db.refresh(held)
         assert held.worker_id == other_id
         assert held.status == SegmentStatus.PROCESSING
+
+    async def test_a_claim_whose_response_was_lost_comes_back(self, db):
+        """wanly-api#242. GET /segments/next mutates: the segment is marked and assigned
+        before the answer is sent, so a transport failure on the way back leaves it owned by
+        a worker that never learned of it.
+
+        That worker stays healthy and heartbeating, so neither dead-worker rule fires. Before
+        this, the segment sat PROCESSING forever and the queue stopped beside an idle GPU.
+        """
+        idle = await _worker(db)                     # alive, beating, and genuinely idle
+        idle.status = "online-idle"
+        job = await _job(db, status=JobStatus.PROCESSING)
+        orphan = await _segment(db, job, 0, status=SegmentStatus.PROCESSING)
+        orphan.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=3)
+        orphan.worker_id = idle.id
+        orphan.progress_log = None                   # it never started: nothing was written
+        await db.flush()
+
+        body = (await _claim(db)).json()
+
+        assert body is not None and body["id"] == str(orphan.id)
+        await db.refresh(orphan)
+        assert orphan.worker_id == WORKER_ID
+
+    async def test_an_idle_worker_that_HAS_written_progress_keeps_its_claim(self, db):
+        """Progress is proof the worker received the segment and is working on it.
+
+        The daemon's status push can fail and the heartbeat only re-pushes on a CHANGE, so
+        "idle" can be a lie. An empty progress log cannot be, which is why the rule needs
+        both — and why a segment with progress is never taken, whatever the status says.
+        """
+        worker = await _worker(db)
+        worker.status = "online-idle"                # status is wrong, but...
+        worker_id = worker.id                        # captured: the commit expires the object
+        job = await _job(db, status=JobStatus.PROCESSING)
+        held = await _segment(db, job, 0, status=SegmentStatus.PROCESSING)
+        held.claimed_at = datetime.now(timezone.utc) - timedelta(minutes=10)
+        held.worker_id = worker.id
+        held.progress_log = "[1/6] Downloading start image..."   # ...it is demonstrably working
+        await db.flush()
+
+        body = (await _claim(db)).json()
+
+        assert body is None
+        await db.refresh(held)
+        assert held.worker_id == worker_id
+
+    async def test_a_fresh_claim_is_not_reclaimed_before_the_grace_period(self, db):
+        """A worker that has just claimed has not had time to report busy or write progress.
+
+        Too short a window and the reclaim races the very worker it belongs to, which is how
+        two workers end up on one segment.
+        """
+        worker = await _worker(db)
+        worker.status = "online-idle"
+        worker_id = worker.id                        # captured: the commit expires the object
+        job = await _job(db, status=JobStatus.PROCESSING)
+        fresh = await _segment(db, job, 0, status=SegmentStatus.PROCESSING)
+        fresh.claimed_at = datetime.now(timezone.utc) - timedelta(seconds=20)
+        fresh.worker_id = worker.id
+        await db.flush()
+
+        body = (await _claim(db)).json()
+
+        assert body is None
+        await db.refresh(fresh)
+        assert fresh.worker_id == worker_id
 
     async def test_a_worker_that_stopped_heartbeating_loses_its_claim(self, db):
         # The heartbeat rule needs no 30-minute wait: ~10 missed beats is already proof of death.

@@ -49,6 +49,10 @@ logger = logging.getLogger(__name__)
 # comfortably past a transient network blip. Renders themselves have no upper bound (60fps jobs
 # run 40+ minutes); a claim is held for as long as its worker keeps heartbeating.
 STALE_HEARTBEAT_MINUTES = 5
+# How long an idle worker may hold a claim it has written no progress against before the
+# claim is treated as orphaned. Two minutes is generous: the daemon posts its first progress
+# line within seconds of receiving a segment. See wanly-api#242.
+ORPHANED_CLAIM_MINUTES = 2
 
 # AR hologram work rides a dedicated carrier segment at this sentinel index (far above any
 # real segment count), so the real video segments and the job's finalized status are never
@@ -227,6 +231,7 @@ async def claim_next_segment(
     now = datetime.now(timezone.utc)
     age_cutoff = now - timedelta(minutes=30)
     heartbeat_cutoff = now - timedelta(minutes=STALE_HEARTBEAT_MINUTES)
+    orphan_cutoff = now - timedelta(minutes=ORPHANED_CLAIM_MINUTES)
 
     stale_result = await db.execute(
         select(Segment, Worker.last_heartbeat)
@@ -239,12 +244,52 @@ async def claim_next_segment(
                 # last_heartbeat is NOT NULL on the workers table, so "no heartbeat to
                 # consult" is exactly "the worker row is gone" (outerjoin came up empty).
                 and_(Segment.claimed_at < age_cutoff, Worker.id.is_(None)),
+                # A claim whose RESPONSE was lost. GET /segments/next mutates: the segment is
+                # marked and assigned before the answer is sent, so a transport failure on the
+                # way back leaves it owned by a worker that never learned of it. That worker
+                # stays healthy and heartbeating, so neither rule above ever fires and the
+                # segment is stuck forever with the queue stopped beside an idle GPU
+                # (wanly-api#242, hit in production 2026-09-03).
+                #
+                # THREE conditions, all required, because reclaiming from a LIVE worker is
+                # how two GPUs once converged on one segment (see the warning above):
+                #
+                #   1. the worker says it is idle. The daemon sets online-busy immediately on
+                #      receiving a claim, BEFORE rendering — so a worker that got the answer
+                #      is never idle here.
+                #   2. no progress has been written. A running segment logs "[1/6] ..." within
+                #      seconds. This is evidence from the SEGMENT, and it is what makes the
+                #      rule safe: the daemon's status push can fail, and the heartbeat only
+                #      re-pushes on a CHANGE, so status alone can lie. An empty progress log
+                #      cannot.
+                #   3. it has sat like that past the grace period, which is far longer than
+                #      the round trip between claiming and the first progress line.
+                and_(
+                    Worker.status == "online-idle",
+                    # Heartbeating RIGHT NOW. This is what rules out a network partition:
+                    # the worry with the two checks below is a worker that is really
+                    # rendering but whose status push and progress writes both failed. If it
+                    # is beating, the API is reachable from that worker, so those writes had
+                    # no reason to fail — and a worker that has genuinely gone quiet is the
+                    # heartbeat rule's business, not this one's.
+                    Worker.last_heartbeat >= heartbeat_cutoff,
+                    Segment.claimed_at < orphan_cutoff,
+                    or_(Segment.progress_log.is_(None), Segment.progress_log == ""),
+                ),
             ),
         )
     )
     for stale, last_heartbeat in stale_result.all():
-        reason = ("worker heartbeat stale" if last_heartbeat is not None
-                  else "worker row gone and claimed over 30m ago")
+        # Naming which rule fired matters: "the worker died" and "the worker is fine but
+        # never received the answer" have completely different fixes, and the log line is
+        # where that is decided at 2am.
+        if last_heartbeat is None:
+            reason = "worker row gone and claimed over 30m ago"
+        elif last_heartbeat < heartbeat_cutoff:
+            reason = "worker heartbeat stale"
+        else:
+            reason = ("claim response lost — worker is idle with no progress logged "
+                      "(wanly-api#242)")
         logger.warning(
             "Reclaiming segment %s (status=%s, claimed_at=%s, worker=%s, last_heartbeat=%s): %s",
             stale.id, stale.status, stale.claimed_at, stale.worker_name, last_heartbeat, reason,
