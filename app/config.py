@@ -17,6 +17,28 @@ class Settings(BaseSettings):
     aws_region: str = "us-west-2"
     api_key: str = ""
     civitai_api_token: str = ""
+    # JoyCaption, for the <SCENE> placeholder (console#405). Runs on the 2070 rather than a
+    # render box: the 3090 sits at ~23 of 24 GB while rendering LTX, and loading a vision
+    # model beside that OOMs a segment ten minutes in.
+    joycaption_url: str = "http://2070.zero:11434"
+    joycaption_model: str = "joycaption:beta-one"
+    # Deliberately tiny. sd.service (Automatic1111) shares that GPU and spikes several GB
+    # generating SDXL, and a resident 5.5 GB JoyCaption would starve it. The two are never
+    # meant to run at once, so the model should hold the card only while it is actually
+    # working.
+    #
+    # This is cheap because a cold start is cheap. MEASURED on the 2070:
+    #
+    #   cold (not resident)   4.5 s total   2.9 s load, 0.5 s prompt, 0.9 s generate
+    #   warm (resident)       1.2 s total   0.2 s load, 1.0 s generate
+    #
+    # So releasing VRAM after every caption costs ~2.9 s on the next one. 5s still coalesces
+    # a burst of images captioned back to back, while giving SD the card back essentially as
+    # soon as captioning stops.
+    joycaption_keep_alive: str = "5s"
+    # Generous next to a 4.5 s cold caption. It is here to stop a wedged or unreachable
+    # captioner holding a request open, not to bound normal work.
+    joycaption_timeout_s: int = 60
     cors_origins: str = ""
     login_rate_limit: str = "5/minute"
     heartbeat_offline_seconds: int = 120
