@@ -104,3 +104,41 @@ class TestReservation:
         from app.routes.wildcards import RESERVED_WILDCARD_NAMES
         assert "SCENE" in RESERVED_WILDCARD_NAMES
         assert "TRIGGER" in RESERVED_WILDCARD_NAMES
+
+
+class TestDeferral:
+    """A continuation is routinely created BEFORE the segment it follows has rendered.
+
+    Its start frame is that segment's last frame, which does not exist yet. Resolving at
+    submit would therefore find nothing to describe — and dropping the placeholder there
+    would be unrecoverable, because no later step could tell a description was ever wanted.
+
+    Continuations are the case this feature helps MOST: they condition on a generated frame
+    nobody has ever described, using recipe wording written before that frame existed. So
+    losing them silently is the worst outcome available, and these tests pin the deferral.
+    """
+
+    @pytest.mark.asyncio
+    async def test_submit_leaves_the_placeholder_when_there_is_no_image_yet(self):
+        from app.routes.segments import _resolve_scene
+        prompt = f"trig, {SCENE_PLACEHOLDER}, she moves"
+        out = await _resolve_scene(None, prompt, None, final=False)
+        assert out == prompt, "submit must defer, not drop"
+
+    @pytest.mark.asyncio
+    async def test_claim_drops_it_when_there_is_still_no_image(self):
+        """Last responsible moment: a text-to-video segment, or a predecessor that produced
+        no last frame. Shipping a literal <SCENE> to the encoder is the one outcome that is
+        strictly worse than a generic prompt."""
+        from app.routes.segments import _resolve_scene
+        out = await _resolve_scene(None, f"trig, {SCENE_PLACEHOLDER}, she moves", None, final=True)
+        assert SCENE_PLACEHOLDER not in out
+        assert out == "trig, she moves"
+
+    @pytest.mark.asyncio
+    async def test_a_prompt_without_the_placeholder_never_calls_the_captioner(self):
+        """Every pose today. The captioner must not be touched for them — this runs on the
+        claim path, which every worker polls."""
+        from app.routes.segments import _resolve_scene
+        p = "k3lly2026, a woman kneeling, she grips his hand"
+        assert await _resolve_scene(None, p, "s3://bucket/would-explode-if-fetched", final=True) == p

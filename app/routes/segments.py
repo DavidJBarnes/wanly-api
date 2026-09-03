@@ -76,7 +76,8 @@ router = APIRouter()
 SCENE_PLACEHOLDER = "<SCENE>"
 
 
-async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None) -> str:
+async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
+                         *, final: bool = False) -> str:
     """Fill a pose's <SCENE> with a description of the frame this segment starts from.
 
     Recipes are start-frame-agnostic by design — one pose serves every character — so their
@@ -98,15 +99,33 @@ async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None) -
     character LoRA is worse and harder to notice. Here the reasoning flips: a literal
     "<SCENE>" is garbage tokens fed to the text encoder, while dropping it leaves a valid if
     generic prompt. So it is dropped, and the drop is logged.
+
+    `final` is which of the two resolution points this is. At SUBMIT (final=False) a missing
+    image means "not yet" — a continuation is routinely created before the segment it
+    follows has rendered — so the placeholder survives for the claim to resolve. At CLAIM
+    (final=True) the start image is as known as it will ever be, so an unresolved
+    placeholder is dropped rather than shipped to the encoder.
     """
     if SCENE_PLACEHOLDER not in prompt:
         return prompt
 
     if not image_uri:
-        # A continuation whose previous frame does not exist yet, or a text-to-video segment.
-        # Nothing to describe.
-        logger.info("Dropping %s: no start image to describe", SCENE_PLACEHOLDER)
-        return _drop_scene(prompt)
+        if final:
+            # Last responsible moment and still no image: a text-to-video segment, or a
+            # continuation whose predecessor produced no last frame. Nothing to describe.
+            logger.info("Dropping %s: no start image to describe", SCENE_PLACEHOLDER)
+            return _drop_scene(prompt)
+        # A continuation submitted before its predecessor has rendered. The frame it will
+        # start from does not exist yet, so the placeholder is LEFT IN PLACE and resolved at
+        # claim time, when the previous segment's last frame is known.
+        #
+        # Dropping it here instead would be unrecoverable: the placeholder would be gone
+        # from the stored prompt and no later step could tell that a description was ever
+        # wanted. Continuations are the case this feature helps most — they condition on a
+        # generated frame nobody has ever described — so losing them silently is the worst
+        # available outcome.
+        logger.info("Deferring %s: start image not known until claim", SCENE_PLACEHOLDER)
+        return prompt
 
     try:
         image = await asyncio.to_thread(s3.download_bytes, image_uri)
@@ -473,6 +492,23 @@ async def claim_next_segment(
     else:
         neg_setting = await db.get(AppSetting, "negative_prompt")
         negative_prompt = neg_setting.value if neg_setting else None
+
+    # <SCENE> for a continuation. The start frame is a GENERATED image that exists only now
+    # — the previous segment produced it — so this is the first moment it can be described,
+    # and it is the case the feature exists for: nobody has ever written a description of
+    # that frame, and the recipe's own scene wording was authored before it existed.
+    #
+    # On the claim path deliberately, despite this being polled. A caption is 4.5s cold and
+    # 1.2s warm (measured), against a segment that then renders for ten minutes, and it only
+    # runs for a prompt that actually carries the placeholder. An earlier draft of this work
+    # avoided the claim path on the strength of a 60-90s estimate that turned out to be
+    # wall-clock on a multi-prompt script, and was wrong.
+    if SCENE_PLACEHOLDER in (segment.prompt or ""):
+        resolved = await _resolve_scene(db, segment.prompt, resolved_start_image, final=True)
+        if resolved != segment.prompt:
+            # Persisted, not just returned: the segment must record what it actually ran, so
+            # a retry reproduces it and a rated result can be traced to its real prompt.
+            segment.prompt = resolved
 
     # Resolve continuation mode API-side (VACE vs traditional). seg0 is always i2v;
     # VACE requires index>0 + the previous segment's video. The daemon falls back to
