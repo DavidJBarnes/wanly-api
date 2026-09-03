@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import asyncio
 import logging
 import math
 import random
@@ -17,7 +18,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
+from app import s3
 from app.database import get_db
+from app.routes.captions import caption_image_bytes
 from app.seeds import new_seed
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.models import AppSetting, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker
@@ -68,6 +71,85 @@ SMASHCUT_CARRIER_INDEX = 2000
 _CPU_REPROCESS_TYPES = ("ar_hologram", "smashcut_concat")
 
 router = APIRouter()
+
+
+SCENE_PLACEHOLDER = "<SCENE>"
+
+
+async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
+                         *, final: bool = False) -> str:
+    """Fill a pose's <SCENE> with a description of the frame this segment starts from.
+
+    Recipes are start-frame-agnostic by design — one pose serves every character — so their
+    static half is a generic guess about an image they have never seen. A validated pose
+    reads "a woman kneeling in front of a nude man" while the actual start frame is a
+    clothed woman sitting on a sofa. <SCENE> lets the pose defer that half to the frame.
+
+    ORDER: this runs AFTER _resolve_wildcards, the opposite of _resolve_trigger, and the
+    reason is the caption text. A caption is model output that may contain bracketed tokens,
+    and running the wildcard resolver over it afterwards would expand them. Going last means
+    the caption is never re-scanned.
+
+    That ordering removes the protection _resolve_trigger gets for free — a wildcard named
+    SCENE would be substituted before we ever look — so SCENE is RESERVED in the wildcard
+    routes. For <TRIGGER> the reservation is belt-and-braces; here it is the only guard.
+
+    FAILURE INVERTS FROM <TRIGGER>. _resolve_trigger deliberately leaves the literal
+    placeholder when it cannot resolve, because silently dropping the token that anchors the
+    character LoRA is worse and harder to notice. Here the reasoning flips: a literal
+    "<SCENE>" is garbage tokens fed to the text encoder, while dropping it leaves a valid if
+    generic prompt. So it is dropped, and the drop is logged.
+
+    `final` is which of the two resolution points this is. At SUBMIT (final=False) a missing
+    image means "not yet" — a continuation is routinely created before the segment it
+    follows has rendered — so the placeholder survives for the claim to resolve. At CLAIM
+    (final=True) the start image is as known as it will ever be, so an unresolved
+    placeholder is dropped rather than shipped to the encoder.
+    """
+    if SCENE_PLACEHOLDER not in prompt:
+        return prompt
+
+    if not image_uri:
+        if final:
+            # Last responsible moment and still no image: a text-to-video segment, or a
+            # continuation whose predecessor produced no last frame. Nothing to describe.
+            logger.info("Dropping %s: no start image to describe", SCENE_PLACEHOLDER)
+            return _drop_scene(prompt)
+        # A continuation submitted before its predecessor has rendered. The frame it will
+        # start from does not exist yet, so the placeholder is LEFT IN PLACE and resolved at
+        # claim time, when the previous segment's last frame is known.
+        #
+        # Dropping it here instead would be unrecoverable: the placeholder would be gone
+        # from the stored prompt and no later step could tell that a description was ever
+        # wanted. Continuations are the case this feature helps most — they condition on a
+        # generated frame nobody has ever described — so losing them silently is the worst
+        # available outcome.
+        logger.info("Deferring %s: start image not known until claim", SCENE_PLACEHOLDER)
+        return prompt
+
+    try:
+        image = await asyncio.to_thread(s3.download_bytes, image_uri)
+        caption, _ = await caption_image_bytes(db, image)
+    except Exception as e:
+        # Never fatal. A captioner that is down must not stop a render — the pose still has
+        # its arc, and a generic scene is what every pose used before this existed.
+        logger.warning("Dropping %s: could not describe %s (%s)",
+                       SCENE_PLACEHOLDER, image_uri, e)
+        return _drop_scene(prompt)
+
+    logger.info("Resolved %s from %s: %r", SCENE_PLACEHOLDER, image_uri, caption[:80])
+    return prompt.replace(SCENE_PLACEHOLDER, caption)
+
+
+def _drop_scene(prompt: str) -> str:
+    """Remove the placeholder and the comma-space that would be left dangling beside it.
+
+    "<TRIGGER>, <SCENE>, she grips..." must not become "trigger, , she grips...", which
+    reaches the encoder as a stray empty clause.
+    """
+    out = prompt.replace(f", {SCENE_PLACEHOLDER},", ",")
+    out = out.replace(f"{SCENE_PLACEHOLDER}, ", "").replace(f", {SCENE_PLACEHOLDER}", "")
+    return " ".join(out.replace(SCENE_PLACEHOLDER, "").split())
 
 
 async def _resolve_trigger(db: AsyncSession, prompt: str, ltx_recipe: dict | None) -> str:
@@ -182,6 +264,11 @@ async def add_segment(
 
     prompt = await _resolve_trigger(db, body.prompt, body.ltx_recipe)
     resolved_prompt, prompt_template = await _resolve_wildcards(db, prompt)
+    # After wildcards, deliberately — see _resolve_scene. The console resolves this itself
+    # for segment 0, where a person can review the caption first; this catches a prompt that
+    # arrives still carrying the placeholder, which is every continuation and any caller
+    # that is not the console. Same convention as <TRIGGER>.
+    resolved_prompt = await _resolve_scene(db, resolved_prompt, body.start_image)
 
     # Inherit negative_prompt from prior segment if not explicitly set.
     # Segments are eagerly loaded and ordered by index via the relationship,
@@ -405,6 +492,23 @@ async def claim_next_segment(
     else:
         neg_setting = await db.get(AppSetting, "negative_prompt")
         negative_prompt = neg_setting.value if neg_setting else None
+
+    # <SCENE> for a continuation. The start frame is a GENERATED image that exists only now
+    # — the previous segment produced it — so this is the first moment it can be described,
+    # and it is the case the feature exists for: nobody has ever written a description of
+    # that frame, and the recipe's own scene wording was authored before it existed.
+    #
+    # On the claim path deliberately, despite this being polled. A caption is 4.5s cold and
+    # 1.2s warm (measured), against a segment that then renders for ten minutes, and it only
+    # runs for a prompt that actually carries the placeholder. An earlier draft of this work
+    # avoided the claim path on the strength of a 60-90s estimate that turned out to be
+    # wall-clock on a multi-prompt script, and was wrong.
+    if SCENE_PLACEHOLDER in (segment.prompt or ""):
+        resolved = await _resolve_scene(db, segment.prompt, resolved_start_image, final=True)
+        if resolved != segment.prompt:
+            # Persisted, not just returned: the segment must record what it actually ran, so
+            # a retry reproduces it and a rated result can be traced to its real prompt.
+            segment.prompt = resolved
 
     # Resolve continuation mode API-side (VACE vs traditional). seg0 is always i2v;
     # VACE requires index>0 + the previous segment's video. The daemon falls back to

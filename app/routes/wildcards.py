@@ -18,7 +18,17 @@ router = APIRouter()
 # The trigger is already substituted before wildcard resolution runs, so this is the second of
 # two guards rather than the only one. Reserving the name means the collision cannot be created
 # by hand in the first place, which is cheaper than reasoning about ordering later.
-RESERVED_WILDCARD_NAMES = {"TRIGGER"}
+# SCENE is reserved for a DIFFERENT reason than TRIGGER, and the difference matters.
+#
+# <TRIGGER> is resolved BEFORE the wildcard resolver runs, so a wildcard named TRIGGER can
+# never hijack it; the reservation is a second belt.
+#
+# <SCENE> must resolve AFTER wildcards, so the caption — model output that may contain
+# bracketed tokens — is never wildcard-expanded. That means the wildcard resolver sees the
+# placeholder first, and a wildcard named SCENE WOULD substitute a random option before the
+# captioner is ever called. The render would look plausible and be wrong. So for SCENE this
+# reservation is not belt-and-braces; it is the only guard there is.
+RESERVED_WILDCARD_NAMES = {"TRIGGER", "SCENE"}
 
 
 @router.get("/wildcards", response_model=list[WildcardResponse])
