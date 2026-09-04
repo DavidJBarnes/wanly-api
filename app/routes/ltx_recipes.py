@@ -105,18 +105,14 @@ async def get_recipe_book(
                 # would silently replace it with the stack default.
                 "img_compression": (r.img_compression if r.img_compression is not None
                                     else LTX_STACK["img_compression"]),
-                # `or` IS right for the name: NULL and "" both mean "not set", and the stack
-                # value is "none" — which the engine reads as "render without one". There is
-                # no falsy string here that means something different.
-                "content_lora": r.content_lora or LTX_STACK["content_lora"],
-                # ...but `is None` is right for the strengths, for the same reason as
-                # img_compression above: 0 is a REAL setting. It loads the LoRA and gives it
-                # no weight, which is how you measure what it is contributing. `or` would
-                # quietly turn that into 0.6 and the measurement would be of the wrong thing.
-                "content_s1": (r.content_s1 if r.content_s1 is not None
-                               else LTX_STACK["content_s1"]),
-                "content_s2": (r.content_s2 if r.content_s2 is not None
-                               else LTX_STACK["content_s2"]),
+                # In application order, and returned as stored. No stack fallback: the
+                # stack's content_lora is "none", and an empty list already says that more
+                # directly than a one-element list naming "none" would.
+                #
+                # Strengths are whatever was stored, including 0 — which is a REAL setting:
+                # it loads the LoRA and gives it no weight, which is how you measure what it
+                # contributes. Nothing here may silently promote a 0 to 0.6.
+                "content_loras": r.content_loras or [],
                 # `or` is right here: NULL and "" both mean "not set", and there is no
                 # falsy checkpoint name that means something different.
                 "checkpoint": r.checkpoint or LTX_STACK["checkpoint"],
