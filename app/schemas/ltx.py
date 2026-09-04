@@ -67,6 +67,9 @@ class LtxRecipeCreate(BaseModel):
     # minutes into a claimed segment -- the validation has to be the tighter of the two.
     content_s1: Optional[float] = Field(default=None, ge=0, le=2)
     content_s2: Optional[float] = Field(default=None, ge=0, le=2)
+    # Base model for this pose. NULL uses the stack's. A filename as ComfyUI lists it;
+    # the engine appends .safetensors when missing.
+    checkpoint: Optional[str] = Field(default=None, max_length=256)
     validated: bool = False
 
 
@@ -79,6 +82,9 @@ class LtxRecipeUpdate(BaseModel):
     content_lora: Optional[str] = Field(default=None, max_length=256)
     content_s1: Optional[float] = Field(default=None, ge=0, le=2)
     content_s2: Optional[float] = Field(default=None, ge=0, le=2)
+    # Base model for this pose. NULL uses the stack's. A filename as ComfyUI lists it;
+    # the engine appends .safetensors when missing.
+    checkpoint: Optional[str] = Field(default=None, max_length=256)
     validated: Optional[bool] = None
 
 
@@ -94,6 +100,7 @@ class LtxRecipeResponse(BaseModel):
     content_lora: Optional[str]
     content_s1: Optional[float]
     content_s2: Optional[float]
+    checkpoint: Optional[str]
     validated: bool
     created_at: datetime
     updated_at: Optional[datetime]

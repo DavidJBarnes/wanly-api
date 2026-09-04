@@ -117,6 +117,9 @@ async def get_recipe_book(
                                else LTX_STACK["content_s1"]),
                 "content_s2": (r.content_s2 if r.content_s2 is not None
                                else LTX_STACK["content_s2"]),
+                # `or` is right here: NULL and "" both mean "not set", and there is no
+                # falsy checkpoint name that means something different.
+                "checkpoint": r.checkpoint or LTX_STACK["checkpoint"],
                 "validated": r.validated,
             }
             for r in poses

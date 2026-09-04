@@ -417,5 +417,14 @@ class LtxRecipe(Base):
     # hardcode 0.6 for both, which is a configuration, not a default.
     content_s1 = mapped_column(Float, nullable=True)
     content_s2 = mapped_column(Float, nullable=True)
+    # The base model this pose renders on. NULL means the stack's value, as everything else
+    # nullable here does. Exists so two checkpoints can be compared against one pose and one
+    # seed — sulphur vs 10Eros being the first such comparison.
+    #
+    # Note the character LoRA was trained against sulphur: on another base it may fuse
+    # nothing at all, silently, and the render comes back as the base model with none of the
+    # character in it. The engine reports its fusion count per render, which is what makes
+    # that visible rather than a surprise.
+    checkpoint = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), nullable=True)
