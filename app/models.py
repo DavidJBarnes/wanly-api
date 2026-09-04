@@ -406,29 +406,19 @@ class LtxRecipe(Base):
     # A video CRF applied to the conditioning frame before it anchors the render;
     # 0 bypasses it. See wanly-api#235.
     img_compression = mapped_column(Integer, nullable=True)
-    # The content LoRA is WHAT IS HAPPENING — motion and act — and so belongs to the POSE,
-    # where the character LoRA is WHO and belongs to the character. The graph has always
-    # chained both (content -> character -> branch); this is the half that had no home
-    # except a single global, which cannot say "sfbehind for the from-behind poses and
-    # nothing for the rest".
+    # Content LoRAs — WHAT IS HAPPENING, motion and act — chained ahead of the character
+    # LoRA, which is WHO. A LIST because they stack: motion, act and framing are separable
+    # and a pose may want several (console#410).
     #
-    # NULL means "use the stack's value", exactly as frames and img_compression do — and the
-    # stack value is still "none". Dropping DR34ML4Y is what removed the motion horror, so
-    # the default must stay off rather than becoming "whatever was last set".
-    content_lora = mapped_column(Text, nullable=True)
-    # Per-stage, never flat — the same reason LtxCharacter carries two. Stage 1 generates at
-    # half size from noise; stage 2 refines the 2x-upscaled latent. resolve() used to
-    # hardcode 0.6 for both, which is a configuration, not a default.
-    content_s1 = mapped_column(Float, nullable=True)
-    content_s2 = mapped_column(Float, nullable=True)
-    # The base model this pose renders on. NULL means the stack's value, as everything else
-    # nullable here does. Exists so two checkpoints can be compared against one pose and one
-    # seed — sulphur vs 10Eros being the first such comparison.
+    # [{"name": str, "s1": float, "s2": float}], and ORDER IS SIGNIFICANT — it is the order
+    # they are applied in the chain. Two poses with the same LoRAs in a different order are
+    # different configurations. Not a set.
     #
-    # Note the character LoRA was trained against sulphur: on another base it may fuse
-    # nothing at all, silently, and the render comes back as the base model with none of the
-    # character in it. The engine reports its fusion count per render, which is what makes
-    # that visible rather than a surprise.
+    # Empty list means none, which is what every pose did before this existed and what most
+    # still do. Per-stage strengths on each because stage 1 generates at half size from
+    # noise and stage 2 refines the 2x-upscaled latent; lowering a competing content LoRA on
+    # stage 2 is a recorded lever and one flat number cannot express it.
+    content_loras = mapped_column(JSONB, nullable=True)
     checkpoint = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), nullable=True)
