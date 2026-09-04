@@ -19,79 +19,6 @@ class SegmentCreate(BaseModel):
     transition: Optional[str] = None
 
 
-# The vocabulary lives server-side so the console and any analysis agree on the exact strings.
-# Grouping is the entire point of tags; two spellings of the same observation are two labels.
-#
-# Every tag is <location>-<condition>: where you were looking, then what was wrong or right with
-# it. That keeps the chip row scannable by region and makes the set extensible without debate
-# about naming -- a new observation about the eyes is eyes-<something>, not a fresh coinage.
-#
-OBSERVATION_TAGS = [
-    # Face
-    "face-frozen",
-    "face-blurry",
-    "face-expressive",
-    "mouth-void",
-    # Repetitive rather than absent: the same open-close cycle looping for the whole segment,
-    # "goldfish mouth". Distinct from face-frozen (no movement) and mouth-void (the gaping black
-    # space), and worth its own label because it inflates the expression metric rather than
-    # depressing it -- sustained large landmark displacement is exactly what that metric rewards,
-    # which makes this the third artifact it scores as a success.
-    "mouth-looping",
-    "teeth-mush",
-    "identity-drift",
-    # Motion, per person. motion_magnitude WAS whole-frame Farneback optical flow (removed in
-    # #151, and this is part of why): it summed every
-    # moving pixel, so a lively woman with a static man scores identically to the reverse. The
-    # metric cannot separate them even in principle, which makes these the ONLY per-person
-    # motion data obtainable.
-    "him-static",
-    "her-static",
-    "him-strong",
-    "her-strong",
-    # Pace. Unlike every other axis, the middle value has to be explicit: with only fast/slow,
-    # an untagged segment is ambiguous between "the pace was fine" and "I did not judge the
-    # pace", and those are different data.
-    "pace-slow",
-    "pace-right",
-    "pace-fast",
-    # Body mechanics -- the single largest quality differentiator observed so far, and one no
-    # metric can see: two bodies moving as ONE UNIT generate enormous whole-frame optical flow
-    # while being the wrong motion entirely. The 5-rated segment scored 0.545 and a 3-rated one
-    # scored 1.162. The metric measured quantity; these record correctness, which is why
-    # they outlived it.
-    #
-    # The axis is TRAVEL: he withdraws and re-enters, so the bodies separate and rejoin along an
-    # axis. What fails is not that they "rock" -- that is only how the failure looks from outside
-    # -- it is that they stay joined and there is no relative displacement between them. Naming
-    # both ends for travel keeps the judgement on the thing being judged.
-    "bodies-locked",
-    "bodies-inout",
-    "anatomy-break",
-]
-
-# Sets whose members contradict each other. A segment cannot be both too fast and too slow, and
-# a man cannot be both static and thrusting strongly. Rejecting these server-side matters because
-# the tags exist to be ground truth -- a contradictory label is worse than a missing one, since
-# it quietly poisons whatever it is later used to validate.
-EXCLUSIVE_TAG_GROUPS = [
-    {"pace-slow", "pace-right", "pace-fast"},
-    {"him-static", "him-strong"},
-    {"her-static", "her-strong"},
-    {"bodies-locked", "bodies-inout"},
-]
-
-
-class SegmentAnnotation(BaseModel):
-    """What a human saw. Never read by generation."""
-
-    notes: Optional[str] = Field(None, max_length=4000)
-    rating: Optional[int] = Field(None, ge=1, le=5, description="Overall, 1-5")
-    # Sent as a list and stored comma separated; validated against OBSERVATION_TAGS so a typo
-    # cannot quietly create a ninth tag that groups with nothing.
-    observation_tags: Optional[list[str]] = None
-
-
 class SegmentPromptUpdate(BaseModel):
     """Change what a segment will generate, before it starts.
 
@@ -149,11 +76,8 @@ class SegmentResponse(BaseModel):
     ltx_recipe: Optional[dict[str, Any]] = None
     auto_finalize: bool
     transition: Optional[str]
-    # Soft-deleted: kept for its rating, tags and notes, excluded from the video.
+    # Soft-deleted: kept with its video and seed, excluded from the video.
     discarded: bool = False
-    notes: Optional[str] = None
-    rating: Optional[int] = None
-    observation_tags: Optional[str] = None
     trim_start_frames: int
     trim_end_frames: int
     reference_frames: Optional[list[str]] = None
@@ -280,11 +204,8 @@ class SegmentClipResponse(BaseModel):
 
 
 class SegmentTrimUpdate(BaseModel):
-    # Soft-deleted: kept for its rating, tags and notes, excluded from the video.
+    # Soft-deleted: kept with its video and seed, excluded from the video.
     discarded: bool = False
-    notes: Optional[str] = None
-    rating: Optional[int] = None
-    observation_tags: Optional[str] = None
     trim_start_frames: int = Field(ge=0)
     trim_end_frames: int = Field(ge=0)
 

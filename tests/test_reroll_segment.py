@@ -55,8 +55,6 @@ async def _job_with_segment(db, user, **segment_kwargs) -> tuple[Job, Segment]:
         ltx_recipe={"name": "Missionary Side", "character": "k3lly2026"},
         status=SegmentStatus.COMPLETED,
         output_path="s3://b/out.mp4",
-        rating=4,
-        notes="good travel",
         trim_start_frames=3,
     )
     fields.update(segment_kwargs)
@@ -148,16 +146,16 @@ class TestReroll:
         # it and rendered free-form, so this is the assertion that guards that fix.
         assert body["ltx_recipe"] == old.ltx_recipe
 
-    async def test_the_annotations_of_the_old_take_are_not_copied(self, db):
-        # Rating, notes and trims describe the take being archived. Carrying them over would
-        # attribute one take's judgement to another one that has not been watched yet.
+    async def test_the_state_of_the_old_take_is_not_copied(self, db):
+        # Trims and output describe the take being archived, not the one about to render.
+        # Carrying them over would attribute one take's state to another that has not run yet
+        # -- and a non-null output_path in particular would make an unrendered segment look
+        # finished.
         user = await _user(db)
         job, _ = await _job_with_segment(db, user)
 
         body = (await _reroll(db, user, job.id)).json()
 
-        assert body["rating"] is None
-        assert body["notes"] is None
         assert body["trim_start_frames"] == 0
         assert body["output_path"] is None
 

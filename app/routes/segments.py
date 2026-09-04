@@ -26,9 +26,6 @@ from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.models import AppSetting, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker
 from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
-    EXCLUSIVE_TAG_GROUPS,
-    OBSERVATION_TAGS,
-    SegmentAnnotation,
     SegmentPromptUpdate,
     FramePreview,
     FramePreviewResponse,
@@ -1304,17 +1301,17 @@ async def reroll_first_segment(
     already-resolved for the same reason: re-rolling the wildcards as well would change two
     variables at once and make the comparison worth nothing.
 
-    The old take is discarded, not deleted. It keeps its video, rating, tags and notes, and it
-    keeps them under its own seed -- which is why segments have a seed column at all. Rolling
-    repeatedly is the point of this endpoint, so an archive that relabelled every previous take
-    with the newest seed would destroy exactly the record it exists to accumulate.
+    The old take is discarded, not deleted. It keeps its video under its own seed -- which is why
+    segments have a seed column at all. Rolling repeatedly is the point of this endpoint, so an
+    archive that relabelled every previous take with the newest seed would destroy exactly the
+    record it exists to accumulate.
 
     Only offered while the job is a single live segment. Once there is a segment 1, segment 0 is
     the thing it continues from, and replacing it would orphan every successor that was generated
     from its last frame.
 
-    Trim, transition, rating, notes and observation tags are deliberately NOT copied: they
-    describe the take being archived, not the one about to be generated.
+    Trim and transition are deliberately NOT copied: they describe the take being archived,
+    not the one about to be generated.
 
     The "re-roll until" rule is gone with the metrics it judged (#151) — it compared a
     threshold against the mean of an identity or motion series, and nothing produces those
@@ -1367,20 +1364,18 @@ async def discard_segment(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Take a segment out of the video without losing what was recorded about it.
+    """Take a segment out of the video without losing the take itself.
 
-    Deleting destroys the row, and with it the rating, tags and notes. That was tolerable when a
-    segment was only output; it is not now that annotations are the primary evidence in every
-    experiment. A bad segment is frequently the MOST informative one, and discarding the
-    observation in order to get it out of the cut is exactly backwards.
+    Deleting destroys the row, and with it the record that this seed produced this clip. A bad
+    take is frequently the most informative one, and destroying it in order to get it out of
+    the cut is exactly backwards.
 
     The row keeps its index, so the record reads as "the discarded version of segment 2" and a
     regenerated segment can take the same position. The unique constraint is partial for that
     reason -- see migration 063.
 
-    Output files are deliberately NOT removed. The clip is the evidence behind the rating; a note
-    saying "mouth loops for the whole segment" is worth much less if the segment cannot be
-    rewatched.
+    Output files are deliberately NOT removed. The clip IS the record -- a discarded take that
+    cannot be rewatched is not archived, it is deleted with extra steps.
     """
     result = await db.execute(
         select(Segment)
@@ -1489,72 +1484,3 @@ async def delete_segment(
         job.status = JobStatus.AWAITING
 
     await db.commit()
-
-
-@router.get("/segments/observation-tags", response_model=list[str],
-            dependencies=[Depends(get_current_user)])
-async def list_observation_tags():
-    """The controlled vocabulary, served rather than hardcoded in the console.
-
-    One source of truth so a tag written by the UI is the same string any later analysis groups
-    on. That grouping is the whole value: "mouth-void" and "mouth void" are two labels.
-    """
-    return OBSERVATION_TAGS
-
-
-@router.patch("/segments/{segment_id}/annotation", response_model=SegmentResponse)
-async def annotate_segment(
-    segment_id: UUID,
-    body: SegmentAnnotation,
-    user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    """Record what a human saw in this segment.
-
-    Deliberately separate from the daemon's PATCH /segments/{id}: that one carries an API key and
-    writes generation state. This is user-authenticated, writes only annotation, and touches
-    nothing generation reads -- an observation must never be able to change output.
-
-    Fields are individually optional so the modal can save a rating without clearing notes, but
-    an explicitly-sent empty value still clears, because "I typed notes by mistake" needs an undo.
-    """
-    result = await db.execute(
-        select(Segment)
-        .join(Job, Segment.job_id == Job.id)
-        .where(Segment.id == segment_id, Job.user_id == user.id)
-    )
-    segment = result.scalar_one_or_none()
-    if segment is None:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
-
-    fields = body.model_dump(exclude_unset=True)
-
-    if "notes" in fields:
-        segment.notes = (fields["notes"] or "").strip() or None
-    if "rating" in fields:
-        segment.rating = fields["rating"]
-    if "observation_tags" in fields:
-        tags = fields["observation_tags"] or []
-        unknown = [t for t in tags if t not in OBSERVATION_TAGS]
-        if unknown:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Unknown observation tag(s): {', '.join(unknown)}. "
-                       f"Allowed: {', '.join(OBSERVATION_TAGS)}",
-            )
-        chosen = set(tags)
-        for group in EXCLUSIVE_TAG_GROUPS:
-            clash = sorted(chosen & group)
-            if len(clash) > 1:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Contradictory tags: {', '.join(clash)}. Pick one.",
-                )
-        # Deduped and stored in vocabulary order, so two segments tagged the same way produce
-        # identical strings and group without normalising at read time.
-        ordered = [t for t in OBSERVATION_TAGS if t in chosen]
-        segment.observation_tags = ",".join(ordered) or None
-
-    await db.commit()
-    await db.refresh(segment)
-    return segment

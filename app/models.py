@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, SmallInteger, String, Text, UniqueConstraint, text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -98,8 +98,8 @@ class Segment(Base):
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     job_id = mapped_column(UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), nullable=False)
     index = mapped_column(Integer, nullable=False)
-    # Soft delete. The row and its rating, tags and notes survive; the video does not include it.
-    # A bad segment is often the most informative one, so discarding the observation to get it out
+    # Soft delete. The row survives with its video and its seed; the video does not include it.
+    # A bad take is still the record of what that seed produced, so destroying it to get it out
     # of the cut is exactly backwards.
     discarded = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     # The noise seed this segment generates with, when it has one of its own.
@@ -112,8 +112,8 @@ class Segment(Base):
     # It is set when a segment needs a seed that is NOT a function of its position, which today
     # means re-rolling segment 0 to see a different take of the same prompt. Without a per-segment
     # seed the only way to re-roll would be to overwrite job.seed, and that silently rewrites
-    # history: the archived clip keeps its video and its rating while the number that produced it
-    # is replaced by the number that produced its replacement. That is the worst possible thing to
+    # history: the archived clip keeps its video while the number that produced it is replaced by
+    # the number that produced its replacement. That is the worst possible thing to
     # lose here, because seed is the dominant variable in what a take actually looks like —
     # expression in particular is seed-driven far more than it is LoRA-driven — so "which seed was
     # that one?" is the question the whole archive exists to answer.
@@ -130,14 +130,6 @@ class Segment(Base):
     start_image = mapped_column(Text, nullable=True)
     auto_finalize = mapped_column(Boolean, nullable=False, default=False)
     transition = mapped_column(String(20), nullable=True, default=None)
-    # Human observation. The metrics cannot rank quality -- expression rewards the mouth-gape
-    # artifact it should penalise -- so what a person saw is primary evidence, not a footnote.
-    # None of these three are read by generation; annotation must never change output.
-    notes = mapped_column(Text, nullable=True)
-    rating = mapped_column(SmallInteger, nullable=True)
-    # Controlled vocabulary, comma separated. Free-form would drift ("mouth void" vs "black
-    # mouth") and stop grouping, which destroys the only thing these are for.
-    observation_tags = mapped_column(String(500), nullable=True)
     trim_start_frames = mapped_column(Integer, nullable=False, default=0)
     trim_end_frames = mapped_column(Integer, nullable=False, default=0)
     # Length (seconds) of the reconstructed lead-in a VACE-continuation segment carries.
@@ -399,7 +391,7 @@ class LtxRecipe(Base):
     negative_prompt = mapped_column(Text, nullable=True)
     frames = mapped_column(Integer, nullable=True)
     # The POSE is proven: this prompt produces what it claims. Whether a given CHARACTER
-    # renders well is a property of its LoRA, and segment ratings already record that.
+    # renders well is a property of its LoRA, which is a separate question from this flag.
     # NOT a quality score: the automated metrics have picked the wrong clip before.
     validated = mapped_column(Boolean, nullable=False, server_default="false", default=False)
     # NULL means "use the stack's value", exactly as frames and negative_prompt do.
