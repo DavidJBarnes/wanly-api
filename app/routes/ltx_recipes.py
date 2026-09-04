@@ -26,7 +26,7 @@ from app.s3 import list_bucket
 from app.auth import get_current_user, verify_api_key_or_bearer
 from app.database import get_db
 from app.ltx_stack import LTX_STACK
-from app.models import LtxCharacter, LtxRecipe, User
+from app.models import LtxCharacter, LtxRecipe, User, Worker
 from app.schemas.ltx import (
     LtxCharacterCreate,
     LtxCharacterUpdate,
@@ -117,6 +117,9 @@ async def get_recipe_book(
                                else LTX_STACK["content_s1"]),
                 "content_s2": (r.content_s2 if r.content_s2 is not None
                                else LTX_STACK["content_s2"]),
+                # `or` is right here: NULL and "" both mean "not set", and there is no
+                # falsy checkpoint name that means something different.
+                "checkpoint": r.checkpoint or LTX_STACK["checkpoint"],
                 "validated": r.validated,
             }
             for r in poses
@@ -133,6 +136,34 @@ async def get_recipe_book(
             for c in chars
         ],
     }
+
+
+@router.get("/ltx/checkpoints", dependencies=[Depends(verify_api_key_or_bearer)])
+async def list_checkpoints(db: AsyncSession = Depends(get_db)):
+    """Base models a pose can actually be rendered on (console#404).
+
+    The union of what live workers report, not a list held here. A checkpoint is a 46 GB
+    file on a GPU box; whether one is loadable is a fact about that box, and the engine
+    binds to 127.0.0.1 inside its container so nothing upstream can ask directly. Workers
+    report it through the heartbeat instead.
+
+    OFFLINE WORKERS ARE EXCLUDED. Offering a checkpoint that only exists on a box which is
+    not running means picking it produces a job nothing can claim — a queue that silently
+    stops rather than an error. What is offered should be what can be rendered now.
+
+    The stack's default is always included even when no worker is up, so the dropdown is
+    never empty and always contains the value every existing pose already uses.
+    """
+    rows = (await db.execute(
+        select(Worker.checkpoints).where(Worker.status != "offline")
+    )).scalars().all()
+
+    names: set[str] = {LTX_STACK["checkpoint"]}
+    for row in rows:
+        for name in row or []:
+            if isinstance(name, str) and name.strip():
+                names.add(name.strip())
+    return {"checkpoints": sorted(names), "default": LTX_STACK["checkpoint"]}
 
 
 @router.get("/loras", dependencies=[Depends(verify_api_key_or_bearer)])

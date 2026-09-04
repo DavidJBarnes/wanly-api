@@ -297,6 +297,10 @@ class Worker(Base):
     # heartbeat cannot do. NULL means "never reported" (or an older daemon), which is not
     # the same as an empty inventory and should not render the same way. See daemon#165.
     loras: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)
+    # Base models this worker can load, as ComfyUI reports them. Reported rather than
+    # discovered: the engine binds to localhost, so the daemon is the only thing that can
+    # ask. NULL means never reported — not the same as none available. See console#404.
+    checkpoints: Mapped[list | None] = mapped_column(JSONB, nullable=True, default=None)
     drain_after_jobs: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
@@ -417,5 +421,14 @@ class LtxRecipe(Base):
     # hardcode 0.6 for both, which is a configuration, not a default.
     content_s1 = mapped_column(Float, nullable=True)
     content_s2 = mapped_column(Float, nullable=True)
+    # The base model this pose renders on. NULL means the stack's value, as everything else
+    # nullable here does. Exists so two checkpoints can be compared against one pose and one
+    # seed — sulphur vs 10Eros being the first such comparison.
+    #
+    # Note the character LoRA was trained against sulphur: on another base it may fuse
+    # nothing at all, silently, and the render comes back as the base model with none of the
+    # character in it. The engine reports its fusion count per render, which is what makes
+    # that visible rather than a surprise.
+    checkpoint = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), nullable=True)
