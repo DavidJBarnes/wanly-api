@@ -297,6 +297,10 @@ class Worker(Base):
     # heartbeat cannot do. NULL means "never reported" (or an older daemon), which is not
     # the same as an empty inventory and should not render the same way. See daemon#165.
     loras: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)
+    # Base models this worker can load, as ComfyUI reports them. Reported rather than
+    # discovered: the engine binds to localhost, so the daemon is the only thing that can
+    # ask. NULL means never reported — not the same as none available. See console#404.
+    checkpoints: Mapped[list | None] = mapped_column(JSONB, nullable=True, default=None)
     drain_after_jobs: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 

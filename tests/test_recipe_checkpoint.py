@@ -46,3 +46,41 @@ def test_the_stack_default_is_unchanged():
     """This is what every validated result to date was produced on. If it moves, the whole
     rated history stops being comparable to anything new."""
     assert LTX_STACK["checkpoint"] == "sulphur_dev_bf16"
+
+
+class TestCheckpointListing:
+    """What the dropdown offers (console#404).
+
+    The union of what LIVE workers report. A checkpoint is a 46 GB file on a GPU box, so
+    whether one is loadable is a fact about that box — and the engine binds to localhost,
+    so workers report it through the heartbeat rather than the API discovering it.
+    """
+
+    def test_offline_workers_are_excluded_from_the_query(self):
+        """Offering a checkpoint that exists only on a box which is not running produces a
+        job nothing can claim — a queue that silently stops rather than an error."""
+        import inspect
+        from app.routes import ltx_recipes as mod
+        src = inspect.getsource(mod.list_checkpoints)
+        assert 'Worker.status != "offline"' in src
+
+    def test_the_stack_default_is_always_offered(self):
+        """With no worker online the dropdown must still contain the value every existing
+        pose already renders on, or the field looks broken when the fleet is idle."""
+        import inspect
+        from app.routes import ltx_recipes as mod
+        src = inspect.getsource(mod.list_checkpoints)
+        assert 'LTX_STACK["checkpoint"]' in src
+
+    def test_an_older_daemon_still_heartbeats(self):
+        """checkpoints must be optional. Required, every worker on the previous daemon
+        would 422 and drop out of the pool the moment this deployed."""
+        from app.schemas.workers import WorkerHeartbeat
+        assert WorkerHeartbeat(comfyui_running=True).checkpoints is None
+
+    def test_omitting_it_must_not_erase_a_stored_list(self):
+        """An older daemon omits the field on every heartbeat; assigning None would blank a
+        good list seconds after a newer worker reported it."""
+        import inspect
+        from app.routes import workers as mod
+        assert "if body.checkpoints is not None:" in inspect.getsource(mod.heartbeat)

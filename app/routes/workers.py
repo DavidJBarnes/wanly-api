@@ -157,6 +157,11 @@ async def heartbeat(
     # None would erase a good inventory every heartbeat during a rolling upgrade.
     if body.loras is not None:
         worker.loras = body.loras
+    # Same conditional write, same reason: an older daemon omits the field on every
+    # heartbeat, and assigning None would blank a good list seconds after a newer worker
+    # reported it.
+    if body.checkpoints is not None:
+        worker.checkpoints = body.checkpoints
     if worker.status == "offline":
         worker.status = "online-idle"
     # If sd-scripts is actively training, worker can't be idle

@@ -23,6 +23,8 @@ class WorkerHeartbeat(BaseModel):
     # Cached LoRA inventory from the worker's last sync. Optional so an older daemon still
     # heartbeats successfully rather than 422-ing itself out of the pool on upgrade day.
     loras: dict[str, Any] | None = None
+    # Base models this worker can load. Optional so an older daemon still heartbeats.
+    checkpoints: list[str] | None = None
 
 
 class WorkerRename(BaseModel):
@@ -64,6 +66,7 @@ class WorkerResponse(BaseModel):
     sd_scripts: dict[str, Any] | None = None
     a1111: dict[str, Any] | None = None
     loras: dict[str, Any] | None = None
+    checkpoints: list[str] | None = None
     drain_after_jobs: int | None = None
     last_heartbeat: datetime
     registered_at: datetime
