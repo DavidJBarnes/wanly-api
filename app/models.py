@@ -391,7 +391,7 @@ class LtxRecipe(Base):
     negative_prompt = mapped_column(Text, nullable=True)
     frames = mapped_column(Integer, nullable=True)
     # The POSE is proven: this prompt produces what it claims. Whether a given CHARACTER
-    # renders well is a property of its LoRA, and segment ratings already record that.
+    # renders well is a property of its LoRA, which is a separate question from this flag.
     # NOT a quality score: the automated metrics have picked the wrong clip before.
     validated = mapped_column(Boolean, nullable=False, server_default="false", default=False)
     # NULL means "use the stack's value", exactly as frames and negative_prompt do.

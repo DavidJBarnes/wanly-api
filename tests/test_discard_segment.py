@@ -1,9 +1,8 @@
-"""Discarding keeps the record and removes the segment from the video.
+"""Discarding keeps the take and removes the segment from the video.
 
-Deleting destroyed the row and with it the rating, tags and notes. That was tolerable when a
-segment was only output. It is not now that annotations are the primary evidence in every
-experiment -- a bad segment is frequently the MOST informative one, and throwing away the
-observation in order to get it out of the cut is exactly backwards.
+Deleting destroys the row and with it the record that this seed produced this clip. A bad take
+is frequently the most informative one, and destroying it in order to get it out of the cut is
+exactly backwards -- so the row survives, keeping its index and its output.
 """
 
 import os
