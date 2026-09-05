@@ -162,6 +162,8 @@ async def heartbeat(
     # reported it.
     if body.checkpoints is not None:
         worker.checkpoints = body.checkpoints
+    if body.fetchable_kinds is not None:
+        worker.fetchable_kinds = body.fetchable_kinds
     if worker.status == "offline":
         worker.status = "online-idle"
     # If sd-scripts is actively training, worker can't be idle

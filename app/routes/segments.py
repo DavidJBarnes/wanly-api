@@ -13,7 +13,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import and_, or_, select, text
+from sqlalchemy import and_, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -23,6 +23,8 @@ from app.database import get_db
 from app.routes.captions import caption_image_bytes
 from app.seeds import new_seed
 from app.enums import JobStatus, SegmentStatus, VideoStatus
+from app.ltx_stack import LTX_STACK
+from app.model_requirements import CHECKPOINT, canonical
 from app.models import AppSetting, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker
 from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
@@ -295,6 +297,51 @@ async def add_segment(
     return segment
 
 
+def _model_gate(worker: Worker | None) -> tuple:
+    """SQL that hides segments this worker cannot render. console#422.
+
+    A pod carries sulphur and nothing else. Before this, it claimed a 10Eros pose anyway,
+    uploaded the start image, and ComfyUI rejected the graph across three loaders — after the
+    claim, so the segment failed and the job stalled beside a 3090 that had the file.
+
+    IN THE QUERY, not after it. Filtering the selected row in Python would either re-pick the
+    same unrunnable segment on every poll — head-of-line blocking, with the whole queue behind
+    it — or need a second SELECT that breaks the skip-locked concurrency the claim depends on.
+
+    Three things deliberately do NOT gate:
+
+      * a NULL ltx_recipe. Not a recipe render: a WAN segment, a free-form LTX one, or a CPU
+        reprocess carrier. It declares no models, so it requires none. Conservative on
+        purpose — this must not withhold work that flows today.
+      * a worker that has never reported its checkpoints (NULL, not []). An older daemon
+        would otherwise starve on upgrade day, and a fleet claiming nothing looks exactly
+        like an empty queue.
+      * a kind the worker says it can fetch. It already downloads LoRAs at claim time; when
+        it learns to fetch checkpoints (console#423) this stops gating on its own.
+
+    Inventory comes from the last heartbeat rather than the claim request: the poll is
+    frequent and the inventory is not. The staleness window is one heartbeat, and a claim
+    made against a stale one degrades to exactly the old behaviour — a loud engine failure —
+    rather than to something worse.
+    """
+    if worker is None or worker.checkpoints is None:
+        return ()
+    if CHECKPOINT in (worker.fetchable_kinds or []):
+        return ()
+
+    names = {canonical(n) for n in worker.checkpoints if isinstance(n, str) and n.strip()}
+    # Both spellings. Recipes store a bare stem and the daemon strips the extension before
+    # reporting, so these agree today; if that convention ever drifts the gate does not fail
+    # loudly, it silently matches nothing and the worker claims no work at all.
+    names |= {f"{n}.safetensors" for n in names}
+
+    checkpoint = func.coalesce(
+        func.nullif(Segment.ltx_recipe["checkpoint"].astext, ""),
+        canonical(LTX_STACK["checkpoint"]),
+    )
+    return (or_(Segment.ltx_recipe.is_(None), checkpoint.in_(names)),)
+
+
 @router.get("/segments/next", dependencies=[Depends(verify_api_key)])
 async def claim_next_segment(
     worker_id: UUID = Query(...),
@@ -421,10 +468,14 @@ async def claim_next_segment(
                 Segment.reprocess_type.in_(_CPU_REPROCESS_TYPES),
             ),
         )
+    # Read once, used twice: the gate needs this worker's inventory before the query, and the
+    # GPU name is snapshotted off the same row after it.
+    claiming_worker = await db.get(Worker, worker_id)
+
     result = await db.execute(
         select(Segment)
         .join(Job, Segment.job_id == Job.id)
-        .where(*where)
+        .where(*where, *_model_gate(claiming_worker))
         .order_by(Job.priority.asc(), Segment.created_at.asc())
         .limit(1)
         .with_for_update(skip_locked=True)
@@ -442,7 +493,6 @@ async def claim_next_segment(
     # Snapshot the GPU now, not at read time. Worker rows are deleted on deregister — every
     # RunPod pod takes its row with it when it drains — so a later join would silently lose the
     # hardware for every segment a since-terminated pod ran.
-    claiming_worker = await db.get(Worker, worker_id)
     if claiming_worker and claiming_worker.gpu_stats:
         segment.gpu_name = claiming_worker.gpu_stats.get("gpu_name")
 

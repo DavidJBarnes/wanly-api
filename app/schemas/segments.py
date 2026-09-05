@@ -99,6 +99,14 @@ class SegmentResponse(BaseModel):
     error_message: Optional[str]
     progress_log: Optional[str]
     estimated_run_time: Optional[float] = None
+    # Why a PENDING segment is not being picked up: the models it names are on no online
+    # worker (console#422). Computed on read, not stored — it is a fact about the fleet right
+    # now, and a column would go stale the moment a worker with the file came online.
+    #
+    # None means "nothing to say", which covers both "somebody can run it" and "nothing has
+    # reported an inventory yet". Only the job detail route fills this in; every other
+    # construction leaves the default, which is why it HAS one.
+    blocked_reason: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

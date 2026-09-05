@@ -20,7 +20,13 @@ from app.database import get_db
 from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStatus
 from app.seeds import new_seed
 from app.estimation import estimate_segment_time, get_estimation_rates, sum_estimated_queue_time
-from app.models import Job, Segment, User, Video
+from app.models import Job, Segment, User, Video, Worker
+from app.model_requirements import (
+    CHECKPOINT,
+    describe,
+    required_artifacts,
+    unsatisfied,
+)
 from app.routes.segments import _resolve_wildcards
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
 from app.tag_filter import like_escape, tag_clause
@@ -454,6 +460,51 @@ async def reorder_jobs(
     return ordered
 
 
+
+async def _annotate_blocked(db: AsyncSession, segments, seg_responses) -> None:
+    """Say why a PENDING segment is going nowhere, when the answer is "no worker has it".
+
+    console#422. The claim gate turns a loud failure into a silent one: a segment whose base
+    model is on no online worker now sits PENDING forever beside an idle fleet, and that
+    looks exactly like an empty queue. This is the other half of that feature, not a nicety
+    — shipping the gate without it trades a visible failure for an invisible one.
+
+    Computed per request rather than stored. It is a fact about the fleet at this moment: a
+    column would say "blocked" for as long as it took someone to notice a worker with the
+    file had come online, which is the same staleness in a more expensive form.
+
+    Silent when nothing has reported an inventory. An older daemon reports no checkpoints at
+    all, and "no online worker can load X" would then be a guess dressed as a diagnosis.
+    """
+    pending = [s for s in segments
+               if s.status == SegmentStatus.PENDING and s.ltx_recipe]
+    if not pending:
+        return
+
+    workers = (await db.execute(
+        select(Worker).where(Worker.status != "offline")
+    )).scalars().all()
+    fleet = [w for w in workers if w.checkpoints is not None]
+    if not fleet:
+        return
+
+    by_id = {sr.id: sr for sr in seg_responses}
+    for seg in pending:
+        required = required_artifacts(seg.ltx_recipe)
+        misses = [
+            unsatisfied(required, {CHECKPOINT: set(w.checkpoints or [])}, w.fetchable_kinds)
+            for w in fleet
+        ]
+        if any(not m for m in misses):
+            continue
+        # The closest worker's shortfall, not the union of everybody's. "The 3090 is one file
+        # short" is a fix; "the fleet collectively lacks five things" is a shrug.
+        response = by_id.get(seg.id)
+        if response is not None:
+            response.blocked_reason = f"No online worker can load {describe(min(misses, key=len))}"
+
+
+
 @router.get("/jobs/{job_id}", response_model=JobDetailResponse)
 async def get_job(
     job_id: UUID,
@@ -496,6 +547,8 @@ async def get_job(
             seg_responses.append(sr)
     else:
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
+
+    await _annotate_blocked(db, segments, seg_responses)
 
     return JobDetailResponse(
         id=job.id,
@@ -638,6 +691,8 @@ async def reopen_job(
             seg_responses.append(sr)
     else:
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
+
+    await _annotate_blocked(db, segments, seg_responses)
 
     return JobDetailResponse(
         id=job.id, name=job.name, width=job.width, height=job.height,
