@@ -26,6 +26,7 @@ from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.ltx_stack import LTX_STACK
 from app.model_requirements import CHECKPOINT, canonical
 from app.models import AppSetting, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker
+from app.negative_prompt import default_negative_prompt
 from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
     SegmentPromptUpdate,
@@ -533,12 +534,14 @@ async def claim_next_segment(
                     reference_frames.append(prev_segment.last_frame_path)
                     reference_frames = reference_frames[-3:]
 
-    # Use segment negative_prompt if set, otherwise fall back to global app setting
+    # The segment's own negative if it has one, otherwise the resolved default: the Settings
+    # field, or the stack constant when that is blank. It used to read the setting row
+    # directly and hand the daemon None when there was no row, which left whatever negative
+    # the workflow template happens to bake in — a third answer to the same question.
     if segment.negative_prompt is not None:
         negative_prompt = segment.negative_prompt
     else:
-        neg_setting = await db.get(AppSetting, "negative_prompt")
-        negative_prompt = neg_setting.value if neg_setting else None
+        negative_prompt = await default_negative_prompt(db)
 
     # <SCENE> for a continuation. The start frame is a GENERATED image that exists only now
     # — the previous segment produced it — so this is the first moment it can be described,
