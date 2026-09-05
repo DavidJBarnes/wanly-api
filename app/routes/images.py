@@ -466,10 +466,23 @@ def _scene_response(path: str, meta: ImageMeta | None) -> ImageSceneResponse:
     )
 
 
-def _require_images_bucket(path: str) -> None:
-    bucket = settings.s3_images_bucket
-    if not path.startswith(f"s3://{bucket}/"):
-        raise HTTPException(status_code=400, detail="Path must be in the images bucket")
+def _describable_buckets() -> tuple[str, ...]:
+    """Where a frame this API will describe may live.
+
+    The images bucket is the repo. The jobs bucket holds generated frames — a segment's last
+    frame is the start frame of the one after it, and describing it is how a continuation
+    shows the words before they are used (console#438). Both are ours; anything else is not
+    a path this endpoint should be fetching.
+    """
+    return tuple(b for b in (settings.s3_images_bucket, settings.s3_jobs_bucket) if b)
+
+
+def _require_known_bucket(path: str) -> None:
+    if not any(path.startswith(f"s3://{b}/") for b in _describable_buckets()):
+        raise HTTPException(
+            status_code=400,
+            detail="Path must be in the images bucket or the jobs bucket",
+        )
 
 
 @router.get("/images/scene", response_model=ImageSceneResponse,
@@ -480,7 +493,7 @@ async def get_image_scene(path: str = Query(...), db: AsyncSession = Depends(get
     Nulls rather than a 404: "no description yet" is an ordinary state of a perfectly good
     image, and the caller — the New Job modal — has to render it either way.
     """
-    _require_images_bucket(path)
+    _require_known_bucket(path)
     return _scene_response(path, await db.get(ImageMeta, path))
 
 
@@ -498,7 +511,7 @@ async def describe_image_scene(
     "only if missing" rule here would be a second opinion about a decision the UI has
     already made, and would make re-roll impossible to express.
     """
-    _require_images_bucket(path)
+    _require_known_bucket(path)
     body = body or ImageSceneRequest()
 
     try:
@@ -586,6 +599,22 @@ def image_filter(q: str | None, tags: list[str], exclude: list[str]) -> list:
     return clauses
 
 
+def repo_images_only():
+    """Restrict a query over image_meta to the repo.
+
+    image_meta is keyed by s3:// path and now also holds descriptions of GENERATED frames —
+    a segment's last frame, described so a continuation can show the words before they are
+    used (console#438). Those live in the jobs bucket and are not repo images. Without this,
+    a filename search would HEAD one, find it, and put a render's intermediate frame in the
+    Image Repo, which is why console#427 refused to store them at all.
+
+    Separate from image_filter deliberately: that function returns the USER's criteria, and
+    an empty list is how the route knows nothing was asked for and answers 400 rather than
+    serving the whole repo. Folding this in would make it never empty.
+    """
+    return ImageMeta.path.like(f"s3://{settings.s3_images_bucket}/%")
+
+
 @router.get("/images/search", dependencies=[Depends(get_current_user)])
 async def search_images(
     q: str | None = Query(None, max_length=500),
@@ -613,12 +642,12 @@ async def search_images(
             detail="Provide q, or at least one tag — an unfiltered search is the folder listing.",
         )
 
-    count_q = select(func.count()).select_from(ImageMeta).where(*clauses)
+    count_q = select(func.count()).select_from(ImageMeta).where(repo_images_only(), *clauses)
     total = (await db.execute(count_q)).scalar() or 0
 
     meta_q = (
         select(ImageMeta)
-        .where(*clauses)
+        .where(repo_images_only(), *clauses)
         .order_by(ImageMeta.updated_at.desc())
         .offset(offset)
         .limit(limit)
@@ -683,7 +712,7 @@ async def image_tag_counts(
         select(tag_expr.label("tag"), func.count().label("count"))
         .select_from(ImageMeta)
         .join(tag_rows, true())
-        .where(*clauses, tag_expr != "")
+        .where(repo_images_only(), *clauses, tag_expr != "")
         .group_by(tag_expr)
         .order_by(func.count().desc(), tag_expr)
     )

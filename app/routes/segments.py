@@ -134,10 +134,10 @@ async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
         logger.info("Deferring %s: start image not known until claim", SCENE_PLACEHOLDER)
         return prompt
 
-    # A repo image may already have been described, by the person who tagged it or by an
-    # earlier claim (console#414). Reusing those words costs a SELECT instead of 1.2-4.5s on
-    # the 2070, and it means the render uses the description that was read and accepted
-    # rather than a fresh, different one the model happened to produce this time.
+    # The frame may already have been described — by the person who tagged it, by the Next
+    # Segment dialog opening, or by an earlier claim (console#414, #438). Reusing those words
+    # costs a SELECT instead of 1.2-4.5s on the 2070, and it means the render uses the
+    # description that was actually shown rather than a fresh, different one.
     cached = await _cached_scene(db, image_uri)
     if cached:
         logger.info("Resolved %s from %s (saved description)", SCENE_PLACEHOLDER, image_uri)
@@ -158,18 +158,28 @@ async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
     return prompt.replace(SCENE_PLACEHOLDER, caption)
 
 
-def _is_repo_image(uri: str | None) -> bool:
-    """Is this an image in the repo, as opposed to a frame a render produced?
+def _is_describable(uri: str | None) -> bool:
+    """May this frame's description be kept?
 
-    Only repo images get image_meta rows. A continuation starts from a generated frame in
-    the JOBS bucket, and giving those rows would leak them into the Image Repo's filename
-    search — /images/search selects FROM image_meta and HEADs whatever path it finds.
+    Both buckets now. console#427 restricted this to the repo because /images/search selects
+    FROM image_meta and HEADs whatever path it finds, so a jobs-bucket row would have put a
+    generated frame in the Image Repo. That leak is fixed at its source — the search and
+    tag-count filters are constrained to the images bucket — so the restriction has been
+    lifted rather than worked around.
+
+    Keeping them matters: a segment's last frame is the start frame of the next one, the
+    console describes it when the Next Segment dialog opens (console#438), and without a
+    stored copy the claim would describe it AGAIN and render with different words from the
+    ones that were shown.
     """
-    return bool(uri) and uri.startswith(f"s3://{settings.s3_images_bucket}/")
+    if not uri:
+        return False
+    buckets = (settings.s3_images_bucket, settings.s3_jobs_bucket)
+    return any(uri.startswith(f"s3://{b}/") for b in buckets if b)
 
 
 async def _cached_scene(db: AsyncSession, image_uri: str) -> str | None:
-    if not _is_repo_image(image_uri):
+    if not _is_describable(image_uri):
         return None
     meta = await db.get(ImageMeta, image_uri)
     return (meta.scene_description or None) if meta else None
@@ -181,7 +191,7 @@ async def _save_scene(db: AsyncSession, image_uri: str, caption: str, instructio
     Best-effort: a segment that rendered must not fail over bookkeeping, and the caption is
     already in hand either way.
     """
-    if not _is_repo_image(image_uri) or not caption.strip():
+    if not _is_describable(image_uri) or not caption.strip():
         return
     try:
         meta = await db.get(ImageMeta, image_uri)
