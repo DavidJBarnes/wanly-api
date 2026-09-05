@@ -27,7 +27,7 @@ from app.model_requirements import (
     required_artifacts,
     unsatisfied,
 )
-from app.routes.segments import _resolve_wildcards
+from app.routes.segments import _resolve_wildcards, _unwrap_scene
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
 from app.tag_filter import like_escape, tag_clause
 
@@ -187,7 +187,10 @@ async def create_job(
         job.lynx_subject_image = job.starting_image
 
     seg = body.first_segment
-    resolved_prompt, prompt_template = await _resolve_wildcards(db, seg.prompt)
+    # The console fills and strips its own <scene>…</scene> markers (console#427). Stripped
+    # again here because this path stores the prompt without going through _resolve_scene,
+    # and a marker left in it would reach the text encoder as literal tokens.
+    resolved_prompt, prompt_template = await _resolve_wildcards(db, _unwrap_scene(seg.prompt))
     segment = Segment(
         job_id=job.id,
         index=0,

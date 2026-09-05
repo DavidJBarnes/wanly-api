@@ -19,13 +19,16 @@ from sqlalchemy.orm import selectinload
 
 from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
 from app import s3
+from app.config import settings
 from app.database import get_db
 from app.routes.captions import caption_image_bytes
 from app.seeds import new_seed
 from app.enums import JobStatus, SegmentStatus, VideoStatus
 from app.ltx_stack import LTX_STACK
 from app.model_requirements import CHECKPOINT, canonical
-from app.models import AppSetting, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker
+from app.models import (
+    AppSetting, ImageMeta, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker,
+)
 from app.negative_prompt import default_negative_prompt
 from app.s3 import delete_object, download_file, move_object, parse_s3_uri
 from app.schemas.segments import (
@@ -106,6 +109,10 @@ async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
     (final=True) the start image is as known as it will ever be, so an unresolved
     placeholder is dropped rather than shipped to the encoder.
     """
+    # Before anything else: a prompt may arrive with a region the console filled and failed
+    # to strip, and the words inside it are the scene — there is nothing left to resolve.
+    prompt = _unwrap_scene(prompt)
+
     if SCENE_PLACEHOLDER not in prompt:
         return prompt
 
@@ -127,9 +134,18 @@ async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
         logger.info("Deferring %s: start image not known until claim", SCENE_PLACEHOLDER)
         return prompt
 
+    # A repo image may already have been described, by the person who tagged it or by an
+    # earlier claim (console#414). Reusing those words costs a SELECT instead of 1.2-4.5s on
+    # the 2070, and it means the render uses the description that was read and accepted
+    # rather than a fresh, different one the model happened to produce this time.
+    cached = await _cached_scene(db, image_uri)
+    if cached:
+        logger.info("Resolved %s from %s (saved description)", SCENE_PLACEHOLDER, image_uri)
+        return prompt.replace(SCENE_PLACEHOLDER, cached)
+
     try:
         image = await asyncio.to_thread(s3.download_bytes, image_uri)
-        caption, _ = await caption_image_bytes(db, image)
+        caption, instruction = await caption_image_bytes(db, image)
     except Exception as e:
         # Never fatal. A captioner that is down must not stop a render — the pose still has
         # its arc, and a generic scene is what every pose used before this existed.
@@ -137,8 +153,66 @@ async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
                        SCENE_PLACEHOLDER, image_uri, e)
         return _drop_scene(prompt)
 
+    await _save_scene(db, image_uri, caption, instruction)
     logger.info("Resolved %s from %s: %r", SCENE_PLACEHOLDER, image_uri, caption[:80])
     return prompt.replace(SCENE_PLACEHOLDER, caption)
+
+
+def _is_repo_image(uri: str | None) -> bool:
+    """Is this an image in the repo, as opposed to a frame a render produced?
+
+    Only repo images get image_meta rows. A continuation starts from a generated frame in
+    the JOBS bucket, and giving those rows would leak them into the Image Repo's filename
+    search — /images/search selects FROM image_meta and HEADs whatever path it finds.
+    """
+    return bool(uri) and uri.startswith(f"s3://{settings.s3_images_bucket}/")
+
+
+async def _cached_scene(db: AsyncSession, image_uri: str) -> str | None:
+    if not _is_repo_image(image_uri):
+        return None
+    meta = await db.get(ImageMeta, image_uri)
+    return (meta.scene_description or None) if meta else None
+
+
+async def _save_scene(db: AsyncSession, image_uri: str, caption: str, instruction: str) -> None:
+    """Keep what this claim just paid for, so the next job starting here gets it free.
+
+    Best-effort: a segment that rendered must not fail over bookkeeping, and the caption is
+    already in hand either way.
+    """
+    if not _is_repo_image(image_uri) or not caption.strip():
+        return
+    try:
+        meta = await db.get(ImageMeta, image_uri)
+        if meta is None:
+            meta = ImageMeta(path=image_uri)
+            db.add(meta)
+        meta.scene_description = caption
+        meta.scene_instruction = instruction
+        meta.scene_described_at = datetime.now(timezone.utc)
+        await db.flush()
+    except Exception as e:  # noqa: BLE001 - never fatal to a render
+        logger.warning("Could not save the description for %s (%s)", image_uri, e)
+
+
+# `<scene>…</scene>` — a scene the console has already filled in (console#427).
+#
+# The console marks the filled region so it can be rewritten in place: re-describe, or
+# change the start frame, and only the inside changes. It strips the markers before it
+# sends. This strips them AGAIN, because a marker reaching the text encoder is garbage
+# tokens for exactly the reason _drop_scene exists, and "the client promised not to" is not
+# a guarantee — the daemon, a retry of an older prompt, and anything not the console all
+# post here too.
+#
+# Paired form first, then any leftover bare tag. That pairing, not letter case, is what
+# separates a filled region from the unfilled <SCENE> placeholder.
+_SCENE_REGION = re.compile(r"<scene>(.*?)</scene>", re.IGNORECASE | re.DOTALL)
+
+
+def _unwrap_scene(prompt: str) -> str:
+    """Keep the words, drop the markers. Leaves the bare <SCENE> placeholder alone."""
+    return _SCENE_REGION.sub(r"\1", prompt)
 
 
 def _drop_scene(prompt: str) -> str:
@@ -553,7 +627,9 @@ async def claim_next_segment(
     # runs for a prompt that actually carries the placeholder. An earlier draft of this work
     # avoided the claim path on the strength of a 60-90s estimate that turned out to be
     # wall-clock on a multi-prompt script, and was wrong.
-    if SCENE_PLACEHOLDER in (segment.prompt or ""):
+    # Either form: an unfilled placeholder to resolve, or a filled region whose markers must
+    # come off before the prompt reaches the encoder.
+    if SCENE_PLACEHOLDER in (segment.prompt or "") or _SCENE_REGION.search(segment.prompt or ""):
         resolved = await _resolve_scene(db, segment.prompt, resolved_start_image, final=True)
         if resolved != segment.prompt:
             # Persisted, not just returned: the segment must record what it actually ran, so
@@ -786,7 +862,7 @@ async def update_segment_prompt(
             ),
         )
 
-    source = body.prompt
+    source = _unwrap_scene(body.prompt)
 
     resolved, template = await _resolve_wildcards(db, source)
     segment.prompt = resolved
