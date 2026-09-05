@@ -115,8 +115,8 @@ class TestDescribeEndpoint:
         assert await db.get(ImageMeta, PATH) is None
 
     @pytest.mark.asyncio
-    async def test_a_path_outside_the_images_bucket_is_refused(self, db):
-        resp = await _post_scene(db, "s3://wanly-jobs/x/seg0-last.png", caption="nope")
+    async def test_a_path_in_neither_of_our_buckets_is_refused(self, db):
+        resp = await _post_scene(db, "s3://someone-elses-bucket/x.png", caption="nope")
         assert resp.status_code == 400
 
 
@@ -227,3 +227,69 @@ async def _move(db, keys, target):
                                     json={"keys": keys, "target_folder": target})
     finally:
         app.dependency_overrides.clear()
+
+
+class TestGeneratedFramesStayOutOfTheRepo:
+    """image_meta now holds descriptions of generated frames too (console#438).
+
+    That is only safe because the search is constrained to the images bucket. /images/search
+    selects FROM image_meta and HEADs whatever path it finds, so without the predicate a
+    filename search would put a render's intermediate frame in the Image Repo — which is the
+    reason console#427 refused to store them at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_search_filter_excludes_the_jobs_bucket(self, db):
+        from app.routes.images import image_filter, repo_images_only
+        from app.models import ImageMeta as IM
+
+        db.add_all([
+            IM(path=f"s3://{BUCKET}/2026-09-05/pool-party.png", tags="Kelly"),
+            IM(path="s3://wanly-jobs/j1/pool-party-seg0-last.png",
+               scene_description="a woman by a pool"),
+        ])
+        await db.flush()
+
+        # A filename fragment both rows match.
+        rows = (await db.execute(
+            sa.select(IM.path).where(repo_images_only(), *image_filter("pool-party", [], []))
+        )).scalars().all()
+
+        assert rows == [f"s3://{BUCKET}/2026-09-05/pool-party.png"]
+
+    @pytest.mark.asyncio
+    async def test_a_generated_frame_row_is_invisible_even_with_no_query(self, db):
+        from app.routes.images import image_filter, repo_images_only
+        from app.models import ImageMeta as IM
+
+        db.add(IM(path="s3://wanly-jobs/j1/seg0-last.png", tags="Kelly"))
+        await db.flush()
+
+        rows = (await db.execute(
+            sa.select(IM.path).where(repo_images_only(), *image_filter(None, ["Kelly"], []))
+        )).scalars().all()
+
+        assert rows == []
+
+
+class TestSceneEndpointsAcceptAGeneratedFrame:
+    """A segment's last frame is the start frame of the next one, so the Next Segment dialog
+    has to be able to read and describe it (console#438)."""
+
+    @pytest.mark.asyncio
+    async def test_get_accepts_a_jobs_bucket_path(self, db):
+        resp = await _get_scene(db, "s3://wanly-jobs/j1/seg0-last.png")
+        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_post_describes_and_stores_a_jobs_bucket_path(self, db):
+        path = "s3://wanly-jobs/j1/seg0-last.png"
+        resp = await _post_scene(db, path, caption="a woman kneeling on a bed")
+        assert resp.status_code == 200
+        meta = await db.get(ImageMeta, path)
+        assert meta.scene_description == "a woman kneeling on a bed"
+
+    @pytest.mark.asyncio
+    async def test_an_unknown_bucket_is_still_refused(self, db):
+        resp = await _post_scene(db, "s3://someone-elses-bucket/x.png", caption="nope")
+        assert resp.status_code == 400

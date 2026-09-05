@@ -16,7 +16,7 @@ from app.config import settings
 from app.models import ImageMeta
 from app.routes.segments import (
     SCENE_PLACEHOLDER,
-    _is_repo_image,
+    _is_describable,
     _resolve_scene,
     _unwrap_scene,
 )
@@ -51,19 +51,27 @@ class TestUnwrapMarkers:
         assert _unwrap_scene("k3llydw, a woman on a sofa") == "k3llydw, a woman on a sofa"
 
 
-class TestWhichImagesGetRows:
-    """Only repo images. /images/search selects FROM image_meta and HEADs whatever path it
-    finds, so a row for a generated frame would put that frame in the Image Repo."""
+class TestWhichFramesMayBeKept:
+    """Both buckets, since console#438.
 
-    def test_a_repo_image_does(self):
-        assert _is_repo_image(REPO)
+    console#427 restricted this to the repo because a jobs-bucket row would surface in the
+    Image Repo's filename search. That leak is now fixed where it lives — the search filter
+    is constrained to the images bucket — so the restriction is lifted rather than worked
+    around, and a generated frame's description survives instead of being paid for twice.
+    """
 
-    def test_a_generated_continuation_frame_does_not(self):
-        assert not _is_repo_image(GENERATED)
+    def test_a_repo_image_may_be_kept(self):
+        assert _is_describable(REPO)
 
-    def test_nothing_does(self):
-        assert not _is_repo_image(None)
-        assert not _is_repo_image("")
+    def test_a_generated_continuation_frame_may_be_kept(self):
+        assert _is_describable(GENERATED)
+
+    def test_nothing_may_be_kept(self):
+        assert not _is_describable(None)
+        assert not _is_describable("")
+
+    def test_somebody_elses_bucket_may_not(self):
+        assert not _is_describable("s3://someone-elses-bucket/x.png")
 
 
 class TestResolveUsesTheCache:
@@ -94,16 +102,30 @@ class TestResolveUsesTheCache:
         assert meta.scene_instruction == "an instruction"
 
     @pytest.mark.asyncio
-    async def test_a_generated_frame_is_described_but_never_stored(self, db):
-        """Every continuation is this case. It still gets a description; it just does not
-        get a row, because a row would put it in the Image Repo."""
+    async def test_a_generated_frame_is_kept_too(self, db):
+        """Every continuation is this case. The console describes the previous segment's
+        last frame when the dialog opens; if the claim did not reuse that, it would describe
+        the same frame again and render with DIFFERENT words from the ones shown."""
         with patch("app.routes.segments.s3.download_bytes", return_value=b"png"), \
              patch("app.routes.segments.caption_image_bytes",
                    new=AsyncMock(return_value=("a woman by a pool", "an instruction"))):
             out = await _resolve_scene(db, TEMPLATE, GENERATED, final=True)
 
         assert "a woman by a pool" in out
-        assert await db.get(ImageMeta, GENERATED) is None
+        meta = await db.get(ImageMeta, GENERATED)
+        assert meta is not None
+        assert meta.scene_description == "a woman by a pool"
+
+    @pytest.mark.asyncio
+    async def test_a_kept_generated_frame_is_reused_rather_than_re_described(self, db):
+        db.add(ImageMeta(path=GENERATED, scene_description="a woman by a pool"))
+        await db.flush()
+
+        with patch("app.routes.segments.caption_image_bytes", new=AsyncMock()) as captioner:
+            out = await _resolve_scene(db, TEMPLATE, GENERATED, final=True)
+
+        captioner.assert_not_called()
+        assert "a woman by a pool" in out
 
     @pytest.mark.asyncio
     async def test_a_row_with_tags_but_no_description_still_describes(self, db):
