@@ -215,6 +215,50 @@ def _unwrap_scene(prompt: str) -> str:
     return _SCENE_REGION.sub(r"\1", prompt)
 
 
+# A stand-in the wildcard resolver cannot see. Its pattern is <([^<>]+)>, and this has no
+# angle brackets at all.
+def _scene_mask(i: int) -> str:
+    return f"\x00wanly-scene-{i}\x00"
+
+
+async def _resolve_wildcards_outside_scene(
+    db: AsyncSession, prompt: str
+) -> tuple[str, str | None]:
+    """Resolve wildcards with any filled <scene> region held out of reach.
+
+    THE CAPTION MUST NEVER BE SCANNED FOR WILDCARDS. It is model output, and a description
+    that happened to contain <colour> would have a random option spliced into it. The API's
+    own ordering used to guarantee that for free — <SCENE> is filled AFTER wildcards, so the
+    words were not there yet — but the console now fills the region before it sends
+    (console#427), so the caption arrives inside the prompt and the guarantee has to be
+    enforced rather than inherited.
+
+    Masking also keeps the MARKERS away from the resolver. `<scene>` and `</scene>` both
+    match its pattern, as names "scene" and "/scene". Neither can be substituted today —
+    "scene" is reserved case-insensitively, and nothing is named "/scene" — but a match with
+    no substitution still makes _resolve_wildcards return a non-NULL template, which is the
+    record of "this prompt had wildcards in it" and would then be wrong.
+
+    Returns the caption UNWRAPPED in both the resolved prompt and the template: the markers
+    are a console editing affordance and have no meaning once a segment is stored.
+    """
+    captions: list[str] = []
+
+    def take(m: re.Match) -> str:
+        captions.append(m.group(1))
+        return _scene_mask(len(captions) - 1)
+
+    masked = _SCENE_REGION.sub(take, prompt)
+    resolved, template = await _resolve_wildcards(db, masked)
+
+    def restore(text: str) -> str:
+        for i, caption in enumerate(captions):
+            text = text.replace(_scene_mask(i), caption)
+        return text
+
+    return restore(resolved), (restore(template) if template is not None else None)
+
+
 def _drop_scene(prompt: str) -> str:
     """Remove the placeholder and the comma-space that would be left dangling beside it.
 
@@ -337,7 +381,7 @@ async def add_segment(
     next_index = max((s.index for s in job.segments), default=-1) + 1
 
     prompt = await _resolve_trigger(db, body.prompt, body.ltx_recipe)
-    resolved_prompt, prompt_template = await _resolve_wildcards(db, prompt)
+    resolved_prompt, prompt_template = await _resolve_wildcards_outside_scene(db, prompt)
     # After wildcards, deliberately — see _resolve_scene. The console resolves this itself
     # for segment 0, where a person can review the caption first; this catches a prompt that
     # arrives still carrying the placeholder, which is every continuation and any caller
@@ -862,9 +906,9 @@ async def update_segment_prompt(
             ),
         )
 
-    source = _unwrap_scene(body.prompt)
+    source = body.prompt
 
-    resolved, template = await _resolve_wildcards(db, source)
+    resolved, template = await _resolve_wildcards_outside_scene(db, source)
     segment.prompt = resolved
     segment.prompt_template = template
     await db.commit()
@@ -1537,7 +1581,7 @@ async def _reroll(db: AsyncSession, job: Job, old: Segment,
         # does not exist yet, and the claim resolves it then — the same way a continuation
         # created through the normal path is handled.
         triggered = await _resolve_trigger(db, prompt, old.ltx_recipe)
-        resolved, template = await _resolve_wildcards(db, triggered)
+        resolved, template = await _resolve_wildcards_outside_scene(db, triggered)
 
     fresh = _roll_new_take(job, old, prompt=resolved, prompt_template=template)
     db.add(fresh)
