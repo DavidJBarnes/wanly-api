@@ -88,20 +88,41 @@ class TestRollingAContinuation:
         assert resp.status_code == 400
         assert "current segment" in resp.json()["detail"]
 
-    async def test_the_predecessors_keep_the_seed_they_ran_on(self, db):
-        """The subtle one. A live take holds seed NULL, which means "ask the job", and this
-        roll gives the job a new seed. Without stamping them first, retrying segment 0 would
-        re-claim it, be handed the NEW seed, and render a different take from the one it is
-        retrying — silently."""
+    async def test_a_continuation_keeps_the_chains_seed(self, db):
+        """The seed is locked across a chain so segment 3 looks like segment 2 carrying on.
+        Rolling a continuation asks for another take of the same shot, not a different shot,
+        so the job's seed must not move."""
         user = await _user(db)
         job, segs = await _chain(db, user)
         original = job.seed
 
         await _post(db, user, f"/segments/{segs[-1].id}/reroll")
 
+        await db.refresh(job)
+        assert job.seed == original
+
+    async def test_a_continuation_roll_leaves_the_predecessors_alone(self, db):
+        """They hold seed NULL, meaning "ask the job", and the job still answers the same.
+        Stamping them would replace that with a copy free to drift."""
+        user = await _user(db)
+        _, segs = await _chain(db, user)
+
+        await _post(db, user, f"/segments/{segs[-1].id}/reroll")
+
         for seg in segs[:-1]:
             await db.refresh(seg)
-            assert seg.seed == original
+            assert seg.seed is None
+
+    async def test_rolling_segment_0_draws_a_new_seed(self, db):
+        """Segment 0 IS the chain's first frame, so rolling it is asking for a different shot
+        — which is what a new seed produces. It can only be the target when it is the only
+        live segment, so nothing else derives from the value being replaced."""
+        user = await _user(db)
+        job, segs = await _chain(db, user, length=1)
+        original = job.seed
+
+        await _post(db, user, f"/segments/{segs[0].id}/reroll")
+
         await db.refresh(job)
         assert job.seed != original
 
