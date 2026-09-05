@@ -25,6 +25,11 @@ class WorkerHeartbeat(BaseModel):
     loras: dict[str, Any] | None = None
     # Base models this worker can load. Optional so an older daemon still heartbeats.
     checkpoints: list[str] | None = None
+    # Artifact kinds this worker can fetch on demand ("lora" today). Optional, like every
+    # field before it: an older daemon that sends nothing must keep heartbeating rather than
+    # 422 itself out of the pool on upgrade day. Absent is read as "fetches nothing", which
+    # is the safe direction — it can still claim work whose files it already holds.
+    fetchable_kinds: list[str] | None = None
 
 
 class WorkerRename(BaseModel):

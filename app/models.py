@@ -293,6 +293,13 @@ class Worker(Base):
     # discovered: the engine binds to localhost, so the daemon is the only thing that can
     # ask. NULL means never reported — not the same as none available. See console#404.
     checkpoints: Mapped[list | None] = mapped_column(JSONB, nullable=True, default=None)
+    # Artifact kinds this worker can FETCH on demand, as it reports them: today ["lora"],
+    # because the daemon downloads a LoRA a pose names but this worker has never seen. It is
+    # declared by the worker rather than assumed by the API so that a daemon which learns to
+    # fetch checkpoints (console#423) opens the claim gate by saying so — no API change, and
+    # no second opinion here about what a daemon can do. NULL means never reported, which
+    # this treats as fetching nothing. See app/model_requirements.py.
+    fetchable_kinds: Mapped[list | None] = mapped_column(JSONB, nullable=True, default=None)
     drain_after_jobs: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
