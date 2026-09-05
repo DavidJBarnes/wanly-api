@@ -39,6 +39,18 @@ class Settings(BaseSettings):
     # Generous next to a 4.5 s cold caption. It is here to stop a wedged or unreachable
     # captioner holding a request open, not to bound normal work.
     joycaption_timeout_s: int = 60
+    # Automatic1111 on the same 2070, so a caption can ask it for the card back.
+    #
+    # The keep_alive above makes JoyCaption yield to A1111. Nothing made A1111 yield back,
+    # and it holds its checkpoint whether or not it is generating — which is enough on its
+    # own to abort a caption. See _yield_the_gpu in app/joycaption.py for the measurements.
+    #
+    # Empty disables it: anywhere the captioner does not share a card with A1111, there is
+    # nothing to ask and nothing to reload.
+    a1111_url: str = "http://2070.zero:7860"
+    # Unloading is a few seconds of torch teardown. Short, because failing to free the card
+    # only costs the caption, which is never fatal to a render.
+    a1111_yield_timeout_s: int = 20
     cors_origins: str = ""
     login_rate_limit: str = "5/minute"
     heartbeat_offline_seconds: int = 120

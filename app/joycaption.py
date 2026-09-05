@@ -17,7 +17,7 @@ WHY AN UNCENSORED MODEL
 WHERE IT RUNS
     The 2070, not a render box. The 3090 sits at ~23 of 24 GB while rendering. The 2070 also
     hosts Automatic1111, which is why keep_alive is short: a resident 5.5 GB model would
-    starve image generation.
+    starve image generation. Sharing goes both ways now — see _yield_the_gpu.
 """
 import base64
 import hashlib
@@ -107,6 +107,59 @@ def image_key(image_bytes: bytes, instruction: str) -> str:
     return h.hexdigest()
 
 
+async def _yield_the_gpu() -> bool:
+    """Ask Automatic1111 for the card back. True if it actually let go.
+
+    The 2070 is shared, and the sharing was one-directional: joycaption_keep_alive is 5s so
+    a caption releases VRAM the moment it is done, while A1111 holds its checkpoint until
+    told otherwise — idle or not. That is enough on its own to abort a caption.
+
+    MEASURED on the 2070, an 8192 MiB card:
+
+        JoyCaption at load    ~5970 MiB   3992 weights + 512 KV + 669 compute + 800 vision
+        A1111 idle, loaded    ~1720-1850 MiB
+
+    They do not fit. The load gets as far as the vision projector, the last 800 MiB
+    cudaMalloc fails, ggml aborts the runner, and ollama reports it as
+
+        llama runner process has terminated: %!w(<nil>)
+
+    which names neither the GPU nor the memory, and reads like a broken model. Both times it
+    happened here the card was NOT busy — A1111 was idle with a checkpoint resident, which
+    is simply its state between generations.
+
+    A1111 reloads its checkpoint from RAM on its next generation, a few seconds. That is the
+    right trade against a caption that cannot run at all — but only when it buys something,
+    which is why this is called on failure rather than before every caption. A burst of
+    captions coalesces inside the 5s keep_alive and never disturbs A1111 at all.
+
+    NOTHING HERE IS FATAL. An absent A1111 is the normal case anywhere else and returns
+    False, exactly like one that refuses: both mean the retry has no reason to behave
+    differently, so there is no retry.
+    """
+    base = settings.a1111_url.rstrip("/")
+    if not base:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=settings.a1111_yield_timeout_s) as client:
+            # Never interrupt work in progress. Unloading mid-generation would take down
+            # somebody's image to caption a frame, and the caption is the less urgent of the
+            # two — it has a fallback, the generation does not.
+            busy = await client.get(f"{base}/sdapi/v1/progress")
+            if busy.status_code == 200 and (busy.json().get("state") or {}).get("job_count"):
+                logger.info("A1111 is generating; leaving its checkpoint alone")
+                return False
+            resp = await client.post(f"{base}/sdapi/v1/unload-checkpoint")
+            if resp.status_code != 200:
+                logger.warning("A1111 refused to unload: %s", resp.status_code)
+                return False
+    except httpx.HTTPError as e:
+        logger.info("A1111 not reachable at %s (%s) — nothing to free", base, e)
+        return False
+    logger.info("A1111 released its checkpoint; retrying the caption")
+    return True
+
+
 async def describe(image_bytes: bytes, instruction: str) -> str:
     """Caption one image. Raises CaptionError; callers must treat that as non-fatal."""
     payload = {
@@ -120,6 +173,12 @@ async def describe(image_bytes: bytes, instruction: str) -> str:
     try:
         async with httpx.AsyncClient(timeout=settings.joycaption_timeout_s) as client:
             resp = await client.post(url, json=payload)
+            # ollama answers 500 for a runner that died loading, which on this box is
+            # almost always the GPU rather than the model. Ask the other tenant to let go
+            # and try once more; if nothing was freed, the second attempt would fail
+            # identically, so it is not made.
+            if resp.status_code == 500 and await _yield_the_gpu():
+                resp = await client.post(url, json=payload)
     except httpx.HTTPError as e:
         raise CaptionError(f"captioner unreachable at {settings.joycaption_url}: {e}") from e
     if resp.status_code != 200:
