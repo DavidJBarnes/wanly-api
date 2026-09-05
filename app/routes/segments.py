@@ -1233,7 +1233,27 @@ async def cancel_segment(
     return segment
 
 
-def _roll_new_take(job: Job, old: Segment) -> Segment:
+def _recipe_for_take(old: Segment, prompt: str | None) -> dict | None:
+    """The outgoing take's recipe, marked if this roll changed the prompt.
+
+    A re-roll's premise is that the seed is the ONLY difference, which is what makes two takes
+    comparable. Changing the prompt deliberately breaks that — and six takes later nothing
+    distinguishes a prompt-changed pair from a seed-only one, so a judgement made across them
+    is quietly worthless.
+
+    `edited` already carries exactly this meaning: the console writes it at creation to record
+    which of a pose's defaults the user overrode. A copy, never a mutation — the archived take
+    and its replacement share the dict otherwise, and marking one would rewrite the record of
+    the other.
+    """
+    recipe = old.ltx_recipe
+    if recipe is None or prompt is None or prompt == old.prompt:
+        return recipe
+    return {**recipe, "edited": sorted({*(recipe.get("edited") or []), "prompt"})}
+
+
+def _roll_new_take(job: Job, old: Segment, *, prompt: str | None = None,
+                   prompt_template: str | None = None) -> Segment:
     """Archive `old` and build its replacement.
 
     Was shared by a user-initiated re-roll and an automatic rule-driven one; the rule-driven
@@ -1249,6 +1269,15 @@ def _roll_new_take(job: Job, old: Segment) -> Segment:
     The job's seed then becomes the new take's seed, and the new take derives from it like any
     other segment. This is only safe because the outgoing take was just stamped: the seed being
     replaced is still recorded, on the row it actually produced. See #199 for the full model.
+
+    ANY INDEX, not only 0 (console#424). The replacement takes the index it replaces, and only
+    the LAST live segment may be rolled — a segment with a successor is the frame that
+    successor continues from. The predecessors are untouched, so the new take starts from the
+    same frame the archived one did, which is what keeps the pair comparable.
+
+    An optional `prompt` is the second half of that ticket: "that take was close, let me nudge
+    the wording". It arrives already resolved, because resolution needs the database and this
+    does not touch it.
     """
     if old.seed is None:
         # Exactly what the worker ran: the claim hands out job.seed. This said
@@ -1258,17 +1287,30 @@ def _roll_new_take(job: Job, old: Segment) -> Segment:
         # ran on the first time anyone re-rolled a continuation.
         old.seed = job.seed
     old.discarded = True
+
+    # Every OTHER live take deriving its seed from the job has to be stamped too, before the
+    # job's seed moves out from under it. Rolling index 0 never needed this — there was
+    # nothing else live. Rolling a continuation does: segments 0..n-1 hold seed NULL, which
+    # means "ask the job", and the job is about to answer differently. They would not just be
+    # mislabelled; retrying one re-claims it, the claim hands out job.seed, and it would
+    # render a different take from the one it is retrying.
+    for sibling in job.segments:
+        if sibling is not old and not sibling.discarded and sibling.seed is None:
+            sibling.seed = job.seed
+
     job.seed = new_seed()
 
     fresh = Segment(
         job_id=job.id,
-        index=0,
+        # The index it replaces. Both rows hold it at once — the unique index is partial over
+        # live rows — which is what lets an archived take keep its place in the chain.
+        index=old.index,
         # NULL: derive from the job like every other segment. The job seed WAS just set to this
         # take's seed, so a second copy on the segment would be the same number in two places,
         # free to drift.
         seed=None,
-        prompt=old.prompt,
-        prompt_template=old.prompt_template,
+        prompt=old.prompt if prompt is None else prompt,
+        prompt_template=old.prompt_template if prompt is None else prompt_template,
         duration_seconds=old.duration_seconds,
         speed=old.speed,
         start_image=old.start_image,
@@ -1276,7 +1318,7 @@ def _roll_new_take(job: Job, old: Segment) -> Segment:
         # The recipe is what the take IS. Without it a re-rolled LTX segment renders free-form
         # — no character LoRA, no trigger, no per-stage strengths — and comes back looking like
         # a different shot, which is the opposite of a re-roll's entire purpose.
-        ltx_recipe=old.ltx_recipe,
+        ltx_recipe=_recipe_for_take(old, prompt),
         auto_finalize=old.auto_finalize,
     )
 
@@ -1286,37 +1328,128 @@ def _roll_new_take(job: Job, old: Segment) -> Segment:
     return fresh
 
 
+_REROLL_REFUSED_STATUSES = (JobStatus.FINALIZED, JobStatus.FINALIZING, JobStatus.ARCHIVED)
+
+
+async def _reroll(db: AsyncSession, job: Job, old: Segment,
+                  prompt: str | None) -> Segment:
+    """Archive `old` and queue a fresh take of it. Shared by both routes.
+
+    This is the "show me another take" button. Everything that defines the shot — LoRAs,
+    recipe, start image, duration — is copied verbatim so that the seed is the only thing
+    that differs and the two takes are actually comparable. A wildcard prompt is copied
+    already-resolved for the same reason: re-rolling the wildcards too would change two
+    variables at once and make the comparison worth nothing.
+
+    Unless the caller asks for a different prompt, which is the point of console#424 and is
+    an explicit choice rather than a side effect. The recipe records that it happened.
+
+    ONLY THE LAST LIVE SEGMENT. A segment with a live successor is the frame that successor
+    continues from; replacing it would leave every one of them continuing from a frame that
+    no longer exists. That was expressed as "index must be 0" while re-roll only served
+    single-segment jobs — it is the same protection, stated generally.
+
+    The old take is discarded, not deleted. It keeps its video under its own seed, which is
+    why segments have a seed column at all. Rolling repeatedly is the point, so an archive
+    that relabelled every previous take with the newest seed would destroy exactly the record
+    it exists to accumulate.
+
+    Trim and transition are deliberately NOT copied: they describe the take being archived,
+    not the one about to be generated.
+    """
+    if job.status in _REROLL_REFUSED_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Job is '{job.status}' and cannot be re-rolled. Its stitched output "
+                "describes the takes that were live when it was built; archiving one behind "
+                "that video would make the record wrong."
+            ),
+        )
+
+    live = [s for s in job.segments if not s.discarded]
+    last = max(live, key=lambda s: s.index, default=None)
+    if old.discarded or last is None or old.id != last.id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Only the job's current segment can be re-rolled (that is index "
+                f"{last.index if last else '-'}, this is {old.index}). A later segment "
+                "continues from this one's last frame, so replacing it would orphan them."
+            ),
+        )
+
+    if old.status not in (SegmentStatus.FAILED, SegmentStatus.COMPLETED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Segment {old.index} is '{old.status}'. Cancel it before re-rolling — "
+                "otherwise the worker finishes generating a take that has already been "
+                "archived."
+            ),
+        )
+
+    resolved, template = None, None
+    if prompt is not None:
+        # Exactly the creation path's order. <TRIGGER> first, because it shares syntax with
+        # wildcards and a Wildcard named TRIGGER would otherwise substitute a random option
+        # and the render would quietly name the wrong character.
+        #
+        # <SCENE> is deliberately left alone: for a continuation it describes a frame that
+        # does not exist yet, and the claim resolves it then — the same way a continuation
+        # created through the normal path is handled.
+        triggered = await _resolve_trigger(db, prompt, old.ltx_recipe)
+        resolved, template = await _resolve_wildcards(db, triggered)
+
+    fresh = _roll_new_take(job, old, prompt=resolved, prompt_template=template)
+    db.add(fresh)
+    await db.commit()
+    await db.refresh(fresh)
+    return fresh
+
+
+@router.post("/segments/{segment_id}/reroll", response_model=SegmentResponse)
+async def reroll_segment(
+    segment_id: UUID,
+    body: RerollRequest | None = None,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Another take of this segment, optionally with a different prompt (console#424).
+
+    Addressed by SEGMENT rather than by job. "The job's one segment" was unambiguous while
+    re-roll only served index 0; once any index can be the target, the caller has to be able
+    to say which one it meant — and the API has to be able to refuse when that is no longer
+    the current segment, rather than rolling something the user was not looking at.
+    """
+    result = await db.execute(
+        select(Segment)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+    )
+    segment = result.scalar_one_or_none()
+    if segment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+
+    job = (await db.execute(
+        select(Job).where(Job.id == segment.job_id).options(selectinload(Job.segments))
+    )).scalar_one()
+
+    return await _reroll(db, job, segment, body.prompt if body else None)
+
+
 @router.post("/jobs/{job_id}/reroll", response_model=SegmentResponse)
-async def reroll_first_segment(
+async def reroll_current_segment(
     job_id: UUID,
     body: RerollRequest | None = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Archive segment 0 and queue a fresh one, identical except for the seed.
+    """Re-roll whatever the job's current segment is.
 
-    This is the "show me another take" button. Everything that defines the shot -- prompt, LoRAs,
-    recipe, start image, duration -- is copied verbatim so that the seed is the ONLY
-    thing that differs and the two takes are actually comparable. A wildcard prompt is copied
-    already-resolved for the same reason: re-rolling the wildcards as well would change two
-    variables at once and make the comparison worth nothing.
-
-    The old take is discarded, not deleted. It keeps its video under its own seed -- which is why
-    segments have a seed column at all. Rolling repeatedly is the point of this endpoint, so an
-    archive that relabelled every previous take with the newest seed would destroy exactly the
-    record it exists to accumulate.
-
-    Only offered while the job is a single live segment. Once there is a segment 1, segment 0 is
-    the thing it continues from, and replacing it would orphan every successor that was generated
-    from its last frame.
-
-    Trim and transition are deliberately NOT copied: they describe the take being archived,
-    not the one about to be generated.
-
-    The "re-roll until" rule is gone with the metrics it judged (#151) — it compared a
-    threshold against the mean of an identity or motion series, and nothing produces those
-    now. A rule would have been permanently unevaluable, which the old code degraded to by
-    logging "sitting idle" rather than failing. Rolling a take by hand is unaffected.
+    Superseded by POST /segments/{id}/reroll and kept because a browser holding the previous
+    console still calls it — dropping it would break the button for as long as a stale tab
+    lives. For the single-segment job that console offers it on, the two are identical.
     """
     result = await db.execute(
         select(Job)
@@ -1327,35 +1460,13 @@ async def reroll_first_segment(
     if job is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
 
-    # Live segments only. After a re-roll the job holds a discarded segment 0 beside the new one,
-    # and rolling again has to stay available -- that is the whole workflow.
     live = [s for s in job.segments if not s.discarded]
-    if len(live) != 1 or live[0].index != 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                "Re-roll only applies to a job with a single segment. This job has "
-                f"{len(live)} live segments; a later segment continues from segment 0's last "
-                "frame, so replacing it would orphan them."
-            ),
-        )
+    if not live:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Job has no live segment to re-roll.")
 
-    old = live[0]
-    if old.status not in (SegmentStatus.FAILED, SegmentStatus.COMPLETED):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Segment 0 is '{old.status}'. Cancel it before re-rolling — otherwise the "
-                "worker finishes generating a take that has already been archived."
-            ),
-        )
-
-    fresh = _roll_new_take(job, old)
-    db.add(fresh)
-
-    await db.commit()
-    await db.refresh(fresh)
-    return fresh
+    return await _reroll(db, job, max(live, key=lambda s: s.index),
+                         body.prompt if body else None)
 
 
 @router.post("/segments/{segment_id}/discard", response_model=SegmentResponse)

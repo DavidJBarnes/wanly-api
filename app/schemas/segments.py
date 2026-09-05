@@ -231,12 +231,19 @@ class HologramRequest(BaseModel):
 
 
 class RerollRequest(BaseModel):
-    """Body for POST /jobs/{id}/reroll.
+    """Body for POST /segments/{id}/reroll.
 
     Carried a "re-roll until" rule — a metric and a threshold, judged on completion. The
     metrics it judged are gone (#151), so a rule would be permanently unevaluable and the
-    fields with it. Kept as a class because the endpoint still accepts an optional body.
+    fields with it.
+
+    It now carries a prompt instead (console#424): "that take was close, let me nudge the
+    wording". Absent means a seed-only roll, which is what re-roll has always been and still
+    is by default — the two takes then differ in one variable and are comparable. Present is
+    an explicit choice to break that, and the new take's recipe records it.
     """
+
+    prompt: Optional[str] = None
 
 
 class SegmentStatusUpdate(BaseModel):
