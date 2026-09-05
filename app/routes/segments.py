@@ -1316,9 +1316,13 @@ def _roll_new_take(job: Job, old: Segment, *, prompt: str | None = None,
     answer than a recorded number. Same value the worker used -- this records it, it does not
     change it.
 
-    The job's seed then becomes the new take's seed, and the new take derives from it like any
+    Rolling SEGMENT 0 then gives the job a new seed, and the new take derives from it like any
     other segment. This is only safe because the outgoing take was just stamped: the seed being
     replaced is still recorded, on the row it actually produced. See #199 for the full model.
+
+    Rolling a CONTINUATION keeps the job's seed. The seed is locked across a chain so that
+    segment 3 looks like segment 2 carrying on, and a roll there is asking for a different
+    take of the same shot — not a different shot.
 
     ANY INDEX, not only 0 (console#424). The replacement takes the index it replaces, and only
     the LAST live segment may be rolled — a segment with a successor is the frame that
@@ -1338,17 +1342,22 @@ def _roll_new_take(job: Job, old: Segment, *, prompt: str | None = None,
         old.seed = job.seed
     old.discarded = True
 
-    # Every OTHER live take deriving its seed from the job has to be stamped too, before the
-    # job's seed moves out from under it. Rolling index 0 never needed this — there was
-    # nothing else live. Rolling a continuation does: segments 0..n-1 hold seed NULL, which
-    # means "ask the job", and the job is about to answer differently. They would not just be
-    # mislabelled; retrying one re-claims it, the claim hands out job.seed, and it would
-    # render a different take from the one it is retrying.
-    for sibling in job.segments:
-        if sibling is not old and not sibling.discarded and sibling.seed is None:
-            sibling.seed = job.seed
-
-    job.seed = new_seed()
+    # SEGMENT 0 REDRAWS THE SEED; A CONTINUATION KEEPS IT.
+    #
+    # Segment 0 IS the chain's first frame, so rolling it is asking for a different shot and
+    # a new seed is the whole point. A continuation is not: the seed is locked across a chain
+    # precisely so segment 3 looks like segment 2 carrying on, and redrawing it there would
+    # change the one variable that is supposed to stay fixed for the length of the shot.
+    #
+    # So rolling a continuation varies the PROMPT and nothing else — which is why the prompt
+    # override exists, and why rolling one without editing the prompt will reproduce much the
+    # same take. That is the honest consequence of a locked seed, not a bug in the roll.
+    #
+    # This also removes the need to stamp the other live takes: their seeds only had to be
+    # rescued when the job's seed moved under them, and now it moves only for index 0, where
+    # nothing else is live — the last-live-segment rule makes index 0 the only segment.
+    if old.index == 0:
+        job.seed = new_seed()
 
     fresh = Segment(
         job_id=job.id,
