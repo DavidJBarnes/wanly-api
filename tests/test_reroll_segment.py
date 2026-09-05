@@ -231,16 +231,24 @@ class TestReroll:
             (await db.execute(select(Segment).where(Segment.job_id == job.id))).scalars().all()
         ) == 3
 
-    async def test_a_job_with_a_successor_segment_is_refused(self, db):
-        """Segment 1 was generated from segment 0's last frame. Replacing 0 orphans it."""
+    async def test_the_job_route_rolls_whatever_is_current(self, db):
+        """It used to refuse a job with a successor outright, because re-roll only served
+        index 0. It now targets the job's CURRENT segment (console#424) — segment 1 here —
+        and segment 0 is left alone, since segment 1 continues from its last frame.
+
+        Rolling an earlier segment is still refused; that is the segment-addressed route's
+        job now, and test_reroll_any_segment.py covers it."""
         user = await _user(db)
-        job, _ = await _job_with_segment(db, user)
+        job, first = await _job_with_segment(db, user)
         db.add(Segment(job_id=job.id, index=1, prompt="p", status=SegmentStatus.COMPLETED))
         await db.flush()
 
         resp = await _reroll(db, user, job.id)
-        assert resp.status_code == 400
-        assert "single segment" in resp.json()["detail"]
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["index"] == 1
+        await db.refresh(first)
+        assert first.discarded is False
 
     async def test_a_running_segment_is_refused(self, db):
         # Otherwise the worker keeps generating a take that has already been archived.
