@@ -72,6 +72,12 @@ class WorkerResponse(BaseModel):
     a1111: dict[str, Any] | None = None
     loras: dict[str, Any] | None = None
     checkpoints: list[str] | None = None
+    # What the worker says it can FETCH, beside what it already holds. Stored since #249 and
+    # missing from this schema until now, so it read as NULL everywhere it was looked at —
+    # including while checking whether a restarted daemon had picked the field up. Pydantic
+    # drops what a response model does not name, silently, which makes a stored value and an
+    # unreported one indistinguishable from outside.
+    fetchable_kinds: list[str] | None = None
     drain_after_jobs: int | None = None
     last_heartbeat: datetime
     registered_at: datetime
