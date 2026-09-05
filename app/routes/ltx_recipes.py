@@ -27,6 +27,7 @@ from app.auth import get_current_user, verify_api_key_or_bearer
 from app.database import get_db
 from app.ltx_stack import LTX_STACK
 from app.models import LtxCharacter, LtxRecipe, User, Worker
+from app.negative_prompt import default_negative_prompt
 from app.schemas.ltx import (
     LtxCharacterCreate,
     LtxCharacterUpdate,
@@ -88,17 +89,32 @@ async def get_recipe_book(
         select(LtxRecipe).order_by(LtxRecipe.name)
     )).scalars().all()
 
+    # The Settings field, not LTX_STACK['negative']. Resolving against the constant is what
+    # made the setting unreachable: the console prefills its form from the resolved value,
+    # so every segment was created carrying the constant and the claim-time fallback to the
+    # setting never had a NULL to fire on (console#430).
+    default_negative = await default_negative_prompt(db)
+
     # Poses are character-agnostic, so EVERY pose is offered for EVERY character. That is the
     # point: a new LoRA is never locked out for want of rows in a table — add the character
     # and all of them work immediately.
     return {
         "stack": LTX_STACK,
+        # What an un-overridden pose resolves to. Returned alongside the stack rather than
+        # folded into it: `stack` is the constant configuration the image ships with, and
+        # this one is a setting that can differ from it.
+        "default_negative_prompt": default_negative,
         "poses": [
             {
                 "id": str(r.id),
                 "name": r.name,
                 "prompt_template": r.prompt_template,
-                "negative_prompt": r.negative_prompt or LTX_STACK["negative"],
+                "negative_prompt": r.negative_prompt or default_negative,
+                # The RAW override, so the editor can tell "inherits the default" from
+                # "overridden". Without it the editor could only show the resolved value,
+                # and saving an untouched pose wrote that back as an override -- which is
+                # how all 16 poses ended up pinned to a copy of the stack constant.
+                "negative_prompt_override": r.negative_prompt,
                 "frames": r.frames or LTX_STACK["frames"],
                 # `or` is wrong here and `is None` is right: img_compression 0 is a REAL
                 # setting -- it bypasses the conditioning-frame encode entirely -- and `or`
