@@ -259,11 +259,38 @@ class Favorite(Base):
 
 
 class ImageMeta(Base):
+    """What we know about an image in the repo, beyond what S3 itself stores.
+
+    One row per s3:// path, created on first use. A row exists only because something was
+    said about the image — tags, or a description — so the absence of a row is meaningful:
+    `list_untagged_images` reads it as "never tagged".
+    """
     __tablename__ = "image_meta"
 
     path = mapped_column(Text, primary_key=True)
     tags = mapped_column(Text, nullable=True)
+    # JoyCaption's description of this frame, produced once and reused (console#414).
+    #
+    # Cached rather than re-derived because it costs 2070 time — 4.5s cold, 1.2s warm — and
+    # the same image starts many jobs. It is not a derived value that can be recomputed for
+    # free: the model is nondeterministic, so a second call gives DIFFERENT words, and the
+    # words are what the person read and accepted.
+    scene_description = mapped_column(Text, nullable=True)
+    # Which instruction produced it. A caption written under "terse" and one under "rich"
+    # are different artefacts, and the row has to say which one this is — the same reason
+    # CaptionResponse returns it.
+    scene_instruction = mapped_column(Text, nullable=True)
+    scene_described_at = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    def is_empty(self) -> bool:
+        """Nothing left worth a row.
+
+        The tags endpoint deletes a row when its tags are cleared. Once a description can
+        also live here that is no longer the same question, and getting it wrong throws away
+        GPU work over a tag edit.
+        """
+        return not (self.tags or "").strip() and not (self.scene_description or "").strip()
 
 
 class Worker(Base):

@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import re
 import uuid
 from datetime import datetime, timezone
@@ -11,8 +12,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
 from app.config import settings
 from app.database import get_db
-from app.models import Favorite, ImageMeta, Job, Segment
-from app.schemas.images import ImageTagsUpdate
+from app.joycaption import CaptionError
+from app.models import Favorite, ImageMeta, Job, Segment, User
+from app.routes.captions import caption_image_bytes
+from app.schemas.images import ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate
 from app.tag_filter import like_escape
 from app.tag_filter import tag_clause as _tag_clause
 from app.s3 import (
@@ -26,9 +29,64 @@ from app.s3 import (
     upload_bytes,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(tags=["images"])
 
 _FOLDER_NAME_RE = re.compile(r"^[a-zA-Z0-9 _-]+$")
+
+
+async def _meta_by_path(db: AsyncSession, paths: list[str]) -> dict[str, dict]:
+    """The image_meta fields a listing shows, keyed by path.
+
+    One helper rather than a copy of the same select in each of the four listings. There
+    were three copies when this only had to fetch tags, and adding the scene description
+    would have made four — which is how one listing quietly ends up returning a field the
+    others do not.
+
+    Columns, not entities: a listing needs three values per row and never mutates one, and
+    the whole point of the folder view is that it stays cheap over a few thousand objects.
+    """
+    if not paths:
+        return {}
+    rows = (await db.execute(
+        select(ImageMeta.path, ImageMeta.tags,
+               ImageMeta.scene_description, ImageMeta.scene_described_at)
+        .where(ImageMeta.path.in_(paths))
+    )).all()
+    return {
+        row[0]: {
+            "tags": row[1] or None,
+            "scene_description": row[2] or None,
+            "scene_described_at": row[3],
+        }
+        for row in rows
+    }
+
+
+_NO_META = {"tags": None, "scene_description": None, "scene_described_at": None}
+
+
+def _meta_fields(meta) -> dict:
+    """The image_meta half of a listing row. Every listing returns the same shape.
+
+    Takes either the mapping _meta_by_path builds or an ImageMeta itself — search already
+    holds the entity, and making it re-fetch the same row as columns would be a second
+    query for data it has. None is an image with no row.
+
+    An image with no row is not a different shape from one with a row: it is the same
+    fields, all empty. Returning fewer keys is how a client ends up with `undefined` where
+    it expected null.
+    """
+    if meta is None:
+        return dict(_NO_META)
+    if isinstance(meta, ImageMeta):
+        return {
+            "tags": meta.tags or None,
+            "scene_description": meta.scene_description or None,
+            "scene_described_at": meta.scene_described_at,
+        }
+    return dict(meta)
 
 # Every column that can hold an s3:// path a user could delete through this router.
 # Job.identity_reference_image is deliberately absent: the daemon writes it into the *jobs*
@@ -157,18 +215,12 @@ async def list_folder_images(
 
     paths = [f"s3://{bucket}/{obj['Key']}" for obj in objects if not obj["Key"].endswith("/.folder")]
     in_use_set: set[str] = set()
-    tags_map: dict[str, str] = {}
+    meta_map: dict[str, dict] = {}
     if paths:
         # Same helper the delete endpoint gates on. When these two disagree the UI is the one
         # that gets believed, which is how referenced images got deleted in the first place.
         in_use_set = set(await find_image_references(db, paths))
-
-        meta_result = await db.execute(
-            select(ImageMeta.path, ImageMeta.tags).where(ImageMeta.path.in_(paths))
-        )
-        for row in meta_result.all():
-            if row[1]:
-                tags_map[row[0]] = row[1]
+        meta_map = await _meta_by_path(db, paths)
 
     return [
         {
@@ -178,7 +230,7 @@ async def list_folder_images(
             "size": obj["Size"],
             "last_modified": obj["LastModified"],
             "in_use": f"s3://{bucket}/{obj['Key']}" in in_use_set,
-            "tags": tags_map.get(f"s3://{bucket}/{obj['Key']}"),
+            **_meta_fields(meta_map.get(f"s3://{bucket}/{obj['Key']}")),
         }
         for obj in objects
         if not obj["Key"].endswith("/.folder")
@@ -214,14 +266,10 @@ async def list_favorite_images(
     items = await asyncio.gather(*[_meta(ref) for ref in refs])
 
     uris = [item["path"] for item in items if item is not None]
-    if uris:
-        meta_result = await db.execute(
-            select(ImageMeta.path, ImageMeta.tags).where(ImageMeta.path.in_(uris))
-        )
-        tags_map = {row[0]: row[1] for row in meta_result.all() if row[1]}
-        for item in items:
-            if item is not None:
-                item["tags"] = tags_map.get(item["path"])
+    meta_map = await _meta_by_path(db, uris)
+    for item in items:
+        if item is not None:
+            item.update(_meta_fields(meta_map.get(item["path"])))
 
     return [item for item in items if item is not None]
 
@@ -251,14 +299,15 @@ async def list_untagged_images(
 
     tagged: set[str] = set()
     in_use_set: set[str] = set()
+    meta_map: dict[str, dict] = {}
     if paths:
-        meta_result = await db.execute(
-            select(ImageMeta.path, ImageMeta.tags).where(ImageMeta.path.in_(paths))
-        )
-        tagged = {row[0] for row in meta_result.all() if row[1] and row[1].strip()}
+        meta_map = await _meta_by_path(db, paths)
+        tagged = {p for p, m in meta_map.items() if (m["tags"] or "").strip()}
 
         in_use_set = set(await find_image_references(db, paths))
 
+    # An untagged image can still carry a description — describing one is offered in the
+    # modal whether or not it has tags — so the row is read here rather than assumed empty.
     untagged = [
         {
             "key": obj["Key"],
@@ -267,7 +316,7 @@ async def list_untagged_images(
             "size": obj["Size"],
             "last_modified": obj["LastModified"],
             "in_use": f"s3://{bucket}/{obj['Key']}" in in_use_set,
-            "tags": None,
+            **_meta_fields(meta_map.get(f"s3://{bucket}/{obj['Key']}")),
         }
         for obj in objects
         if f"s3://{bucket}/{obj['Key']}" not in tagged
@@ -277,8 +326,14 @@ async def list_untagged_images(
 
 
 @router.post("/images/move", dependencies=[Depends(get_current_user)])
-async def move_images(body: dict):
-    """Move one or more images to a target folder (S3 copy + delete)."""
+async def move_images(body: dict, db: AsyncSession = Depends(get_db)):
+    """Move one or more images to a target folder (S3 copy + delete).
+
+    The image_meta row moves WITH the object. It did not before, so a move silently dropped
+    an image's tags — survivable when a tag is five seconds of typing, not when the row also
+    holds a scene description that cost GPU time and cannot be reproduced word for word
+    (console#414). The path is that row's primary key, so this is a rename, not a copy.
+    """
     keys: list[str] = body.get("keys", [])
     target_folder: str = body.get("target_folder", "").strip()
     if not keys:
@@ -287,13 +342,41 @@ async def move_images(body: dict):
         raise HTTPException(status_code=400, detail="target_folder is required")
     bucket = settings.s3_images_bucket
 
-    async def _move_one(src_key: str) -> str:
+    async def _move_one(src_key: str) -> tuple[str, str]:
         filename = src_key.split("/", 1)[1] if "/" in src_key else src_key
         dst_key = f"{target_folder}/{filename}"
         await asyncio.to_thread(move_object, bucket, src_key, dst_key)
-        return dst_key
+        return src_key, dst_key
 
     moved = await asyncio.gather(*[_move_one(k) for k in keys])
+
+    # After the objects, deliberately. If a move fails the metadata must still describe
+    # where the image actually is, and a row pointing at the old key is right in that case.
+    for src_key, dst_key in moved:
+        src = f"s3://{bucket}/{src_key}"
+        dst = f"s3://{bucket}/{dst_key}"
+        if src == dst:
+            continue
+        meta = await db.get(ImageMeta, src)
+        if meta is None:
+            continue
+        # The path is the primary key, so this is a delete plus an insert. A row already at
+        # the destination — the same filename moved back into a folder it came from — is
+        # overwritten by the one that travelled with the object.
+        existing = await db.get(ImageMeta, dst)
+        if existing is not None:
+            await db.delete(existing)
+            await db.flush()
+        db.add(ImageMeta(
+            path=dst,
+            tags=meta.tags,
+            scene_description=meta.scene_description,
+            scene_instruction=meta.scene_instruction,
+            scene_described_at=meta.scene_described_at,
+        ))
+        await db.delete(meta)
+    await db.commit()
+
     return {"moved": len(moved)}
 
 
@@ -348,18 +431,109 @@ async def update_image_tags(
     else:
         tags_val = None
 
-    if tags_val is None:
-        if meta:
+    if meta:
+        meta.tags = tags_val
+        # Deleting the row on a cleared tag was fine when tags were all it held. A scene
+        # description costs 2070 time to produce and cannot be regenerated identically, so
+        # the row goes only when nothing is left on it at all (console#414).
+        if meta.is_empty():
             await db.delete(meta)
-    else:
-        if meta:
-            meta.tags = tags_val
-        else:
-            meta = ImageMeta(path=path, tags=tags_val)
-            db.add(meta)
+    elif tags_val is not None:
+        db.add(ImageMeta(path=path, tags=tags_val))
 
     await db.commit()
     return {"path": path, "tags": tags_val}
+
+
+# ---------------------------------------------------------------------------------------
+# Scene descriptions (console#414)
+#
+# JoyCaption's description of a frame, stored on the image rather than re-derived per job.
+# POST /captions/describe stays as it is: a stateless preview for bytes nobody has committed
+# to. This is the other case — an image that lives in the repo, described once, by a person
+# who is looking at it.
+# ---------------------------------------------------------------------------------------
+
+
+def _scene_response(path: str, meta: ImageMeta | None) -> ImageSceneResponse:
+    description = (meta.scene_description if meta else None) or None
+    return ImageSceneResponse(
+        path=path,
+        scene_description=description,
+        scene_instruction=(meta.scene_instruction if meta else None) or None,
+        scene_described_at=meta.scene_described_at if meta else None,
+        words=len(description.split()) if description else 0,
+    )
+
+
+def _require_images_bucket(path: str) -> None:
+    bucket = settings.s3_images_bucket
+    if not path.startswith(f"s3://{bucket}/"):
+        raise HTTPException(status_code=400, detail="Path must be in the images bucket")
+
+
+@router.get("/images/scene", response_model=ImageSceneResponse,
+            dependencies=[Depends(get_current_user)])
+async def get_image_scene(path: str = Query(...), db: AsyncSession = Depends(get_db)):
+    """This image's saved description, or nulls if it has never been described.
+
+    Nulls rather than a 404: "no description yet" is an ordinary state of a perfectly good
+    image, and the caller — the New Job modal — has to render it either way.
+    """
+    _require_images_bucket(path)
+    return _scene_response(path, await db.get(ImageMeta, path))
+
+
+@router.post("/images/scene", response_model=ImageSceneResponse,
+             dependencies=[Depends(get_current_user)])
+async def describe_image_scene(
+    path: str = Query(...),
+    body: ImageSceneRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Describe this image now and store the result, replacing any previous description.
+
+    ALWAYS regenerates. This one call is both the first description and the re-roll, because
+    they are the same act — the caller decides which it is by deciding whether to call. Any
+    "only if missing" rule here would be a second opinion about a decision the UI has
+    already made, and would make re-roll impossible to express.
+    """
+    _require_images_bucket(path)
+    body = body or ImageSceneRequest()
+
+    try:
+        # boto3 is synchronous; off the event loop so one slow fetch cannot stall the API.
+        image = await asyncio.to_thread(download_bytes, path)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"could not read {path}: {e}") from e
+
+    try:
+        caption, instruction = await caption_image_bytes(
+            db, image, style=body.style, instruction=body.instruction)
+    except CaptionError as e:
+        # 503, as /captions/describe does: the captioner being down is a temporary condition
+        # on another host, not a bug in this request. "Try again" is honest advice.
+        logger.warning("scene description failed for %s: %s", path, e)
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    caption = caption.strip()
+    if not caption:
+        # A blank caption is a failure wearing a success's clothes. Storing it would mark the
+        # image described and stop anything ever asking again.
+        raise HTTPException(status_code=503,
+                            detail="the captioner returned nothing for this image")
+
+    meta = await db.get(ImageMeta, path)
+    if meta is None:
+        meta = ImageMeta(path=path)
+        db.add(meta)
+    meta.scene_description = caption
+    meta.scene_instruction = instruction
+    meta.scene_described_at = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(meta)
+
+    return _scene_response(path, meta)
 
 
 def search_pattern(q: str) -> str:
@@ -462,7 +636,7 @@ async def search_images(
             "filename": key.split("/", 1)[1] if "/" in key else key,
             "size": obj["Size"],
             "last_modified": obj["LastModified"],
-            "tags": meta.tags,
+            **_meta_fields(meta),
         }
 
     # Concurrently, because this is the page's real cost. Each row needs one S3 HEAD, and a
