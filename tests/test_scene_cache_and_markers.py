@@ -140,3 +140,87 @@ class TestResolveUsesTheCache:
 
         assert SCENE_PLACEHOLDER not in out
         assert await db.get(ImageMeta, REPO) is None
+
+
+class TestSceneAndWildcardsDoNotCollide:
+    """A filled scene must be invisible to the wildcard resolver.
+
+    <SCENE> is filled AFTER wildcards precisely so the caption is never re-scanned — a
+    description is model output, and one containing <color> would otherwise have a random
+    option spliced into it. The console filling the region before it sends (console#427)
+    moved the caption into the prompt BEFORE the API sees it, so that ordering no longer
+    protects anything on its own and the region has to be held out of reach explicitly.
+    """
+
+    @staticmethod
+    async def _wildcard(db, name, options):
+        from app.models import Wildcard
+
+        db.add(Wildcard(name=name, options=options))
+        await db.flush()
+
+    @pytest.mark.asyncio
+    async def test_a_caption_containing_a_wildcard_name_is_left_alone(self, db):
+        from app.routes.segments import _resolve_wildcards_outside_scene
+
+        await self._wildcard(db, "color", ["scarlet"])
+        prompt = "k3llydw, <scene>a woman in a <color> dress</scene>, she grips"
+
+        resolved, _ = await _resolve_wildcards_outside_scene(db, prompt)
+
+        assert resolved == "k3llydw, a woman in a <color> dress, she grips"
+        assert "scarlet" not in resolved, "the caption was scanned for wildcards"
+
+    @pytest.mark.asyncio
+    async def test_a_wildcard_OUTSIDE_the_scene_still_resolves(self, db):
+        """The masking must not cost the feature it is protecting."""
+        from app.routes.segments import _resolve_wildcards_outside_scene
+
+        await self._wildcard(db, "color", ["scarlet"])
+        prompt = "k3llydw, <scene>a woman on a sofa</scene>, a <color> light"
+
+        resolved, _ = await _resolve_wildcards_outside_scene(db, prompt)
+
+        assert resolved == "k3llydw, a woman on a sofa, a scarlet light"
+
+    @pytest.mark.asyncio
+    async def test_the_markers_do_not_count_as_wildcards(self, db):
+        """`<scene>` and `</scene>` both match the resolver's pattern, as "scene" and
+        "/scene". A match that substitutes nothing still sets the template, which is the
+        record of "this prompt had wildcards in it"."""
+        from app.routes.segments import _resolve_wildcards_outside_scene
+
+        resolved, template = await _resolve_wildcards_outside_scene(
+            db, "k3llydw, <scene>a woman on a sofa</scene>, she grips")
+
+        assert resolved == "k3llydw, a woman on a sofa, she grips"
+        assert template is None, "the markers were counted as wildcards"
+
+    @pytest.mark.asyncio
+    async def test_an_unfilled_placeholder_still_reaches_the_resolver_untouched(self, db):
+        """<SCENE> is not a region and must survive to be described later."""
+        from app.routes.segments import _resolve_wildcards_outside_scene
+
+        resolved, _ = await _resolve_wildcards_outside_scene(db, TEMPLATE)
+        assert SCENE_PLACEHOLDER in resolved
+
+    @pytest.mark.asyncio
+    async def test_the_template_records_the_prompt_with_its_wildcards_intact(self, db):
+        from app.routes.segments import _resolve_wildcards_outside_scene
+
+        await self._wildcard(db, "color", ["scarlet"])
+        prompt = "k3llydw, <scene>a woman on a sofa</scene>, a <color> light"
+
+        _, template = await _resolve_wildcards_outside_scene(db, prompt)
+
+        # The scene comes back unwrapped -- the markers are a console affordance and mean
+        # nothing to a stored segment -- while <color> is still there to be re-drawn.
+        assert template == "k3llydw, a woman on a sofa, a <color> light"
+
+    @pytest.mark.asyncio
+    async def test_two_regions_keep_their_own_captions(self, db):
+        from app.routes.segments import _resolve_wildcards_outside_scene
+
+        resolved, _ = await _resolve_wildcards_outside_scene(
+            db, "<scene>first</scene> then <scene>second</scene>")
+        assert resolved == "first then second"
