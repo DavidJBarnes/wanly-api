@@ -637,20 +637,34 @@ async def claim_next_segment(
         if segment.index == 0:
             resolved_start_image = job.starting_image
         else:
-            # The LIVE segment at the previous index. Index alone stopped identifying one row
-            # when re-rolling arrived: an archived take keeps its index, so a job rolled six
-            # times has seven rows at index 0 and this raised MultipleResultsFound — a 500 on
-            # every claim, which stops the queue dead rather than degrading.
+            # The NEAREST PRECEDING live segment that actually produced a frame — not
+            # whatever sits at index - 1.
             #
-            # Live is also the right answer on its own terms: this resolves the frame the next
-            # segment continues from, and a discarded take is not what anything continues from.
+            # Live, because a discarded take is not what anything continues from. Index alone
+            # stopped identifying one row when re-rolling arrived: an archived take keeps its
+            # index, so a job rolled six times has seven rows at index 0, and matching on the
+            # index raised MultipleResultsFound — a 500 on every claim, which stops the queue
+            # dead rather than degrading.
+            #
+            # NEAREST rather than exactly one back, because indexes are not contiguous.
+            # Deleting a segment renumbers the rest, but a discarded take keeps its index, so
+            # a job can hold a live row at 5 whose predecessor is at 3. `index - 1` then found
+            # nothing, the start image stayed NULL, and the daemon rendered a CONTINUATION AS
+            # TEXT-TO-VIDEO: ten minutes of GPU producing a clip unrelated to the chain, with
+            # nothing anywhere saying why (console#440).
+            #
+            # A row with no last_frame_path is skipped for the same reason it would be
+            # useless: there is no frame on it to continue from.
             prev_result = await db.execute(
                 select(Segment)
                 .where(
                     Segment.job_id == job.id,
-                    Segment.index == segment.index - 1,
+                    Segment.index < segment.index,
                     Segment.discarded.is_(False),
+                    Segment.last_frame_path.is_not(None),
                 )
+                .order_by(Segment.index.desc())
+                .limit(1)
             )
             prev_segment = prev_result.scalar_one_or_none()
             if prev_segment is not None:
@@ -661,6 +675,33 @@ async def claim_next_segment(
                 if prev_segment.last_frame_path and prev_segment.last_frame_path not in reference_frames:
                     reference_frames.append(prev_segment.last_frame_path)
                     reference_frames = reference_frames[-3:]
+
+    # A CONTINUATION WITH NO FRAME TO CONTINUE FROM IS NOT A TEXT-TO-VIDEO RENDER.
+    #
+    # start_image=None reaches the daemon as "generate from noise", which is right for a
+    # segment 0 that never had one and catastrophic for a continuation: ten minutes of GPU on
+    # a clip that has nothing to do with the chain, landing as a completed segment nobody can
+    # tell is wrong without watching it. Failing here costs a claim and says why.
+    #
+    # reprocess jobs are exempt — a smashcut or a hologram legitimately has no start image;
+    # its source is elsewhere on the row.
+    if (
+        resolved_start_image is None
+        and segment.index > 0
+        and segment.reprocess_type is None
+    ):
+        segment.status = SegmentStatus.FAILED
+        segment.error_message = (
+            "No frame to continue from: no earlier segment of this job has a last frame. "
+            "The previous segment may have been deleted, or its frame removed from storage. "
+            "Set a start image on this segment to continue."
+        )
+        segment.worker_id = None
+        segment.worker_name = None
+        segment.claimed_at = None
+        await db.commit()
+        logger.warning("Segment %s cannot continue: no predecessor frame", segment.id)
+        return None
 
     # The segment's own negative if it has one, otherwise the resolved default: the Settings
     # field, or the stack constant when that is blank. It used to read the setting row
@@ -1738,9 +1779,29 @@ async def delete_segment(
             detail="Cannot delete the only segment in a job",
         )
 
-    # S3 cleanup
-    for path in [segment.output_path, segment.last_frame_path]:
-        if path:
+    # S3 cleanup — ONLY for objects no other row still points at.
+    #
+    # The key is f"{job_id}/{index}_output.mp4", and the index is neither unique across rows
+    # nor stable: every re-roll take at an index writes the SAME key, and the re-index below
+    # rewrites indexes when a segment is removed. So a path on this row is routinely the path
+    # on another one, and deleting it blind takes that segment's video with it. Measured
+    # before this guard: 73 rows shared a key with another row, 31 of them live (console#440).
+    doomed = [p for p in (segment.output_path, segment.last_frame_path) if p]
+    if doomed:
+        still_referenced = set((await db.execute(
+            select(Segment.output_path)
+            .where(Segment.job_id == job.id, Segment.id != segment.id,
+                   Segment.output_path.in_(doomed))
+        )).scalars().all())
+        still_referenced |= set((await db.execute(
+            select(Segment.last_frame_path)
+            .where(Segment.job_id == job.id, Segment.id != segment.id,
+                   Segment.last_frame_path.in_(doomed))
+        )).scalars().all())
+        for path in doomed:
+            if path in still_referenced:
+                logger.info("Keeping %s: another segment still points at it", path)
+                continue
             try:
                 await asyncio.to_thread(delete_object, path)
             except Exception:
@@ -1761,7 +1822,29 @@ async def delete_segment(
     for i, seg in enumerate(remaining):
         seg.index = i
 
-    # Rename S3 files for segments whose index changed
+    # Rename S3 files for segments whose index changed.
+    #
+    # SHARED KEYS ARE LEFT ALONE. Two rows pointing at one object cannot both rename it: the
+    # first move succeeds, the second fails because the source is gone, and the row whose
+    # move failed keeps a path to an object that has moved — a dangling pointer that only
+    # shows up much later, when something tries to read the frame. Leaving the object where
+    # it is costs a key whose number no longer matches the index, which is cosmetic; moving
+    # it costs the segment.
+    shared: set[str] = set()
+    for attr in ("output_path", "last_frame_path"):
+        seen: set[str] = set()
+        for seg in remaining:
+            path = getattr(seg, attr)
+            if not path:
+                continue
+            if path in seen:
+                shared.add(path)
+            seen.add(path)
+    # A path used as an output by one row and a frame by another counts as shared too.
+    all_paths = [p for seg in remaining
+                 for p in (seg.output_path, seg.last_frame_path) if p]
+    shared |= {p for p in all_paths if all_paths.count(p) > 1}
+
     for seg in remaining:
         old_idx = old_indices[seg.id]
         if old_idx == seg.index:
@@ -1769,6 +1852,9 @@ async def delete_segment(
         for attr in ("output_path", "last_frame_path"):
             old_path = getattr(seg, attr)
             if not old_path:
+                continue
+            if old_path in shared:
+                logger.info("Not renaming %s: more than one segment points at it", old_path)
                 continue
             try:
                 bucket, old_key = parse_s3_uri(old_path)

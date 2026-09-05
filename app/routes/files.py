@@ -95,8 +95,20 @@ async def upload_segment_output(
     video_data = await video.read()
     frame_data = await last_frame.read()
 
-    video_key = f"{segment.job_id}/{segment.index}_output.mp4"
-    frame_key = f"{segment.job_id}/{segment.index}_last_frame.png"
+    # Keyed by SEGMENT ID, not index (console#440).
+    #
+    # The index is neither unique nor stable. Every re-roll take at an index wrote the same
+    # key, so a new take silently overwrote the previous one's video; deleting any segment
+    # then removed an object other rows still pointed at, and the re-index rename could only
+    # move a shared object once, leaving the losers dangling. Measured before this: 73 rows
+    # shared a key with another row, 31 of them live — each one delete away from losing its
+    # video and its last frame.
+    #
+    # The id is unique per row and never changes, so none of that can arise. Nothing reads a
+    # key by reconstructing it — every consumer uses the stored path, and stitching orders by
+    # Segment.index and reads output_path — so the name carries no meaning to lose.
+    video_key = f"{segment.job_id}/{segment.id}_output.mp4"
+    frame_key = f"{segment.job_id}/{segment.id}_last_frame.png"
 
     video_uri, frame_uri = await asyncio.gather(
         asyncio.to_thread(upload_bytes, video_data, video_key, settings.s3_jobs_bucket),
