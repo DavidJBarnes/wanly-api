@@ -163,3 +163,34 @@ class TestTheStatusVocabulary:
         from app.queue_health import LIVE_STATUSES
         assert WorkerStatus.ONLINE not in LIVE_STATUSES
         assert WorkerStatus.DEGRADED not in LIVE_STATUSES
+
+
+class TestAServiceIsNeverCalledIdle:
+    """Registration used to leave a service on the column default, `online-idle`, until its
+    first heartbeat 30 seconds later — so the Workers page said "Idle" about a captioner for
+    that whole window. That is the exact word #269 introduced a separate vocabulary to stop
+    applying to services, so leaving it in the one place that creates the row would have
+    undone the point of the change.
+    """
+
+    def test_a_new_service_is_created_online(self):
+        import inspect
+        from app.routes import workers as mod
+        src = inspect.getsource(mod.register_worker)
+        assert "WorkerStatus.ONLINE_IDLE if body.kind == WorkerKind.RENDER" in src
+
+    def test_a_re_registering_service_is_set_online(self):
+        import inspect
+        from app.routes import workers as mod
+        src = inspect.getsource(mod.register_worker)
+        assert "worker.status = WorkerStatus.ONLINE" in src
+
+    def test_drain_state_is_only_recomputed_for_render_workers(self):
+        """reregistered_drain_state exists to stop a re-register cancelling an operator's
+        drain. A service cannot drain, so running it there would be meaningless."""
+        import inspect
+        from app.routes import workers as mod
+        src = inspect.getsource(mod.register_worker)
+        guard = src.index("if worker.kind == WorkerKind.RENDER:")
+        call = src.index("reregistered_drain_state(")
+        assert guard < call
