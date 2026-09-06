@@ -4,6 +4,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from app.enums import WorkerKind, WorkerStatus
+
 
 class WorkerRegister(BaseModel):
     friendly_name: str
@@ -12,6 +14,17 @@ class WorkerRegister(BaseModel):
     comfyui_running: bool = False
     # Optional: only RunPod workers have one, and older daemons do not send it.
     runpod_pod_id: str | None = None
+    # WHAT THIS WORKER IS (#269). Defaulted rather than required, so every daemon in the fleet
+    # keeps registering unchanged and keeps meaning exactly what it meant before. A service
+    # has to say so explicitly, which is the right way round: the failure of forgetting is
+    # "a service is treated as a render worker", and that is caught the first time it is
+    # offered a segment it cannot do -- loudly -- rather than the reverse, which is a render
+    # worker silently claiming nothing.
+    kind: WorkerKind = WorkerKind.RENDER
+    # WHAT IT RUNS: ["ltx-engine"], ["joycaption", "qwen-edit"]. Optional, and None means
+    # "never reported" rather than "runs nothing" -- the distinction every other optional
+    # worker field here already draws.
+    provides: list[str] | None = None
 
 
 class WorkerHeartbeat(BaseModel):
@@ -35,6 +48,15 @@ class WorkerHeartbeat(BaseModel):
     # 422 itself out of the pool on upgrade day. Absent is read as "fetches nothing", which
     # is the safe direction — it can still claim work whose files it already holds.
     fetchable_kinds: list[str] | None = None
+    # Repeated on the heartbeat, not just at registration, because a services container can
+    # change what it runs without re-registering -- SERVICES is a restart away, and the row
+    # would otherwise keep advertising yesterday's set. Optional and None means "not
+    # reported", so a daemon that never sends it leaves the stored value alone.
+    provides: list[str] | None = None
+    # A service reports its own health here: "online" when everything it was asked to run is
+    # answering, "degraded" when some of it is not. Render workers do not send this -- their
+    # status is derived from claims -- so None means "leave it alone".
+    status: WorkerStatus | None = None
 
 
 class WorkerRename(BaseModel):
@@ -71,6 +93,10 @@ class WorkerResponse(BaseModel):
     hostname: str
     ip_address: str
     status: str
+    # #269. `kind` is never null -- the column is NOT NULL with a default -- so the console
+    # can rely on it and does not need a fallback branch for "unclassified worker".
+    kind: str
+    provides: list[str] | None = None
     comfyui_running: bool
     gpu_stats: dict[str, Any] | None = None
     sd_scripts: dict[str, Any] | None = None

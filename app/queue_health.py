@@ -22,6 +22,16 @@ from datetime import datetime
 # every bit as stalled as one with none -- it just has not noticed yet.
 LIVE_STATUSES = frozenset({"online-idle", "online-busy"})
 
+# ONLY RENDER WORKERS COUNT (#269). A service worker holds a GPU and heartbeats, but it can
+# never take a segment -- so counting it here would mean `stalled` never fires again once
+# wanly-services is up, and it would go quiet at exactly the moment it matters: every render
+# worker down, work queued, and one perfectly healthy captioner keeping the alarm silent.
+#
+# Nothing would error. The alarm would simply stop, which is the failure this whole module was
+# written to end -- the 3090 sat dead for thirteen hours with four segments queued and every
+# fact needed to notice already in the database.
+COUNTED_KINDS = frozenset({"render"})
+
 
 @dataclass(frozen=True)
 class QueueHealth:

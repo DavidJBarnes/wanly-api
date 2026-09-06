@@ -13,7 +13,7 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import and_, func, or_, select, text
+from sqlalchemy import and_, false as sa_false, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -23,7 +23,7 @@ from app.config import settings
 from app.database import get_db
 from app.routes.captions import caption_image_bytes
 from app.seeds import new_seed
-from app.enums import JobStatus, SegmentStatus, VideoStatus
+from app.enums import JobStatus, SegmentStatus, VideoStatus, WorkerKind
 from app.ltx_stack import LTX_STACK
 from app.model_requirements import CHECKPOINT, canonical
 from app.models import (
@@ -465,6 +465,16 @@ def _model_gate(worker: Worker | None) -> tuple:
     made against a stale one degrades to exactly the old behaviour — a loud engine failure —
     rather than to something worse.
     """
+    # A NON-RENDER WORKER TAKES NOTHING, and this is checked FIRST -- before the
+    # never-reported exemption below, which would otherwise wave it straight through (#269).
+    #
+    # A freshly registered service has checkpoints NULL, so without this it would be offered
+    # every pending segment. Nothing breaks today only because wanly-services has no daemon
+    # and never polls; that is the safety being an accident of it not asking rather than a
+    # decision that it must not be asked. `false` rather than an empty tuple, because an empty
+    # tuple means "no restriction" and is exactly the wrong answer here.
+    if worker is not None and worker.kind != WorkerKind.RENDER:
+        return (sa_false(),)
     if worker is None or worker.checkpoints is None:
         return ()
     if CHECKPOINT in (worker.fetchable_kinds or []):
