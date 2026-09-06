@@ -327,6 +327,13 @@ class Worker(Base):
     # no second opinion here about what a daemon can do. NULL means never reported, which
     # this treats as fetching nothing. See app/model_requirements.py.
     fetchable_kinds: Mapped[list | None] = mapped_column(JSONB, nullable=True, default=None)
+    # What code this worker is actually running (wanly-gpu-docker#72). TWO fields, because
+    # there are two update channels that drift separately: the daemon is re-cloned from main
+    # at every container boot, while start.sh, the downloader and the engine only change on
+    # an image pull + recreate. A `docker restart` moves the first and not the second, which
+    # is exactly how the 3090 came to run a current daemon on a 37-hour-old image.
+    daemon_commit: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
+    image_ref: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     drain_after_jobs: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 

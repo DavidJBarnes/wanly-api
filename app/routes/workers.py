@@ -220,6 +220,13 @@ async def heartbeat(
         worker.checkpoints = body.checkpoints
     if body.fetchable_kinds is not None:
         worker.fetchable_kinds = body.fetchable_kinds
+    # Same conditional write again. These two answer "what code is this worker running"
+    # (wanly-gpu-docker#72) and they move independently: the daemon is re-cloned from main at
+    # every container boot, the image only changes on pull + recreate.
+    if body.daemon_commit is not None:
+        worker.daemon_commit = body.daemon_commit
+    if body.image_ref is not None:
+        worker.image_ref = body.image_ref
     if worker.status == "offline":
         worker.status = "online-idle"
     # If sd-scripts is actively training, worker can't be idle
