@@ -54,9 +54,17 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
         # Re-registering after a container restart can land on a new pod id.
         if body.runpod_pod_id:
             worker.runpod_pod_id = body.runpod_pod_id
-        worker.status, worker.drain_after_jobs = reregistered_drain_state(
-            worker.status, worker.drain_after_jobs
-        )
+        if worker.kind == WorkerKind.RENDER:
+            worker.status, worker.drain_after_jobs = reregistered_drain_state(
+                worker.status, worker.drain_after_jobs
+            )
+        else:
+            # A service has nothing to drain, and must not spend its first 30 seconds saying
+            # "idle" -- the word #269 exists to stop applying to it. Without this the row is
+            # created on the model's default, online-idle, and only corrects on the first
+            # heartbeat; the Workers page renders "Idle" on a service for that whole window,
+            # which is exactly the ambiguity the separate vocabulary was introduced to end.
+            worker.status = WorkerStatus.ONLINE
         worker.last_heartbeat = datetime.now(timezone.utc)
     else:
         worker = Worker(
@@ -67,6 +75,9 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
             runpod_pod_id=body.runpod_pod_id,
             kind=body.kind,
             provides=body.provides,
+            # Same reason as above: the column default is online-idle, which is a render word.
+            status=(WorkerStatus.ONLINE_IDLE if body.kind == WorkerKind.RENDER
+                    else WorkerStatus.ONLINE),
         )
         db.add(worker)
 
