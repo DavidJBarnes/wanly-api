@@ -12,7 +12,17 @@ NOT app/seeds.py, which is about NOISE seeds. Different sense of the word entire
 # It was a third LoRA competing for the same layers as the character LoRA, and the
 # checkpoint already carries the NSFW training it was providing.
 LTX_STACK = {
-    'checkpoint': 'sulphur_dev_bf16',
+    # The base model every pose falls back to (console#431). 10Eros is what the work
+    # actually runs on -- 9 of 16 poses named it and it took 115 of the last 30 days' 145
+    # segments, while the six sulphur poses are the originals those nine were cloned from.
+    #
+    # TWO OTHER PLACES ANSWER THIS and must move with it, both in wanly-gpu-docker:
+    # engine/recipe.py's DEFAULT_CHECKPOINT (what actually renders when a segment arrives
+    # naming no checkpoint) and download_models.sh's _WANTED (what a cold container or pod
+    # actually HAS). A pod holding a different checkpoint reports it through the heartbeat
+    # and _model_gate() then hides every default pose from it -- it claims nothing, and an
+    # idle pod is indistinguishable from an empty queue.
+    'checkpoint': '10Eros_v1.5_bf16',
     'content_lora': 'none',
     # What resolve() hardcoded for BOTH stages before content LoRAs became per-pose. Kept as
     # the default so a pose that names a content LoRA without naming strengths renders at

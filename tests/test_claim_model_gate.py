@@ -19,9 +19,16 @@ from app.auth import get_current_user, verify_api_key
 from app.database import get_db
 from app.enums import JobStatus, SegmentStatus
 from app.main import app
+from app.ltx_stack import LTX_STACK
 from app.models import Job, Segment, User, Worker
+from sqlalchemy import text as sa_text
 
 WORKER_ID = uuid.UUID("2f5a3c4e-0b1d-4a7e-9c88-1c2f3a4b5c6d")
+
+# A real checkpoint that is deliberately NOT the stack default, so a test cannot pass
+# through the checkpoint branch when it means to be testing the no-recipe exemption.
+_NOT_THE_DEFAULT = next(c for c in ("sulphur_dev_bf16", "ltx-2.3-22b-dev")
+                        if c != LTX_STACK["checkpoint"])
 
 
 async def _user(db) -> User:
@@ -156,20 +163,55 @@ class TestWorkStillFlows:
         assert (await _claim(db)).json()["id"] == str(seg.id)
 
     async def test_a_segment_with_no_recipe_is_never_gated(self, db):
-        """A WAN segment or a free-form render declares no models, so it requires none."""
+        """A WAN segment or a free-form render declares no models, so it requires none.
+
+        The worker deliberately carries a checkpoint that is NOT the stack default
+        (console#431). This test used to hand it the default, so it passed through the
+        checkpoint branch rather than through the exemption it claims to be testing, and
+        went on passing while the exemption itself was broken.
+        """
         job = await _job(db, await _user(db))
         seg = await _segment(db, job, recipe=None)
-        await _worker(db, checkpoints=["sulphur_dev_bf16"], fetchable=["lora"])
+        await _worker(db, checkpoints=[_NOT_THE_DEFAULT], fetchable=["lora"])
 
+        assert (await _claim(db)).json()["id"] == str(seg.id)
+
+    async def test_no_recipe_means_json_null_too(self, db):
+        """`ltx_recipe` is JSONB with none_as_null=False, so assigning None stores the JSON
+        value `null`, not SQL NULL — and `.is_(None)` is FALSE against it (console#431).
+
+        Production holds 12 such rows next to 21 genuinely-SQL-NULL ones. Asserted on the
+        stored shape rather than trusted, because the whole bug was that the two look
+        identical from Python.
+        """
+        job = await _job(db, await _user(db))
+        seg = await _segment(db, job, recipe=None)
+        shape = (await db.execute(sa_text(
+            "select ltx_recipe is null as sql_null, jsonb_typeof(ltx_recipe) as jtype "
+            "from segments where id = :i"), {"i": seg.id})).mappings().one()
+        assert shape["sql_null"] is False and shape["jtype"] == "null", (
+            f"expected a JSONB null to reproduce the bug, got {dict(shape)}")
+
+        await _worker(db, checkpoints=[_NOT_THE_DEFAULT], fetchable=["lora"])
         assert (await _claim(db)).json()["id"] == str(seg.id)
 
     async def test_a_recipe_without_a_checkpoint_runs_on_the_stack_default(self, db):
-        """Segments predating per-pose base models must keep flowing."""
+        """Segments predating per-pose base models must keep flowing — on whatever the
+        stack default currently is, which is the point of the coalesce."""
         job = await _job(db, await _user(db))
         seg = await _segment(db, job, recipe={"recipe": "old", "char_lora": "k3llydw_v2"})
-        await _worker(db, checkpoints=["sulphur_dev_bf16"], fetchable=["lora"])
+        await _worker(db, checkpoints=[LTX_STACK["checkpoint"]], fetchable=["lora"])
 
         assert (await _claim(db)).json()["id"] == str(seg.id)
+
+    async def test_a_recipe_without_a_checkpoint_is_gated_on_the_default(self, db):
+        """The other half: the fallback is a real requirement, not a free pass. A worker
+        without the default cannot take a segment that leaves the checkpoint unset."""
+        job = await _job(db, await _user(db))
+        await _segment(db, job, recipe={"recipe": "old", "char_lora": "k3llydw_v2"})
+        await _worker(db, checkpoints=[_NOT_THE_DEFAULT], fetchable=["lora"])
+
+        assert (await _claim(db)).json() is None
 
     async def test_either_spelling_of_the_checkpoint_matches(self, db):
         job = await _job(db, await _user(db))

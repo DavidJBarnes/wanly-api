@@ -439,9 +439,21 @@ def _model_gate(worker: Worker | None) -> tuple:
 
     Three things deliberately do NOT gate:
 
-      * a NULL ltx_recipe. Not a recipe render: a WAN segment, a free-form LTX one, or a CPU
-        reprocess carrier. It declares no models, so it requires none. Conservative on
-        purpose — this must not withhold work that flows today.
+      * a recipe that is not a JSON OBJECT. Not a recipe render: a WAN segment, a free-form
+        LTX one, or a CPU reprocess carrier. It declares no models, so it requires none.
+        Conservative on purpose — this must not withhold work that flows today.
+
+        BOTH spellings of "no recipe" count, and that is not pedantry (console#431).
+        `ltx_recipe` is JSONB with SQLAlchemy's default none_as_null=False, so assigning
+        None stores the JSON value `null` rather than SQL NULL — and `.is_(None)` is FALSE
+        against it. Production holds both: 21 rows SQL NULL, 12 rows JSONB null.
+
+        Written as `is_(None)` alone, this exemption never actually worked for the JSONB
+        half. Nothing showed, because the coalesce below then fell through to the stack
+        default and every worker happened to carry it — so the row was claimable by
+        accident, via the checkpoint branch, rather than by the exemption. Moving the
+        default to a checkpoint some pod lacks is exactly what turns that into a segment
+        nothing will pick up, silently.
       * a worker that has never reported its checkpoints (NULL, not []). An older daemon
         would otherwise starve on upgrade day, and a fleet claiming nothing looks exactly
         like an empty queue.
@@ -468,7 +480,13 @@ def _model_gate(worker: Worker | None) -> tuple:
         func.nullif(Segment.ltx_recipe["checkpoint"].astext, ""),
         canonical(LTX_STACK["checkpoint"]),
     )
-    return (or_(Segment.ltx_recipe.is_(None), checkpoint.in_(names)),)
+    # Only a JSON object declares models. SQL NULL and JSONB `null` both mean "no recipe";
+    # jsonb_typeof covers the second, which `is_(None)` cannot see.
+    declares_nothing = or_(
+        Segment.ltx_recipe.is_(None),
+        func.jsonb_typeof(Segment.ltx_recipe) != "object",
+    )
+    return (or_(declares_nothing, checkpoint.in_(names)),)
 
 
 @router.get("/segments/next", dependencies=[Depends(verify_api_key)])

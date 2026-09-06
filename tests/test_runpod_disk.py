@@ -21,7 +21,9 @@ DOCKER_REPO = pathlib.Path(__file__).parent.parent.parent / "wanly-gpu-docker"
 # not of the script; the NAMES are cross-checked against the script below so the two cannot
 # drift apart silently.
 MODEL_SIZES_GB = {
-    "sulphur_dev_bf16.safetensors": 43,
+    # The default base model (console#431). 46,139,886,366 bytes = 43 GiB, within a few
+    # hundred KB of the sulphur checkpoint it replaced, so the volume maths is unchanged.
+    "10Eros_v1.5_bf16.safetensors": 43,
     "gemma_3_12B_it_fp8_scaled.safetensors": 13,
     "ltx-2.3-spatial-upscaler-x2-1.1.safetensors": 1,
     "sulphur_distill_lora_condsafe.safetensors": 1,
