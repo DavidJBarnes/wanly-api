@@ -150,17 +150,7 @@ async def launch_runpod_worker(body: RunPodLaunchRequest):
             ),
         )
 
-    # The worker needs the queue to claim from, and its own name so it registers legibly rather
-    # than as runpod-<podid>. QUEUE_API_KEY is this server's own daemon key.
-    env = {
-        "FRIENDLY_NAME": name,
-        "QUEUE_URL": body.queue_url or settings.runpod_worker_queue_url,
-        "QUEUE_API_KEY": settings.api_key,
-    }
-    if settings.runpod_api_key:
-        # Lets the worker stop its own pod when drained. Without it a drain leaves the pod
-        # running and the container simply respawns.
-        env["RUNPOD_API_KEY"] = settings.runpod_api_key
+    env = runpod_client.worker_env(name, body.queue_url)
 
     try:
         return await runpod_client.launch_worker(name, env, gpu)

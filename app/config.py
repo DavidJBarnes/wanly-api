@@ -88,6 +88,18 @@ class Settings(BaseSettings):
     # deliberately absent because the workflow does not run on it.
     runpod_gpu_type_ids: str = "NVIDIA GeForce RTX 4090,NVIDIA GeForce RTX 3090"
     runpod_image: str = "davidjbarnes/wanly-gpu-docker:latest"
+    # Passed to pods as HF_TOKEN so model staging is authenticated (#260). huggingface_hub
+    # reads it from the environment on its own, so download_models.sh and the image are
+    # untouched -- the whole job is getting the variable into the pod.
+    #
+    # Empty means not configured, and the key is then OMITTED rather than sent blank: an
+    # empty HF_TOKEN is worse than none, because huggingface_hub would try to authenticate
+    # with it. Same shape as runpod_api_key above.
+    #
+    # Anonymous staging works today -- the repos are public and measured 14 MB/s -- so this
+    # is about the cases where it stops working: HF's anonymous limits are per-IP and pods
+    # share datacenter egress, and a gated repo 401s outright rather than warning.
+    hf_token: str = ""
     # Writable container disk. Holds /jobs — every render's graph, keyframe and mp4, roughly
     # 30-60 MB a piece — plus ComfyUI's scratch. NOT the image, which RunPod accounts for
     # separately: a pod with a 30 GB container disk reports 30 GB free before anything runs.

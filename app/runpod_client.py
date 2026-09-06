@@ -126,6 +126,37 @@ async def get_availability(gpu_type_id: str | None = None) -> dict:
     }
 
 
+def worker_env(name: str, queue_url: str | None = None) -> dict[str, str]:
+    """The environment a launched pod gets. ONE builder, deliberately (#260).
+
+    This was built twice -- once in routes/runpod.py for the manual launch and once in
+    reservation_monitor.py for the scheduled one -- with the same four keys and the same
+    guard on RUNPOD_API_KEY. Two copies of "what a worker needs to know" is how a pod
+    launched overnight quietly ends up with a different environment from one launched by
+    hand, and that difference presents as "it works when I click the button", which is a
+    horrible thing to debug from a pod that has already been terminated.
+
+    Adding HF_TOKEN as a fifth key to two dicts is exactly the edit that would have started
+    it, so the copies were collapsed first.
+    """
+    env = {
+        # So the worker registers legibly rather than as runpod-<podid>.
+        "FRIENDLY_NAME": name,
+        "QUEUE_URL": queue_url or settings.runpod_worker_queue_url,
+        # This server's own daemon key -- what the worker claims segments with.
+        "QUEUE_API_KEY": settings.api_key,
+    }
+    if settings.runpod_api_key:
+        # Lets the worker stop its own pod when drained. Without it a drain leaves the pod
+        # running and the container simply respawns.
+        env["RUNPOD_API_KEY"] = settings.runpod_api_key
+    if settings.hf_token:
+        # Authenticates model staging. Omitted rather than blank when unset -- see the
+        # setting's own note; huggingface_hub would try to use an empty token.
+        env["HF_TOKEN"] = settings.hf_token
+    return env
+
+
 async def launch_worker(name: str, env: dict[str, str], gpu_type_id: str | None = None) -> dict:
     """Create a pod, attached to the configured network volume.
 
