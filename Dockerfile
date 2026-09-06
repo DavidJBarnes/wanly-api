@@ -33,4 +33,11 @@ EXPOSE 8001
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD curl -f http://localhost:8001/health || exit 1
 
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8001"]
+# --timeout-keep-alive MUST exceed the daemon's httpx pool expiry (30s, wanly-gpu-daemon
+# queue_client.py). uvicorn's default is 5s, so every worker was handed pooled sockets the
+# server had already closed and found out only after writing the request -- a steady drip of
+# RemoteProtocolError on /segments/next and /workers/*/heartbeat (#262).
+#
+# Server longer than client is the correct direction: whichever end expires first decides,
+# and that should be the end which can retire a connection with no request in flight.
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8001 --timeout-keep-alive 65"]
