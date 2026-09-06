@@ -3,8 +3,9 @@
 `checkpoint` was a global, so every render used one base model and two could not be
 compared. Four sit on the 3090 and only one was reachable.
 
-THE RISK IS ACCEPTED, NOT ABSENT. Character LoRAs were trained against sulphur. Against
-another base a LoRA whose keys do not line up fuses NOTHING and says nothing about it — the
+THE RISK IS ACCEPTED, NOT ABSENT. Character LoRAs were trained against sulphur, which is no
+longer the default (console#431). Against another base a LoRA whose keys do not line up
+fuses NOTHING and says nothing about it — the
 engine's own lora_coverage() docstring records that there is no error, no warning and no
 log line. The render comes back as the base model with none of the character in it.
 
@@ -26,9 +27,14 @@ def _resolve(pose):
     return pose.checkpoint or LTX_STACK["checkpoint"]
 
 
-def test_a_pose_that_says_nothing_still_renders_on_sulphur():
-    """Every existing pose. The migration must change no output."""
-    assert _resolve(_Pose()) == "sulphur_dev_bf16"
+def test_a_pose_that_says_nothing_renders_on_the_stack_default():
+    """The fallback itself, stated against the stack rather than against a literal.
+
+    Which checkpoint is default is a policy decision and it has moved once already
+    (console#431); that it falls back at all is the invariant. Pinning the literal here as
+    well as in test_the_stack_default_is() only produced two failures for one change.
+    """
+    assert _resolve(_Pose()) == LTX_STACK["checkpoint"]
 
 
 def test_a_pose_can_name_its_own_base_model():
@@ -39,13 +45,22 @@ def test_a_pose_can_name_its_own_base_model():
 def test_clearing_it_falls_back_rather_than_rendering_on_an_empty_name():
     """"" reaches the resolver when a user clears the field. It must mean "use the stack",
     not "load a checkpoint called nothing"."""
-    assert _resolve(_Pose(checkpoint="")) == "sulphur_dev_bf16"
+    assert _resolve(_Pose(checkpoint="")) == LTX_STACK["checkpoint"]
 
 
-def test_the_stack_default_is_unchanged():
-    """This is what every validated result to date was produced on. If it moves, the whole
-    rated history stops being comparable to anything new."""
-    assert LTX_STACK["checkpoint"] == "sulphur_dev_bf16"
+def test_the_stack_default_is_10eros():
+    """THE policy pin, and the only place the literal belongs.
+
+    Moved from sulphur in console#431. 10Eros is what the work already ran on -- 9 of 16
+    poses named it and it took 115 of the last 30 days' 145 segments, while the six sulphur
+    poses are the originals those nine were hand-cloned from to escape this default.
+
+    Two other places answer this same question and must move with it, both in
+    wanly-gpu-docker: engine/recipe.py's DEFAULT_CHECKPOINT and download_models.sh's
+    _WANTED. They are covered by that repo's own test; this one exists so the value cannot
+    drift here unnoticed.
+    """
+    assert LTX_STACK["checkpoint"] == "10Eros_v1.5_bf16"
 
 
 class TestCheckpointListing:
