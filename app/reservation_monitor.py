@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from sqlalchemy import select, update
 
 from app import runpod_client
-from app.config import settings
 from app.database import async_session
 from app.models import GpuReservation
 from app.reservations import Action, ReservationStatus, decide
@@ -110,13 +109,7 @@ async def _apply(session, reservation: GpuReservation, decision, now) -> None:
         return
 
     reservation.attempts = (reservation.attempts or 0) + 1
-    env = {
-        "FRIENDLY_NAME": reservation.name,
-        "QUEUE_URL": settings.runpod_worker_queue_url,
-        "QUEUE_API_KEY": settings.api_key,
-    }
-    if settings.runpod_api_key:
-        env["RUNPOD_API_KEY"] = settings.runpod_api_key
+    env = runpod_client.worker_env(reservation.name)
 
     try:
         pod = await runpod_client.launch_worker(reservation.name, env, reservation.gpu_type_id)
