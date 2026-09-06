@@ -25,6 +25,7 @@ from app.config import settings
 from app.s3 import list_bucket
 from app.auth import get_current_user, verify_api_key_or_bearer
 from app.database import get_db
+from app.checkpoint_sources import CHECKPOINT_SOURCES
 from app.ltx_stack import LTX_STACK
 from app.models import LtxCharacter, LtxRecipe, User, Worker
 from app.negative_prompt import default_negative_prompt
@@ -176,6 +177,27 @@ async def list_checkpoints(db: AsyncSession = Depends(get_db)):
             if isinstance(name, str) and name.strip():
                 names.add(name.strip())
     return {"checkpoints": sorted(names), "default": LTX_STACK["checkpoint"]}
+
+
+@router.get("/ltx/checkpoints/catalog", dependencies=[Depends(verify_api_key_or_bearer)])
+async def checkpoint_catalog():
+    """Where each known checkpoint can be fetched from (console#423).
+
+    Asked by a WORKER, not the console: a worker handed a pose whose base model it does not
+    hold downloads it rather than failing the claim. It must not guess a URL, so the mapping
+    from name to {repo, path} lives here -- one entry adds a base model for the whole fleet,
+    against redeploying every worker to teach it a new name.
+
+    Separate from /ltx/checkpoints, which answers "what can be rendered NOW" from live worker
+    inventory. This answers "where does one come from", which is a fact about the file and
+    true whether any worker is up.
+
+    `size_bytes` is the point of the response as much as the URL. A partial safetensors is a
+    valid header over missing data -- it passes every existence check and fails only at load,
+    inside a claimed segment -- so the fetcher needs the expected length to verify against
+    before it renames the file into place.
+    """
+    return {"sources": CHECKPOINT_SOURCES}
 
 
 @router.get("/loras", dependencies=[Depends(verify_api_key_or_bearer)])
