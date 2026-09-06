@@ -8,9 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import verify_api_key, verify_api_key_or_bearer
 from app.database import get_db
-from app.enums import JobStatus, SegmentStatus
+from app.enums import JobStatus, SegmentStatus, WorkerKind, WorkerStatus
 from app.models import Job, Segment, Worker
-from app.queue_health import assess
+from app.queue_health import COUNTED_KINDS, assess
 from app.schemas.workers import QueueHealthResponse, WorkerDrain, WorkerHeartbeat, WorkerRegister, WorkerRename, WorkerResponse, WorkerStatusUpdate
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,12 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
         worker.hostname = body.hostname
         worker.ip_address = body.ip_address
         worker.comfyui_running = body.comfyui_running
+        # Re-registering can legitimately change what a box is: the same host could stop
+        # running services and start running an engine. Taken from the request rather than
+        # preserved, so the row follows reality instead of the first thing it ever saw.
+        worker.kind = body.kind
+        if body.provides is not None:
+            worker.provides = body.provides
         # Re-registering after a container restart can land on a new pod id.
         if body.runpod_pod_id:
             worker.runpod_pod_id = body.runpod_pod_id
@@ -59,6 +65,8 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
             ip_address=body.ip_address,
             comfyui_running=body.comfyui_running,
             runpod_pod_id=body.runpod_pod_id,
+            kind=body.kind,
+            provides=body.provides,
         )
         db.add(worker)
 
@@ -227,17 +235,36 @@ async def heartbeat(
         worker.daemon_commit = body.daemon_commit
     if body.image_ref is not None:
         worker.image_ref = body.image_ref
-    if worker.status == "offline":
-        worker.status = "online-idle"
-    # If sd-scripts is actively training, worker can't be idle
-    if worker.status not in ("offline", "draining"):
-        sd_training = (
-            body.sd_scripts.get("sd_scripts_training", False)
-            if body.sd_scripts
-            else False
-        )
-        if sd_training:
-            worker.status = "online-busy"
+    # Same conditional write once more. A services container can change what it runs across a
+    # restart without re-registering, so the row would otherwise advertise yesterday's set.
+    if body.provides is not None:
+        worker.provides = body.provides
+
+    if worker.kind != WorkerKind.RENDER:
+        # A SERVICE REPORTS ITS OWN HEALTH, because there is no claim state to derive one
+        # from -- it is never idle-waiting-for-work and never busy-with-a-segment. It sends
+        # "online" when everything it was asked to run answers and "degraded" when some of it
+        # does not, which is a distinction the render vocabulary cannot express and which
+        # wanly-gpu-docker#80 is open because we could not express.
+        #
+        # `status` is honoured ONLY here. A render worker's status stays derived, so a daemon
+        # cannot talk itself into looking idle.
+        if body.status is not None:
+            worker.status = body.status
+        elif worker.status == "offline":
+            worker.status = WorkerStatus.ONLINE
+    else:
+        if worker.status == "offline":
+            worker.status = "online-idle"
+        # If sd-scripts is actively training, worker can't be idle
+        if worker.status not in ("offline", "draining"):
+            sd_training = (
+                body.sd_scripts.get("sd_scripts_training", False)
+                if body.sd_scripts
+                else False
+            )
+            if sd_training:
+                worker.status = "online-busy"
     await db.commit()
     await db.refresh(worker)
     return worker
@@ -317,7 +344,12 @@ async def queue_health(db: AsyncSession = Depends(get_db)):
         )
     )).scalar() or 0
 
-    rows = (await db.execute(select(Worker.status, Worker.last_heartbeat))).all()
+    # Render workers only. A service can never take a segment, so letting one count as live
+    # would silence `stalled` permanently -- see COUNTED_KINDS in app/queue_health.py.
+    rows = (await db.execute(
+        select(Worker.status, Worker.last_heartbeat)
+        .where(Worker.kind.in_(COUNTED_KINDS))
+    )).all()
     health = assess(
         pending_segments=pending,
         worker_statuses=[r[0] for r in rows],

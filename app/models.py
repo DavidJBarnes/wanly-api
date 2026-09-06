@@ -5,7 +5,7 @@ from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, 
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from app.enums import JobStatus, SegmentStatus, VideoStatus
+from app.enums import JobStatus, SegmentStatus, VideoStatus, WORKER_KIND_RENDER
 
 
 class Base(DeclarativeBase):
@@ -300,6 +300,25 @@ class Worker(Base):
     friendly_name: Mapped[str] = mapped_column(String(255), nullable=False)
     hostname: Mapped[str] = mapped_column(String(255), nullable=False)
     ip_address: Mapped[str] = mapped_column(String(45), nullable=False)
+    # WHAT THIS WORKER IS, read by the claim gate and by queue-health (#269). `render` takes
+    # segments; `service` never can. Scalar and NOT NULL on purpose: there must be no window
+    # in which a live worker's claimability is unknown, because the gate would then have to
+    # guess, and the safe guess and the useful guess are opposites.
+    #
+    # Defaulting to `render` keeps every existing row and every current daemon meaning exactly
+    # what it meant before this column existed.
+    kind: Mapped[str] = mapped_column(String(20), nullable=False, default=WORKER_KIND_RENDER,
+                                      server_default=WORKER_KIND_RENDER)
+    # WHAT IT RUNS, for display: ["ltx-engine"], ["joycaption", "qwen-edit"]. A list because a
+    # services container runs several at once, which is the entire point of its SERVICES flag.
+    #
+    # Deliberately NOT what the gate reads. A gate keyed on names needs an allowlist, and a new
+    # engine missing from that allowlist claims nothing -- indistinguishable from an empty
+    # queue, which is the failure this codebase keeps paying for.
+    #
+    # NULL means never reported, [] means reports nothing. Same distinction as checkpoints and
+    # loras above, same reason: an older daemon must not look like one with nothing to offer.
+    provides: Mapped[list | None] = mapped_column(JSONB, nullable=True, default=None)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="online-idle")
     comfyui_running: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # Set by workers running on RunPod. NULL for the 3090 and anything else self-hosted.
