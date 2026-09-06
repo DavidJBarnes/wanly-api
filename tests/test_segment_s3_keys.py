@@ -69,9 +69,17 @@ async def test_upload_keys_by_segment_id(db):
                            "last_frame": ("f.png", b"f", "image/png")},
                 )
         assert resp.status_code == 200, resp.text
-        keys = [call.args[1] for call in up.call_args_list]
-        assert keys == [f"{job.id}/{seg.id}_output.mp4",
-                        f"{job.id}/{seg.id}_last_frame.png"]
+        # A SET, not a list (#272). The route uploads both files through asyncio.gather over
+        # two threads, so the order the mock records them in is whatever the scheduler did --
+        # and asserting a list failed about one run in four, on clean main too. That cost
+        # three false failures during unrelated work, which is worse than no test: the reflex
+        # becomes "just re-run it", and that is the reflex that lets a real failure through.
+        #
+        # The order was never the point. What this test is about, per its own docstring, is
+        # that the keys are built from the segment ID rather than the index.
+        keys = {call.args[1] for call in up.call_args_list}
+        assert keys == {f"{job.id}/{seg.id}_output.mp4",
+                        f"{job.id}/{seg.id}_last_frame.png"}
         # And emphatically NOT the index.
         assert not any(f"/{seg.index}_" in k for k in keys)
     finally:
