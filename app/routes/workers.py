@@ -1,8 +1,9 @@
+import logging
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import verify_api_key, verify_api_key_or_bearer
@@ -11,6 +12,8 @@ from app.enums import JobStatus, SegmentStatus
 from app.models import Job, Segment, Worker
 from app.queue_health import assess
 from app.schemas.workers import QueueHealthResponse, WorkerDrain, WorkerHeartbeat, WorkerRegister, WorkerRename, WorkerResponse, WorkerStatusUpdate
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -59,6 +62,9 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
         )
         db.add(worker)
 
+    # A worker that is registering holds nothing. Release anything still assigned to it.
+    await _release_orphaned_claims(db, worker)
+
     # A reservation may have asked for a drain policy up front. Apply it the moment the worker
     # it was waiting for appears.
     #
@@ -71,6 +77,56 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
     await db.commit()
     await db.refresh(worker)
     return worker
+
+
+async def _release_orphaned_claims(db: AsyncSession, worker: Worker) -> None:
+    """Free any segment still assigned to a worker that has just registered.
+
+    Registration means the daemon has started fresh: it happens once, before the claim loop,
+    so a worker reaching this point is by definition rendering nothing. Any segment still
+    marked CLAIMED or PROCESSING against it belongs to a previous life of that worker, and
+    nothing will ever finish it.
+
+    WHY NOTHING ELSE CATCHES THIS
+        The reclaim in /segments/next needs either a stale heartbeat or an idle worker with
+        an empty progress log. A replaced container satisfies neither: registration upserts
+        on friendly_name, so the row -- and its id -- is REUSED, the new daemon heartbeats
+        immediately, and it goes on to claim something else and report online-busy. The old
+        claim is pinned to a live, healthy, busy worker and is unreachable by every existing
+        rule.
+
+        Observed 2026-09-06: a container was replaced 50% through a 673 MB LoRA download in
+        [2/6]. The segment sat in PROCESSING for SEVEN HOURS against a worker that had never
+        heard of it, and its job could not finish. It had to be freed by hand.
+
+    A worker renders one segment at a time -- the claim loop guards it with executing_event --
+    so there is no case where a registering worker legitimately holds work. Deliberately not
+    tied to container replacement specifically: any path that gets a daemon back to
+    registration (crash, OOM kill, manual restart, a pod recreated by the updater) leaves the
+    same wreckage, and they should all be cleaned up by the same rule.
+
+    Progress log is cleared with the claim. It describes an attempt that no longer exists, and
+    leaving it would also make the segment permanently ineligible for the live-worker reclaim
+    in /segments/next, which requires an empty log.
+    """
+    if worker.id is None:
+        return  # brand new row; it cannot hold anything yet
+    result = await db.execute(
+        update(Segment)
+        .where(
+            Segment.worker_id == worker.id,
+            Segment.status.in_([SegmentStatus.CLAIMED, SegmentStatus.PROCESSING]),
+        )
+        .values(status=SegmentStatus.PENDING, worker_id=None, worker_name=None,
+                claimed_at=None, progress_log=None)
+        .returning(Segment.id)
+    )
+    freed = result.scalars().all()
+    if freed:
+        logger.warning(
+            "Worker %s re-registered holding %d claimed segment(s); released to PENDING: %s",
+            worker.friendly_name, len(freed), ", ".join(str(i) for i in freed),
+        )
 
 
 async def _apply_reserved_drain(db: AsyncSession, worker: Worker) -> None:
