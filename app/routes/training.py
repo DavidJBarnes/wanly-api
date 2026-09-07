@@ -55,6 +55,15 @@ RECIPE_DEFAULTS = {
 }
 
 
+def _default_lora_name(character: str) -> str:
+    """A safe filename stem, as a STARTING POINT for the user to correct.
+
+    Stripping is the honest default -- it never invents a letter -- but it is not always the
+    right answer, which is why the field exists.
+    """
+    return "".join(c for c in character if c.isalnum() or c in "._-") or "lora"
+
+
 def _live_states() -> list[str]:
     return [TrainingStatus.CLAIMED, TrainingStatus.RUNNING]
 
@@ -87,7 +96,8 @@ async def create_training_job(
         trigger=body.trigger,
         version=body.version,
         dataset_images=body.dataset_images,
-        config={**RECIPE_DEFAULTS, "steps": body.steps, "caption": body.caption},
+        config={**RECIPE_DEFAULTS, "steps": body.steps, "caption": body.caption,
+                "lora_name": body.lora_name or _default_lora_name(body.character)},
         status=TrainingStatus.PENDING,
         total_steps=body.steps,
     )
@@ -332,11 +342,12 @@ async def upload_training_artifact(
             detail=f"refusing a {len(data)} byte LoRA — a rank-32 character LoRA is ~650 MB, "
                    f"so this is a truncated upload")
 
-    # `@` and friends cannot be in the name: this is served over HTTP and lands in JSON and
-    # URLs. The TRIGGER keeps the original -- that is what the captions trained on.
-    safe = "".join(c for c in job.character if c.isalnum() or c in "._-")
+    # The stem the job was created with. Not derived here: stripping `p@y` gives `py`, while
+    # the file this project actually renders with is `pay_...` -- a human read `@` as `a`, and
+    # no rule produces that. The TRIGGER keeps the original either way; that is what trained.
+    stem = (job.config or {}).get("lora_name") or _default_lora_name(job.character)
     tag = f"_e{epoch:02d}" if epoch is not None else ""
-    key = f"character/{safe}_v{job.version}{tag}.safetensors"
+    key = f"character/{stem}_v{job.version}{tag}.safetensors"
     uri = await asyncio.to_thread(s3.upload_bytes, data, key, settings.s3_loras_bucket)
 
     job.output_lora_path = uri

@@ -233,13 +233,20 @@ class TestCharacterNaming:
         t = TrainingCreate(character="p@y", trigger="p@y", dataset_images=_images())
         assert t.character == "p@y"
 
-    def test_the_filename_is_sanitised_at_upload_not_at_creation(self):
+    def test_the_filename_stem_is_decided_at_creation_not_at_upload(self):
+        """It is a field on the request, defaulted and correctable, rather than a guess made
+        silently when the file lands. See TestTheLoraFilename for why."""
+        import inspect
+        from app.routes import training as mod
+        assert "lora_name" in inspect.getsource(mod.create_training_job)
+        assert 'get("lora_name")' in inspect.getsource(mod.upload_training_artifact)
+
+    def test_the_trigger_never_feeds_the_filename(self):
+        """They are different things. The trigger keeps whatever trained."""
         import inspect
         from app.routes import training as mod
         src = inspect.getsource(mod.upload_training_artifact)
-        assert 'c.isalnum() or c in "._-"' in src
-        # and the trigger is untouched by that
-        assert "job.trigger" not in src.split("safe =")[1].split("key =")[0]
+        assert "job.trigger" not in src
 
     @pytest.mark.asyncio
     async def test_retraining_a_character_with_an_at_sign_repoints_one_row(self, db):
@@ -254,3 +261,40 @@ class TestCharacterNaming:
             LtxCharacter.name == "p@y"))).scalars().all()
         assert len(rows) == 1
         assert rows[0].char_lora == "pay_v3_e04.safetensors"
+
+
+class TestTheLoraFilename:
+    """The stem is ASKED, not derived.
+
+    Stripping `p@y` gives `py`. The file this project has actually been rendering with is
+    `pay_v2_e05.safetensors` — a human read `@` as `a`, and no rule produces that. `@`->`a` is a
+    transliteration, and a table for it generalises badly: k3lly2026 keeps its digits, so
+    `3`->`e` would be wrong.
+    """
+
+    def test_the_default_strips_and_never_invents_a_letter(self):
+        from app.routes.training import _default_lora_name
+        assert _default_lora_name("p@y") == "py"
+        assert _default_lora_name("k3lly2026") == "k3lly2026"
+
+    def test_a_name_of_only_unsafe_characters_still_yields_something(self):
+        from app.routes.training import _default_lora_name
+        assert _default_lora_name("@@@") == "lora"
+
+    def test_an_explicit_name_is_accepted(self):
+        t = TrainingCreate(character="p@y", trigger="p@y", lora_name="pay",
+                           dataset_images=_images())
+        assert t.lora_name == "pay"
+
+    def test_an_unsafe_explicit_name_is_refused(self):
+        """Otherwise the field just moves the problem."""
+        for bad in ("p@y", "a/b", "with space"):
+            with pytest.raises(ValueError):
+                TrainingCreate(character="x", trigger="x", lora_name=bad,
+                               dataset_images=_images())
+
+    def test_the_upload_uses_the_stored_stem_not_a_fresh_guess(self):
+        import inspect
+        from app.routes import training as mod
+        src = inspect.getsource(mod.upload_training_artifact)
+        assert 'get("lora_name")' in src

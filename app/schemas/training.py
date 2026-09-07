@@ -44,6 +44,18 @@ class TrainingCreate(BaseModel):
     #: carries close-up framing as part of its identity.
     caption: str | None = Field(default=None, max_length=500)
     steps: int = Field(default=1200, ge=100, le=6000)
+    #: The filename stem the LoRA installs under. ASKED, NOT DERIVED.
+    #:
+    #: A LoRA is served over HTTP and lands in JSON and URLs, so `p@y` cannot be a filename --
+    #: but stripping the character it cannot carry gives `py`, and the file this project has
+    #: actually been rendering with is `pay_v2_e05.safetensors`. A human read `@` as `a`. There
+    #: is no rule that produces that: `@`->`a` is a transliteration, and inventing a table for
+    #: it generalises badly (k3lly2026 keeps its digits, so `3`->`e` is wrong).
+    #:
+    #: So it is a field, defaulted to the stripped form and visible in the dialog, rather than
+    #: a guess made silently at upload time.
+    lora_name: str | None = Field(default=None, max_length=64,
+                                  pattern=r"^[A-Za-z0-9._-]+$")
 
     @field_validator("character")
     @classmethod
