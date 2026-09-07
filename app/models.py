@@ -396,6 +396,39 @@ class GpuReservation(Base):
     )
 
 
+class Dataset(Base):
+    """A named, taggable set of images kept for training.
+
+    THE THING THAT DID NOT EXIST. Until now the only groupings were an S3 folder prefix and a
+    per-user favourites list, so "these 27 images are p@y v2's training set" could not be
+    written down -- you re-selected them by hand every time, and a v3 meant doing it again from
+    memory.
+
+    Images are an explicit ORDERED list of s3:// URIs rather than a folder listing. A dataset
+    usually corresponds to a folder, and uploads go into one, but the list is what the dataset
+    IS: it survives an image being moved, and it records the order the trainer will stage them
+    in, which pairs with the captions.
+    """
+    __tablename__ = "datasets"
+    __table_args__ = (Index("ix_datasets_name", "name", unique=True),)
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+    name = mapped_column(String(100), nullable=False)
+    # Comma-separated, matching ImageMeta.tags rather than inventing a second convention. The
+    # console already knows how to parse, render and filter that shape.
+    tags = mapped_column(String(500), nullable=True)
+    notes = mapped_column(Text, nullable=True)
+    #: s3:// URIs, order significant.
+    images = mapped_column(JSONB, nullable=False, default=list)
+    #: The S3 prefix uploads land in. Recorded rather than derived, because a rename must not
+    #: silently point a dataset at a folder that does not exist.
+    prefix = mapped_column(String(200), nullable=True)
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
+                               onupdate=lambda: datetime.now(timezone.utc))
+
+
 class TrainingJob(Base):
     """A character-LoRA training run: what to train, who is training it, and what came out.
 

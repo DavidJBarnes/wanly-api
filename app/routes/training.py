@@ -27,9 +27,10 @@ from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
 from app.config import settings
 from app.database import get_db
 from app.enums import TRAINING_TERMINAL, TrainingStatus, WorkerKind
-from app.models import LtxCharacter, TrainingJob, User, Worker
+from app.models import Dataset, LtxCharacter, TrainingJob, User, Worker
 from app.schemas.training import (
-    TrainingClaimResponse, TrainingCreate, TrainingProgress, TrainingResponse,
+    MIN_DATASET_IMAGES, TrainingClaimResponse, TrainingCreate, TrainingProgress,
+    TrainingResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,23 @@ async def create_training_job(
     db: AsyncSession = Depends(get_db),
 ):
     """Queue a training run. The console's entry point."""
+    # A dataset is the normal path; a raw list stays supported so a CLI or a curl can train
+    # without creating one first.
+    images = list(body.dataset_images)
+    if body.dataset_id:
+        ds = await db.get(Dataset, body.dataset_id)
+        if not ds:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        images = list(ds.images)
+    # Checked here rather than on the schema, because it applies to whichever of the two was
+    # given -- a schema minimum on dataset_images would reject every dataset_id request.
+    if len(images) < MIN_DATASET_IMAGES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{len(images)} images — at least {MIN_DATASET_IMAGES} are needed")
+    if len(set(images)) != len(images):
+        raise HTTPException(status_code=422, detail="the dataset contains duplicates")
+
     dupe = (await db.execute(
         select(TrainingJob).where(
             TrainingJob.character == body.character,
@@ -95,7 +113,7 @@ async def create_training_job(
         character=body.character,
         trigger=body.trigger,
         version=body.version,
-        dataset_images=body.dataset_images,
+        dataset_images=images,
         config={**RECIPE_DEFAULTS, "steps": body.steps, "caption": body.caption,
                 "lora_name": body.lora_name or _default_lora_name(body.character)},
         status=TrainingStatus.PENDING,
@@ -350,6 +368,13 @@ async def upload_training_artifact(
     key = f"character/{stem}_v{job.version}{tag}.safetensors"
     uri = await asyncio.to_thread(s3.upload_bytes, data, key, settings.s3_loras_bucket)
 
+    # EVERY EPOCH IS RECORDED, not just the last. Choosing between them is a judgement made by
+    # eye at a fixed seed -- loss does not rank them -- so the console has to be able to offer
+    # all of them for download. `output_lora_path` tracks the most recent, which is what the
+    # character row points at until someone picks differently.
+    existing = [c for c in (job.checkpoints or []) if isinstance(c, str)]
+    if uri not in existing:
+        job.checkpoints = existing + [uri]
     job.output_lora_path = uri
     await db.commit()
     await db.refresh(job)
