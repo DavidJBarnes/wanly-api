@@ -50,9 +50,12 @@ class TestTheRequest:
             TrainingCreate(character="pay", trigger="p@y",
                            dataset_images=["s3://b/a.jpg"] * 13)
 
-    def test_too_few_images_is_refused(self):
-        with pytest.raises(ValueError):
-            TrainingCreate(character="pay", trigger="p@y", dataset_images=_images(3))
+    def test_too_few_images_is_refused_by_the_route(self):
+        """The floor moved off the schema when dataset_id arrived: a schema minimum on
+        dataset_images would reject every dataset_id request, which is the normal path now."""
+        import inspect
+        from app.routes import training as mod
+        assert "at least {MIN_DATASET_IMAGES} are needed" in inspect.getsource(mod.create_training_job)
 
     def test_a_character_cannot_contain_a_path(self):
         """It becomes a directory name and an output filename on the trainer."""
@@ -298,3 +301,26 @@ class TestTheLoraFilename:
         from app.routes import training as mod
         src = inspect.getsource(mod.upload_training_artifact)
         assert 'get("lora_name")' in src
+
+
+class TestEveryCheckpointIsOffered:
+    """Choosing between epochs is a judgement made by eye at a fixed seed. Loss does not rank
+    them — a confident "later epochs overfit" call read off a loss curve was refuted outright on
+    d0ggyff — so a console that only offers the final epoch has thrown the decision away."""
+
+    def test_uploading_appends_rather_than_replaces(self):
+        import inspect
+        from app.routes import training as mod
+        src = inspect.getsource(mod.upload_training_artifact)
+        assert "job.checkpoints = existing + [uri]" in src
+
+    def test_the_same_uri_is_not_recorded_twice(self):
+        import inspect
+        from app.routes import training as mod
+        assert "if uri not in existing:" in inspect.getsource(mod.upload_training_artifact)
+
+    def test_output_lora_path_tracks_the_most_recent(self):
+        """It is what the character row points at until someone picks differently."""
+        import inspect
+        from app.routes import training as mod
+        assert "job.output_lora_path = uri" in inspect.getsource(mod.upload_training_artifact)

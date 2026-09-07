@@ -37,8 +37,12 @@ class TrainingCreate(BaseModel):
     character: str = Field(min_length=1, max_length=64)
     trigger: str = Field(min_length=1, max_length=64)
     version: int = Field(default=1, ge=1, le=99)
-    dataset_images: list[str] = Field(min_length=MIN_DATASET_IMAGES,
-                                      max_length=MAX_DATASET_IMAGES)
+    #: Either give the images, or name a dataset and let the API resolve them. The dataset is
+    #: the normal path now -- a set worth training is a set worth being able to re-open. The
+    #: minimum is enforced in the route rather than here, because it applies to whichever of
+    #: the two was used.
+    dataset_images: list[str] = Field(default_factory=list, max_length=MAX_DATASET_IMAGES)
+    dataset_id: uuid.UUID | None = None
     #: One caption for every image. Per-image captions come from the dataset instead, and are
     #: the better answer -- all 13 of p@y's read "p@y, woman" over close-ups, so the trigger
     #: carries close-up framing as part of its identity.
