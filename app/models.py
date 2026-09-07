@@ -5,7 +5,7 @@ from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, 
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from app.enums import JobStatus, SegmentStatus, VideoStatus, WORKER_KIND_RENDER
+from app.enums import JobStatus, SegmentStatus, TrainingStatus, VideoStatus, WORKER_KIND_RENDER
 
 
 class Base(DeclarativeBase):
@@ -394,6 +394,81 @@ class GpuReservation(Base):
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
     )
+
+
+class TrainingJob(Base):
+    """A character-LoRA training run: what to train, who is training it, and what came out.
+
+    SHAPED ON Segment, deliberately. It is the same problem — a row the console creates, a
+    remote worker claims, works on for a long time, and reports back about — and the existing
+    machinery for that (orphan reclaim, the heartbeat sweep, the console's status rendering)
+    only transfers if the shape does.
+
+    It is a separate table rather than a Segment variant because almost nothing overlaps: no
+    job, no index, no seed, no video. The two share a lifecycle, not a payload.
+    """
+    __tablename__ = "training_jobs"
+    __table_args__ = (
+        Index("ix_training_jobs_status", "status"),
+        # One live run per character+version. A second attempt at v2 while the first is still
+        # going would train two LoRAs into the same output name and the second would win
+        # silently -- the same class of collision that made new_character.sh mix versions.
+        Index("uq_training_jobs_character_version_live", "character", "version",
+              unique=True,
+              postgresql_where=text("status NOT IN ('completed','failed','cancelled')")),
+    )
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
+
+    # ---- what to train
+    character = mapped_column(String(64), nullable=False)
+    # The token the captions use and a prompt types. Allowed to differ from `character`, and on
+    # p@y it must: the LoRA installs as `pay_...` because it is served over HTTP and lands in
+    # JSON and URLs, while the trigger stays `p@y` because that is what trained.
+    trigger = mapped_column(String(64), nullable=False)
+    version = mapped_column(Integer, nullable=False, default=1)
+    # The dataset, as s3:// URIs, ORDER SIGNIFICANT -- the trainer stages them as sel_000..N and
+    # the captions pair by index. Precedent: Segment.smashcut_clip_paths.
+    dataset_images = mapped_column(JSONB, nullable=False)
+    # Everything the run needs, snapshotted. Same rule as Segment.ltx_recipe: the worker must
+    # never look its configuration up for itself, because a worker that cannot look one up
+    # cannot look up a STALE one. Holds caption(s), steps, rank, LR -- the recipe as it was
+    # when the job was created, so a later change to the defaults cannot retroactively alter
+    # what a queued job will do.
+    config = mapped_column(JSONB, nullable=False, default=dict)
+
+    # ---- who is doing it
+    status = mapped_column(String(20), nullable=False, default=TrainingStatus.PENDING)
+    # No FK on worker_id, matching Segment: worker rows are deleted on deregister, and a
+    # finished training run should still say which box produced it.
+    worker_id = mapped_column(UUID(as_uuid=True), nullable=True)
+    worker_name = mapped_column(String(255), nullable=True)
+    # Snapshotted at claim, because the workers row vanishes when a pod drains and "which GPU
+    # trained this" is exactly the question you ask six weeks later.
+    gpu_name = mapped_column(String(100), nullable=True)
+
+    # ---- what happened
+    # Free text, wholly overwritten on each report, exactly like Segment.progress_log -- and
+    # load-bearing for the same reason: an empty progress log is the only trustworthy evidence
+    # that a claim is not actually being worked on. Status can lie; this cannot.
+    progress_log = mapped_column(Text, nullable=True)
+    # Structured progress, which Segment has no equivalent of. A training run genuinely has a
+    # step count, and the console already has a determinate progress bar looking for exactly
+    # these two numbers.
+    step = mapped_column(Integer, nullable=True)
+    total_steps = mapped_column(Integer, nullable=True)
+    error_message = mapped_column(Text, nullable=True)
+    # Every epoch checkpoint the run produced, as reported. The choice of WHICH one to install
+    # is a human judgement made by eye at a fixed seed -- loss does not rank them -- so all of
+    # them are recorded rather than just the last.
+    checkpoints = mapped_column(JSONB, nullable=True)
+    # The s3:// URI of the installed LoRA, once one is chosen.
+    output_lora_path = mapped_column(Text, nullable=True)
+
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    claimed_at = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class LtxCharacter(Base):
