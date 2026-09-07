@@ -13,7 +13,8 @@ from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_
 from app.config import settings
 from app.database import get_db
 from app.joycaption import CaptionError
-from app.models import Favorite, ImageMeta, Job, Segment, User
+from app.enums import TRAINING_TERMINAL
+from app.models import Favorite, ImageMeta, Job, Segment, TrainingJob, User
 from app.routes.captions import caption_image_bytes
 from app.schemas.images import ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate
 from app.tag_filter import like_escape
@@ -117,7 +118,8 @@ async def find_image_references(db: AsyncSession, paths: list[str]) -> dict[str,
     def _hold(path: str | None, kind: str, holder_id) -> None:
         if not path or path not in wanted:
             return
-        entry = refs.setdefault(path, {"job_ids": [], "segment_ids": []})
+        entry = refs.setdefault(path, {"job_ids": [], "segment_ids": [],
+                                       "training_ids": []})
         if str(holder_id) not in entry[kind]:
             entry[kind].append(str(holder_id))
 
@@ -138,6 +140,22 @@ async def find_image_references(db: AsyncSession, paths: list[str]) -> dict[str,
     for row in seg_rows.all():
         for value in row[1:]:
             _hold(value, "segment_ids", row[0])
+
+    # TRAINING DATASETS COUNT TOO (wanly-api#274). A queued training job holds its dataset as a
+    # JSONB list of s3:// URIs, and deleting one of those images is the same silent failure as
+    # deleting a start frame: nothing breaks until the trainer claims the job, fetches a 404,
+    # and fails a run that was queued days earlier for a reason nowhere near the cause.
+    #
+    # Matched in Python rather than SQL because the paths live inside a JSON array; the row
+    # count here is tiny (one per training run, ever) so a containment query would be more
+    # machinery than the problem deserves.
+    train_rows = await db.execute(
+        select(TrainingJob.id, TrainingJob.dataset_images)
+        .where(TrainingJob.status.not_in(list(TRAINING_TERMINAL)))
+    )
+    for job_id, images in train_rows.all():
+        for value in images or []:
+            _hold(value, "training_ids", job_id)
 
     return refs
 

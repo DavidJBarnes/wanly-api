@@ -1,0 +1,114 @@
+"""Wire shapes for character-LoRA training (wanly-api#274).
+
+Three audiences, and they want different things, which is why this is not one model:
+
+  the console   creates a job and reads its progress
+  the trainer   claims a job and needs EVERYTHING to run it in one response
+  both          list and inspect
+
+The claim response is deliberately self-contained. Same rule as SegmentClaimResponse: a worker
+must never look its configuration up for itself, because a worker that cannot look one up cannot
+look up a STALE one.
+"""
+import uuid
+from datetime import datetime
+
+from pydantic import BaseModel, Field, field_validator
+
+from app.enums import TrainingStatus
+
+#: Below this a run is not worth the GPU hour. p@y worked on 13 and that is the floor anyone has
+#: actually proved; 8 is where it stops being arguable.
+MIN_DATASET_IMAGES = 8
+#: Culling k3llydw from 622 to 50 lifted mean cos 0.558 -> 0.699. More is not better, the extras
+#: dilute -- but this is a guard against a mis-click selecting a whole folder, not a quality
+#: opinion, so it sits well above the useful range.
+MAX_DATASET_IMAGES = 400
+
+
+class TrainingCreate(BaseModel):
+    #: THE LtxCharacter NAME, not a filesystem-safe version of it. `p@y` is correct here.
+    #:
+    #: This is what the finished LoRA is published against, and it upserts on the name -- so
+    #: passing `pay` for a character the system already knows as `p@y` creates a SECOND
+    #: character row pointing at the same LoRA, and recipes keep using the old one. The
+    #: filename is sanitised separately at upload (`pay_v3_e04.safetensors`), because a LoRA
+    #: is served over HTTP and lands in JSON and URLs; the name and the trigger are not.
+    character: str = Field(min_length=1, max_length=64)
+    trigger: str = Field(min_length=1, max_length=64)
+    version: int = Field(default=1, ge=1, le=99)
+    dataset_images: list[str] = Field(min_length=MIN_DATASET_IMAGES,
+                                      max_length=MAX_DATASET_IMAGES)
+    #: One caption for every image. Per-image captions come from the dataset instead, and are
+    #: the better answer -- all 13 of p@y's read "p@y, woman" over close-ups, so the trigger
+    #: carries close-up framing as part of its identity.
+    caption: str | None = Field(default=None, max_length=500)
+    steps: int = Field(default=1200, ge=100, le=6000)
+
+    @field_validator("character")
+    @classmethod
+    def _no_path_tricks(cls, v: str) -> str:
+        # It becomes a directory name and an output filename on the trainer.
+        if "/" in v or v.startswith(".") or any(c.isspace() for c in v):
+            raise ValueError("character cannot contain slashes, whitespace, or start with a dot")
+        return v
+
+    @field_validator("dataset_images")
+    @classmethod
+    def _s3_uris_only(cls, v: list[str]) -> list[str]:
+        bad = [x for x in v if not x.startswith("s3://")]
+        if bad:
+            raise ValueError(f"dataset_images must be s3:// URIs, got {bad[0]!r}")
+        if len(set(v)) != len(v):
+            # Duplicates train the same image twice under two sel_NNN names, silently
+            # reweighting the set.
+            raise ValueError("dataset_images contains duplicates")
+        return v
+
+
+class TrainingResponse(BaseModel):
+    id: uuid.UUID
+    character: str
+    trigger: str
+    version: int
+    status: str
+    dataset_images: list[str]
+    config: dict
+    worker_name: str | None = None
+    gpu_name: str | None = None
+    progress_log: str | None = None
+    step: int | None = None
+    total_steps: int | None = None
+    error_message: str | None = None
+    checkpoints: list | None = None
+    output_lora_path: str | None = None
+    created_at: datetime | None = None
+    claimed_at: datetime | None = None
+    completed_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class TrainingClaimResponse(TrainingResponse):
+    """What a trainer gets. Everything it needs, resolved.
+
+    `download_urls` pairs 1:1 with dataset_images, in order, so the trainer never needs S3
+    credentials -- it fetches through the API's own proxy, the same way the render daemon gets
+    its LoRAs.
+    """
+    download_urls: list[str]
+
+
+class TrainingProgress(BaseModel):
+    """A trainer reporting in. Every field optional and written only when present.
+
+    Same conditional-write rule as the worker heartbeat: a report that omits a field must not
+    blank what a previous one set, or a trainer that only sends `step` erases the log.
+    """
+    status: TrainingStatus | None = None
+    progress_log: str | None = None
+    step: int | None = Field(default=None, ge=0)
+    total_steps: int | None = Field(default=None, ge=1)
+    error_message: str | None = None
+    checkpoints: list | None = None
+    output_lora_path: str | None = None

@@ -46,6 +46,31 @@ JOB_VALID_TRANSITIONS: dict[str, set[str]] = {
 }
 
 
+class TrainingStatus(StrEnum):
+    """A character-LoRA training job, wanly-api#274.
+
+    Deliberately the same shape as SegmentStatus, because it is the same shape of problem: a
+    row the console creates, a remote worker claims, works on for a long time, and reports back
+    about. Copying the vocabulary means the orphan-reclaim rules, the console's StatusChip and
+    everything else that reasons about "claimed but making no progress" transfer unchanged.
+
+    RUNNING rather than PROCESSING only because a training run has phases a render does not
+    (staging, caching latents, caching text, training) and "processing" reads as one of them.
+    """
+    PENDING = "pending"
+    CLAIMED = "claimed"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+#: Terminal states. A job in one of these is never reclaimed and never claimed again.
+TRAINING_TERMINAL = frozenset({
+    TrainingStatus.COMPLETED, TrainingStatus.FAILED, TrainingStatus.CANCELLED,
+})
+
+
 class WorkerKind(StrEnum):
     """What a worker IS — the only thing the claim gate reads (#269).
 
@@ -59,6 +84,11 @@ class WorkerKind(StrEnum):
     """
     RENDER = "render"
     SERVICE = "service"
+    #: Runs character-LoRA training (wanly-api#274). A separate kind rather than a `service`
+    #: that happens to train, because the claim gates key on this: a TRAINER takes training
+    #: jobs and never segments, and a SERVICE takes neither. Collapsing them would mean the
+    #: captioner on the 2070 being offered a 50-minute training run it has no GPU for.
+    TRAINER = "trainer"
 
 
 #: Convenience for the model's column defaults, which cannot reference the enum member
