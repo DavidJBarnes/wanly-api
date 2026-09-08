@@ -16,6 +16,7 @@ class LtxCharacterCreate(BaseModel):
     # Per-stage, never flat — stage 1 decides the body, stage 2 resolves the face.
     strength_stage_1: float = 0.8
     strength_stage_2: float = 1.5
+    image_uri: Optional[str] = None
 
 
 class LtxCharacterResponse(BaseModel):
@@ -27,6 +28,7 @@ class LtxCharacterResponse(BaseModel):
     trigger: str
     strength_stage_1: float
     strength_stage_2: float
+    image_uri: Optional[str] = None
 
 
 class LtxCharacterUpdate(BaseModel):
@@ -43,6 +45,7 @@ class LtxCharacterUpdate(BaseModel):
     trigger: Optional[str] = Field(default=None, min_length=1, max_length=64)
     strength_stage_1: Optional[float] = Field(default=None, ge=0)
     strength_stage_2: Optional[float] = Field(default=None, ge=0)
+    image_uri: Optional[str] = None
 
 
 class ContentLora(BaseModel):

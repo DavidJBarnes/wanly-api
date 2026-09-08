@@ -616,3 +616,90 @@ class TestCancellingActuallyCancels:
 
         assert out.status == TrainingStatus.RUNNING
         assert out.step == 7
+
+
+class TestOnlyTheFinalGoesUpByDefault:
+    """A 650 MB checkpoint takes ~18 minutes to leave the 3090 and "I often only want 1 or 2
+    epochs". Every epoch stays on the trainer; the rest are asked for."""
+
+    def test_the_default_policy_is_final(self):
+        req = TrainingCreate(character="p@y", trigger="p@y", dataset_images=_images())
+        assert req.publish == "final"
+
+    def test_all_is_the_other_choice_and_nothing_else_is(self):
+        assert TrainingCreate(character="p@y", trigger="p@y", dataset_images=_images(),
+                              publish="all").publish == "all"
+        with pytest.raises(ValueError):
+            TrainingCreate(character="p@y", trigger="p@y", dataset_images=_images(),
+                           publish="some")
+
+    def test_the_policy_reaches_the_job_config(self):
+        import inspect
+        from app.routes import training as mod
+        assert '"publish": body.publish' in inspect.getsource(mod.create_training_job)
+
+    async def test_a_publish_request_is_recorded_once(self, db):
+        from app.routes.training import request_publish
+        job = _job(status=TrainingStatus.COMPLETED,
+                   epochs=[{"label": "e01", "step": 80, "loss": 0.7},
+                           {"label": "final", "step": 100, "loss": 0.68}],
+                   checkpoints=["s3://ltx-loras/character/pay_v1_final.safetensors"])
+        db.add(job)
+        await db.commit()
+        out = await request_publish(job.id, label="e01", _user=None, db=db)
+        out = await request_publish(job.id, label="e01", _user=None, db=db)
+        assert out.publish_requests == ["e01"]
+
+    async def test_a_checkpoint_the_run_never_wrote_is_refused(self, db):
+        from fastapi import HTTPException
+        from app.routes.training import request_publish
+        job = _job(status=TrainingStatus.COMPLETED, epochs=[{"label": "final", "step": 100}])
+        db.add(job)
+        await db.commit()
+        with pytest.raises(HTTPException) as e:
+            await request_publish(job.id, label="e07", _user=None, db=db)
+        assert e.value.status_code == 404
+
+    async def test_one_already_in_the_bucket_is_refused(self, db):
+        from fastapi import HTTPException
+        from app.routes.training import request_publish
+        job = _job(status=TrainingStatus.COMPLETED, epochs=[{"label": "final", "step": 100}],
+                   checkpoints=["s3://ltx-loras/character/pay_v1_final.safetensors"])
+        db.add(job)
+        await db.commit()
+        with pytest.raises(HTTPException) as e:
+            await request_publish(job.id, label="final", _user=None, db=db)
+        assert e.value.status_code == 409
+
+
+class TestTheLoraHasAFace:
+    async def test_the_dataset_anchor_is_snapshotted_at_creation(self, db):
+        from app.models import Dataset
+        from app.routes.training import create_training_job
+        ds = Dataset(name="faces", images=_images(), anchor_uri=_images()[3], prefix="x")
+        db.add(ds)
+        await db.commit()
+
+        class _U:
+            id = None
+            username = "t"
+        job = await create_training_job(
+            TrainingCreate(character="p@y", trigger="p@y", dataset_id=ds.id), user=_U(), db=db)
+        assert job.thumbnail_uri == _images()[3]
+
+    async def test_publishing_puts_the_face_on_the_character(self, db):
+        job = _job(character="p@y", output_lora_path="s3://ltx-loras/character/pay_v3_final.safetensors",
+                   thumbnail_uri="s3://wanly-images/datasets/x/anchor.jpg")
+        await _publish_character(db, job)
+        await db.commit()
+        from sqlalchemy import select
+        c = (await db.execute(select(LtxCharacter).where(LtxCharacter.name == "p@y"))).scalar_one()
+        assert c.image_uri == "s3://wanly-images/datasets/x/anchor.jpg"
+
+    def test_a_progress_report_can_carry_the_curve_and_the_epochs(self):
+        p = TrainingProgress(loss_log=[[10, 0.9], [20, 0.8]],
+                             epochs=[{"label": "e01", "step": 80, "loss": 0.7}])
+        assert p.loss_log[-1] == [20, 0.8]
+        import inspect
+        from app.routes import training as mod
+        assert '"loss_log", "epochs"' in inspect.getsource(mod.update_training_job)
