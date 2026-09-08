@@ -169,7 +169,7 @@ class TestPublishing:
         from sqlalchemy import select
         row = (await db.execute(select(LtxCharacter).where(
             LtxCharacter.name == "pay"))).scalar_one()
-        assert row.char_lora == "pay_v1_e05.safetensors"
+        assert row.char_lora == "pay_v1_e05"
         assert row.trigger == "p@y"
 
     async def test_retraining_repoints_the_existing_character(self, db):
@@ -183,7 +183,7 @@ class TestPublishing:
         from sqlalchemy import select
         row = (await db.execute(select(LtxCharacter).where(
             LtxCharacter.name == "pay"))).scalar_one()
-        assert row.char_lora == "pay_v2_e03.safetensors"
+        assert row.char_lora == "pay_v2_e03"
         assert row.strength_stage_1 == 0.9, "hand-tuned strengths were overwritten"
 
     async def test_nothing_is_published_without_a_file(self, db):
@@ -268,7 +268,7 @@ class TestCharacterNaming:
         rows = (await db.execute(select(LtxCharacter).where(
             LtxCharacter.name == "p@y"))).scalars().all()
         assert len(rows) == 1
-        assert rows[0].char_lora == "pay_v3_e04.safetensors"
+        assert rows[0].char_lora == "pay_v3_e04"
 
 
 class TestTheLoraFilename:
@@ -687,6 +687,17 @@ class TestOnlyTheFinalGoesUpByDefault:
         with pytest.raises(HTTPException) as e:
             await request_publish(job.id, label="final", _user=None, db=db)
         assert e.value.status_code == 409
+
+
+class TestThePublishedCharacterStoresTheStem:
+    async def test_no_extension_on_the_row(self, db):
+        """Every other row stores `pay_v2_e05`; the console compares stems."""
+        job = _job(character="Me", output_lora_path="s3://ltx-loras/character/david_v1_final.safetensors")
+        await _publish_character(db, job)
+        await db.commit()
+        from sqlalchemy import select
+        c = (await db.execute(select(LtxCharacter).where(LtxCharacter.name == "Me"))).scalar_one()
+        assert c.char_lora == "david_v1_final"
 
 
 class TestTheLoraHasAFace:
