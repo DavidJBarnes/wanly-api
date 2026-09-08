@@ -167,6 +167,7 @@ async def crop_faces(
     dataset_id: uuid.UUID,
     reference_dataset_id: uuid.UUID | None = None,
     gate: bool = True,
+    largest_only: bool = True,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -185,6 +186,13 @@ async def crop_faces(
     Writes a NEW dataset rather than replacing this one. The photographs are the source of truth
     and a crop is derived; overwriting them would make the operation unrepeatable with different
     padding or a different reference.
+
+    `largest_only` DEFAULTS TRUE BUT IS NOT ALWAYS RIGHT. A dataset of solo portraits wants one
+    face per photo. A dataset of couples does not: "largest" is then whoever stood closer to the
+    camera, so the output silently interleaves two people -- and with no reference the gate
+    scores against the crops' own mean, which for a mixed set is a blend of both and cannot
+    separate them. For that shape the working order is: take every face, gate off, remove the
+    wrong people by hand, then run again using the result as the reference.
     """
     ds = await db.get(Dataset, dataset_id)
     if not ds:
@@ -207,7 +215,7 @@ async def crop_faces(
         "images": [base64.b64encode(await asyncio.to_thread(s3.download_bytes, u)).decode()
                    for u in ds.images],
         "reference": ref_embeddings,
-        "largest_only": True,
+        "largest_only": largest_only,
     }
     async with httpx.AsyncClient(timeout=settings.face_crop_timeout_s) as client:
         try:
@@ -244,7 +252,8 @@ async def crop_faces(
         name = f"{name} {uuid.uuid4().hex[:4]}"
     out = Dataset(user_id=user.id, name=name, tags=ds.tags, images=[], prefix=_prefix(name),
                   notes=(f"Cropped from {ds.name}: {len(faces)} faces from {len(ds.images)} "
-                         f"photos, {len(result.get('no_face', []))} with none detected, "
+                         f"photos ({'largest only' if largest_only else 'every face'}), "
+                         f"{len(result.get('no_face', []))} with none detected, "
                          f"{len(dropped)} below the {floor} floor"
                          + ("" if ref_embeddings else
                             " (scored against the crops' own mean — internal consistency only, "
