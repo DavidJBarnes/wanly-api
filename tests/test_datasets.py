@@ -125,6 +125,30 @@ class TestCropping:
         assert "out = Dataset(" in src
         assert "ds.images = uris" not in src
 
+    def test_one_face_per_photo_is_the_default_but_is_a_choice(self):
+        """A dataset of couples does not want the largest face: "largest" is then whoever stood
+        closer to the camera, so the output silently interleaves two people."""
+        import inspect
+        from app.routes import datasets as mod
+        sig = inspect.signature(mod.crop_faces)
+        assert sig.parameters["largest_only"].default is True
+
+    def test_the_choice_actually_reaches_the_service(self):
+        """It was hardcoded True in the payload, so the parameter alone would do nothing."""
+        import inspect
+        from app.routes import datasets as mod
+        src = inspect.getsource(mod.crop_faces)
+        assert '"largest_only": largest_only,' in src
+        assert '"largest_only": True,' not in src
+
+    def test_the_new_dataset_records_which_mode_produced_it(self):
+        """Two crops of the same photographs differ in what they contain, not just how many —
+        a note saying only the count cannot tell them apart."""
+        import inspect
+        from app.routes import datasets as mod
+        src = inspect.getsource(mod.crop_faces)
+        assert "largest only" in src and "every face" in src
+
     def test_an_unconfigured_service_says_so_rather_than_timing_out(self):
         import inspect
         from app.routes import datasets as mod
