@@ -1,0 +1,127 @@
+"""Two people in one shot (wanly-console#473).
+
+The blob names them as `characters: [...]`, slot 0 fills <TRIGGER> and slot 1 <TRIGGER2>,
+and the scalar keys stay mirrored from slot 0 so nothing written before the list is refused.
+"""
+import pytest
+
+from app.model_requirements import LORA, Artifact, required_artifacts
+from app.models import LtxCharacter
+from app.recipe_blob import (
+    MAX_CHARACTERS, TRIGGER2_PLACEHOLDER, recipe_characters, recipe_problem, render_prompt,
+)
+from app.routes.wildcards import RESERVED_WILDCARD_NAMES
+
+TWO = {
+    "recipe": "Bedroom, two", "character": "p@y", "trigger": "p@y", "char_lora": "pay_v2_e05",
+    "char_s1": 0.8, "char_s2": 1.5,
+    "characters": [
+        {"name": "p@y", "trigger": "p@y", "char_lora": "pay_v2_e05", "s1": 0.8, "s2": 1.5},
+        {"name": "Me", "trigger": "d@vid", "char_lora": "david_v1_final", "s1": 0.7, "s2": 1.2},
+    ],
+}
+ONE_SCALAR = {"recipe": "Missionary", "character": "p@y", "trigger": "p@y",
+              "char_lora": "pay_v2_e05", "char_s1": 0.8, "char_s2": 1.5}
+
+
+class TestRenderPrompt:
+    def test_fills_both_slots_in_order(self):
+        assert render_prompt("<TRIGGER2> behind <TRIGGER>", ["p@y", "d@vid"]) == "d@vid behind p@y"
+
+    def test_a_missing_second_trigger_is_left_literal_not_dropped(self):
+        assert render_prompt("<TRIGGER> and <TRIGGER2>", ["p@y"]) == "p@y and <TRIGGER2>"
+        assert render_prompt("<TRIGGER> and <TRIGGER2>", ["p@y", None]) == "p@y and <TRIGGER2>"
+
+    def test_still_takes_a_single_string(self):
+        assert render_prompt("<TRIGGER>, a woman", "p@y") == "p@y, a woman"
+
+    def test_trigger_does_not_eat_trigger2(self):
+        """"<TRIGGER>" is not a substring of "<TRIGGER2>", and this proves it stays so."""
+        assert render_prompt("<TRIGGER2>", ["p@y"]) == "<TRIGGER2>"
+
+
+class TestTheOneReader:
+    def test_the_list_wins(self):
+        assert [c["name"] for c in recipe_characters(TWO)] == ["p@y", "Me"]
+
+    def test_the_scalar_shape_is_one_person(self):
+        [one] = recipe_characters(ONE_SCALAR)
+        assert one == {"name": "p@y", "trigger": "p@y", "char_lora": "pay_v2_e05",
+                       "s1": 0.8, "s2": 1.5}
+
+    def test_nothing_is_nothing(self):
+        assert recipe_characters(None) == []
+        assert recipe_characters({"recipe": "x"}) == []
+        assert recipe_characters({"characters": []}) == []
+
+
+class TestRequirements:
+    def test_every_character_lora_is_a_requirement(self):
+        names = {a.name for a in required_artifacts(TWO) if a.kind == LORA}
+        assert {"pay_v2_e05", "david_v1_final"} <= names
+
+    def test_the_scalar_shape_still_yields_one(self):
+        names = {a.name for a in required_artifacts(ONE_SCALAR) if a.kind == LORA}
+        assert names == {"pay_v2_e05"}
+
+    def test_a_none_slot_is_not_a_file(self):
+        blob = dict(TWO, characters=[TWO["characters"][0], {"name": "x", "char_lora": "none"}])
+        names = {a.name for a in required_artifacts(blob) if a.kind == LORA}
+        assert names == {"pay_v2_e05"}
+
+
+class TestValidation:
+    def test_a_third_character_is_refused(self):
+        blob = dict(TWO, characters=TWO["characters"] + [{"name": "third", "char_lora": "t"}])
+        assert "at most 2" in recipe_problem(blob, "<TRIGGER>")
+        assert MAX_CHARACTERS == 2
+
+    def test_trigger2_in_the_prompt_needs_a_second_character(self):
+        assert "second person" in recipe_problem(ONE_SCALAR, "<TRIGGER> with <TRIGGER2>")
+
+    def test_a_two_person_blob_with_a_two_person_prompt_is_fine(self):
+        assert recipe_problem(TWO, "<TRIGGER> with <TRIGGER2>") is None
+
+    def test_old_blobs_are_never_refused(self):
+        assert recipe_problem(ONE_SCALAR, "p@y, a woman") is None
+        assert recipe_problem(None, "<TRIGGER2>") is None
+
+    def test_the_routes_check_before_resolving(self):
+        import inspect
+        from app.routes import jobs, segments
+        assert "recipe_problem(seg.ltx_recipe, seg.prompt)" in inspect.getsource(jobs.create_job)
+        src = inspect.getsource(segments)
+        assert src.index("recipe_problem(body.ltx_recipe, body.prompt)") < src.index(
+            "prompt = await _resolve_trigger(db, body.prompt, body.ltx_recipe)")
+
+    def test_trigger2_is_a_reserved_wildcard_name(self):
+        assert "TRIGGER2" in RESERVED_WILDCARD_NAMES
+
+
+@pytest.mark.asyncio
+class TestResolveTrigger:
+    async def test_fills_trigger2_from_the_second_character(self, db):
+        from app.routes.segments import _resolve_trigger
+        db.add(LtxCharacter(name="p@y", char_lora="pay_v2_e05", trigger="p@y"))
+        db.add(LtxCharacter(name="Me", char_lora="david_v1_final", trigger="d@vid"))
+        await db.commit()
+        out = await _resolve_trigger(db, "<TRIGGER2> stands behind <TRIGGER>", TWO)
+        assert out == "d@vid stands behind p@y"
+
+    async def test_the_rows_trigger_beats_the_recorded_one(self, db):
+        """A trigger corrected on the character row applies to the next render."""
+        from app.routes.segments import _resolve_trigger
+        db.add(LtxCharacter(name="Me", char_lora="david_v1_final", trigger="dav1d"))
+        await db.commit()
+        out = await _resolve_trigger(db, "<TRIGGER> and <TRIGGER2>", TWO)
+        assert out.endswith("and dav1d")
+
+    async def test_a_deleted_row_falls_back_to_what_was_recorded(self, db):
+        from app.routes.segments import _resolve_trigger
+        out = await _resolve_trigger(db, "<TRIGGER> and <TRIGGER2>", TWO)
+        assert out == "p@y and d@vid"
+
+    async def test_a_scalar_blob_still_fills_one(self, db):
+        from app.routes.segments import _resolve_trigger
+        out = await _resolve_trigger(db, "<TRIGGER>, a woman", ONE_SCALAR)
+        assert out == "p@y, a woman"

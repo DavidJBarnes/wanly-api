@@ -20,6 +20,7 @@ from app.database import get_db
 from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStatus
 from app.seeds import new_seed
 from app.estimation import estimate_segment_time, get_estimation_rates, sum_estimated_queue_time
+from app.recipe_blob import recipe_problem
 from app.models import Job, Segment, User, Video, Worker
 from app.model_requirements import (
     CHECKPOINT,
@@ -187,6 +188,9 @@ async def create_job(
         job.lynx_subject_image = job.starting_image
 
     seg = body.first_segment
+    problem = recipe_problem(seg.ltx_recipe, seg.prompt)
+    if problem:
+        raise HTTPException(status_code=422, detail=problem)
     # The console fills and strips its own <scene>…</scene> markers (console#427). Handled
     # again here because this path stores the prompt without going through _resolve_scene:
     # the markers come off, and the caption inside them is held back from the wildcard

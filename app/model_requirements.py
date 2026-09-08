@@ -31,6 +31,7 @@ second opinion about what a daemon can do.
 from dataclasses import dataclass
 
 from app.ltx_stack import LTX_STACK
+from app.recipe_blob import recipe_characters
 
 CHECKPOINT = "checkpoint"
 LORA = "lora"
@@ -89,7 +90,10 @@ def required_artifacts(ltx_recipe: dict | None) -> set[Artifact]:
     # (console#413/#416) and the stack's content_lora is the literal string "none". It means
     # no LoRA, so it must never become a requirement for a file called "none.safetensors",
     # which is precisely the bug wanly-gpu-docker#68 fixed downstream.
-    for raw in [ltx_recipe.get("char_lora"), *_content_lora_names(ltx_recipe)]:
+    # Every person's LoRA (wanly-console#473), read through the one reader of the blob's
+    # people, plus the pose's content LoRAs.
+    for raw in [*(c.get("char_lora") for c in recipe_characters(ltx_recipe)),
+                *_content_lora_names(ltx_recipe)]:
         name = canonical(str(raw or ""))
         if name and name.lower() != "none":
             out.add(Artifact(LORA, name))
