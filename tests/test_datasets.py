@@ -102,3 +102,59 @@ class TestUploadSemantics:
         import inspect
         from app.routes import datasets as mod
         assert "does NOT follow a rename" in inspect.getsource(mod.update_dataset)
+
+
+class TestCropping:
+    """Steps 2 and 3 of the documented pipeline — crop, then gate — which until now existed
+    only as laptop scripts that ssh'd to the box with insightface."""
+
+    def test_the_gate_is_on_by_default(self):
+        """Detection is easy; telling one person from another in the same photo set is what
+        hand-culling failed at twice, once into a set already culled by eye."""
+        import inspect
+        from app.routes import datasets as mod
+        sig = inspect.signature(mod.crop_faces)
+        assert sig.parameters["gate"].default is True
+
+    def test_it_writes_a_new_dataset_rather_than_replacing(self):
+        """The photographs are the source of truth and a crop is derived. Overwriting them
+        makes the operation unrepeatable with different padding or a different reference."""
+        import inspect
+        from app.routes import datasets as mod
+        src = inspect.getsource(mod.crop_faces)
+        assert "out = Dataset(" in src
+        assert "ds.images = uris" not in src
+
+    def test_an_unconfigured_service_says_so_rather_than_timing_out(self):
+        import inspect
+        from app.routes import datasets as mod
+        assert "face_crop_url is empty" in inspect.getsource(mod.crop_faces)
+
+    def test_scoring_without_a_reference_is_labelled_as_weak(self):
+        """Against the crops' own mean it proves internal consistency and nothing more — the
+        l@ura set scored 0.931 mean that way and it meant only "the swap held"."""
+        import inspect
+        from app.routes import datasets as mod
+        assert "internal consistency only" in inspect.getsource(mod.crop_faces)
+
+    def test_everything_failing_the_gate_is_an_error_not_an_empty_dataset(self):
+        import inspect
+        from app.routes import datasets as mod
+        assert "either the reference is wrong" in inspect.getsource(mod.crop_faces)
+
+    def test_the_note_records_what_was_dropped(self):
+        """"10 of 38 had no face" is the number that tells you the source set is wrong."""
+        import inspect
+        from app.routes import datasets as mod
+        src = inspect.getsource(mod.crop_faces)
+        assert "with none detected" in src and "below the" in src
+
+    def test_the_mean_is_computed_here_not_round_tripped(self):
+        from app.routes.datasets import _cos, _mean_via_service
+        import asyncio
+        mu = asyncio.run(_mean_via_service([[1.0, 0.0], [0.0, 1.0]]))
+        assert _cos(mu, mu) == pytest.approx(1.0, abs=1e-6)
+
+    def test_an_absent_embedding_scores_below_any_floor(self):
+        from app.routes.datasets import _cos
+        assert _cos([], [1.0]) < 0.4

@@ -47,6 +47,15 @@ class Settings(BaseSettings):
     #
     # Empty disables it: anywhere the captioner does not share a card with A1111, there is
     # nothing to ask and nothing to reload.
+    # face-crop, in wanly-services. Called inline like JoyCaption is, and for the same reason:
+    # detection on a handful of images is seconds of CPU, not a job worth queueing.
+    #
+    # Empty disables cropping from the console, which is the honest state anywhere the service
+    # is not deployed — the button says so rather than timing out.
+    face_crop_url: str = "http://2070.zero:8084"
+    # Generous. It is per REQUEST, and a request carries a whole dataset — 50 images at a
+    # second or two each on CPU.
+    face_crop_timeout_s: int = 300
     a1111_url: str = "http://2070.zero:7860"
     # Unloading is a few seconds of torch teardown. Short, because failing to free the card
     # only costs the caption, which is never fatal to a render.
