@@ -10,9 +10,11 @@ ordered LIST, not the folder listing: it survives an image being moved, and it f
 the trainer stages them in, which is what the captions pair against.
 """
 import asyncio
+import base64
 import logging
 import uuid
 
+import httpx
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -158,3 +160,133 @@ async def delete_dataset(
         await asyncio.to_thread(s3.delete_prefix, settings.s3_images_bucket, ds.prefix + "/")
     await db.delete(ds)
     await db.commit()
+
+
+@router.post("/datasets/{dataset_id}/crop", response_model=DatasetResponse)
+async def crop_faces(
+    dataset_id: uuid.UUID,
+    reference_dataset_id: uuid.UUID | None = None,
+    gate: bool = True,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Turn a dataset of photographs into a dataset of face crops.
+
+    This is steps 2 and 3 of the documented pipeline -- crop, then gate -- which until now
+    existed only as laptop scripts that ssh'd to the box with insightface. A dataset uploaded in
+    the console had no way to become face crops, so the whole flow stopped at step one.
+
+    THE GATE IS ON BY DEFAULT and that is the important half. Detection is easy; telling p@y
+    from someone else in the same photo set is what hand-culling failed at twice, once into a
+    set that had already been culled by eye. Scored against the mean embedding of a reference
+    dataset -- or against the crops' own mean when none is given, which proves internal
+    consistency and nothing more, and is reported as such.
+
+    Writes a NEW dataset rather than replacing this one. The photographs are the source of truth
+    and a crop is derived; overwriting them would make the operation unrepeatable with different
+    padding or a different reference.
+    """
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    if not settings.face_crop_url:
+        raise HTTPException(
+            status_code=503,
+            detail="no face-crop service is configured (face_crop_url is empty)")
+    if not ds.images:
+        raise HTTPException(status_code=422, detail="this dataset has no images")
+
+    ref_embeddings: list[list[float]] = []
+    if reference_dataset_id:
+        ref = await db.get(Dataset, reference_dataset_id)
+        if not ref:
+            raise HTTPException(status_code=404, detail="Reference dataset not found")
+        ref_embeddings = await _embed_all(ref.images)
+
+    payload = {
+        "images": [base64.b64encode(await asyncio.to_thread(s3.download_bytes, u)).decode()
+                   for u in ds.images],
+        "reference": ref_embeddings,
+        "largest_only": True,
+    }
+    async with httpx.AsyncClient(timeout=settings.face_crop_timeout_s) as client:
+        try:
+            r = await client.post(f"{settings.face_crop_url.rstrip('/')}/crop", json=payload)
+            r.raise_for_status()
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=503, detail=f"face-crop unreachable: {e}") from e
+    result = r.json()
+
+    faces = result["faces"]
+    floor = result.get("cos_floor", 0.4)
+    # With no reference, score against the crops' own mean. It cannot tell you the set is the
+    # right person -- only that it is internally consistent -- and the note says so.
+    if gate and not ref_embeddings and faces:
+        own = [f.get("embedding") or [] for f in faces]
+        mean = await _mean_via_service(own)
+        for f in faces:
+            f["cos"] = _cos(f.get("embedding") or [], mean)
+
+    kept, dropped = [], []
+    for f in faces:
+        if gate and f.get("cos") is not None and f["cos"] < floor:
+            dropped.append((ds.images[f["source_index"]], f["cos"]))
+        else:
+            kept.append(f)
+    if not kept:
+        raise HTTPException(
+            status_code=422,
+            detail=f"every crop scored below the {floor} same-person floor — "
+                   f"either the reference is wrong or this is not one person")
+
+    name = f"{ds.name} faces"
+    if (await db.execute(select(Dataset).where(Dataset.name == name))).scalar_one_or_none():
+        name = f"{name} {uuid.uuid4().hex[:4]}"
+    out = Dataset(user_id=user.id, name=name, tags=ds.tags, images=[], prefix=_prefix(name),
+                  notes=(f"Cropped from {ds.name}: {len(faces)} faces from {len(ds.images)} "
+                         f"photos, {len(result.get('no_face', []))} with none detected, "
+                         f"{len(dropped)} below the {floor} floor"
+                         + ("" if ref_embeddings else
+                            " (scored against the crops' own mean — internal consistency only, "
+                            "not proof of identity)")))
+    db.add(out)
+    await db.flush()
+
+    uris = []
+    for i, f in enumerate(kept):
+        src = ds.images[f["source_index"]].rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        key = f"{out.prefix}/{i:03d}_{src}_f{f['face_index']}.png"
+        uris.append(await asyncio.to_thread(
+            s3.upload_bytes, base64.b64decode(f["png_b64"]), key, settings.s3_images_bucket))
+    out.images = uris
+    await db.commit()
+    await db.refresh(out)
+    logger.info("cropped %s -> %s: %d kept, %d dropped below %.2f",
+                ds.name, out.name, len(uris), len(dropped), floor)
+    return out
+
+
+async def _embed_all(uris: list[str]) -> list[list[float]]:
+    body = {"images": [base64.b64encode(await asyncio.to_thread(s3.download_bytes, u)).decode()
+                       for u in uris]}
+    async with httpx.AsyncClient(timeout=settings.face_crop_timeout_s) as client:
+        r = await client.post(f"{settings.face_crop_url.rstrip('/')}/embed", json=body)
+        r.raise_for_status()
+    return r.json()["embeddings"]
+
+
+async def _mean_via_service(embeddings: list[list[float]]) -> list[float]:
+    """The mean is arithmetic, not a model call — done here rather than round-tripping bytes."""
+    usable = [e for e in embeddings if e]
+    if not usable:
+        return []
+    n = len(usable[0])
+    mean = [sum(e[i] for e in usable) / len(usable) for i in range(n)]
+    norm = sum(x * x for x in mean) ** 0.5
+    return [x / norm for x in mean] if norm else []
+
+
+def _cos(a: list[float], b: list[float]) -> float:
+    if not a or not b:
+        return -2.0
+    return sum(x * y for x, y in zip(a, b))
