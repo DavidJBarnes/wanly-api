@@ -105,7 +105,7 @@ class TestRegistration:
         follow reality rather than the first thing it ever saw."""
         from app.routes import workers as mod
         src = inspect.getsource(mod.register_worker)
-        assert "worker.kind = body.kind" in src
+        assert "worker.kind = kinds[0]" in src  # kinds[0] is body.kind when the daemon sends one kind (094)
 
     def test_provides_is_a_conditional_write_on_register(self):
         from app.routes import workers as mod
@@ -177,7 +177,7 @@ class TestAServiceIsNeverCalledIdle:
         import inspect
         from app.routes import workers as mod
         src = inspect.getsource(mod.register_worker)
-        assert "WorkerStatus.ONLINE_IDLE if body.kind == WorkerKind.RENDER" in src
+        assert "WorkerStatus.ONLINE_IDLE if kinds[0] == WorkerKind.RENDER" in src
 
     def test_a_re_registering_service_is_set_online(self):
         import inspect

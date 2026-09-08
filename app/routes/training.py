@@ -27,7 +27,7 @@ from app import s3
 from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
 from app.config import settings
 from app.database import get_db
-from app.enums import TRAINING_TERMINAL, TrainingStatus, WorkerKind
+from app.enums import TRAINING_TERMINAL, TrainingStatus, WorkerKind, worker_can
 from app.models import Dataset, LtxCharacter, TrainingJob, User, Worker
 from app.schemas.training import (
     MIN_DATASET_IMAGES, TrainingClaimResponse, TrainingCreate, TrainingProgress,
@@ -173,7 +173,9 @@ async def claim_next_training_job(
     is not an error and a poller should not have to distinguish it from one.
     """
     worker = await db.get(Worker, worker_id)
-    if worker is None or worker.kind != WorkerKind.TRAINER:
+    # `worker_can`, not `kind ==`: a box that runs the render stack and the trainer in one
+    # container registers as ["render", "trainer"] with kind = render (wanly-gpu-docker#83).
+    if worker is None or not worker_can(worker, WorkerKind.TRAINER):
         # Not an error the poller can fix by retrying differently, but not fatal either: a
         # worker that registered before this existed simply gets nothing.
         return None

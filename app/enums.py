@@ -96,6 +96,31 @@ class WorkerKind(StrEnum):
 WORKER_KIND_RENDER = str(WorkerKind.RENDER)
 
 
+def worker_kinds(worker) -> list[str]:
+    """Every kind a worker is. Rows from before `kinds` existed are their one `kind`."""
+    return list(worker.kinds) if worker.kinds else [str(worker.kind)]
+
+
+def worker_can(worker, kind: "WorkerKind | str") -> bool:
+    """Is this worker one of `kind`? The training gate reads this, because a box that is
+    render AND trainer carries `kind = render` (render first, always) and the trainer half
+    lives only in `kinds`. The render gates keep reading `kind` -- it is render exactly when
+    render is among the kinds."""
+    return str(kind) in worker_kinds(worker)
+
+
+def ordered_kinds(kinds: list) -> list[str]:
+    """Render first, then the rest in the order given, de-duplicated. `kind` is the first."""
+    out: list[str] = []
+    for k in [str(k) for k in kinds]:
+        if k not in out:
+            out.append(k)
+    if WorkerKind.RENDER in out:
+        out.remove(str(WorkerKind.RENDER))
+        out.insert(0, str(WorkerKind.RENDER))
+    return out
+
+
 class WorkerStatus(StrEnum):
     """Worker statuses, across both kinds.
 

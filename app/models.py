@@ -307,6 +307,11 @@ class Worker(Base):
     #
     # Defaulting to `render` keeps every existing row and every current daemon meaning exactly
     # what it meant before this column existed.
+    # Every kind this worker is (wanly-gpu-docker#83): a box running the render stack and the
+    # trainer registers once as ["render", "trainer"]. `kind` below is the first of these,
+    # with render first whenever present, so the render gates and the console keep reading
+    # one word. Nullable: rows from before the column are read as [kind].
+    kinds: Mapped[list | None] = mapped_column(JSONB, nullable=True, default=None)
     kind: Mapped[str] = mapped_column(String(20), nullable=False, default=WORKER_KIND_RENDER,
                                       server_default=WORKER_KIND_RENDER)
     # WHAT IT RUNS, for display: ["ltx-engine"], ["joycaption", "qwen-edit"]. A list because a

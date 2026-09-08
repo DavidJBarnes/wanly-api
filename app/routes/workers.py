@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import verify_api_key, verify_api_key_or_bearer
 from app.database import get_db
-from app.enums import JobStatus, SegmentStatus, WorkerKind, WorkerStatus
+from app.enums import JobStatus, SegmentStatus, WorkerKind, WorkerStatus, ordered_kinds
 from app.models import Job, Segment, Worker
 from app.queue_health import COUNTED_KINDS, assess
 from app.schemas.workers import QueueHealthResponse, WorkerDrain, WorkerHeartbeat, WorkerRegister, WorkerRename, WorkerResponse, WorkerStatusUpdate
@@ -41,6 +41,9 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
         select(Worker).where(Worker.friendly_name == body.friendly_name)
     )
     worker = result.scalar_one_or_none()
+    # Every kind this box is, render first (wanly-gpu-docker#83). A daemon that predates
+    # `kinds` sends one `kind`, and that is the whole list.
+    kinds = ordered_kinds(body.kinds or [body.kind])
     if worker:
         worker.hostname = body.hostname
         worker.ip_address = body.ip_address
@@ -48,7 +51,8 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
         # Re-registering can legitimately change what a box is: the same host could stop
         # running services and start running an engine. Taken from the request rather than
         # preserved, so the row follows reality instead of the first thing it ever saw.
-        worker.kind = body.kind
+        worker.kind = kinds[0]
+        worker.kinds = kinds
         if body.provides is not None:
             worker.provides = body.provides
         # Re-registering after a container restart can land on a new pod id.
@@ -73,10 +77,11 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
             ip_address=body.ip_address,
             comfyui_running=body.comfyui_running,
             runpod_pod_id=body.runpod_pod_id,
-            kind=body.kind,
+            kind=kinds[0],
+            kinds=kinds,
             provides=body.provides,
             # Same reason as above: the column default is online-idle, which is a render word.
-            status=(WorkerStatus.ONLINE_IDLE if body.kind == WorkerKind.RENDER
+            status=(WorkerStatus.ONLINE_IDLE if kinds[0] == WorkerKind.RENDER
                     else WorkerStatus.ONLINE),
         )
         db.add(worker)
