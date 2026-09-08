@@ -263,10 +263,36 @@ def generate_presigned_url(uri: str, expires: int = 21600) -> str:
     )
 
 
+def generate_presigned_put(uri: str, expires: int = 21600) -> str:
+    """A presigned PUT for an S3 URI, so a worker with no AWS credentials can write ONE object.
+
+    The trainer's checkpoints are ~650 MB each and there are five or six per run. Routed
+    through this API they were read whole into a t3.small's memory and then re-sent to S3,
+    and the console showed "running" for the extra hour that took; a presigned PUT sends them
+    straight from the GPU box to the bucket, and the API only has to be told when one landed.
+
+    Six hours, the same as the GET: a checkpoint takes ten minutes to cross a home uplink and a
+    retry must not find its URL expired.
+
+    Signed with NO Content-Type. Every header that is part of the signature has to be sent
+    back byte-for-byte, and the uploader is not a browser -- the fewer things it has to get
+    right, the fewer SignatureDoesNotMatch rejections after ten minutes of upload.
+    """
+    bucket, key = parse_s3_uri(uri)
+    client = _client_for_bucket(bucket)
+    return client.generate_presigned_url(
+        "put_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires,
+        HttpMethod="PUT",
+    )
+
+
 def head_object(uri: str) -> dict | None:
     """Return {Key, Size, LastModified} for a single S3 object, or None."""
     bucket, key = parse_s3_uri(uri)
-    client = _get_client()
+    # Per-bucket, for the same reason the presigners are: ltx-loras is in another region.
+    client = _client_for_bucket(bucket)
     try:
         resp = client.head_object(Bucket=bucket, Key=key)
         return {
