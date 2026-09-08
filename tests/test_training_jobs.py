@@ -84,7 +84,7 @@ class TestTheClaimGate:
         import inspect
         from app.routes import training as mod
         src = inspect.getsource(mod.claim_next_training_job)
-        assert "worker.kind != WorkerKind.TRAINER" in src
+        assert "not worker_can(worker, WorkerKind.TRAINER)" in src  # reads kinds, not kind (094)
         assert kind != WorkerKind.TRAINER
 
     def test_the_gate_runs_before_the_reclaim_and_the_select(self):

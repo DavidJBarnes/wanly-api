@@ -21,6 +21,9 @@ class WorkerRegister(BaseModel):
     # offered a segment it cannot do -- loudly -- rather than the reverse, which is a render
     # worker silently claiming nothing.
     kind: WorkerKind = WorkerKind.RENDER
+    # Every kind at once (wanly-gpu-docker#83). Absent from every daemon before it; then it
+    # is [kind]. `kind` is derived from it when both are sent, render first.
+    kinds: list[WorkerKind] | None = None
     # WHAT IT RUNS: ["ltx-engine"], ["joycaption", "qwen-edit"]. Optional, and None means
     # "never reported" rather than "runs nothing" -- the distinction every other optional
     # worker field here already draws.
@@ -96,6 +99,7 @@ class WorkerResponse(BaseModel):
     # #269. `kind` is never null -- the column is NOT NULL with a default -- so the console
     # can rely on it and does not need a fallback branch for "unclassified worker".
     kind: str
+    kinds: list[str] | None = None
     provides: list[str] | None = None
     comfyui_running: bool
     gpu_stats: dict[str, Any] | None = None
