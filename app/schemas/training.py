@@ -49,6 +49,10 @@ class TrainingCreate(BaseModel):
     #: the better answer -- all 13 of p@y's read "p@y, woman" over close-ups, so the trigger
     #: carries close-up framing as part of its identity.
     caption: str | None = Field(default=None, max_length=500)
+    #: The console's way of saying the caption: every image is captioned "<trigger>, <gender>".
+    #: Explicit because a free caption field was filled in with "man" alone and the trigger
+    #: was never learned. When given, it decides the caption.
+    gender: Literal["woman", "man", "person"] | None = None
     steps: int = Field(default=1200, ge=100, le=6000)
     #: The filename stem the LoRA installs under. ASKED, NOT DERIVED.
     #:
