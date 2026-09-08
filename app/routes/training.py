@@ -345,6 +345,18 @@ async def upload_training_artifact(
     derives kind from that prefix, so there is nothing else to call: the LoRA is offerable to
     every worker the moment the object lands. The LtxCharacter row that makes it reachable from
     a recipe is created when the job reports `completed`.
+
+    IT NEEDS s3:PutObject ON ltx-loras/character/*, WHICH THE ROLE DID NOT HAVE.
+    Every other bucket this API touches it also writes to, so nothing else noticed; the only
+    ltx-loras policy on `wanly-gpu-registry-ec2` was `s3-ltx-loras-readonly`, named exactly
+    what it was. The endpoint therefore 500'd in production from the day it shipped:
+
+        botocore.errorfactory.AccessDenied: ... not authorized to perform: s3:PutObject
+        on resource: "arn:aws:s3:::ltx-loras/character/pay_v2_e01.safetensors"
+
+    Granted 2026-09-08 as a separate inline policy, `s3-ltx-loras-write-character`, scoped to
+    the one prefix this writes -- separate rather than widening the read policy, so its name
+    stays true. A 500 here is the first thing to re-check if that role is ever rebuilt.
     """
     job = await db.get(TrainingJob, job_id)
     if not job:
