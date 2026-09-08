@@ -1485,8 +1485,17 @@ async def cancel_segment(
     return segment
 
 
-def _recipe_for_take(old: Segment, prompt: str | None) -> dict | None:
-    """The outgoing take's recipe, marked if this roll changed the prompt.
+# Sentinel for "the re-roll request said nothing about the negative prompt". A distinct
+# object rather than None, because None is a REAL value here: the restored-to-default state
+# an explicit empty string asks for (console#449). A plain object() rather than a class
+# instance, because test_chain_seed reads this module as AST, and a module-level call to a
+# private name would read as a call to a definition that does not exist.
+_COPY = object()
+
+
+def _recipe_for_take(old: Segment, prompt: str | None,
+                     negative: str | None | object = _COPY) -> dict | None:
+    """The outgoing take's recipe, marked if this roll changed the prompt or the negative.
 
     A re-roll's premise is that the seed is the ONLY difference, which is what makes two takes
     comparable. Changing the prompt deliberately breaks that — and six takes later nothing
@@ -1497,15 +1506,25 @@ def _recipe_for_take(old: Segment, prompt: str | None) -> dict | None:
     which of a pose's defaults the user overrode. A copy, never a mutation — the archived take
     and its replacement share the dict otherwise, and marking one would rewrite the record of
     the other.
+
+    The negative is measured AFTER translation: a supplied empty string becomes the restored
+    NULL, and restoring when the archived take already had NULL is a no-op — nothing changed,
+    so nothing is marked.
     """
     recipe = old.ltx_recipe
-    if recipe is None or prompt is None or prompt == old.prompt:
+    codes = []
+    if prompt is not None and prompt != old.prompt:
+        codes.append("prompt")
+    if negative is not _COPY and negative != old.negative_prompt:
+        codes.append("negative")
+    if recipe is None or not codes:
         return recipe
-    return {**recipe, "edited": sorted({*(recipe.get("edited") or []), "prompt"})}
+    return {**recipe, "edited": sorted({*(recipe.get("edited") or []), *codes})}
 
 
 def _roll_new_take(job: Job, old: Segment, *, prompt: str | None = None,
-                   prompt_template: str | None = None) -> Segment:
+                   prompt_template: str | None = None,
+                   negative_prompt: str | None | object = _COPY) -> Segment:
     """Archive `old` and build its replacement.
 
     Was shared by a user-initiated re-roll and an automatic rule-driven one; the rule-driven
@@ -1575,11 +1594,14 @@ def _roll_new_take(job: Job, old: Segment, *, prompt: str | None = None,
         duration_seconds=old.duration_seconds,
         speed=old.speed,
         start_image=old.start_image,
-        negative_prompt=old.negative_prompt,
+        # Absent (the sentinel): the archived take's value, verbatim, which is what re-roll
+        # has always done. Provided: the request's value — including None from an explicit
+        # empty string, which is the deliberate "back to the live default" of console#449.
+        negative_prompt=old.negative_prompt if negative_prompt is _COPY else negative_prompt,
         # The recipe is what the take IS. Without it a re-rolled LTX segment renders free-form
         # — no character LoRA, no trigger, no per-stage strengths — and comes back looking like
         # a different shot, which is the opposite of a re-roll's entire purpose.
-        ltx_recipe=_recipe_for_take(old, prompt),
+        ltx_recipe=_recipe_for_take(old, prompt, negative_prompt),
         auto_finalize=old.auto_finalize,
     )
 
@@ -1593,7 +1615,7 @@ _REROLL_REFUSED_STATUSES = (JobStatus.FINALIZED, JobStatus.FINALIZING, JobStatus
 
 
 async def _reroll(db: AsyncSession, job: Job, old: Segment,
-                  prompt: str | None) -> Segment:
+                  prompt: str | None, negative_prompt: str | None = None) -> Segment:
     """Archive `old` and queue a fresh take of it. Shared by both routes.
 
     This is the "show me another take" button. Everything that defines the shot — LoRAs,
@@ -1602,8 +1624,14 @@ async def _reroll(db: AsyncSession, job: Job, old: Segment,
     already-resolved for the same reason: re-rolling the wildcards too would change two
     variables at once and make the comparison worth nothing.
 
-    Unless the caller asks for a different prompt, which is the point of console#424 and is
-    an explicit choice rather than a side effect. The recipe records that it happened.
+    Unless the caller asks for a different prompt or negative, which is the point of
+    console#424 and console#449. Both are explicit choices rather than side effects, and the
+    recipe records that they happened.
+
+    The negative is translated here, once, before anything sees it: absent stays the
+    sentinel that copies the archived take's value, a blank string becomes the restored NULL,
+    and anything else rides through as written (console#430 makes an explicit empty a
+    "drop it", never a "render with nothing").
 
     ONLY THE LAST LIVE SEGMENT. A segment with a live successor is the frame that successor
     continues from; replacing it would leave every one of them continuing from a frame that
@@ -1662,7 +1690,20 @@ async def _reroll(db: AsyncSession, job: Job, old: Segment,
         triggered = await _resolve_trigger(db, prompt, old.ltx_recipe)
         resolved, template = await _resolve_wildcards_outside_scene(db, triggered)
 
-    fresh = _roll_new_take(job, old, prompt=resolved, prompt_template=template)
+    if negative_prompt is None:
+        # Nothing asked for: the fresh take copies the archived one, verbatim, including a
+        # NULL — which is exactly the inheritance rule the append path applies.
+        negative_at = _COPY
+    elif not negative_prompt.strip():
+        # A blank field is the explicit "drop it" (console#449): back to NULL so the claim
+        # resolves Settings -> stack constant live again. Never stored as '' — the claim
+        # checks `is not None`, and an empty string would become a render with no negative.
+        negative_at = None
+    else:
+        negative_at = negative_prompt
+
+    fresh = _roll_new_take(job, old, prompt=resolved, prompt_template=template,
+                           negative_prompt=negative_at)
     db.add(fresh)
     await db.commit()
     await db.refresh(fresh)
@@ -1676,7 +1717,7 @@ async def reroll_segment(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Another take of this segment, optionally with a different prompt (console#424).
+    """Another take of this segment, optionally with a different prompt or negative.
 
     Addressed by SEGMENT rather than by job. "The job's one segment" was unambiguous while
     re-roll only served index 0; once any index can be the target, the caller has to be able
@@ -1696,7 +1737,8 @@ async def reroll_segment(
         select(Job).where(Job.id == segment.job_id).options(selectinload(Job.segments))
     )).scalar_one()
 
-    return await _reroll(db, job, segment, body.prompt if body else None)
+    return await _reroll(db, job, segment, body.prompt if body else None,
+                         body.negative_prompt if body else None)
 
 
 @router.post("/jobs/{job_id}/reroll", response_model=SegmentResponse)
@@ -1727,7 +1769,8 @@ async def reroll_current_segment(
                             detail="Job has no live segment to re-roll.")
 
     return await _reroll(db, job, max(live, key=lambda s: s.index),
-                         body.prompt if body else None)
+                         body.prompt if body else None,
+                         body.negative_prompt if body else None)
 
 
 @router.post("/segments/{segment_id}/discard", response_model=SegmentResponse)

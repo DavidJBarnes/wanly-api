@@ -83,8 +83,11 @@ def test_every_client_supplied_segment_field_is_wired_into_both_paths():
 
 
 # What a segment IS, as opposed to what happened to it. Every construction of a Segment has to
-# carry these or the thing it builds is a different shot.
-_SHOT_DEFINING = {"prompt", "ltx_recipe"}
+# carry these or the thing it builds is a different shot. negative_prompt joined alongside
+# ltx_recipe with console#449: a take that renders against a different negative conditioning
+# is a different shot by the same argument — and the claim resolves NULL live, so an
+# _roll_new_take that copied nothing here would silently swap the live default in.
+_SHOT_DEFINING = {"prompt", "ltx_recipe", "negative_prompt"}
 
 # Sites that legitimately do not, each with its reason. Both are CARRIERS — a segment row used
 # to hang reprocess work off a job, at a sentinel index far above any real segment. They render
@@ -93,8 +96,8 @@ _SHOT_DEFINING = {"prompt", "ltx_recipe"}
 # The list is the point: an exemption has to be argued for here rather than happening by
 # omission, which is exactly how _roll_new_take lost ltx_recipe.
 _EXEMPT: dict[str, set[str]] = {
-    "make_hologram": {"ltx_recipe"},    # AR hologram carrier, index 1000
-    "create_smashcut": {"ltx_recipe"},  # ffmpeg concat carrier, index 2000
+    "make_hologram": {"ltx_recipe", "negative_prompt"},    # AR hologram carrier, index 1000
+    "create_smashcut": {"ltx_recipe", "negative_prompt"},  # ffmpeg concat carrier, index 2000
 }
 
 
