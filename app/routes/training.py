@@ -372,7 +372,14 @@ async def upload_training_artifact(
     # eye at a fixed seed -- loss does not rank them -- so the console has to be able to offer
     # all of them for download. `output_lora_path` tracks the most recent, which is what the
     # character row points at until someone picks differently.
-    existing = [c for c in (job.checkpoints or []) if isinstance(c, str)]
+    # ONLY s3:// SURVIVES. The console turns every entry into a download button pointed at
+    # GET /files, which can serve an S3 URI and nothing else. Early trainer builds recorded the
+    # container-local output path instead of uploading, so a completed job carries entries like
+    # `/loras/p@y/ltx23b-v2/output/p@y_v2-000003.comfy.safetensors` -- carrying those forward
+    # puts five buttons on the page and four of them 404. Dropping them here is also the
+    # backfill: re-uploading a job's epochs replaces the dead list with the live one.
+    existing = [c for c in (job.checkpoints or [])
+                if isinstance(c, str) and c.startswith("s3://")]
     if uri not in existing:
         job.checkpoints = existing + [uri]
     job.output_lora_path = uri

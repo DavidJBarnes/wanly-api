@@ -324,3 +324,53 @@ class TestEveryCheckpointIsOffered:
         import inspect
         from app.routes import training as mod
         assert "job.output_lora_path = uri" in inspect.getsource(mod.upload_training_artifact)
+
+
+@pytest.mark.asyncio
+class TestOnlyDownloadableCheckpointsSurvive:
+    """The console turns every `checkpoints` entry into a download button pointed at
+    GET /files, which serves an S3 URI and nothing else. Early trainer builds recorded the
+    container-local output path instead of uploading, so a completed job carried five entries
+    that all 404. Re-uploading has to REPLACE that list, not extend it."""
+
+    async def _upload(self, db, job, monkeypatch, epoch=None):
+        import io
+        from fastapi import UploadFile
+        from app.routes import training as mod
+
+        uploaded = {}
+
+        def fake_upload(data, key, bucket):
+            uploaded["key"] = key
+            return f"s3://{bucket}/{key}"
+
+        monkeypatch.setattr(mod.s3, "upload_bytes", fake_upload)
+        # Over the 10 MB floor the route enforces against truncated uploads.
+        payload = b"\0" * (11 * 1024 * 1024)
+        f = UploadFile(filename="lora.safetensors", file=io.BytesIO(payload))
+        return await mod.upload_training_artifact(job.id, lora=f, epoch=epoch, db=db)
+
+    async def test_a_container_local_path_is_dropped(self, db, monkeypatch):
+        job = _job(status=TrainingStatus.COMPLETED, config={"lora_name": "pay"},
+                   checkpoints=["/loras/p@y/ltx23b-v2/output/p@y_v2-000003.comfy.safetensors"])
+        db.add(job)
+        await db.commit()
+
+        out = await self._upload(db, job, monkeypatch, epoch=3)
+
+        assert all(c.startswith("s3://") for c in out.checkpoints), out.checkpoints
+        assert len(out.checkpoints) == 1
+
+    async def test_earlier_s3_epochs_are_still_kept(self, db, monkeypatch):
+        """Dropping the dead entries must not also drop the good ones — every epoch is
+        offered because loss does not rank them."""
+        prior = "s3://ltx-loras/character/pay_v2_e01.safetensors"
+        job = _job(status=TrainingStatus.COMPLETED, config={"lora_name": "pay"},
+                   checkpoints=[prior, "/loras/output/p@y_v2-000002.comfy.safetensors"])
+        db.add(job)
+        await db.commit()
+
+        out = await self._upload(db, job, monkeypatch, epoch=2)
+
+        assert prior in out.checkpoints
+        assert len(out.checkpoints) == 2
