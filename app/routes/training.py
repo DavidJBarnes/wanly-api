@@ -594,7 +594,18 @@ async def delete_training_job(
                 status_code=409,
                 detail=f"{names} renders with a checkpoint of this run — point the character "
                        f"at another LoRA first, or delete the run without its files")
-        await asyncio.gather(*(asyncio.to_thread(s3.delete_object, f) for f in files))
+        try:
+            await asyncio.gather(*(asyncio.to_thread(s3.delete_object, f) for f in files))
+        except Exception as e:
+            # The role needs s3:DeleteObject on ltx-loras/character/*, which it did not have
+            # the first time this ran -- the read policy is read-only by name and the write
+            # policy granted PutObject alone. A 500 here left the row in place and said
+            # nothing; say what is needed instead.
+            raise HTTPException(
+                status_code=503,
+                detail=f"could not delete the LoRA files ({type(e).__name__}: {e}); the run "
+                       f"is still here. The API's role needs s3:DeleteObject on the "
+                       f"character/ prefix.") from e
         logger.info("deleted %d checkpoint(s) of %s v%d", len(files), job.character, job.version)
     await db.delete(job)
     await db.commit()

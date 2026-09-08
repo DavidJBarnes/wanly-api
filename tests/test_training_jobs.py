@@ -477,6 +477,23 @@ class TestAFinishedRunCanBeDeleted:
         assert deleted == []
         assert await db.get(TrainingJob, job.id) is not None
 
+    async def test_a_file_that_cannot_be_deleted_keeps_the_row_and_says_why(self, db, monkeypatch):
+        """It 500'd in production: the role had PutObject on character/* and not DeleteObject."""
+        from fastapi import HTTPException
+        from app.routes import training as mod
+        job = _job(status=TrainingStatus.COMPLETED,
+                   checkpoints=["s3://ltx-loras/character/pay_v2_final.safetensors"])
+        db.add(job)
+        await db.commit()
+
+        def denied(uri):
+            raise PermissionError("AccessDenied")
+        monkeypatch.setattr(mod.s3, "delete_object", denied)
+        with pytest.raises(HTTPException) as e:
+            await mod.delete_training_job(job.id, purge=True, _user=None, db=db)
+        assert e.value.status_code == 503 and "DeleteObject" in e.value.detail
+        assert await db.get(TrainingJob, job.id) is not None
+
     async def test_otherwise_the_files_are_deleted(self, db, monkeypatch):
         from app.routes import training as mod
         uris = ["s3://ltx-loras/character/pay_v2_e01.safetensors",
