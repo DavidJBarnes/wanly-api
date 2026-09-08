@@ -226,9 +226,12 @@ async def crop_faces(
             raise HTTPException(status_code=404, detail="Reference dataset not found")
         ref_embeddings = await _embed_all(ref.images)
 
+    # CONCURRENTLY. Fetched one at a time this was fourteen serial round trips to S3 before any
+    # work started; they are independent and the wait is entirely network.
+    blobs = await asyncio.gather(
+        *(asyncio.to_thread(s3.download_bytes, u) for u in ds.images))
     payload = {
-        "images": [base64.b64encode(await asyncio.to_thread(s3.download_bytes, u)).decode()
-                   for u in ds.images],
+        "images": [base64.b64encode(b).decode() for b in blobs],
         "reference": ref_embeddings,
         "largest_only": largest_only,
     }
@@ -279,12 +282,22 @@ async def crop_faces(
     db.add(out)
     await db.flush()
 
-    uris = []
-    for i, f in enumerate(kept):
+    # THE EXTENSION FOLLOWS WHAT THE SERVICE ACTUALLY SENT. It returns JPEG now, capped at the
+    # trainer's resolution ceiling, because full-resolution lossless PNG made an 80 MB response
+    # that could not cross a home uplink inside the read timeout. `format` is absent on a
+    # face-crop that predates that, and the old contract there was PNG -- so the two repos can
+    # deploy in either order.
+    ext = {"jpeg": "jpg"}.get(str(kept[0].get("format", "png")).lower(), "png")
+
+    # Uploaded concurrently, for the same reason the fetch is: independent, network-bound, and
+    # serial round trips are the whole cost.
+    async def put(i: int, f: dict) -> str:
         src = ds.images[f["source_index"]].rsplit("/", 1)[-1].rsplit(".", 1)[0]
-        key = f"{out.prefix}/{i:03d}_{src}_f{f['face_index']}.png"
-        uris.append(await asyncio.to_thread(
-            s3.upload_bytes, base64.b64decode(f["png_b64"]), key, settings.s3_images_bucket))
+        key = f"{out.prefix}/{i:03d}_{src}_f{f['face_index']}.{ext}"
+        return await asyncio.to_thread(
+            s3.upload_bytes, base64.b64decode(f["png_b64"]), key, settings.s3_images_bucket)
+
+    uris = list(await asyncio.gather(*(put(i, f) for i, f in enumerate(kept))))
     out.images = uris
     await db.commit()
     await db.refresh(out)
@@ -367,8 +380,8 @@ async def score_against_anchor(
 
 
 async def _embed_all(uris: list[str]) -> list[list[float]]:
-    body = {"images": [base64.b64encode(await asyncio.to_thread(s3.download_bytes, u)).decode()
-                       for u in uris]}
+    blobs = await asyncio.gather(*(asyncio.to_thread(s3.download_bytes, u) for u in uris))
+    body = {"images": [base64.b64encode(b).decode() for b in blobs]}
     async with httpx.AsyncClient(timeout=settings.face_crop_timeout_s) as client:
         r = await client.post(f"{settings.face_crop_url.rstrip('/')}/embed", json=body)
         r.raise_for_status()
