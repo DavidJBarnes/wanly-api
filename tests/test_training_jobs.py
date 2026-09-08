@@ -758,3 +758,19 @@ class TestTheCaptionCarriesTheTrigger:
     async def test_no_caption_stays_none_for_the_trainers_default(self, db):
         job = await self._create(db, "   ")
         assert job.config["caption"] is None
+
+    async def test_gender_writes_the_whole_caption(self, db):
+        from app.routes.training import create_training_job
+
+        class _U:
+            id = None
+            username = "t"
+        job = await create_training_job(
+            TrainingCreate(character="Me", trigger="d@vid", dataset_images=_images(),
+                           gender="man"), user=_U(), db=db)
+        assert job.config["caption"] == "d@vid, man"
+        assert job.config["gender"] == "man"
+
+    def test_gender_is_one_of_three(self):
+        with pytest.raises(ValueError):
+            TrainingCreate(character="Me", trigger="d@vid", dataset_images=_images(), gender="boy")

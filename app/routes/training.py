@@ -118,7 +118,9 @@ async def create_training_job(
     # identity bound to "man" instead. A caption that does not mention the trigger gets it
     # prepended here, the way the trainer's own default ("<trigger>, woman") is shaped.
     caption = (body.caption or "").strip() or None
-    if caption and body.trigger not in caption:
+    if body.gender:
+        caption = f"{body.trigger}, {body.gender}"
+    elif caption and body.trigger not in caption:
         caption = f"{body.trigger}, {caption}"
 
     job = TrainingJob(
@@ -128,6 +130,7 @@ async def create_training_job(
         version=body.version,
         dataset_images=images,
         config={**RECIPE_DEFAULTS, "steps": body.steps, "caption": caption,
+                "gender": body.gender,
                 "lora_name": body.lora_name or _default_lora_name(body.character),
                 "publish": body.publish},
         status=TrainingStatus.PENDING,
