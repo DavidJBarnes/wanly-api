@@ -16,6 +16,11 @@ from app.routes.training import ORPHANED_TRAINING_MINUTES, _publish_character, _
 from app.schemas.training import TrainingCreate, TrainingProgress
 
 
+def _run_sync(coro):
+    import asyncio
+    return asyncio.run(coro)
+
+
 def _images(n=13):
     return [f"s3://wanly-images/2026-09-07/img{i}.jpg" for i in range(n)]
 
@@ -242,7 +247,7 @@ class TestCharacterNaming:
         import inspect
         from app.routes import training as mod
         assert "lora_name" in inspect.getsource(mod.create_training_job)
-        assert 'get("lora_name")' in inspect.getsource(mod.upload_training_artifact)
+        assert 'get("lora_name")' in inspect.getsource(mod._artifact_key)
 
     def test_the_trigger_never_feeds_the_filename(self):
         """They are different things. The trigger keeps whatever trained."""
@@ -297,10 +302,17 @@ class TestTheLoraFilename:
                                dataset_images=_images())
 
     def test_the_upload_uses_the_stored_stem_not_a_fresh_guess(self):
+        from app.routes.training import _artifact_key
+        job = _job(character="p@y", version=3, config={"lora_name": "pay"})
+        assert _artifact_key(job, 4, False) == "character/pay_v3_e04.safetensors"
+
+    def test_both_upload_paths_name_the_file_the_same_way(self):
+        """The CLI backfill and the trainer's direct PUT must land on identical keys, or a
+        backfilled epoch sits beside the live one under a second name."""
         import inspect
         from app.routes import training as mod
-        src = inspect.getsource(mod.upload_training_artifact)
-        assert 'get("lora_name")' in src
+        assert "_artifact_key(job, epoch, final)" in inspect.getsource(mod.upload_training_artifact)
+        assert "_artifact_key(job, epoch, final)" in inspect.getsource(mod.presign_training_artifact)
 
 
 class TestEveryCheckpointIsOffered:
@@ -309,21 +321,154 @@ class TestEveryCheckpointIsOffered:
     d0ggyff — so a console that only offers the final epoch has thrown the decision away."""
 
     def test_uploading_appends_rather_than_replaces(self):
-        import inspect
-        from app.routes import training as mod
-        src = inspect.getsource(mod.upload_training_artifact)
-        assert "job.checkpoints = existing + [uri]" in src
+        from app.routes.training import _record_checkpoint
+        job = _job(checkpoints=["s3://ltx-loras/character/pay_v1_e01.safetensors"])
+        _record_checkpoint(job, "s3://ltx-loras/character/pay_v1_e02.safetensors")
+        assert job.checkpoints == ["s3://ltx-loras/character/pay_v1_e01.safetensors",
+                                   "s3://ltx-loras/character/pay_v1_e02.safetensors"]
 
     def test_the_same_uri_is_not_recorded_twice(self):
-        import inspect
-        from app.routes import training as mod
-        assert "if uri not in existing:" in inspect.getsource(mod.upload_training_artifact)
+        from app.routes.training import _record_checkpoint
+        job = _job(checkpoints=["s3://ltx-loras/character/pay_v1_e01.safetensors"])
+        _record_checkpoint(job, "s3://ltx-loras/character/pay_v1_e01.safetensors")
+        assert len(job.checkpoints) == 1
 
     def test_output_lora_path_tracks_the_most_recent(self):
         """It is what the character row points at until someone picks differently."""
+        from app.routes.training import _record_checkpoint
+        job = _job()
+        _record_checkpoint(job, "s3://ltx-loras/character/pay_v1_e01.safetensors")
+        _record_checkpoint(job, "s3://ltx-loras/character/pay_v1_final.safetensors")
+        assert job.output_lora_path == "s3://ltx-loras/character/pay_v1_final.safetensors"
+
+    def test_both_upload_paths_record_through_one_function(self):
         import inspect
         from app.routes import training as mod
-        assert "job.output_lora_path = uri" in inspect.getsource(mod.upload_training_artifact)
+        assert "_record_checkpoint(job, uri)" in inspect.getsource(mod.upload_training_artifact)
+        assert "_record_checkpoint(job, uri)" in inspect.getsource(mod.commit_training_artifact)
+
+
+class TestTheFinalCheckpointIsNamed:
+    """The trainer writes the checkpoint at the end of the step count WITHOUT an epoch number.
+    It is usually a partial epoch and it is the one with the most training in it; published
+    as a bare `pay_v2.safetensors` it read as "the v2" and hid that four other candidates
+    existed. The console labelled it with the whole filename."""
+
+    def test_final_gets_its_own_tag(self):
+        from app.routes.training import _artifact_key
+        job = _job(character="p@y", version=2, config={"lora_name": "pay"})
+        assert _artifact_key(job, None, True) == "character/pay_v2_final.safetensors"
+
+    def test_an_epoch_is_zero_padded(self):
+        from app.routes.training import _artifact_key
+        assert _artifact_key(_job(config={"lora_name": "pay"}), 5, False).endswith("_e05.safetensors")
+
+    def test_the_url_endpoint_insists_on_one_or_the_other(self):
+        """A checkpoint with neither an epoch nor `final` would land on the bare name."""
+        from fastapi import HTTPException
+        from app.routes.training import presign_training_artifact
+
+        class _DB:
+            async def get(self, *_a):
+                return _job()
+
+        with pytest.raises(HTTPException) as e:
+            _run_sync(presign_training_artifact(uuid.uuid4(), epoch=None, final=False, db=_DB()))
+        assert e.value.status_code == 422
+
+
+class TestACommitIsBelievedOnlyAfterLooking:
+    """The trainer PUTs straight to S3 and then says so. Saying so must not be enough: a PUT
+    that failed, was truncated, or went to somebody else's key would otherwise put a dead
+    download button on the page -- exactly what this replaces."""
+
+    def _job(self):
+        return _job(character="p@y", version=2, config={"lora_name": "pay"})
+
+    def test_a_uri_of_another_job_is_refused(self):
+        from app.routes.training import _belongs_to
+        job = self._job()
+        assert not _belongs_to(job, "s3://ltx-loras/character/laura_v2_e01.safetensors")
+        assert not _belongs_to(job, "s3://ltx-loras/character/pay_v20_e01.safetensors")
+        assert not _belongs_to(job, "s3://ltx-loras/character/pay_v3_e01.safetensors")
+        assert not _belongs_to(job, "s3://wanly-images/character/pay_v2_e01.safetensors")
+
+    def test_its_own_names_are_accepted(self):
+        from app.routes.training import _belongs_to
+        job = self._job()
+        assert _belongs_to(job, "s3://ltx-loras/character/pay_v2_e01.safetensors")
+        assert _belongs_to(job, "s3://ltx-loras/character/pay_v2_final.safetensors")
+
+    def test_a_put_that_did_not_land_records_nothing(self, monkeypatch):
+        from fastapi import HTTPException
+        from app.routes import training as mod
+        job = self._job()
+        monkeypatch.setattr(mod.s3, "head_object", lambda uri: None)
+
+        class _DB:
+            async def get(self, *_a):
+                return job
+
+        with pytest.raises(HTTPException) as e:
+            _run_sync(mod.commit_training_artifact(
+                job.id, uri="s3://ltx-loras/character/pay_v2_e01.safetensors", db=_DB()))
+        assert e.value.status_code == 409
+        assert not job.checkpoints
+
+    def test_a_truncated_object_records_nothing(self, monkeypatch):
+        from fastapi import HTTPException
+        from app.routes import training as mod
+        job = self._job()
+        monkeypatch.setattr(mod.s3, "head_object", lambda uri: {"Key": "k", "Size": 1234})
+
+        class _DB:
+            async def get(self, *_a):
+                return job
+
+        with pytest.raises(HTTPException) as e:
+            _run_sync(mod.commit_training_artifact(
+                job.id, uri="s3://ltx-loras/character/pay_v2_e01.safetensors", db=_DB()))
+        assert e.value.status_code == 409
+        assert not job.checkpoints
+
+    async def test_a_real_object_is_recorded(self, db, monkeypatch):
+        from app.routes import training as mod
+        job = self._job()
+        db.add(job)
+        await db.commit()
+        monkeypatch.setattr(mod.s3, "head_object",
+                            lambda uri: {"Key": "k", "Size": 650 * 1024 * 1024})
+
+        out = await mod.commit_training_artifact(
+            job.id, uri="s3://ltx-loras/character/pay_v2_final.safetensors", db=db)
+
+        assert out.checkpoints == ["s3://ltx-loras/character/pay_v2_final.safetensors"]
+        assert out.output_lora_path == "s3://ltx-loras/character/pay_v2_final.safetensors"
+
+
+class TestAFinishedRunCanBeDeleted:
+    """Four failed and cancelled p@y rows sat above the one that worked, forever."""
+
+    def test_a_live_job_is_refused(self):
+        from fastapi import HTTPException
+        from app.routes.training import delete_training_job
+        job = _job(status=TrainingStatus.RUNNING)
+
+        class _DB:
+            async def get(self, *_a):
+                return job
+
+        with pytest.raises(HTTPException) as e:
+            _run_sync(delete_training_job(job.id, _user=None, db=_DB()))
+        assert e.value.status_code == 409
+
+    async def test_a_terminal_job_goes(self, db):
+        from app.routes.training import delete_training_job
+        job = _job(status=TrainingStatus.FAILED)
+        db.add(job)
+        await db.commit()
+        await delete_training_job(job.id, _user=None, db=db)
+        assert await db.get(TrainingJob, job.id) is None
 
 
 @pytest.mark.asyncio

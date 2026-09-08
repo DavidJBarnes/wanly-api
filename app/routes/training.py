@@ -15,6 +15,7 @@ trainer verbatim. This module could not tell you what rank 32 means, and should 
 """
 import asyncio
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -340,15 +341,145 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
         logger.info("created character %s -> %s", job.character, basename)
 
 
+#: Below this a "LoRA" is a truncated upload or an error page. A rank-32 character LoRA is
+#: ~650 MB; letting a tiny one land puts a file in the library that fails at load, inside
+#: somebody's render, days later.
+MIN_ARTIFACT_BYTES = 10 * 1024 * 1024
+
+
+def _artifact_key(job: TrainingJob, epoch: int | None, final: bool) -> str:
+    """Where a checkpoint of this job lives in the LoRA bucket.
+
+    The stem is the one the job was created with, not derived here: stripping `p@y` gives
+    `py`, while the file this project actually renders with is `pay_...` -- a human read `@`
+    as `a`, and no rule produces that.
+
+    `_eNN` for an epoch, `_final` for the checkpoint written when the step count ran out. The
+    trainer writes that one WITHOUT an epoch number, and it is usually a partial epoch -- 1200
+    steps over 27 images is 4.4 epochs, so the final file is the fifth, unfinished pass and
+    also the one with the most training in it. Left unlabelled it was published as a bare
+    `pay_v2.safetensors`, which reads as "the v2" and hides that four other candidates exist.
+    """
+    stem = (job.config or {}).get("lora_name") or _default_lora_name(job.character)
+    tag = "_final" if final else (f"_e{epoch:02d}" if epoch is not None else "")
+    return f"character/{stem}_v{job.version}{tag}.safetensors"
+
+
+def _belongs_to(job: TrainingJob, uri: str) -> bool:
+    """Is this URI one of the names `_artifact_key` can produce for THIS job?
+
+    Anchored on the whole name, not a prefix: `pay_v2` is a prefix of `pay_v20_e01`.
+    """
+    own = f"s3://{settings.s3_loras_bucket}/" + _artifact_key(job, None, False)[:-len(".safetensors")]
+    if not uri.startswith(own):
+        return False
+    return re.fullmatch(r"(_e\d{2}|_final)?\.safetensors", uri[len(own):]) is not None
+
+
+def _record_checkpoint(job: TrainingJob, uri: str) -> None:
+    """One more downloadable checkpoint on the job.
+
+    EVERY EPOCH IS RECORDED, not just the last. Choosing between them is a judgement made by
+    eye at a fixed seed -- loss does not rank them -- so the console has to be able to offer
+    all of them. `output_lora_path` tracks the most recent, which is what the character row
+    points at until someone picks differently.
+
+    ONLY s3:// SURVIVES. The console turns every entry into a download button pointed at
+    GET /files, which can serve an S3 URI and nothing else. Early trainer builds recorded the
+    container-local output path instead of uploading, so a completed job carried entries like
+    `/loras/p@y/ltx23b-v2/output/p@y_v2-000003.comfy.safetensors` -- five buttons on the page
+    and four of them 404. Dropping them here is also the backfill.
+    """
+    existing = [c for c in (job.checkpoints or [])
+                if isinstance(c, str) and c.startswith("s3://")]
+    if uri not in existing:
+        # Reassigned, never appended: JSONB does not see an in-place mutation.
+        job.checkpoints = existing + [uri]
+    job.output_lora_path = uri
+
+
+@router.post("/training/{job_id}/artifact-url", dependencies=[Depends(verify_api_key)])
+async def presign_training_artifact(
+    job_id: uuid.UUID,
+    epoch: int | None = None,
+    final: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    """Where to PUT one checkpoint, signed so the trainer needs no AWS credentials.
+
+    THE TRAINER WRITES STRAIGHT TO S3. The multipart `/artifact` endpoint below still works
+    and is what a CLI backfill uses, but it was the wrong shape for the trainer: five 650 MB
+    files, each read whole into the memory of a t3.small and re-sent to S3, one after the
+    other, AFTER training -- so the console showed "running" at 100% for the hour that took,
+    and when two of the five did not survive the trip the job still said "completed" with
+    the final checkpoint missing and the character row pointing at last week's file.
+
+    Two calls: this one for the URL, `/artifact-commit` once the PUT succeeded. The commit is
+    what records the checkpoint, and it checks the object is really there and really a LoRA,
+    so a failed or truncated PUT records nothing.
+    """
+    job = await db.get(TrainingJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Training job not found")
+    if epoch is None and not final:
+        raise HTTPException(status_code=422, detail="say which: epoch=N or final=true")
+    uri = f"s3://{settings.s3_loras_bucket}/{_artifact_key(job, epoch, final)}"
+    try:
+        url = await asyncio.to_thread(s3.generate_presigned_put, uri)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"could not presign {uri}: {e}") from e
+    return {"uri": uri, "put_url": url, "expires_in": 21600}
+
+
+@router.post("/training/{job_id}/artifact-commit", response_model=TrainingResponse,
+             dependencies=[Depends(verify_api_key)])
+async def commit_training_artifact(
+    job_id: uuid.UUID,
+    uri: str = Query(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """The trainer says a checkpoint landed. Believed only after looking.
+
+    The object has to exist, be big enough to be a LoRA, and belong to THIS job -- a trainer
+    cannot register somebody else's file, or a file outside `character/`, against a run.
+    """
+    job = await db.get(TrainingJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Training job not found")
+    if not _belongs_to(job, uri):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{uri} is not a checkpoint of {job.character} v{job.version}")
+    head = await asyncio.to_thread(s3.head_object, uri)
+    if head is None:
+        raise HTTPException(status_code=409, detail=f"{uri} is not in the bucket — the PUT did not land")
+    if head["Size"] < MIN_ARTIFACT_BYTES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{uri} is {head['Size']} bytes — a rank-32 character LoRA is ~650 MB, so "
+                   f"this is a truncated upload")
+    _record_checkpoint(job, uri)
+    await db.commit()
+    await db.refresh(job)
+    logger.info("recorded %s (%.0f MB) for %s v%d",
+                uri, head["Size"] / 1024 ** 2, job.character, job.version)
+    return job
+
+
 @router.post("/training/{job_id}/artifact", response_model=TrainingResponse,
              dependencies=[Depends(verify_api_key)])
 async def upload_training_artifact(
     job_id: uuid.UUID,
     lora: UploadFile = File(...),
     epoch: int | None = None,
+    final: bool = False,
     db: AsyncSession = Depends(get_db),
 ):
-    """Publish a finished LoRA.
+    """Publish a finished LoRA, through this API. The CLI and backfill path.
+
+    The trainer no longer uses this -- see `/artifact-url` for why -- but a curl from a
+    laptop with a checkpoint on it still does, and it has to land in the same place with the
+    same name.
 
     THIS ENDPOINT EXISTS BECAUSE POST /upload NEEDS A JWT. A trainer holds the shared worker API
     key and nothing else, so it cannot use the console's upload path. Without this it would need
@@ -376,43 +507,40 @@ async def upload_training_artifact(
         raise HTTPException(status_code=404, detail="Training job not found")
 
     data = await lora.read()
-    # A character LoRA at rank 32 is ~650 MB. Anything tiny is a truncated upload or an error
-    # page, and letting it land would put a file in the library that fails at load, inside
-    # somebody's render, days later.
-    if len(data) < 10 * 1024 * 1024:
+    if len(data) < MIN_ARTIFACT_BYTES:
         raise HTTPException(
             status_code=400,
             detail=f"refusing a {len(data)} byte LoRA — a rank-32 character LoRA is ~650 MB, "
                    f"so this is a truncated upload")
-
-    # The stem the job was created with. Not derived here: stripping `p@y` gives `py`, while
-    # the file this project actually renders with is `pay_...` -- a human read `@` as `a`, and
-    # no rule produces that. The TRIGGER keeps the original either way; that is what trained.
-    stem = (job.config or {}).get("lora_name") or _default_lora_name(job.character)
-    tag = f"_e{epoch:02d}" if epoch is not None else ""
-    key = f"character/{stem}_v{job.version}{tag}.safetensors"
+    key = _artifact_key(job, epoch, final)
     uri = await asyncio.to_thread(s3.upload_bytes, data, key, settings.s3_loras_bucket)
-
-    # EVERY EPOCH IS RECORDED, not just the last. Choosing between them is a judgement made by
-    # eye at a fixed seed -- loss does not rank them -- so the console has to be able to offer
-    # all of them for download. `output_lora_path` tracks the most recent, which is what the
-    # character row points at until someone picks differently.
-    # ONLY s3:// SURVIVES. The console turns every entry into a download button pointed at
-    # GET /files, which can serve an S3 URI and nothing else. Early trainer builds recorded the
-    # container-local output path instead of uploading, so a completed job carries entries like
-    # `/loras/p@y/ltx23b-v2/output/p@y_v2-000003.comfy.safetensors` -- carrying those forward
-    # puts five buttons on the page and four of them 404. Dropping them here is also the
-    # backfill: re-uploading a job's epochs replaces the dead list with the live one.
-    existing = [c for c in (job.checkpoints or [])
-                if isinstance(c, str) and c.startswith("s3://")]
-    if uri not in existing:
-        job.checkpoints = existing + [uri]
-    job.output_lora_path = uri
+    _record_checkpoint(job, uri)
     await db.commit()
     await db.refresh(job)
     logger.info("published %s (%.0f MB) for %s v%d",
                 uri, len(data) / 1024 ** 2, job.character, job.version)
     return job
+
+
+@router.delete("/training/{job_id}", status_code=204)
+async def delete_training_job(
+    job_id: uuid.UUID,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Take a finished run off the board.
+
+    Terminal jobs only: a live one is cancelled first, so that the trainer working on it
+    still has a row to report to. The LoRAs it published stay in the bucket -- they are
+    library items now, and a character may be pointing at one.
+    """
+    job = await db.get(TrainingJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Training job not found")
+    if job.status not in TRAINING_TERMINAL:
+        raise HTTPException(status_code=409, detail=f"still {job.status} — cancel it first")
+    await db.delete(job)
+    await db.commit()
 
 
 @router.post("/training/{job_id}/cancel", response_model=TrainingResponse)
