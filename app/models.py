@@ -511,6 +511,19 @@ class TrainingJob(Base):
     checkpoints = mapped_column(JSONB, nullable=True)
     # The s3:// URI of the installed LoRA, once one is chosen.
     output_lora_path = mapped_column(Text, nullable=True)
+    # [[step, avr_loss], ...] sampled from the trainer's progress bar every report. Small --
+    # a report every 20 s over an hour is under two hundred points -- and it is what lets
+    # the console draw the curve rather than print the last number.
+    loss_log = mapped_column(JSONB, nullable=True)
+    # Every checkpoint the run WROTE, as [{label, step, loss}], published or not. Only the
+    # final one is uploaded by default: a 650 MB checkpoint takes ~18 minutes to leave the
+    # 3090, and "I often only want 1 or 2 epochs". The rest sit on the trainer until asked
+    # for through publish_requests, and `checkpoints` records the ones that arrived.
+    epochs = mapped_column(JSONB, nullable=True)
+    publish_requests = mapped_column(JSONB, nullable=True)
+    # The dataset's anchor image at creation -- the face this LoRA is of, for the console
+    # and for the character row it publishes to.
+    thumbnail_uri = mapped_column(Text, nullable=True)
 
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     claimed_at = mapped_column(DateTime(timezone=True), nullable=True)
@@ -538,6 +551,9 @@ class LtxCharacter(Base):
     # is a different configuration, not a simplification.
     strength_stage_1 = mapped_column(Float, nullable=False, server_default="0.8")
     strength_stage_2 = mapped_column(Float, nullable=False, server_default="1.5")
+    # A face for the LoRA: the anchor image of the dataset that trained it. Set when a
+    # training run publishes to this character, editable like everything else here.
+    image_uri = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     # passive_deletes leaves the cascade to the database, where the FK already declares

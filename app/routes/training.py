@@ -80,11 +80,14 @@ async def create_training_job(
     # A dataset is the normal path; a raw list stays supported so a CLI or a curl can train
     # without creating one first.
     images = list(body.dataset_images)
+    thumbnail = None
     if body.dataset_id:
         ds = await db.get(Dataset, body.dataset_id)
         if not ds:
             raise HTTPException(status_code=404, detail="Dataset not found")
         images = list(ds.images)
+        # The anchor is the face the set was checked against; failing that, the first image.
+        thumbnail = ds.anchor_uri or (ds.images[0] if ds.images else None)
     # Checked here rather than on the schema, because it applies to whichever of the two was
     # given -- a schema minimum on dataset_images would reject every dataset_id request.
     if len(images) < MIN_DATASET_IMAGES:
@@ -116,9 +119,11 @@ async def create_training_job(
         version=body.version,
         dataset_images=images,
         config={**RECIPE_DEFAULTS, "steps": body.steps, "caption": body.caption,
-                "lora_name": body.lora_name or _default_lora_name(body.character)},
+                "lora_name": body.lora_name or _default_lora_name(body.character),
+                "publish": body.publish},
         status=TrainingStatus.PENDING,
         total_steps=body.steps,
+        thumbnail_uri=thumbnail,
     )
     db.add(job)
     await db.commit()
@@ -285,7 +290,7 @@ async def update_training_job(
         raise HTTPException(status_code=404, detail="Training job not found")
 
     for field in ("progress_log", "step", "total_steps", "error_message",
-                  "checkpoints", "output_lora_path"):
+                  "checkpoints", "output_lora_path", "loss_log", "epochs"):
         value = getattr(body, field)
         if value is not None:
             setattr(job, field, value)
@@ -335,9 +340,12 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
     if existing:
         existing.char_lora = basename
         existing.trigger = job.trigger
+        if job.thumbnail_uri:
+            existing.image_uri = job.thumbnail_uri
         logger.info("character %s now points at %s", job.character, basename)
     else:
-        db.add(LtxCharacter(name=job.character, char_lora=basename, trigger=job.trigger))
+        db.add(LtxCharacter(name=job.character, char_lora=basename, trigger=job.trigger,
+                            image_uri=job.thumbnail_uri))
         logger.info("created character %s -> %s", job.character, basename)
 
 
@@ -519,6 +527,35 @@ async def upload_training_artifact(
     await db.refresh(job)
     logger.info("published %s (%.0f MB) for %s v%d",
                 uri, len(data) / 1024 ** 2, job.character, job.version)
+    return job
+
+
+@router.post("/training/{job_id}/publish", response_model=TrainingResponse)
+async def request_publish(
+    job_id: uuid.UUID,
+    label: str = Query(..., pattern=r"^(e\d{2}|final)$"),
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Ask for a checkpoint that stayed on the trainer to be uploaded after all.
+
+    Only the final checkpoint goes up by default ("I often only want 1 or 2 epochs"); the
+    rest sit in the run directory on the GPU box. The trainer polls its finished jobs for
+    this list and uploads what it finds, the same way as during a run.
+    """
+    job = await db.get(TrainingJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Training job not found")
+    if not any(e.get("label") == label for e in (job.epochs or [])):
+        raise HTTPException(status_code=404, detail=f"this run has no checkpoint {label}")
+    tag = f"_{label}.safetensors"
+    if any(c.endswith(tag) for c in (job.checkpoints or [])):
+        raise HTTPException(status_code=409, detail=f"{label} is already in the bucket")
+    wanted = list(job.publish_requests or [])
+    if label not in wanted:
+        job.publish_requests = wanted + [label]
+        await db.commit()
+        await db.refresh(job)
     return job
 
 

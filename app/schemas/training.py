@@ -13,6 +13,8 @@ look up a STALE one.
 import uuid
 from datetime import datetime
 
+from typing import Literal
+
 from pydantic import BaseModel, Field, field_validator
 
 from app.enums import TrainingStatus
@@ -60,6 +62,11 @@ class TrainingCreate(BaseModel):
     #: a guess made silently at upload time.
     lora_name: str | None = Field(default=None, max_length=64,
                                   pattern=r"^[A-Za-z0-9._-]+$")
+    #: Which checkpoints to upload as they are written. "final" is the default: a 650 MB
+    #: checkpoint takes ~18 minutes to leave the 3090 and a five-epoch run's uploads
+    #: outlast the training, for epochs that mostly go unused. "all" uploads every one.
+    #: Either way every epoch stays on the trainer and can be published afterwards.
+    publish: Literal["final", "all"] = "final"
 
     @field_validator("character")
     @classmethod
@@ -98,6 +105,12 @@ class TrainingResponse(BaseModel):
     error_message: str | None = None
     checkpoints: list | None = None
     output_lora_path: str | None = None
+    loss_log: list | None = None
+    epochs: list | None = None
+    loss_log: list | None = None
+    epochs: list | None = None
+    publish_requests: list | None = None
+    thumbnail_uri: str | None = None
     created_at: datetime | None = None
     claimed_at: datetime | None = None
     completed_at: datetime | None = None
@@ -128,3 +141,5 @@ class TrainingProgress(BaseModel):
     error_message: str | None = None
     checkpoints: list | None = None
     output_lora_path: str | None = None
+    loss_log: list | None = None
+    epochs: list | None = None
