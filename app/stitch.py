@@ -19,6 +19,51 @@ logger = logging.getLogger(__name__)
 FADE_DURATION = 1.0
 FLASH_DURATION = 1.0
 
+# Real LTX renders carry AAC 48 kHz stereo (ffprobe of a 2026-09-08 segment, console#475).
+# Everything in a stitch list must agree on that shape for `-c copy` to work, so silent
+# entries are synthesized at the same rate; this constant states the agreed value once.
+AUDIO_SAMPLE_RATE = 48000
+
+
+def _has_audio_stream(path: str) -> bool:
+    """Whether a media file carries an audio stream, per ffprobe.
+
+    Decides what audio means for a stitch (console#475): either every clip has it and the
+    result keeps it, or the result is honestly silent. The shape between those — a mixed
+    list — used to be worse than either: `-c copy` rejects inhomogeneous streams, so a
+    job mixing pre-audio and audio-bearing segments failed the whole stitch, and the
+    crossfade path answered the same input with a silent `-an` output, no warning.
+    """
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a",
+         "-show_entries", "stream=index", "-of", "csv=p=0", path],
+        capture_output=True, timeout=60,
+    )
+    return probe.returncode == 0 and bool(probe.stdout.decode(errors="replace").strip())
+
+
+def _pad_silent_track(input_path: str, output_path: str) -> None:
+    """Mux a silent AAC track of the agreed layout under a clip that has no audio.
+
+    Video is stream-copied; the silent source is synthesized infinite and `-shortest` cut
+    to the video's length, so the result matches the audio-bearing neighbors and the
+    literal concat pair works again.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-f", "lavfi", "-i",
+        f"anullsrc=r={AUDIO_SAMPLE_RATE}:cl=stereo",
+        "-map", "0:v", "-map", "1:a",
+        "-shortest",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        output_path,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, timeout=300)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg silent-track mux failed: {proc.stderr.decode()[-500:]}")
+
 
 def _apply_fades(input_path: str, output_path: str, duration: float,
                  fade_in: bool, fade_out: bool) -> None:
@@ -44,12 +89,20 @@ def _apply_fades(input_path: str, output_path: str, duration: float,
 
 
 def _generate_black(output_path: str, duration: float, width: int, height: int, fps: int) -> None:
-    """Generate a short black video clip."""
+    """Generate a short black video clip.
+
+    Carries a silent AAC track at the stitch's agreed layout (console#475): the clip sits in
+    a `-c copy` concat list between audio-bearing LTX segments, and a stream-copy list
+    requires every entry to have the same streams — a naked video-only clip in that list is
+    what used to reject the whole stitch or, at best, mute it.
+    """
     cmd = [
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", f"color=c=black:s={width}x{height}:d={duration}:r={fps}",
+        "-f", "lavfi", "-i", f"anullsrc=r={AUDIO_SAMPLE_RATE}:cl=stereo",
+        "-shortest",
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-an",
+        "-c:a", "aac",
         output_path,
     ]
     proc = subprocess.run(cmd, capture_output=True, timeout=60)
@@ -92,13 +145,21 @@ def _apply_trim(input_path: str, output_path: str, fps: int,
 
 
 def _crossfade_concat(input_paths: list[str], durations: list[float],
-                      crossfade: float, fps: int, output_path: str) -> float:
+                      crossfade: float, fps: int, output_path: str,
+                      carry_audio: bool = False) -> float:
     """Blend consecutive segments with an xfade crossfade (overlapping seam) and
     re-encode to a single clip. Returns the total output duration.
 
     Each boundary overlaps by ``d`` seconds, so the output is shorter than the sum
     of the parts by ``d * (n - 1)``. ``d`` is clamped to fit the shortest segment.
     Raises ValueError if a crossfade can't be applied (too few clips / too short).
+
+    carry_audio (console#475) is the caller's all-or-nothing answer to "do these clips
+    have sound": True chains an acrossfade pass parallel to the xfade pass — the same
+    overlap arithmetic, so picture and sound shorten together — and encodes AAC. False
+    keeps the old video-only output, which is the honest treatment of a list any entry
+    of which is silent: acrossfade needs a stream on every input, and padding one edge
+    to fake uniformity would invent silence where LTX wrote audio for everything else.
     """
     n = len(input_paths)
     if n < 2:
@@ -127,11 +188,28 @@ def _crossfade_concat(input_paths: list[str], durations: list[float],
         running = running + durations[i] - d
         prev_label = out_label
 
+    maps = ["-map", "[out]"]
+
+    if carry_audio:
+        # Same overlap arithmetic as the video chain, one stream behind it.
+        filters += [
+            f"[{i}:a]aformat=sample_fmts=fltp:sample_rates={AUDIO_SAMPLE_RATE}:"
+            f"channel_layouts=stereo[a{i}]"
+            for i in range(n)
+        ]
+        a_prev = "a0"
+        for i in range(1, n):
+            a_out = "aout" if i == n - 1 else f"xa{i}"
+            filters.append(f"[{a_prev}][a{i}]acrossfade=d={d:.4f}[{a_out}]")
+            a_prev = a_out
+        maps += ["-map", "[aout]", "-c:a", "aac"]
+    else:
+        maps += ["-an"]
+
     cmd += [
         "-filter_complex", ";".join(filters),
-        "-map", "[out]",
+        *maps,
         "-c:v", "libx264", "-preset", "fast", "-crf", "18",
-        "-an",
         output_path,
     ]
     proc = subprocess.run(cmd, capture_output=True, timeout=600)
@@ -245,6 +323,13 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
 
                 if use_crossfade:
                     try:
+                        # All-or-nothing by probe: every clip audible -> keep sound (the
+                        # crossfade graph fades it through the seams); any silent clip ->
+                        # the old video-only output, honestly silent. See _crossfade_concat.
+                        audio_flags = []
+                        for f in local_files:
+                            audio_flags.append(await asyncio.to_thread(
+                                _has_audio_stream, str(tmppath / f)))
                         total_duration = await asyncio.to_thread(
                             _crossfade_concat,
                             [str(tmppath / f) for f in local_files],
@@ -252,10 +337,11 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
                             crossfade,
                             job.fps,
                             str(output_path),
+                            all(audio_flags),
                         )
                         logger.info(
-                            "Stitched job %s with %.2fs crossfade across %d segments",
-                            job_id, crossfade, len(segments),
+                            "Stitched job %s with %.2fs crossfade across %d segments (audio: %s)",
+                            job_id, crossfade, len(segments), all(audio_flags),
                         )
                     except ValueError as e:
                         logger.warning("Crossfade skipped (%s); using hard-cut concat", e)
@@ -296,6 +382,31 @@ async def stitch_video(video_id: UUID, job_id: UUID) -> None:
 
                     # Write ffmpeg concat list
                     concat_list = tmppath / "concat.txt"
+
+                    # A stream-copy list requires every file to have the same streams
+                    # (console#475). Audio-bearing LTX segments mixed with anything silent —
+                    # an old pre-audio take, a bare black clip before this change — used to
+                    # fail the copy outright. Pad the silent entries with synthesized
+                    # silence at the agreed layout so the list is uniform again; the user
+                    # gets what the segments actually contain, and the copy survives.
+                    flags = []
+                    for name in concat_names:
+                        flags.append(await asyncio.to_thread(
+                            _has_audio_stream, str(tmppath / name)))
+                    if any(flags) and not all(flags):
+                        padded = []
+                        for name, has_audio in zip(concat_names, flags):
+                            if has_audio:
+                                padded.append(name)
+                            else:
+                                padded_name = f"silent_{name}"
+                                await asyncio.to_thread(
+                                    _pad_silent_track,
+                                    str(tmppath / name),
+                                    str(tmppath / padded_name),
+                                )
+                                padded.append(padded_name)
+                        concat_names = padded
                     concat_list.write_text(
                         "\n".join(f"file '{name}'" for name in concat_names)
                     )
