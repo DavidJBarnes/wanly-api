@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
 from app.config import settings
+from app.routes.datasets import DATASETS_PREFIX
 from app.database import get_db
 from app.joycaption import CaptionError
 from app.enums import TRAINING_TERMINAL
@@ -207,6 +208,9 @@ async def list_folders():
     """List folders in the images bucket, sorted by creation date newest first."""
     bucket = settings.s3_images_bucket
     prefixes = await asyncio.to_thread(list_common_prefixes, bucket)
+    # Datasets share the bucket but are not repo folders: they are training input, and
+    # listing them here made the two look connected (wanly-console#464).
+    prefixes = [p for p in prefixes if p.rstrip("/") != DATASETS_PREFIX]
 
     async def _folder_info(prefix: str) -> dict:
         name = prefix.rstrip("/")

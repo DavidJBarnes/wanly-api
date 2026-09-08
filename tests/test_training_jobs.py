@@ -449,6 +449,48 @@ class TestACommitIsBelievedOnlyAfterLooking:
 class TestAFinishedRunCanBeDeleted:
     """Four failed and cancelled p@y rows sat above the one that worked, forever."""
 
+    def test_the_files_go_with_it_by_default(self):
+        """A deleted run whose checkpoints linger in the library is what someone deleting a
+        run does not expect (console#464)."""
+        import inspect
+        from app.routes.training import delete_training_job
+        sig = inspect.signature(delete_training_job)
+        assert sig.parameters["purge"].default is True
+        assert "s3.delete_object" in inspect.getsource(delete_training_job)
+
+    async def test_a_character_rendering_with_one_stops_the_purge(self, db, monkeypatch):
+        """Deleting the file under a character breaks every recipe that names it."""
+        from fastapi import HTTPException
+        from app.routes import training as mod
+        job = _job(status=TrainingStatus.COMPLETED,
+                   checkpoints=["s3://ltx-loras/character/pay_v2_final.safetensors"])
+        db.add(job)
+        db.add(LtxCharacter(name="p@y", char_lora="pay_v2_final", trigger="p@y"))
+        await db.commit()
+        deleted = []
+        monkeypatch.setattr(mod.s3, "delete_object", lambda uri: deleted.append(uri))
+
+        with pytest.raises(HTTPException) as e:
+            await mod.delete_training_job(job.id, purge=True, _user=None, db=db)
+        assert e.value.status_code == 409
+        assert "p@y" in e.value.detail
+        assert deleted == []
+        assert await db.get(TrainingJob, job.id) is not None
+
+    async def test_otherwise_the_files_are_deleted(self, db, monkeypatch):
+        from app.routes import training as mod
+        uris = ["s3://ltx-loras/character/pay_v2_e01.safetensors",
+                "s3://ltx-loras/character/pay_v2_final.safetensors"]
+        job = _job(status=TrainingStatus.COMPLETED, checkpoints=uris)
+        db.add(job)
+        await db.commit()
+        deleted = []
+        monkeypatch.setattr(mod.s3, "delete_object", lambda uri: deleted.append(uri))
+
+        await mod.delete_training_job(job.id, purge=True, _user=None, db=db)
+        assert sorted(deleted) == sorted(uris)
+        assert await db.get(TrainingJob, job.id) is None
+
     def test_a_live_job_is_refused(self):
         from fastapi import HTTPException
         from app.routes.training import delete_training_job
@@ -459,7 +501,7 @@ class TestAFinishedRunCanBeDeleted:
                 return job
 
         with pytest.raises(HTTPException) as e:
-            _run_sync(delete_training_job(job.id, _user=None, db=_DB()))
+            _run_sync(delete_training_job(job.id, purge=True, _user=None, db=_DB()))
         assert e.value.status_code == 409
 
     async def test_a_terminal_job_goes(self, db):
@@ -467,7 +509,7 @@ class TestAFinishedRunCanBeDeleted:
         job = _job(status=TrainingStatus.FAILED)
         db.add(job)
         await db.commit()
-        await delete_training_job(job.id, _user=None, db=db)
+        await delete_training_job(job.id, purge=False, _user=None, db=db)
         assert await db.get(TrainingJob, job.id) is None
 
 

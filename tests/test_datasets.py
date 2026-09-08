@@ -25,10 +25,26 @@ class TestNaming:
         with pytest.raises(ValueError):
             DatasetCreate(name=bad)
 
-    def test_the_prefix_is_typeable(self):
-        """Spaces work in S3 and are miserable in a URL or a listing."""
-        assert _prefix("p@y v2 faces") == "dataset-p@y-v2-faces"
+    def test_the_prefix_is_keyed_by_id_under_one_hidden_folder(self):
+        """It used to be `dataset-<name>`, which put every dataset in the Image Repo's folder
+        list beside the generation folders and made the two look connected (console#464).
+        By id, so a rename is just a rename."""
+        import uuid
+        from app.routes.datasets import DATASETS_PREFIX, _prefix
+        i = uuid.uuid4()
+        assert _prefix(i) == f"{DATASETS_PREFIX}/{i}"
 
+    def test_the_image_repo_does_not_list_the_datasets_folder(self):
+        import inspect
+        from app.routes import images as mod
+        src = inspect.getsource(mod.list_folders)
+        assert 'p.rstrip("/") != DATASETS_PREFIX' in src
+
+    def test_a_rename_refuses_a_name_that_exists(self):
+        import inspect
+        from app.routes import datasets as mod
+        src = inspect.getsource(mod.update_dataset)
+        assert "already exists" in src
 
 class TestTraining:
     def test_a_job_can_name_a_dataset_instead_of_listing_images(self):
@@ -98,37 +114,51 @@ class TestUploadSemantics:
         assert "purge" in src and "if purge" in src
 
     def test_renaming_does_not_move_the_prefix(self):
-        """Objects other rows point at must not move under them."""
+        """A finished training job's dataset_images point at the old keys."""
         import inspect
         from app.routes import datasets as mod
-        assert "does NOT follow a rename" in inspect.getsource(mod.update_dataset)
-
+        src = inspect.getsource(mod.update_dataset)
+        assert "ds.prefix" not in src.split("body.name")[1].split("body.tags")[0]
 
 class TestCropping:
-    """Steps 2 and 3 of the documented pipeline — crop, then gate — which until now existed
-    only as laptop scripts that ssh'd to the box with insightface."""
+    """Step 2 of the documented pipeline, which until now existed only as laptop scripts that
+    ssh'd to the box with insightface."""
 
-    def test_the_gate_is_on_by_default(self):
-        """Detection is easy; telling one person from another in the same photo set is what
-        hand-culling failed at twice, once into a set already culled by eye."""
-        import inspect
-        from app.routes import datasets as mod
-        sig = inspect.signature(mod.crop_faces)
-        assert sig.parameters["gate"].default is True
-
-    def test_it_writes_a_new_dataset_rather_than_replacing(self):
-        """The photographs are the source of truth and a crop is derived. Overwriting them
-        makes the operation unrepeatable with different padding or a different reference."""
+    def test_it_replaces_the_images_in_place(self):
+        """It used to write a second dataset called "<name> faces". Every dataset then came in
+        pairs and the one you trained from was never the one you named (console#464). The
+        photographs stay in the bucket under the dataset's prefix; the dataset IS the crops."""
         import inspect
         from app.routes import datasets as mod
         src = inspect.getsource(mod.crop_faces)
-        assert "out = Dataset(" in src
-        assert "ds.images = uris" not in src
+        assert "ds.images = uris" in src
+        assert "out = Dataset(" not in src
+
+    def test_a_second_crop_cannot_overwrite_the_first_batch(self):
+        """A training job may still record the first batch's keys."""
+        import inspect
+        from app.routes import datasets as mod
+        assert 'faces-{uuid.uuid4().hex[:6]}' in inspect.getsource(mod.crop_faces)
+
+    def test_the_anchor_is_cleared_because_it_was_a_photograph(self):
+        import inspect
+        from app.routes import datasets as mod
+        assert "ds.anchor_uri = None" in inspect.getsource(mod.crop_faces)
+
+    def test_there_is_no_reference_and_no_gate(self):
+        """Scoring a mixed set against a reference dataset's MEAN separates nobody, and the
+        dropdown for naming one was the most confusing control on the page. Culling happens
+        afterwards against ONE anchor, with the numbers on screen."""
+        import inspect
+        from app.routes import datasets as mod
+        params = inspect.signature(mod.crop_faces).parameters
+        assert "reference_dataset_id" not in params
+        assert "gate" not in params
+        assert not hasattr(mod, "_mean_via_service")
 
     def test_how_many_faces_to_keep_is_a_choice(self):
         """A dataset of couples does not want only the largest face: "largest" is then whoever
-        stood closer to the camera, so the output silently interleaves two people. Which way it
-        defaults is asserted in TestKeepEverythingByDefault."""
+        stood closer to the camera, so the output silently interleaves two people."""
         import inspect
         from app.routes import datasets as mod
         assert "largest_only" in inspect.signature(mod.crop_faces).parameters
@@ -141,46 +171,21 @@ class TestCropping:
         assert '"largest_only": largest_only,' in src
         assert '"largest_only": True,' not in src
 
-    def test_the_new_dataset_records_which_mode_produced_it(self):
-        """Two crops of the same photographs differ in what they contain, not just how many —
-        a note saying only the count cannot tell them apart."""
+    def test_the_note_records_which_mode_produced_it(self):
         import inspect
         from app.routes import datasets as mod
         src = inspect.getsource(mod.crop_faces)
-        assert "largest only" in src and "every face" in src
+        assert "largest only" in src and "every face" in src and "with none detected" in src
 
     def test_an_unconfigured_service_says_so_rather_than_timing_out(self):
         import inspect
         from app.routes import datasets as mod
         assert "face_crop_url is empty" in inspect.getsource(mod.crop_faces)
 
-    def test_a_crop_with_no_reference_says_nothing_was_dropped(self):
-        """It used to score against the crops' own mean and call that a check — the l@ura set
-        scored 0.931 that way and it meant only "the swap held". Now it drops nothing and the
-        note says why, pointing at the anchor as the thing that would make it meaningful."""
+    def test_no_faces_at_all_is_an_error_not_an_empty_dataset(self):
         import inspect
         from app.routes import datasets as mod
-        src = inspect.getsource(mod.crop_faces)
-        assert "nothing dropped, no reference was given" in src
-        assert "internal consistency only" not in src
-
-    def test_everything_failing_the_gate_is_an_error_not_an_empty_dataset(self):
-        import inspect
-        from app.routes import datasets as mod
-        assert "either the reference is wrong" in inspect.getsource(mod.crop_faces)
-
-    def test_the_note_records_what_was_dropped(self):
-        """"10 of 38 had no face" is the number that tells you the source set is wrong."""
-        import inspect
-        from app.routes import datasets as mod
-        src = inspect.getsource(mod.crop_faces)
-        assert "with none detected" in src and "below the" in src
-
-    def test_the_mean_is_computed_here_not_round_tripped(self):
-        from app.routes.datasets import _cos, _mean_via_service
-        import asyncio
-        mu = asyncio.run(_mean_via_service([[1.0, 0.0], [0.0, 1.0]]))
-        assert _cos(mu, mu) == pytest.approx(1.0, abs=1e-6)
+        assert "no faces were detected" in inspect.getsource(mod.crop_faces)
 
     def test_an_absent_embedding_scores_below_any_floor(self):
         from app.routes.datasets import _cos
@@ -188,32 +193,13 @@ class TestCropping:
 
 
 class TestKeepEverythingByDefault:
-    """An unwanted crop is one click to remove; a missing one is a re-run. So the recoverable
-    default is to keep every face, and to delete nothing without something real to score
-    against."""
+    """An unwanted crop is one click to remove; a missing one is a re-run."""
 
     def test_every_face_is_kept_by_default(self):
         import inspect
         from app.routes import datasets as mod
         sig = inspect.signature(mod.crop_faces)
         assert sig.parameters["largest_only"].default is False
-
-    def test_nothing_is_dropped_without_a_reference(self):
-        """It used to fall back to the crops' own mean. On a set that still contains two people
-        that mean is a blend of both, so whichever person is in the minority scores lower for no
-        reason but being outnumbered — and got deleted."""
-        import inspect
-        from app.routes import datasets as mod
-        src = inspect.getsource(mod.crop_faces)
-        assert "gating = gate and bool(ref_embeddings)" in src
-
-    def test_the_own_mean_fallback_is_gone_not_just_unused(self):
-        import ast, inspect
-        from app.routes import datasets as mod
-        tree = ast.parse(inspect.getsource(mod.crop_faces).strip())
-        calls = [n.func.id for n in ast.walk(tree)
-                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
-        assert "_mean_via_service" not in calls
 
 
 @pytest.mark.asyncio
