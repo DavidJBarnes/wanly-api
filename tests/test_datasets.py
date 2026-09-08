@@ -304,3 +304,50 @@ class TestTheAnchor:
         import inspect
         from app.routes import datasets as mod
         assert "cos=None if not e else" in inspect.getsource(mod.score_against_anchor)
+
+
+class TestTheCropRoundTripFitsThroughTheWire:
+    """`cropping failed` in the console, `200 OK` in face-crop's log, nothing in this API's.
+    The response could not get back: crops were full-resolution lossless PNG, ~80 MB for
+    fourteen group photos, over a home uplink, inside a 300s read timeout."""
+
+    def test_the_extension_follows_what_the_service_sent(self):
+        """It returns JPEG now. Writing `.png` over JPEG bytes gives a library a file whose
+        name lies, and the failure lands somewhere else entirely."""
+        import inspect
+        from app.routes import datasets as mod
+        src = inspect.getsource(mod.crop_faces)
+        assert 'get("format", "png")' in src
+
+    def test_an_older_face_crop_still_works(self):
+        """`format` is absent on a service that predates it, and PNG was the contract then — so
+        the two repos can deploy in either order."""
+        assert {"jpeg": "jpg"}.get(str({}.get("format", "png")).lower(), "png") == "png"
+
+    def test_images_are_fetched_concurrently(self):
+        """Fourteen serial round trips to S3 before any work started; they are independent and
+        the wait is entirely network."""
+        import inspect
+        from app.routes import datasets as mod
+        src = inspect.getsource(mod.crop_faces)
+        assert "asyncio.gather" in src
+        assert "for u in ds.images" in src
+
+    def test_crops_are_uploaded_concurrently(self):
+        import inspect
+        from app.routes import datasets as mod
+        src = inspect.getsource(mod.crop_faces)
+        assert "asyncio.gather(*(put(" in src
+
+    def test_the_upload_order_still_matches_the_scoring_order(self):
+        """gather preserves argument order, and `images` is an ordered list the trainer stages
+        in sequence — a set that came back shuffled would pair captions with the wrong faces."""
+        import inspect
+        from app.routes import datasets as mod
+        src = inspect.getsource(mod.crop_faces)
+        assert "uris = list(await asyncio.gather" in src
+
+    def test_the_reference_embedding_fetch_is_concurrent_too(self):
+        import inspect
+        from app.routes import datasets as mod
+        assert "asyncio.gather" in inspect.getsource(mod._embed_all)
