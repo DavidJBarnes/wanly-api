@@ -56,6 +56,11 @@ class Settings(BaseSettings):
     # Generous. It is per REQUEST, and a request carries a whole dataset — 50 images at a
     # second or two each on CPU.
     face_crop_timeout_s: int = 300
+    # buffalo_l's same-person floor. Below this against a picked anchor is a different person;
+    # it is shown as a line on the scores rather than used to delete anything, because the two
+    # people who got into this project's training sets got there past a human eye, not past a
+    # number nobody was shown.
+    face_cos_floor: float = 0.4
     a1111_url: str = "http://2070.zero:7860"
     # Unloading is a few seconds of torch teardown. Short, because failing to free the card
     # only costs the caption, which is never fatal to a render.
