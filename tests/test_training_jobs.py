@@ -374,3 +374,58 @@ class TestOnlyDownloadableCheckpointsSurvive:
 
         assert prior in out.checkpoints
         assert len(out.checkpoints) == 2
+
+
+@pytest.mark.asyncio
+class TestCancellingActuallyCancels:
+    """Nothing in the API reaches into the GPU box, so a cancelled job keeps reporting
+    `running` until the trainer notices. Writing that report unconditionally undid the cancel
+    within seconds: the button appeared to work and the run went to completion."""
+
+    async def _patch(self, db, job, **fields):
+        from app.routes.training import update_training_job
+        return await update_training_job(job.id, TrainingProgress(**fields), db=db)
+
+    async def test_a_progress_report_does_not_revive_a_cancelled_job(self, db):
+        job = _job(status=TrainingStatus.CANCELLED,
+                   completed_at=datetime.now(timezone.utc))
+        db.add(job)
+        await db.commit()
+
+        out = await self._patch(db, job, status=TrainingStatus.RUNNING, step=412)
+
+        assert out.status == TrainingStatus.CANCELLED
+        # The progress itself is still recorded — it is what the run was doing when it stopped.
+        assert out.step == 412
+
+    async def test_a_cancelled_job_is_not_completed_by_a_late_finish(self, db):
+        """A trainer that finishes before it notices has not made the run wanted again."""
+        job = _job(status=TrainingStatus.CANCELLED,
+                   completed_at=datetime.now(timezone.utc))
+        db.add(job)
+        await db.commit()
+
+        out = await self._patch(db, job, status=TrainingStatus.COMPLETED)
+
+        assert out.status == TrainingStatus.CANCELLED
+
+    async def test_the_reply_tells_the_trainer_it_was_cancelled(self, db):
+        """This is how the trainer finds out — there is no second call."""
+        job = _job(status=TrainingStatus.CANCELLED,
+                   completed_at=datetime.now(timezone.utc))
+        db.add(job)
+        await db.commit()
+
+        out = await self._patch(db, job, status=TrainingStatus.RUNNING)
+
+        assert out.status == TrainingStatus.CANCELLED
+
+    async def test_an_ordinary_running_job_still_advances(self, db):
+        job = _job(status=TrainingStatus.CLAIMED)
+        db.add(job)
+        await db.commit()
+
+        out = await self._patch(db, job, status=TrainingStatus.RUNNING, step=7)
+
+        assert out.status == TrainingStatus.RUNNING
+        assert out.step == 7

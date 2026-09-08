@@ -289,7 +289,20 @@ async def update_training_job(
         if value is not None:
             setattr(job, field, value)
 
-    if body.status is not None:
+    # A CANCEL IS STICKY.
+    #
+    # Nothing here reaches into the GPU box, so a cancelled job keeps reporting `running` until
+    # the trainer notices -- and an unconditional write meant every one of those reports undid
+    # the cancel. The button appeared to work, the row flipped back within seconds, and the run
+    # went to completion. Cancelling had no effect at all.
+    #
+    # Sticky rather than "only a worker may leave cancelled" because a cancel is a human
+    # decision about work nobody wants any more. A trainer that finishes before it notices has
+    # not made the run wanted again.
+    #
+    # This is also how the trainer FINDS OUT: the response carries the row back, so the reply to
+    # the progress report it just sent says cancelled, and it stops. There is no second call.
+    if body.status is not None and job.status != TrainingStatus.CANCELLED:
         job.status = body.status
         if body.status in TRAINING_TERMINAL:
             job.completed_at = datetime.now(timezone.utc)
