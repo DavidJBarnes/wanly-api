@@ -59,17 +59,15 @@ async def _character(db: AsyncSession, character_id: uuid.UUID) -> LtxCharacter:
 # Two things close that. The trigger is substituted BEFORE wildcard resolution runs, so a
 # correctly-built prompt never reaches the resolver carrying this. And the name is reserved
 # in the wildcard routes, so the shadowing wildcard cannot be created in the first place.
-TRIGGER_PLACEHOLDER = "<TRIGGER>"
+#
+# A second person is <TRIGGER2> (wanly-console#473). Both live in app/recipe_blob.py with
+# the one reader of the blob's people; re-exported here because this is where they were.
+from app.recipe_blob import (  # noqa: E402
+    TRIGGER2_PLACEHOLDER, TRIGGER_PLACEHOLDER, TRIGGER_PLACEHOLDERS, render_prompt,
+)
 
-
-def render_prompt(template: str, trigger: str) -> str:
-    """Fill a pose's placeholder with a character's trigger word.
-
-    A template with no placeholder is returned unchanged rather than rejected — a pose whose
-    prompt genuinely does not name the character is unusual but not wrong, and failing here
-    would block a render for a stylistic choice.
-    """
-    return template.replace(TRIGGER_PLACEHOLDER, trigger)
+__all__ = ["router", "TRIGGER_PLACEHOLDER", "TRIGGER2_PLACEHOLDER", "TRIGGER_PLACEHOLDERS",
+           "render_prompt"]
 
 
 @router.get("/recipes")
