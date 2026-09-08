@@ -731,3 +731,30 @@ class TestTheLoraHasAFace:
         import inspect
         from app.routes import training as mod
         assert '"loss_log", "epochs"' in inspect.getsource(mod.update_training_job)
+
+
+class TestTheCaptionCarriesTheTrigger:
+    """Me v1 trained with the caption "man": the trigger d@vid was never in a caption, so the
+    model never learned it and the identity bound to "man" instead."""
+
+    async def _create(self, db, caption):
+        from app.routes.training import create_training_job
+
+        class _U:
+            id = None
+            username = "t"
+        return await create_training_job(
+            TrainingCreate(character="Me", trigger="d@vid", dataset_images=_images(),
+                           caption=caption), user=_U(), db=db)
+
+    async def test_a_caption_without_the_trigger_gets_it_prepended(self, db):
+        job = await self._create(db, "man")
+        assert job.config["caption"] == "d@vid, man"
+
+    async def test_a_caption_that_names_it_is_left_alone(self, db):
+        job = await self._create(db, "portrait of d@vid, man")
+        assert job.config["caption"] == "portrait of d@vid, man"
+
+    async def test_no_caption_stays_none_for_the_trainers_default(self, db):
+        job = await self._create(db, "   ")
+        assert job.config["caption"] is None
