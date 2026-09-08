@@ -249,9 +249,17 @@ class RerollRequest(BaseModel):
     wording". Absent means a seed-only roll, which is what re-roll has always been and still
     is by default — the two takes then differ in one variable and are comparable. Present is
     an explicit choice to break that, and the new take's recipe records it.
+
+    negative_prompt (console#449) follows the same grammar. Absent: the fresh take copies
+    the archived take's value verbatim, because the re-roll's premise is one changed
+    variable. An EMPTY string is a deliberate "drop it": the fresh segment stores NULL and
+    the claim resolves the live default again — it can never mean "render with no negative",
+    which is the console#430 rule one level up. Only a segment row with a value can be
+    cleared this way; a blank field on a take that had none is no request at all.
     """
 
     prompt: Optional[str] = None
+    negative_prompt: Optional[str] = None
 
 
 class SegmentStatusUpdate(BaseModel):

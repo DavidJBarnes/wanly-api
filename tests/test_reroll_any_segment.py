@@ -27,7 +27,7 @@ async def _user(db) -> User:
 
 
 async def _chain(db, user, *, length=3, status=JobStatus.AWAITING,
-                 recipe=None) -> tuple[Job, list[Segment]]:
+                 recipe=None, negative_prompt=None) -> tuple[Job, list[Segment]]:
     """A job of `length` completed segments — the shape re-roll could not touch before."""
     job = Job(user_id=user.id, name="job", width=480, height=832, fps=16, seed=1234,
               starting_image="s3://b/start.png", status=status)
@@ -39,6 +39,7 @@ async def _chain(db, user, *, length=3, status=JobStatus.AWAITING,
             job_id=job.id, index=i, prompt=f"take {i}",
             duration_seconds=5.0, speed=1.0, status=SegmentStatus.COMPLETED,
             output_path=f"s3://b/{i}.mp4", last_frame_path=f"s3://b/{i}.png",
+            negative_prompt=negative_prompt,
             ltx_recipe=recipe if recipe is not None else {"recipe": "Missionary Side"},
         )
         db.add(seg)
@@ -233,3 +234,107 @@ class TestRollingWithANewPrompt:
 
         assert body["prompt"] == "she is smiling"
         assert body["prompt_template"] == f"she is <{name}>"
+
+
+@pytest.mark.asyncio
+class TestRollingWithANewNegative:
+    """console#449: the re-roll dialog can override or drop the negative prompt.
+
+    The grammar matters more than the field: absent inherits (a seed-only roll stays one
+    variable), a written value is an override, and an emptied field on a take that HAD a
+    negative is a deliberate "drop it" back to NULL — which the claim resolves from the live
+    Settings default, never as "render with no negative" (console#430).
+    """
+
+    async def test_the_new_take_carries_the_new_negative(self, db):
+        user = await _user(db)
+        _, segs = await _chain(db, user, negative_prompt="blurry")
+
+        body = (await _post(db, user, f"/segments/{segs[-1].id}/reroll",
+                            {"negative_prompt": "worse"})).json()
+
+        assert body["negative_prompt"] == "worse"
+
+    async def test_the_archived_take_keeps_the_negative_it_ran(self, db):
+        user = await _user(db)
+        _, segs = await _chain(db, user, negative_prompt="blurry")
+
+        await _post(db, user, f"/segments/{segs[-1].id}/reroll", {"negative_prompt": "worse"})
+
+        await db.refresh(segs[-1])
+        assert segs[-1].negative_prompt == "blurry"
+
+    async def test_no_negative_means_the_archived_value_is_copied(self, db):
+        """A seed-only roll must keep even the frozen copy — that is one of the one variables
+        re-roll exists not to touch, and `test_reroll_segment.py` pins the same convention."""
+        user = await _user(db)
+        _, segs = await _chain(db, user, negative_prompt="blurry")
+
+        body = (await _post(db, user, f"/segments/{segs[-1].id}/reroll")).json()
+
+        assert body["negative_prompt"] == "blurry"
+        assert (body["ltx_recipe"] or {}).get("edited") is None
+
+    async def test_a_changed_negative_is_recorded_on_the_recipe(self, db):
+        user = await _user(db)
+        _, segs = await _chain(db, user, negative_prompt="blurry")
+
+        body = (await _post(db, user, f"/segments/{segs[-1].id}/reroll",
+                            {"negative_prompt": "worse"})).json()
+
+        assert "negative" in body["ltx_recipe"]["edited"]
+
+    async def test_resubmitting_the_same_negative_is_not_an_edit(self, db):
+        """The console omits unchanged fields, but a caller is free to send the value back.
+        Same value, same render — marking it would dress a seed-only roll up as an edit."""
+        user = await _user(db)
+        _, segs = await _chain(db, user, negative_prompt="blurry")
+
+        body = (await _post(db, user, f"/segments/{segs[-1].id}/reroll",
+                            {"negative_prompt": "blurry"})).json()
+
+        assert "negative" not in (body["ltx_recipe"] or {}).get("edited", [])
+        assert body["negative_prompt"] == "blurry"
+
+    async def test_an_emptied_negative_restores_the_live_default(self, db):
+        """Stored as NULL, never as '': the claim checks `is not None`, so an empty string
+        would become a render with no negative at all — more than the user asked to drop."""
+        user = await _user(db)
+        _, segs = await _chain(db, user, negative_prompt="blurry")
+
+        body = (await _post(db, user, f"/segments/{segs[-1].id}/reroll",
+                            {"negative_prompt": ""})).json()
+
+        assert body["negative_prompt"] is None
+        assert "negative" in body["ltx_recipe"]["edited"]
+
+    async def test_clearing_a_negative_that_was_never_set_changes_nothing(self, db):
+        """A blank field on a take that had none is no request at all — no value moved, so
+        the roll stays a seed-only roll in the record."""
+        user = await _user(db)
+        _, segs = await _chain(db, user)
+
+        body = (await _post(db, user, f"/segments/{segs[-1].id}/reroll",
+                            {"negative_prompt": "   "})).json()
+
+        assert body["negative_prompt"] is None
+        assert "negative" not in (body["ltx_recipe"] or {}).get("edited", [])
+
+    async def test_marking_the_negative_does_not_rewrite_the_archived_one(self, db):
+        user = await _user(db)
+        _, segs = await _chain(db, user, negative_prompt="blurry",
+                               recipe={"recipe": "Missionary Side", "edited": []})
+
+        await _post(db, user, f"/segments/{segs[-1].id}/reroll", {"negative_prompt": "worse"})
+
+        await db.refresh(segs[-1])
+        assert segs[-1].ltx_recipe["edited"] == []
+
+    async def test_prompt_and_negative_together_record_both(self, db):
+        user = await _user(db)
+        _, segs = await _chain(db, user, negative_prompt="blurry")
+
+        body = (await _post(db, user, f"/segments/{segs[-1].id}/reroll",
+                            {"prompt": "different", "negative_prompt": "worse"})).json()
+
+        assert body["ltx_recipe"]["edited"] == ["negative", "prompt"]
