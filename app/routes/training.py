@@ -333,7 +333,11 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
     """
     if not job.output_lora_path:
         return
-    basename = job.output_lora_path.rsplit("/", 1)[-1]
+    # THE STEM, NOT THE FILENAME. Every character row stores `pay_v2_e05`, the console's Use
+    # button writes the stem, and the character editor says "without .safetensors" -- the
+    # first auto-published character stored `david_v1_final.safetensors` and the page could
+    # not tell it was in use.
+    basename = job.output_lora_path.rsplit("/", 1)[-1].removesuffix(".safetensors")
     existing = (await db.execute(
         select(LtxCharacter).where(LtxCharacter.name == job.character)
     )).scalar_one_or_none()
