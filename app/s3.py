@@ -161,7 +161,7 @@ def delete_prefix_except(prefix: str, bucket: str, except_uris: set[str]) -> int
 def delete_object(uri: str) -> None:
     """Delete a single object by S3 URI."""
     bucket, key = parse_s3_uri(uri)
-    client = _get_client()
+    client = _client_for_bucket(bucket)
     client.delete_object(Bucket=bucket, Key=key)
     logger.info("Deleted %s/%s", bucket, key)
 

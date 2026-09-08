@@ -525,20 +525,40 @@ async def upload_training_artifact(
 @router.delete("/training/{job_id}", status_code=204)
 async def delete_training_job(
     job_id: uuid.UUID,
+    purge: bool = True,
     _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Take a finished run off the board.
+    """Take a finished run off the board, and its LoRA files out of the bucket.
 
     Terminal jobs only: a live one is cancelled first, so that the trainer working on it
-    still has a row to report to. The LoRAs it published stay in the bucket -- they are
-    library items now, and a character may be pointing at one.
+    still has a row to report to.
+
+    THE FILES GO TOO, by default. A deleted run whose checkpoints linger in the library is
+    what someone deleting a run does not expect (wanly-console#464), and a LoRA nobody can
+    trace to a run is a LoRA nobody dares delete later. The one thing that stops it: a
+    character that currently renders with one of these checkpoints. Deleting under it would
+    break every recipe that names the character, so that is refused and says which.
     """
     job = await db.get(TrainingJob, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Training job not found")
     if job.status not in TRAINING_TERMINAL:
         raise HTTPException(status_code=409, detail=f"still {job.status} — cancel it first")
+    files = [c for c in (job.checkpoints or []) if isinstance(c, str) and c.startswith("s3://")]
+    if purge and files:
+        stems = {f.rsplit("/", 1)[-1].removesuffix(".safetensors") for f in files}
+        using = (await db.execute(
+            select(LtxCharacter).where(LtxCharacter.char_lora.in_(stems))
+        )).scalars().all()
+        if using:
+            names = ", ".join(f"{c.name} ({c.char_lora})" for c in using)
+            raise HTTPException(
+                status_code=409,
+                detail=f"{names} renders with a checkpoint of this run — point the character "
+                       f"at another LoRA first, or delete the run without its files")
+        await asyncio.gather(*(asyncio.to_thread(s3.delete_object, f) for f in files))
+        logger.info("deleted %d checkpoint(s) of %s v%d", len(files), job.character, job.version)
     await db.delete(job)
     await db.commit()
 
