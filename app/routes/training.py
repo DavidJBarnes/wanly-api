@@ -112,13 +112,22 @@ async def create_training_job(
             detail=f"{body.character} v{body.version} is already {dupe.status}. "
                    f"Cancel it, or pick another version.")
 
+    # THE CAPTION MUST CARRY THE TRIGGER, or the trigger is never learned. The first run
+    # trained with the caption "man" -- typed literally into a field whose placeholder
+    # said "trigger, woman" -- so its trigger word meant nothing to the model and the
+    # identity bound to "man" instead. A caption that does not mention the trigger gets it
+    # prepended here, the way the trainer's own default ("<trigger>, woman") is shaped.
+    caption = (body.caption or "").strip() or None
+    if caption and body.trigger not in caption:
+        caption = f"{body.trigger}, {caption}"
+
     job = TrainingJob(
         user_id=user.id,
         character=body.character,
         trigger=body.trigger,
         version=body.version,
         dataset_images=images,
-        config={**RECIPE_DEFAULTS, "steps": body.steps, "caption": body.caption,
+        config={**RECIPE_DEFAULTS, "steps": body.steps, "caption": caption,
                 "lora_name": body.lora_name or _default_lora_name(body.character),
                 "publish": body.publish},
         status=TrainingStatus.PENDING,
