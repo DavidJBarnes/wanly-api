@@ -24,7 +24,9 @@ from app.auth import get_current_user, verify_api_key_or_bearer
 from app.config import settings
 from app.database import get_db
 from app.models import Dataset, User
-from app.schemas.datasets import DatasetCreate, DatasetResponse, DatasetUpdate
+from app.schemas.datasets import (
+    DatasetCreate, DatasetResponse, DatasetScore, DatasetScores, DatasetUpdate,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -98,6 +100,13 @@ async def update_dataset(
         ds.notes = body.notes
     if body.images is not None:
         ds.images = body.images
+        # An anchor that was just removed would silently score everything against nothing.
+        if ds.anchor_uri and ds.anchor_uri not in body.images:
+            ds.anchor_uri = None
+    if body.anchor_uri is not None:
+        # "" clears it. None means the field was not sent, which must not clear anything --
+        # the same distinction every other field here makes.
+        ds.anchor_uri = body.anchor_uri or None
     await db.commit()
     await db.refresh(ds)
     return ds
@@ -167,7 +176,7 @@ async def crop_faces(
     dataset_id: uuid.UUID,
     reference_dataset_id: uuid.UUID | None = None,
     gate: bool = True,
-    largest_only: bool = True,
+    largest_only: bool = False,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -177,22 +186,28 @@ async def crop_faces(
     existed only as laptop scripts that ssh'd to the box with insightface. A dataset uploaded in
     the console had no way to become face crops, so the whole flow stopped at step one.
 
-    THE GATE IS ON BY DEFAULT and that is the important half. Detection is easy; telling p@y
-    from someone else in the same photo set is what hand-culling failed at twice, once into a
-    set that had already been culled by eye. Scored against the mean embedding of a reference
-    dataset -- or against the crops' own mean when none is given, which proves internal
-    consistency and nothing more, and is reported as such.
+    Detection is easy; telling p@y from someone else in the same photo set is what hand-culling
+    failed at twice, once into a set that had already been culled by eye. The answer to that is
+    a NUMBER PUT IN FRONT OF THE PERSON CULLING -- see POST /datasets/{id}/score -- not a gate
+    that deletes on a score nobody looked at. An automatic drop still happens when a known-good
+    reference dataset was named, because there the number means something.
 
     Writes a NEW dataset rather than replacing this one. The photographs are the source of truth
     and a crop is derived; overwriting them would make the operation unrepeatable with different
     padding or a different reference.
 
-    `largest_only` DEFAULTS TRUE BUT IS NOT ALWAYS RIGHT. A dataset of solo portraits wants one
-    face per photo. A dataset of couples does not: "largest" is then whoever stood closer to the
-    camera, so the output silently interleaves two people -- and with no reference the gate
-    scores against the crops' own mean, which for a mixed set is a blend of both and cannot
-    separate them. For that shape the working order is: take every face, gate off, remove the
-    wrong people by hand, then run again using the result as the reference.
+    `largest_only` DEFAULTS FALSE: KEEP EVERY FACE.
+
+    It was hardcoded True, which is right only for solo portraits. In a photo of two people
+    "largest" is whoever stood closer to the camera, so the output silently interleaves two
+    people -- and it throws away the other face, which cannot be recovered without cropping
+    again. Keeping everything is the recoverable default: an unwanted crop is one click to
+    remove, a missing one is a re-run.
+
+    THE GATE IS OFF unless something meaningful to score against was given. Scoring a mixed set
+    against its own mean is not a check -- the mean is a blend of everyone in it -- and dropping
+    images on that basis destroys work while looking like diligence. Nominate an anchor
+    (`POST /datasets/{id}/score`) and the number means something.
     """
     ds = await db.get(Dataset, dataset_id)
     if not ds:
@@ -227,17 +242,20 @@ async def crop_faces(
 
     faces = result["faces"]
     floor = result.get("cos_floor", 0.4)
-    # With no reference, score against the crops' own mean. It cannot tell you the set is the
-    # right person -- only that it is internally consistent -- and the note says so.
-    if gate and not ref_embeddings and faces:
-        own = [f.get("embedding") or [] for f in faces]
-        mean = await _mean_via_service(own)
-        for f in faces:
-            f["cos"] = _cos(f.get("embedding") or [], mean)
 
+    # NOTHING IS DROPPED WITHOUT A REAL REFERENCE.
+    #
+    # This used to fall back to the crops' own mean. On a set that still contains two people
+    # that mean is a blend of both: it separates neither, and whichever person happens to be in
+    # the minority scores lower and gets deleted. That is work destroyed by something that looks
+    # like diligence, and it is worse now that every face is kept by default.
+    #
+    # Culling is a person's job, informed by POST /datasets/{id}/score against an anchor they
+    # picked. The gate here is for the case where a known-good set was named.
+    gating = gate and bool(ref_embeddings)
     kept, dropped = [], []
     for f in faces:
-        if gate and f.get("cos") is not None and f["cos"] < floor:
+        if gating and f.get("cos") is not None and f["cos"] < floor:
             dropped.append((ds.images[f["source_index"]], f["cos"]))
         else:
             kept.append(f)
@@ -256,8 +274,8 @@ async def crop_faces(
                          f"{len(result.get('no_face', []))} with none detected, "
                          f"{len(dropped)} below the {floor} floor"
                          + ("" if ref_embeddings else
-                            " (scored against the crops' own mean — internal consistency only, "
-                            "not proof of identity)")))
+                            " — nothing dropped, no reference was given. Pick an anchor and "
+                            "score to see how alike these are.")))
     db.add(out)
     await db.flush()
 
@@ -273,6 +291,79 @@ async def crop_faces(
     logger.info("cropped %s -> %s: %d kept, %d dropped below %.2f",
                 ds.name, out.name, len(uris), len(dropped), floor)
     return out
+
+
+@router.post("/datasets/{dataset_id}/score", response_model=DatasetScores)
+async def score_against_anchor(
+    dataset_id: uuid.UUID,
+    anchor_uri: str | None = None,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Score every image in a set against ONE image in it, nominated as the anchor.
+
+    THE QUESTION THIS ANSWERS IS THE ONLY ONE WORTH ASKING: is this the same person as that.
+
+    The reference machinery that came first scored against a whole dataset's MEAN, and that does
+    not survive contact with a real set. A mean over images that still contain two people is a
+    blend of both -- it separates neither, and whichever person is in the minority scores lower
+    for no reason but being outnumbered. With no reference at all it scored against the crops'
+    own mean, which shows they resemble each other and nothing else. One picked face has neither
+    problem.
+
+    IT RETURNS NUMBERS; IT DELETES NOTHING. Hand-culling failed twice in this project, but the
+    failure was culling with no information, not culling by hand -- an unlabelled thumbnail of a
+    stranger at a bad angle looks like a bad photo of the right person. A score beside each
+    image fixes that, and leaves the judgement where it belongs. Removing is a separate,
+    reversible click.
+
+    The anchor is remembered on the dataset, so re-scoring after a cull compares against the
+    same face rather than a moving target.
+    """
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    if not settings.face_crop_url:
+        raise HTTPException(
+            status_code=503,
+            detail="no face-crop service is configured (face_crop_url is empty)")
+
+    uri = anchor_uri or ds.anchor_uri
+    if not uri:
+        raise HTTPException(status_code=422, detail="pick an anchor image first")
+    if uri not in ds.images:
+        # Most likely it was removed since it was picked. Say which, rather than returning a
+        # set of scores quietly measured against nothing.
+        raise HTTPException(
+            status_code=422,
+            detail="the anchor is not in this dataset — it may have been removed; pick another")
+
+    embeddings = await _embed_all(ds.images)
+    anchor_vec = embeddings[ds.images.index(uri)]
+    if not anchor_vec:
+        raise HTTPException(
+            status_code=422,
+            detail="no face was detected in the anchor image — pick one that is a clear face")
+
+    floor = settings.face_cos_floor
+    scores = [
+        DatasetScore(
+            uri=u,
+            # -2.0 is _cos's "one side had no embedding", which is not a low score but an
+            # absent one. Surfaced as null so the console can say "no face" rather than
+            # rendering it as the worst match in the set.
+            cos=None if not e else round(_cos(e, anchor_vec), 4),
+            is_anchor=(u == uri),
+        )
+        for u, e in zip(ds.images, embeddings)
+    ]
+
+    # Remembered only once it has been shown to work on this set.
+    if ds.anchor_uri != uri:
+        ds.anchor_uri = uri
+        await db.commit()
+
+    return DatasetScores(anchor_uri=uri, cos_floor=floor, scores=scores)
 
 
 async def _embed_all(uris: list[str]) -> list[list[float]]:

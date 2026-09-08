@@ -424,6 +424,19 @@ class Dataset(Base):
     #: The S3 prefix uploads land in. Recorded rather than derived, because a rename must not
     #: silently point a dataset at a folder that does not exist.
     prefix = mapped_column(String(200), nullable=True)
+    #: ONE IMAGE IN THIS SET, NOMINATED AS THE FACE EVERYTHING ELSE IS SCORED AGAINST.
+    #:
+    #: The alternative already here -- score against a reference DATASET's mean -- is unusable
+    #: on the sets people actually have. A mean over a set that still contains two people is a
+    #: blend of both and separates neither, and with no reference at all the crops are scored
+    #: against their own mean, which only shows they resemble each other.
+    #:
+    #: One picked face has no such ambiguity: "is this the same person as THAT" is the question
+    #: worth asking, and it is answerable from the moment the crops exist.
+    #:
+    #: A URI, not an index. The list is reordered by removal, so an index would silently come
+    #: to mean a different photograph.
+    anchor_uri = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
                                onupdate=lambda: datetime.now(timezone.utc))
