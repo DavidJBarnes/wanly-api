@@ -179,23 +179,20 @@ def captioner_host() -> str:
 def render_worker_beside_the_captioner(workers) -> "object | None":
     """The render-capable worker row that shares a card with the captioner, or None.
 
-    Matched by what the row SAYS it runs first: since wanly-gpu-docker#83 the box registers
-    once with `provides` listing image-description, which is the truth from the box itself.
-    A row whose friendly_name is the URL's host is the fallback for a daemon that does not
-    report provides. A row that cannot render is never a collision -- a captioner-only box
-    has nothing to wait for.
+    Matched by HOST: the row whose friendly_name is the host in image_description_url.
+    Not by what a row says it provides -- the 3090 provides image-description, so a
+    provides-match picked the 3090's row even when the URL pointed at the 2070, and a
+    caption during a render was then sent to the box that was rendering. A row that cannot
+    render is never a collision: a captioner-only box has nothing to wait for.
     """
     from app.enums import WorkerKind, worker_can
     host = captioner_host()
-    fallback = None
     for w in workers:
         if not worker_can(w, WorkerKind.RENDER):
             continue
-        if "image-description" in (w.provides or []):
+        if (w.friendly_name or "").lower() == host:
             return w
-        if fallback is None and (w.friendly_name or "").lower() == host:
-            fallback = w
-    return fallback
+    return None
 
 
 async def busy_render_beside_the_captioner(db) -> str | None:

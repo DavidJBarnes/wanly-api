@@ -55,8 +55,11 @@ class Settings(BaseSettings):
         "5s", validation_alias=AliasChoices("image_description_keep_alive", "joycaption_keep_alive"))
     # Generous next to a 4.5 s cold caption. It is here to stop a wedged or unreachable
     # captioner holding a request open, not to bound normal work.
+    # 180, not 60: on the 3090 the vision model is read from disk on every caption (the
+    # renders evict it from the page cache) and a cold caption measured 46 s; the next one
+    # went past 60 and surfaced as "captioner unreachable ... ReadTimeout".
     image_description_timeout_s: int = Field(
-        60, validation_alias=AliasChoices("image_description_timeout_s", "joycaption_timeout_s"))
+        180, validation_alias=AliasChoices("image_description_timeout_s", "joycaption_timeout_s"))
     # Automatic1111 on the same 2070, so a caption can ask it for the card back.
     #
     # The keep_alive above makes JoyCaption yield to A1111. Nothing made A1111 yield back,
