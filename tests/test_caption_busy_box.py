@@ -29,18 +29,20 @@ class TestWhichRowSharesTheCard:
     def test_the_host_comes_from_the_url(self):
         assert captioner_host() == "3090.zero"
 
-    def test_the_row_that_says_it_provides_the_captioner_wins(self):
-        """One row per box: the box itself reports what it runs, and that beats a name."""
+    def test_the_row_named_for_the_url_host_is_the_one(self):
         box = _w("3090.zero", kinds=["render", "trainer"],
                  provides=["ltx-engine", "lora-trainer", "image-description"])
-        other = _w("3090.zero-old")
-        assert render_worker_beside_the_captioner([other, box]) is box
-
-    def test_a_row_named_for_the_url_host_is_the_fallback(self):
-        """A daemon that does not report provides yet."""
-        box = _w("3090.zero", provides=None)
         pod = _w("runpod-abc", provides=None)
         assert render_worker_beside_the_captioner([pod, box]) is box
+
+    def test_provides_does_not_override_the_host(self, monkeypatch):
+        """With the URL pointing at the 2070, the 3090's row (which provides
+        image-description) is NOT the captioner's box -- matching it sent a caption during
+        a render to the box that was rendering (2026-09-08)."""
+        monkeypatch.setattr(settings, "image_description_url", "http://2070.zero:11434")
+        box = _w("3090.zero", kinds=["render", "trainer"],
+                 provides=["ltx-engine", "lora-trainer", "image-description"])
+        assert render_worker_beside_the_captioner([box]) is None
 
     def test_a_captioner_only_box_is_never_a_collision(self):
         """The 2070-style deployment: a service row that cannot render has nothing to wait
