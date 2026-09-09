@@ -484,6 +484,13 @@ async def commit_training_artifact(
             status_code=409,
             detail=f"{uri} is {head['Size']} bytes — a rank-32 character LoRA is ~650 MB, so "
                    f"this is a truncated upload")
+    # AND REALLY A LORA, not just big enough to be one. See s3.safetensors_header_ok for the
+    # zero-filled final that a size check waved through.
+    if not await asyncio.to_thread(s3.safetensors_header_ok, uri):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{uri} is in the bucket but has no safetensors header (a zero-filled or "
+                   f"truncated file). Not recording it; the trainer should regenerate it.")
     _record_checkpoint(job, uri)
     await db.commit()
     await db.refresh(job)
