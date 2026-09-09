@@ -1,6 +1,8 @@
 import logging
 import mimetypes
 
+import json
+
 import boto3
 
 from app.config import settings
@@ -286,6 +288,29 @@ def generate_presigned_put(uri: str, expires: int = 21600) -> str:
         ExpiresIn=expires,
         HttpMethod="PUT",
     )
+
+
+def safetensors_header_ok(uri: str) -> bool:
+    """Does the object start with a safetensors header? A ranged GET of the first eight
+    bytes (the little-endian header length) and then the header itself, parsed as JSON.
+
+    A commit that checks only size lets a zero-filled file through: 2026-09-08 the host
+    hard-reset right after the final checkpoint was written, ext4 kept its size and zeroed
+    its contents, the trainer published it, and every render with that character failed
+    inside ComfyUI. Two small ranged reads here instead of 650 MB.
+    """
+    bucket, key = parse_s3_uri(uri)
+    client = _client_for_bucket(bucket)
+    try:
+        first = client.get_object(Bucket=bucket, Key=key, Range="bytes=0-7")["Body"].read()
+        n = int.from_bytes(first, "little")
+        if not 0 < n < 64 * 1024 * 1024:
+            return False
+        header = client.get_object(Bucket=bucket, Key=key, Range=f"bytes=8-{7 + n}")["Body"].read()
+        json.loads(header)
+        return True
+    except Exception:
+        return False
 
 
 def head_object(uri: str) -> dict | None:
