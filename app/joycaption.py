@@ -217,8 +217,28 @@ async def busy_render_beside_the_captioner(db) -> str | None:
     return None
 
 
-async def describe(image_bytes: bytes, instruction: str) -> str:
+def captioner_for(busy: str | None, interactive: bool) -> str | None:
+    """Which captioner URL to use, or None to refuse.
+
+    The 3090's captioner shares its card with the render stack (wanly-gpu-docker#83), so:
+      * interactive, box idle      -> the primary
+      * interactive, box rendering -> the fallback if there is one, else refuse (None)
+      * claim-time                 -> the fallback first if there is one: the claiming box
+                                      is about to load a 23 GB render, and a caption that
+                                      races it timed out on the first night; else the primary
+    """
+    primary = settings.image_description_url
+    fallback = (settings.image_description_fallback_url or "").strip()
+    if not interactive:
+        return fallback or primary
+    if busy:
+        return fallback or None
+    return primary
+
+
+async def describe(image_bytes: bytes, instruction: str, base_url: str | None = None) -> str:
     """Caption one image. Raises CaptionError; callers must treat that as non-fatal."""
+    base = (base_url or settings.image_description_url).rstrip("/")
     payload = {
         "model": settings.image_description_model,
         "prompt": instruction,
@@ -226,7 +246,7 @@ async def describe(image_bytes: bytes, instruction: str) -> str:
         "stream": False,
         "keep_alive": settings.image_description_keep_alive,
     }
-    url = f"{settings.image_description_url.rstrip('/')}/api/generate"
+    url = f"{base}/api/generate"
     try:
         async with httpx.AsyncClient(timeout=settings.image_description_timeout_s) as client:
             resp = await client.post(url, json=payload)
@@ -237,7 +257,7 @@ async def describe(image_bytes: bytes, instruction: str) -> str:
             if resp.status_code == 500 and await _yield_the_gpu():
                 resp = await client.post(url, json=payload)
     except httpx.HTTPError as e:
-        raise CaptionError(f"captioner unreachable at {settings.image_description_url}: {e}") from e
+        raise CaptionError(f"captioner unreachable at {base}: {e!r}") from e
     if resp.status_code != 200:
         raise CaptionError(f"captioner returned {resp.status_code}: {resp.text[:200]}")
 
