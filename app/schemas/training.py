@@ -109,11 +109,19 @@ class TrainingResponse(BaseModel):
     error_message: str | None = None
     checkpoints: list | None = None
     output_lora_path: str | None = None
+    # [[step, avr_loss], ...] sampled from the trainer's progress bar, for the curve.
     loss_log: list | None = None
-    epochs: list | None = None
-    loss_log: list | None = None
+    # Every checkpoint the run WROTE, as [{label, step, loss}], published or not. Only the
+    # final one is uploaded by default: a 650 MB checkpoint takes ~18 minutes to leave the
+    # 3090, and "I often only want 1 or 2 epochs". The rest sit on the trainer until asked
+    # for through publish_requests, and `checkpoints` records the ones that arrived.
     epochs: list | None = None
     publish_requests: list | None = None
+    # Operator notes, written through the console's own route (wanly-console#484). The
+    # trainer's PATCH deliberately cannot reach this: its conditional writes exist so a
+    # report that omits a field never blanks a previous one, and a human note deserves the
+    # stronger guarantee that no report can blank it at all.
+    notes: str | None = None
     thumbnail_uri: str | None = None
     created_at: datetime | None = None
     claimed_at: datetime | None = None
@@ -147,3 +155,14 @@ class TrainingProgress(BaseModel):
     output_lora_path: str | None = None
     loss_log: list | None = None
     epochs: list | None = None
+
+
+class TrainingNotes(BaseModel):
+    """Operator notes, whole-field replace.
+
+    NOT part of TrainingProgress deliberately: that model is the trainer's report channel,
+    whose conditional writes exist so an omitted field never blanks what came before. A note
+    wants the opposite contract -- an explicit write that the reports can never touch -- and
+    so it has its own tiny shape and its own route.
+    """
+    notes: str | None = Field(default=None, max_length=20000)

@@ -30,8 +30,8 @@ from app.database import get_db
 from app.enums import TRAINING_TERMINAL, TrainingStatus, WorkerKind, worker_can
 from app.models import Dataset, LtxCharacter, TrainingJob, User, Worker
 from app.schemas.training import (
-    MIN_DATASET_IMAGES, TrainingClaimResponse, TrainingCreate, TrainingProgress,
-    TrainingResponse,
+    MIN_DATASET_IMAGES, TrainingClaimResponse, TrainingCreate, TrainingNotes,
+    TrainingProgress, TrainingResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -329,6 +329,30 @@ async def update_training_job(
             if body.status == TrainingStatus.COMPLETED:
                 await _publish_character(db, job)
 
+    await db.commit()
+    await db.refresh(job)
+    return job
+
+
+@router.patch("/training/{job_id}/notes", response_model=TrainingResponse)
+async def set_training_notes(
+    job_id: uuid.UUID,
+    body: TrainingNotes,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Operator notes on a run, whole-field replace (wanly-console#484).
+
+    ITS OWN ROUTE, NOT A FIELD ON THE TRAINER'S PATCH, and that is the whole design: the
+    trainer's PATCH writes only fields it was handed (a report that omits a field must never
+    blank what an earlier one set) and is keyed to the shared worker API key. A note is a
+    human write that the reports must never be able to undo, so it keys to a console JWT
+    instead and accepts an explicit blank as a deliberate clear.
+    """
+    job = await db.get(TrainingJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Training job not found")
+    job.notes = body.notes
     await db.commit()
     await db.refresh(job)
     return job

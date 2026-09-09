@@ -655,6 +655,61 @@ class TestCancellingActuallyCancels:
         assert out.step == 7
 
 
+class TestOperatorNotes:
+    """A note is a human write on a machine-reported row (wanly-console#484).
+
+    The reason it is its own route rather than a field on the trainer's PATCH: TrainingProgress
+    writes only what it is handed, which is exactly the wrong contract for a note -- a report
+    that simply does not mention it would look like a clear. Here the whole field is the unit,
+    and an explicit blank is a deliberate clear rather than an accident of omission.
+    """
+
+    async def _set(self, db, job, notes):
+        from app.routes.training import set_training_notes
+        from app.schemas.training import TrainingNotes
+        return await set_training_notes(job.id, TrainingNotes(notes=notes), _user=None, db=db)
+
+    async def test_a_note_is_set_and_returned(self, db):
+        job = _job()
+        db.add(job)
+        await db.commit()
+
+        out = await self._set(db, job, "e03 was the one that looked right; e04 plastic")
+
+        assert out.notes == "e03 was the one that looked right; e04 plastic"
+
+    async def test_a_trainer_report_cannot_touch_the_note(self, db):
+        """The guarantee the separate route exists for: the report channel omits what it
+        does not have, and omission must never mean clear."""
+        job = _job(notes="picked e03 by eye at seed 42")
+        db.add(job)
+        await db.commit()
+
+        from app.routes.training import update_training_job
+        out = await update_training_job(
+            job.id, TrainingProgress(step=99, progress_log="step 99"), db=db)
+
+        assert out.step == 99
+        assert out.notes == "picked e03 by eye at seed 42"
+
+    async def test_an_explicit_blank_clears_it(self, db):
+        job = _job(notes="obsolete")
+        db.add(job)
+        await db.commit()
+
+        out = await self._set(db, job, None)
+
+        assert out.notes is None
+
+    async def test_an_oversized_note_is_refused(self):
+        """A localStorage spill-out can be half a DVD image; a note is a note."""
+        import pydantic
+        from app.schemas.training import TrainingNotes
+        with pytest.raises(pydantic.ValidationError, match="at most 20000"):
+            TrainingNotes(notes="x" * 20001)
+
+
+
 class TestOnlyTheFinalGoesUpByDefault:
     """A 650 MB checkpoint takes ~18 minutes to leave the 3090 and "I often only want 1 or 2
     epochs". Every epoch stays on the trainer; the rest are asked for."""

@@ -526,6 +526,11 @@ class TrainingJob(Base):
     # for through publish_requests, and `checkpoints` records the ones that arrived.
     epochs = mapped_column(JSONB, nullable=True)
     publish_requests = mapped_column(JSONB, nullable=True)
+    # Free-form operator notes, exactly as Dataset.notes: what was learned about this run,
+    # why a checkpoint was picked. Written only by a human through the console's own route --
+    # not through the trainer's PATCH, whose conditional writes must never be able to clobber
+    # a date an editor typed.
+    notes = mapped_column(Text, nullable=True)
     # The dataset's anchor image at creation -- the face this LoRA is of, for the console
     # and for the character row it publishes to.
     thumbnail_uri = mapped_column(Text, nullable=True)
