@@ -59,7 +59,9 @@ class TestTheRefusal:
         from app.routes import captions, segments
         src = inspect.getsource(captions.caption_image_bytes)
         assert "busy_render_beside_the_captioner(db) if interactive else None" in src
+        assert "base = captioner_for(busy, interactive)" in src
         assert "raise CaptionerBusy" in src
+        assert "describe(image, instruction, base_url=base)" in src
         # Claim-time <SCENE> resolution opts out: the worker was just handed the segment and
         # has not loaded the render; a failed caption there is non-fatal by design.
         assert "caption_image_bytes(db, image, interactive=False)" in inspect.getsource(segments)
@@ -87,3 +89,38 @@ class TestTheConfigIsNamedForTheCapability:
         assert Settings(_env_file=None).image_description_url == "http://old:11434"
         monkeypatch.setenv("IMAGE_DESCRIPTION_URL", "http://new:11434")
         assert Settings(_env_file=None).image_description_url == "http://new:11434"
+
+
+class TestWhichCaptionerIsUsed:
+    """The 2070's captioner is the fallback while the 3090 renders (the first night's
+    "Request failed with status code 503" on every describe during a render)."""
+
+    def test_idle_box_interactive_uses_the_primary(self, monkeypatch):
+        from app.joycaption import captioner_for
+        monkeypatch.setattr(settings, "image_description_fallback_url", "http://2070.zero:11434")
+        assert captioner_for(None, True) == "http://3090.zero:11434"
+
+    def test_busy_box_interactive_uses_the_fallback(self, monkeypatch):
+        from app.joycaption import captioner_for
+        monkeypatch.setattr(settings, "image_description_fallback_url", "http://2070.zero:11434")
+        assert captioner_for("3090.zero", True) == "http://2070.zero:11434"
+
+    def test_busy_box_with_no_fallback_refuses(self, monkeypatch):
+        from app.joycaption import captioner_for
+        monkeypatch.setattr(settings, "image_description_fallback_url", "")
+        assert captioner_for("3090.zero", True) is None
+
+    def test_claim_time_prefers_the_fallback(self, monkeypatch):
+        """The claiming box is about to load a 23 GB render; a caption racing it timed out."""
+        from app.joycaption import captioner_for
+        monkeypatch.setattr(settings, "image_description_fallback_url", "http://2070.zero:11434")
+        assert captioner_for(None, False) == "http://2070.zero:11434"
+        monkeypatch.setattr(settings, "image_description_fallback_url", "")
+        assert captioner_for(None, False) == "http://3090.zero:11434"
+
+    def test_describe_honours_the_base_url(self):
+        import inspect
+        from app import joycaption
+        src = inspect.getsource(joycaption.describe)
+        assert 'base = (base_url or settings.image_description_url).rstrip("/")' in src
+        assert 'url = f"{base}/api/generate"' in src

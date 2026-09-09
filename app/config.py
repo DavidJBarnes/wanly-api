@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     image_description_url: str = Field(
         "http://3090.zero:11434",
         validation_alias=AliasChoices("image_description_url", "joycaption_url"))
+    # A second captioner used while the box above is rendering: the 2070's, which shares its
+    # card with nothing that renders LTX. Interactive captions go there when the 3090 is
+    # busy instead of being refused; claim-time captions go there first, because the box
+    # that claimed is about to load a render. Empty means "refuse while busy".
+    image_description_fallback_url: str = "http://2070.zero:11434"
     image_description_model: str = Field(
         "joycaption:beta-one",
         validation_alias=AliasChoices("image_description_model", "joycaption_model"))

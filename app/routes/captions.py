@@ -15,7 +15,7 @@ from app import s3
 from app.auth import get_current_user
 from app.database import get_db
 from app.joycaption import (CaptionError, CaptionerBusy, busy_render_beside_the_captioner,
-                            describe, instruction_for)
+                            captioner_for, describe, instruction_for)
 from app.models import User
 from app.routes.app_settings import _get_all_settings
 from app.schemas.captions import CaptionRequest, CaptionResponse
@@ -35,20 +35,24 @@ async def caption_image_bytes(db: AsyncSession, image: bytes,
     "rich" are different artefacts, and a rated panel should be able to tell them apart.
     """
     # THE CAPTIONER SHARES A CARD WITH A RENDER WORKER (wanly-gpu-docker#83). Loading the
-    # vision model beside a 720p render OOMs one of them. An INTERACTIVE caption is refused
-    # with the box's name while it is rendering. Claim-time <SCENE> resolution passes
-    # interactive=False: the worker was just handed the segment and has not loaded the
-    # render, and a failed caption there is non-fatal by design.
+    # vision model beside a 720p render OOMs one of them. While the box is rendering an
+    # interactive caption goes to the fallback captioner (the 2070's) when one is
+    # configured, and is otherwise refused with the box's name. Claim-time <SCENE>
+    # resolution passes interactive=False and prefers the fallback outright: the claiming
+    # box is about to load the render. See captioner_for.
     busy = await busy_render_beside_the_captioner(db) if interactive else None
-    if busy:
+    base = captioner_for(busy, interactive)
+    if base is None:
         raise CaptionerBusy(
             f"{busy} is rendering, and the captioner shares its GPU. "
             f"Try again when the render finishes.")
+    if busy:
+        logger.info("%s is rendering; captioning on the fallback captioner %s", busy, base)
     if instruction is None:
         cfg = await _get_all_settings(db)
         instruction = instruction_for(style or cfg.get("caption_style", ""),
                                       cfg.get("caption_instruction", ""))
-    return await describe(image, instruction), instruction
+    return await describe(image, instruction, base_url=base), instruction
 
 
 @router.post("/captions/describe", response_model=CaptionResponse)
