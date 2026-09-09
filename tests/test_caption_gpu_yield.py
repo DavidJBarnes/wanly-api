@@ -143,4 +143,4 @@ async def _boom(self, url):
 
 @pytest.fixture(autouse=True)
 def _point_at_a_test_captioner(monkeypatch):
-    monkeypatch.setattr(settings, "joycaption_url", "http://2070.test:11434")
+    monkeypatch.setattr(settings, "image_description_url", "http://2070.test:11434")

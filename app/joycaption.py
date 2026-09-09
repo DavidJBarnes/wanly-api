@@ -15,9 +15,15 @@ WHY AN UNCENSORED MODEL
     prompt needs and exactly what a general-purpose model will not say.
 
 WHERE IT RUNS
-    The 2070, not a render box. The 3090 sits at ~23 of 24 GB while rendering. The 2070 also
-    hosts Automatic1111, which is why keep_alive is short: a resident 5.5 GB model would
-    starve image generation. Sharing goes both ways now — see _yield_the_gpu.
+    Since wanly-gpu-docker#83, inside the GPU container on the 3090 as the image-description
+    service -- the same card the render stack uses, which sits at ~23 of 24 GB while
+    rendering. keep_alive is short so the model holds VRAM only during a caption, and an
+    INTERACTIVE caption is refused while that box is rendering (busy_render_beside_the_captioner)
+    until the local VRAM lease lands. Before #83 it ran on the 2070 beside Automatic1111;
+    _yield_the_gpu is that arrangement's half of the sharing and still applies wherever
+    a1111_url points at a box that also captions.
+
+    This module keeps its file name; the service it talks to is image-description.
 """
 import base64
 import hashlib
@@ -160,18 +166,69 @@ async def _yield_the_gpu() -> bool:
     return True
 
 
+class CaptionerBusy(CaptionError):
+    """The box that captions is rendering right now; ask again when it finishes."""
+
+
+def captioner_host() -> str:
+    """The host part of image_description_url: `3090.zero` for http://3090.zero:11434."""
+    from urllib.parse import urlsplit
+    return (urlsplit(settings.image_description_url).hostname or "").lower()
+
+
+def render_worker_beside_the_captioner(workers) -> "object | None":
+    """The render-capable worker row that shares a card with the captioner, or None.
+
+    Matched by what the row SAYS it runs first: since wanly-gpu-docker#83 the box registers
+    once with `provides` listing image-description, which is the truth from the box itself.
+    A row whose friendly_name is the URL's host is the fallback for a daemon that does not
+    report provides. A row that cannot render is never a collision -- a captioner-only box
+    has nothing to wait for.
+    """
+    from app.enums import WorkerKind, worker_can
+    host = captioner_host()
+    fallback = None
+    for w in workers:
+        if not worker_can(w, WorkerKind.RENDER):
+            continue
+        if "image-description" in (w.provides or []):
+            return w
+        if fallback is None and (w.friendly_name or "").lower() == host:
+            fallback = w
+    return fallback
+
+
+async def busy_render_beside_the_captioner(db) -> str | None:
+    """The friendly_name of the render worker sharing the captioner's card, if it is
+    rendering right now; else None. The interactive caption routes refuse on it.
+
+    Refuse, not wait: a 720p render is ~30 minutes and the request sits behind a 60 s proxy
+    timeout, so a wait would surface as a 504 that reads like a dead captioner. A clear
+    "3090.zero is rendering" the person can act on is worth more. Claim-time <SCENE>
+    resolution does NOT go through this: the worker has just been handed the segment and
+    has not loaded the render yet, and a failed caption there is non-fatal by design.
+    """
+    from sqlalchemy import select
+    from app.models import Worker
+    rows = (await db.execute(select(Worker).where(Worker.status != "offline"))).scalars().all()
+    w = render_worker_beside_the_captioner(rows)
+    if w is not None and w.status == "online-busy":
+        return w.friendly_name
+    return None
+
+
 async def describe(image_bytes: bytes, instruction: str) -> str:
     """Caption one image. Raises CaptionError; callers must treat that as non-fatal."""
     payload = {
-        "model": settings.joycaption_model,
+        "model": settings.image_description_model,
         "prompt": instruction,
         "images": [base64.b64encode(image_bytes).decode()],
         "stream": False,
-        "keep_alive": settings.joycaption_keep_alive,
+        "keep_alive": settings.image_description_keep_alive,
     }
-    url = f"{settings.joycaption_url.rstrip('/')}/api/generate"
+    url = f"{settings.image_description_url.rstrip('/')}/api/generate"
     try:
-        async with httpx.AsyncClient(timeout=settings.joycaption_timeout_s) as client:
+        async with httpx.AsyncClient(timeout=settings.image_description_timeout_s) as client:
             resp = await client.post(url, json=payload)
             # ollama answers 500 for a runner that died loading, which on this box is
             # almost always the GPU rather than the model. Ask the other tenant to let go
@@ -180,7 +237,7 @@ async def describe(image_bytes: bytes, instruction: str) -> str:
             if resp.status_code == 500 and await _yield_the_gpu():
                 resp = await client.post(url, json=payload)
     except httpx.HTTPError as e:
-        raise CaptionError(f"captioner unreachable at {settings.joycaption_url}: {e}") from e
+        raise CaptionError(f"captioner unreachable at {settings.image_description_url}: {e}") from e
     if resp.status_code != 200:
         raise CaptionError(f"captioner returned {resp.status_code}: {resp.text[:200]}")
 

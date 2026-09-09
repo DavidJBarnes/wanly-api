@@ -148,7 +148,7 @@ async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
 
     try:
         image = await asyncio.to_thread(s3.download_bytes, image_uri)
-        caption, instruction = await caption_image_bytes(db, image)
+        caption, instruction = await caption_image_bytes(db, image, interactive=False)
     except Exception as e:
         # Never fatal. A captioner that is down must not stop a render — the pose still has
         # its arc, and a generic scene is what every pose used before this existed.

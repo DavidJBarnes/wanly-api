@@ -1,3 +1,4 @@
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
@@ -17,11 +18,21 @@ class Settings(BaseSettings):
     aws_region: str = "us-west-2"
     api_key: str = ""
     civitai_api_token: str = ""
-    # JoyCaption, for the <SCENE> placeholder (console#405). Runs on the 2070 rather than a
-    # render box: the 3090 sits at ~23 of 24 GB while rendering LTX, and loading a vision
-    # model beside that OOMs a segment ten minutes in.
-    joycaption_url: str = "http://2070.zero:11434"
-    joycaption_model: str = "joycaption:beta-one"
+    # image-description, for the <SCENE> placeholder (console#405) and dataset tagging. Named
+    # for the capability (wanly-gpu-docker#83): today it is JoyCaption served by ollama inside
+    # the GPU container, and that can change without renaming anything here. The old
+    # JOYCAPTION_* names are still read from the environment.
+    #
+    # It runs on the 3090 beside the render stack. A caption loads a ~6 GB vision model, and
+    # the card sits at ~23 of 24 GB while rendering -- so an interactive caption is REFUSED
+    # while that box is online-busy (see busy_render_beside_the_captioner in app/joycaption.py)
+    # rather than OOMing a segment ten minutes in.
+    image_description_url: str = Field(
+        "http://3090.zero:11434",
+        validation_alias=AliasChoices("image_description_url", "joycaption_url"))
+    image_description_model: str = Field(
+        "joycaption:beta-one",
+        validation_alias=AliasChoices("image_description_model", "joycaption_model"))
     # Deliberately tiny. sd.service (Automatic1111) shares that GPU and spikes several GB
     # generating SDXL, and a resident 5.5 GB JoyCaption would starve it. The two are never
     # meant to run at once, so the model should hold the card only while it is actually
@@ -35,10 +46,12 @@ class Settings(BaseSettings):
     # So releasing VRAM after every caption costs ~2.9 s on the next one. 5s still coalesces
     # a burst of images captioned back to back, while giving SD the card back essentially as
     # soon as captioning stops.
-    joycaption_keep_alive: str = "5s"
+    image_description_keep_alive: str = Field(
+        "5s", validation_alias=AliasChoices("image_description_keep_alive", "joycaption_keep_alive"))
     # Generous next to a 4.5 s cold caption. It is here to stop a wedged or unreachable
     # captioner holding a request open, not to bound normal work.
-    joycaption_timeout_s: int = 60
+    image_description_timeout_s: int = Field(
+        60, validation_alias=AliasChoices("image_description_timeout_s", "joycaption_timeout_s"))
     # Automatic1111 on the same 2070, so a caption can ask it for the card back.
     #
     # The keep_alive above makes JoyCaption yield to A1111. Nothing made A1111 yield back,
@@ -52,7 +65,7 @@ class Settings(BaseSettings):
     #
     # Empty disables cropping from the console, which is the honest state anywhere the service
     # is not deployed — the button says so rather than timing out.
-    face_crop_url: str = "http://2070.zero:8084"
+    face_crop_url: str = "http://3090.zero:8084"
     # Generous. It is per REQUEST, and a request carries a whole dataset — 50 images at a
     # second or two each on CPU.
     face_crop_timeout_s: int = 300
