@@ -438,12 +438,32 @@ class TestACommitIsBelievedOnlyAfterLooking:
         await db.commit()
         monkeypatch.setattr(mod.s3, "head_object",
                             lambda uri: {"Key": "k", "Size": 650 * 1024 * 1024})
+        # Present, big enough, AND a real safetensors header (the 2026-09-08 zero-filled
+        # final passed the first two).
+        monkeypatch.setattr(mod.s3, "safetensors_header_ok", lambda uri: True)
 
         out = await mod.commit_training_artifact(
             job.id, uri="s3://ltx-loras/character/pay_v2_final.safetensors", db=db)
 
         assert out.checkpoints == ["s3://ltx-loras/character/pay_v2_final.safetensors"]
         assert out.output_lora_path == "s3://ltx-loras/character/pay_v2_final.safetensors"
+
+    async def test_a_headerless_object_is_refused_and_records_nothing(self, db, monkeypatch):
+        """The zero-filled Me_v2_final of 2026-09-08: right size, no header."""
+        import pytest
+        from fastapi import HTTPException
+        from app.routes import training as mod
+        job = self._job()
+        db.add(job)
+        await db.commit()
+        monkeypatch.setattr(mod.s3, "head_object",
+                            lambda uri: {"Key": "k", "Size": 650 * 1024 * 1024})
+        monkeypatch.setattr(mod.s3, "safetensors_header_ok", lambda uri: False)
+        with pytest.raises(HTTPException) as e:
+            await mod.commit_training_artifact(
+                job.id, uri="s3://ltx-loras/character/pay_v2_final.safetensors", db=db)
+        assert e.value.status_code == 422 and "no safetensors header" in e.value.detail
+        assert not (job.checkpoints or [])
 
 
 class TestAFinishedRunCanBeDeleted:
