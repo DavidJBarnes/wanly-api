@@ -368,6 +368,10 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
     Upsert on name: retraining a character replaces which LoRA it points at, which is the whole
     point of a v2. The strengths are left alone if the row exists, because they may have been
     tuned by hand.
+
+    The gender travels with the LoRA, not the row: it is the caption THIS file trained on, and
+    a v2 captioned differently must render differently (wanly-console#487). A run that recorded
+    none leaves the row's alone -- it may have been set by hand for a LoRA that predates it.
     """
     if not job.output_lora_path:
         return
@@ -379,15 +383,18 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
     existing = (await db.execute(
         select(LtxCharacter).where(LtxCharacter.name == job.character)
     )).scalar_one_or_none()
+    gender = (job.config or {}).get("gender") or None
     if existing:
         existing.char_lora = basename
         existing.trigger = job.trigger
+        if gender:
+            existing.gender = gender
         if job.thumbnail_uri:
             existing.image_uri = job.thumbnail_uri
         logger.info("character %s now points at %s", job.character, basename)
     else:
         db.add(LtxCharacter(name=job.character, char_lora=basename, trigger=job.trigger,
-                            image_uri=job.thumbnail_uri))
+                            gender=gender, image_uri=job.thumbnail_uri))
         logger.info("created character %s -> %s", job.character, basename)
 
 

@@ -556,6 +556,12 @@ class LtxCharacter(Base):
     # and a trigger swap" — this is the trigger half, and it is why a new LoRA is never
     # locked out: every pose works for it the moment the row exists.
     trigger = mapped_column(String(64), nullable=False)
+    # The other half of the caption this LoRA trained on. Every run captions its images
+    # "<trigger>, <gender>", so the identity is bound to the PAIR; filling <TRIGGER> with
+    # the trigger alone left the binding word out of every render prompt, which is what
+    # decides who is who when two identity LoRAs share the weights (wanly-console#487).
+    # NULL for a character that predates the trainer: it renders the bare trigger as before.
+    gender = mapped_column(String(16), nullable=True)
     # Per-stage, never flat. Stage 1 generates at half size from noise; stage 2 refines the
     # 2x-upscaled latent and is where facial detail resolves. Collapsing them to one number
     # is a different configuration, not a simplification.

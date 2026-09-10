@@ -186,6 +186,32 @@ class TestPublishing:
         assert row.char_lora == "pay_v2_e03"
         assert row.strength_stage_1 == 0.9, "hand-tuned strengths were overwritten"
 
+    async def test_the_gender_the_run_captioned_lands_on_the_row(self, db):
+        """The caption was "p@y, woman"; the row must say so or <TRIGGER> renders the
+        trigger without the word the identity was bound to (wanly-console#487)."""
+        j = _job(config={"gender": "woman", "caption": "p@y, woman"},
+                 output_lora_path="s3://ltx-loras/character/pay_v1_e05.safetensors")
+        db.add(j)
+        await db.flush()
+        await _publish_character(db, j)
+        await db.flush()
+        from sqlalchemy import select
+        row = (await db.execute(select(LtxCharacter).where(
+            LtxCharacter.name == "pay"))).scalar_one()
+        assert row.gender == "woman"
+
+    async def test_a_run_without_a_gender_leaves_a_hand_set_one_alone(self, db):
+        db.add(LtxCharacter(name="pay", char_lora="pay_v1_e05", trigger="p@y", gender="woman"))
+        await db.flush()
+        j = _job(version=2, config={"caption": "p@y, close-up"},
+                 output_lora_path="s3://ltx-loras/character/pay_v2_e03.safetensors")
+        await _publish_character(db, j)
+        await db.flush()
+        from sqlalchemy import select
+        row = (await db.execute(select(LtxCharacter).where(
+            LtxCharacter.name == "pay"))).scalar_one()
+        assert row.gender == "woman"
+
     async def test_nothing_is_published_without_a_file(self, db):
         j = _job(output_lora_path=None)
         await _publish_character(db, j)
