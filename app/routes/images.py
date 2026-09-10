@@ -15,7 +15,7 @@ from app.routes.datasets import DATASETS_PREFIX
 from app.database import get_db
 from app.joycaption import CaptionError
 from app.enums import TRAINING_TERMINAL
-from app.models import Favorite, ImageMeta, Job, Segment, TrainingJob, User
+from app.models import Dataset, Favorite, ImageMeta, Job, Segment, TrainingJob, User
 from app.routes.captions import caption_image_bytes
 from app.schemas.images import ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate
 from app.tag_filter import like_escape
@@ -120,7 +120,7 @@ async def find_image_references(db: AsyncSession, paths: list[str]) -> dict[str,
         if not path or path not in wanted:
             return
         entry = refs.setdefault(path, {"job_ids": [], "segment_ids": [],
-                                       "training_ids": []})
+                                       "training_ids": [], "dataset_ids": []})
         if str(holder_id) not in entry[kind]:
             entry[kind].append(str(holder_id))
 
@@ -157,6 +157,21 @@ async def find_image_references(db: AsyncSession, paths: list[str]) -> dict[str,
     for job_id, images in train_rows.all():
         for value in images or []:
             _hold(value, "training_ids", job_id)
+
+    # DATASET MEMBERSHIP COUNTS TOO (wanly-api#305). A photograph in a dataset that could be
+    # deleted from the repo silently vanished from every set holding it: the set keeps a dead
+    # URI, the count changes with no name, and training fetches a 404. Same Python-side JSONB
+    # matching as the training check above -- one row per dataset ever, so a containment query
+    # would be machinery the problem does not deserve.
+    #
+    # Unlike an in-flight training run, membership is ordinary state: someone rebuilding a set
+    # legitimately wants the originals gone afterwards. That is what DELETE /datasets/{id}
+    # (purge) and removing the image FROM the dataset are for -- this gate says which sets
+    # hold it, and force=true stays the escape, named (wanly-api#156).
+    ds_rows = await db.execute(select(Dataset.id, Dataset.images))
+    for ds_id, images in ds_rows.all():
+        for value in images or []:
+            _hold(value, "dataset_ids", ds_id)
 
     return refs
 
@@ -426,6 +441,7 @@ async def delete_image(
                     "path": path,
                     "job_ids": refs[path]["job_ids"],
                     "segment_ids": refs[path]["segment_ids"],
+                    "dataset_ids": refs[path]["dataset_ids"],
                 },
             )
     await asyncio.to_thread(delete_object, path)
