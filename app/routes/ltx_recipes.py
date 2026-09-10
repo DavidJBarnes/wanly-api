@@ -141,6 +141,7 @@ async def get_recipe_book(
                 "name": c.name,
                 "char_lora": c.char_lora,
                 "trigger": c.trigger,
+                "gender": c.gender,
                 "strength_stage_1": c.strength_stage_1,
                 "strength_stage_2": c.strength_stage_2,
             }

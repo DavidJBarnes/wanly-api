@@ -27,7 +27,8 @@ from app.enums import JobStatus, SegmentStatus, VideoStatus, WorkerKind
 from app.ltx_stack import LTX_STACK
 from app.model_requirements import CHECKPOINT, canonical
 from app.recipe_blob import (
-    TRIGGER_PLACEHOLDERS, placeholders_in, recipe_characters, recipe_problem, render_prompt,
+    TRIGGER_PLACEHOLDERS, character_phrase, placeholders_in, recipe_characters, recipe_problem,
+    render_prompt, trigger_phrase,
 )
 from app.models import (
     AppSetting, ImageMeta, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker,
@@ -296,6 +297,10 @@ async def _resolve_trigger(db: AsyncSession, prompt: str, ltx_recipe: dict | Non
     -- rendering the literal text is bad, but silently dropping the token that anchors a
     character LoRA is worse and much harder to notice.
 
+    What is filled in is the trigger PHRASE, "p@yton, woman" -- the caption the LoRA trained
+    on, gender included (wanly-console#487). The row's gender when the row exists, else the
+    one the blob recorded, else the bare trigger as before.
+
     The console normally substitutes at creation time; this catches a prompt that reaches the
     API still carrying a placeholder — an edited prompt, or any caller that is not the
     console.
@@ -311,7 +316,8 @@ async def _resolve_trigger(db: AsyncSession, prompt: str, ltx_recipe: dict | Non
             row = (await db.execute(
                 select(LtxCharacter).where(LtxCharacter.name == person["name"])
             )).scalar_one_or_none()
-        triggers.append(row.trigger if row else person.get("trigger"))
+        triggers.append(trigger_phrase(row.trigger, row.gender) if row
+                        else character_phrase(person))
     return render_prompt(prompt, triggers)
 
 

@@ -2,7 +2,7 @@
 
 A segment's `ltx_recipe` names the people in the shot as
 
-    characters: [{name, trigger, char_lora, s1, s2}, ...]      # ordered, at most two
+    characters: [{name, trigger, gender, char_lora, s1, s2}, ...]   # ordered, at most two
 
 with the older scalar keys -- `character`, `trigger`, `char_lora`, `char_s1`, `char_s2` --
 mirrored from the first entry so that everything written before the list existed, and
@@ -24,7 +24,9 @@ MAX_CHARACTERS = len(TRIGGER_PLACEHOLDERS)
 
 
 def recipe_characters(ltx_recipe: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """The people in a recipe blob, `[{name, trigger, char_lora, s1, s2}, ...]`.
+    """The people in a recipe blob, `[{name, trigger, gender, char_lora, s1, s2}, ...]`.
+
+    `gender` is recorded since wanly-console#487 and absent before; readers use `.get`.
 
     The list when it is there, else one entry synthesised from the scalars, else nothing.
     Entries are returned as recorded -- including a `char_lora` of "none", which is a real
@@ -44,6 +46,29 @@ def recipe_characters(ltx_recipe: dict[str, Any] | None) -> list[dict[str, Any]]
         "s1": ltx_recipe.get("char_s1"),
         "s2": ltx_recipe.get("char_s2"),
     }]
+
+
+def trigger_phrase(trigger: str | None, gender: str | None) -> str | None:
+    """What fills a placeholder: the trigger AND the word its LoRA bound it to.
+
+    Every run captions its images "<trigger>, <gender>" (wanly-api#293), so "p@yton, woman"
+    is the token pair the identity actually learned, and the render prompt has to say the
+    same thing. With two identity LoRAs summed into the same weights this pair is the only
+    thing that says which face goes on which body (wanly-console#487).
+
+    No trigger means no phrase -- the "no character" slot never grows a gender -- and no
+    gender means the bare trigger, which is exactly what every character rendered before.
+    """
+    if not trigger:
+        return trigger
+    if not gender:
+        return trigger
+    return f"{trigger}, {gender}"
+
+
+def character_phrase(person: dict[str, Any]) -> str | None:
+    """`trigger_phrase` for one entry of `recipe_characters`."""
+    return trigger_phrase(person.get("trigger"), person.get("gender"))
 
 
 def render_prompt(template: str, triggers: str | Sequence[str | None]) -> str:

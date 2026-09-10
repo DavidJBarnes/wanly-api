@@ -8,7 +8,8 @@ import pytest
 from app.model_requirements import LORA, Artifact, required_artifacts
 from app.models import LtxCharacter
 from app.recipe_blob import (
-    MAX_CHARACTERS, TRIGGER2_PLACEHOLDER, recipe_characters, recipe_problem, render_prompt,
+    MAX_CHARACTERS, TRIGGER2_PLACEHOLDER, character_phrase, recipe_characters, recipe_problem,
+    render_prompt, trigger_phrase,
 )
 from app.routes.wildcards import RESERVED_WILDCARD_NAMES
 
@@ -38,6 +39,33 @@ class TestRenderPrompt:
     def test_trigger_does_not_eat_trigger2(self):
         """"<TRIGGER>" is not a substring of "<TRIGGER2>", and this proves it stays so."""
         assert render_prompt("<TRIGGER2>", ["p@y"]) == "<TRIGGER2>"
+
+
+class TestTriggerPhrase:
+    """What fills the placeholder is the caption the LoRA trained on, gender included
+    (wanly-console#487): "p@yton, woman", not "p@yton"."""
+
+    def test_the_phrase_is_the_training_caption(self):
+        assert trigger_phrase("p@yton", "woman") == "p@yton, woman"
+        assert trigger_phrase("d@vid", "man") == "d@vid, man"
+
+    def test_no_gender_is_the_bare_trigger_as_before(self):
+        assert trigger_phrase("k3llydw", None) == "k3llydw"
+        assert trigger_phrase("k3llydw", "") == "k3llydw"
+
+    def test_the_no_character_slot_never_grows_a_gender(self):
+        assert trigger_phrase("", "woman") == ""
+        assert trigger_phrase(None, "woman") is None
+
+    def test_a_blob_entry_renders_its_recorded_gender(self):
+        person = {"name": "Payton", "trigger": "p@yton", "gender": "woman"}
+        assert character_phrase(person) == "p@yton, woman"
+        assert character_phrase({"name": "Me", "trigger": "d@vid"}) == "d@vid"
+
+    def test_both_people_render_bound_to_their_gender(self):
+        people = [{"trigger": "p@yton", "gender": "woman"}, {"trigger": "d@vid", "gender": "man"}]
+        assert render_prompt("<TRIGGER> and <TRIGGER2>", [character_phrase(p) for p in people]) \
+            == "p@yton, woman and d@vid, man"
 
 
 class TestTheOneReader:
@@ -125,3 +153,22 @@ class TestResolveTrigger:
         from app.routes.segments import _resolve_trigger
         out = await _resolve_trigger(db, "<TRIGGER>, a woman", ONE_SCALAR)
         assert out == "p@y, a woman"
+
+    async def test_the_rows_gender_renders_beside_the_trigger(self, db):
+        """The caption was "p@y, woman" / "d@vid, man"; the prompt says the same pair
+        (wanly-console#487)."""
+        from app.routes.segments import _resolve_trigger
+        db.add(LtxCharacter(name="p@y", char_lora="pay_v2_e05", trigger="p@y", gender="woman"))
+        db.add(LtxCharacter(name="Me", char_lora="david_v1_final", trigger="d@vid", gender="man"))
+        await db.commit()
+        out = await _resolve_trigger(db, "<TRIGGER2> stands behind <TRIGGER>", TWO)
+        assert out == "d@vid, man stands behind p@y, woman"
+
+    async def test_a_deleted_row_renders_the_gender_the_blob_recorded(self, db):
+        from app.routes.segments import _resolve_trigger
+        blob = {**TWO, "characters": [
+            {**TWO["characters"][0], "gender": "woman"},
+            {**TWO["characters"][1], "gender": "man"},
+        ]}
+        out = await _resolve_trigger(db, "<TRIGGER> and <TRIGGER2>", blob)
+        assert out == "p@y, woman and d@vid, man"

@@ -2,9 +2,13 @@
 
 import uuid
 from datetime import datetime
-from typing import Optional, List
+from typing import Literal, Optional, List
 
 from pydantic import BaseModel, ConfigDict, Field
+
+#: The word a LoRA's caption bound its trigger to (wanly-console#487). The same three the
+#: training request takes, because this is what that request's caption recorded.
+Gender = Literal["woman", "man", "person"]
 
 
 class LtxCharacterCreate(BaseModel):
@@ -13,6 +17,8 @@ class LtxCharacterCreate(BaseModel):
     # Fills every pose's <TRIGGER> placeholder. Defaults to the character's own name, which
     # is what all three seeded characters use.
     trigger: Optional[str] = Field(default=None, max_length=64)
+    # Renders beside the trigger, "p@yton, woman", exactly as the LoRA's caption read.
+    gender: Optional[Gender] = None
     # Per-stage, never flat — stage 1 decides the body, stage 2 resolves the face.
     strength_stage_1: float = 0.8
     strength_stage_2: float = 1.5
@@ -26,6 +32,7 @@ class LtxCharacterResponse(BaseModel):
     name: str
     char_lora: str
     trigger: str
+    gender: Optional[Gender] = None
     strength_stage_1: float
     strength_stage_2: float
     image_uri: Optional[str] = None
@@ -43,6 +50,9 @@ class LtxCharacterUpdate(BaseModel):
     name: Optional[str] = Field(default=None, min_length=1, max_length=64)
     char_lora: Optional[str] = Field(default=None, min_length=1)
     trigger: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    # Sent as null, it clears: a character whose LoRA trained on a bare caption should not
+    # keep rendering a gender it never bound.
+    gender: Optional[Gender] = None
     strength_stage_1: Optional[float] = Field(default=None, ge=0)
     strength_stage_2: Optional[float] = Field(default=None, ge=0)
     image_uri: Optional[str] = None
