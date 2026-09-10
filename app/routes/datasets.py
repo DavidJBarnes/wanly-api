@@ -185,18 +185,29 @@ async def delete_dataset(
 async def crop_faces(
     dataset_id: uuid.UUID,
     largest_only: bool = False,
+    uris: list[str] | None = None,
+    save_as: bool = False,
     _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Replace this dataset's images with the faces cropped out of them.
+    """Replace this dataset's images with the faces cropped out of them -- or, with `save_as`,
+    keep the set and append the crops as new images instead.
 
-    IN PLACE. It used to write a second dataset called "<name> faces" and leave this one as
-    it was, on the argument that the photographs are the source of truth and a crop is
+    IN PLACE by default. It used to write a second dataset called "<name> faces" and leave this
+    one as it was, on the argument that the photographs are the source of truth and a crop is
     derived. In use that meant every dataset came in pairs, the one you trained from was
     never the one you named, and the question "why did cropping make a new dataset?" was
     asked on the first try (wanly-console#464). The photographs are still in the bucket under
     the dataset's own prefix, so nothing is destroyed; the dataset simply IS the crops now,
-    which is what anyone cropping wanted.
+    which is what anyone cropping wanted. `save_as=True` is the other half of that question:
+    the set keeps its photographs and the crops join the end of it, so one run produces both.
+
+    SELECTIVE. `uris` crops those and only those; absent means every image in the set. A
+    25-image set that needed 5 faces re-cropped cropped all 25 to get them, and the 20 good
+    crops came back different -- the output is not deterministic, so a re-run of the whole set
+    silently replaced crops nobody asked to change. Selected URIs that are not in the set are
+    ignored rather than fatal, the way a stale selection in a long-open dialog survives an
+    image being removed in another tab.
 
     NO GATE, NO REFERENCE. Cropping used to take a reference dataset and drop faces that
     scored below the same-person floor against its mean. A mean over a set that still
@@ -219,10 +230,16 @@ async def crop_faces(
     if not ds.images:
         raise HTTPException(status_code=422, detail="this dataset has no images")
 
+    targets = ds.images if uris is None else [u for u in ds.images if u in set(uris)]
+    if not targets:
+        raise HTTPException(
+            status_code=422,
+            detail="none of the selected images are in this dataset — they may have been removed")
+
     # CONCURRENTLY. Fetched one at a time this was fourteen serial round trips to S3 before any
     # work started; they are independent and the wait is entirely network.
     blobs = await asyncio.gather(
-        *(asyncio.to_thread(s3.download_bytes, u) for u in ds.images))
+        *(asyncio.to_thread(s3.download_bytes, u) for u in targets))
     payload = {
         "images": [base64.b64encode(b).decode() for b in blobs],
         "reference": [],
@@ -245,30 +262,44 @@ async def crop_faces(
     # face-crop that predates that, and the old contract there was PNG -- so the two repos can
     # deploy in either order.
     ext = {"jpeg": "jpg"}.get(str(faces[0].get("format", "png")).lower(), "png")
-    # A crop batch gets its own sub-folder, so cropping twice cannot overwrite the first
-    # batch's files while a training job still records them.
+    # A crop batch gets its own sub-folder, so — in either mode — cropping twice cannot
+    # overwrite the first batch's files while a training job still records them. save_as does
+    # NOT mean overwrite the originals with the crop: a URI a finished training job's
+    # dataset_images points at must keep meaning the photograph it was created with.
     batch = f"{ds.prefix}/faces-{uuid.uuid4().hex[:6]}"
 
     # Uploaded concurrently, for the same reason the fetch is: independent, network-bound, and
     # serial round trips are the whole cost.
     async def put(i: int, f: dict) -> str:
-        src = ds.images[f["source_index"]].rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        src = targets[f["source_index"]].rsplit("/", 1)[-1].rsplit(".", 1)[0]
         key = f"{batch}/{i:03d}_{src}_f{f['face_index']}.{ext}"
         return await asyncio.to_thread(
             s3.upload_bytes, base64.b64decode(f["png_b64"]), key, settings.s3_images_bucket)
 
     uris = list(await asyncio.gather(*(put(i, f) for i, f in enumerate(faces))))
     no_face = len(result.get("no_face", []))
-    note = (f"Cropped {len(faces)} faces from {len(ds.images)} photos "
+    scope = "every image" if uris is None else f"{len(targets)} selected images"
+    note = (f"Cropped {len(faces)} faces from {scope} "
             f"({'largest only' if largest_only else 'every face'})"
-            + (f", {no_face} with none detected" if no_face else "") + ".")
+            + (f", {no_face} with none detected" if no_face else "")
+            + ("; the set kept its photos and the crops joined it" if save_as else "") + ".")
     ds.notes = f"{ds.notes}\n{note}".strip() if ds.notes else note
-    ds.images = uris
-    # The anchor was a photograph; the set is faces now.
-    ds.anchor_uri = None
+    if save_as:
+        # JSONB columns do not see an in-place mutation (see add_images); reassign.
+        ds.images = list(ds.images) + uris
+        # The anchor is still a photograph in the set; scoring against it still works.
+    else:
+        replaced = set(targets)
+        kept_others = [u for u in ds.images if u not in replaced]
+        ds.images = kept_others + uris
+        # The anchor was one of the cropped photographs; the set is faces now — but an anchor
+        # outside the selection is still what it was.
+        if ds.anchor_uri in replaced:
+            ds.anchor_uri = None
     await db.commit()
     await db.refresh(ds)
-    logger.info("cropped %s in place: %d faces from %d photos", ds.name, len(uris), len(blobs))
+    logger.info("cropped %s (save_as=%s): %d faces from %d of %d photos",
+                ds.name, save_as, len(uris), len(targets), len(ds.images) - (len(uris) if save_as else 0))
     return ds
 
 

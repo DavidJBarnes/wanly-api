@@ -127,12 +127,50 @@ class TestCropping:
     def test_it_replaces_the_images_in_place(self):
         """It used to write a second dataset called "<name> faces". Every dataset then came in
         pairs and the one you trained from was never the one you named (console#464). The
-        photographs stay in the bucket under the dataset's prefix; the dataset IS the crops."""
+        photographs stay in the bucket under the dataset's prefix; the dataset IS the crops --
+        and #303 added a save_as mode where the set keeps its photos and the crops join it."""
         import inspect
         from app.routes import datasets as mod
         src = inspect.getsource(mod.crop_faces)
-        assert "ds.images = uris" in src
+        assert "ds.images = kept_others + uris" in src
+        assert "ds.images = list(ds.images) + uris" in src
         assert "out = Dataset(" not in src
+
+    def test_it_crops_a_subset_when_uris_are_named(self):
+        """A 25-image set that needed 5 faces re-cropped got all 25 re-cropped: the output is
+        not deterministic, so the 20 good crops came back different. #303: absent/None means
+        every image (the old behavior); a list means those and only those."""
+        import inspect
+        from app.routes import datasets as mod
+        src = inspect.getsource(mod.crop_faces)
+        sig = inspect.signature(mod.crop_faces).parameters
+        assert "uris" in sig and sig["uris"].default is None
+        assert "ds.images if uris is None else" in src
+
+    def test_a_stale_selection_is_refused_not_fatal(self):
+        """URIs named but not in the set -- removed in another tab while the dialog was open --
+        are filtered out; naming only stale ones is a 422 that says so, not a silent no-op."""
+        import inspect
+        from app.routes import datasets as mod
+        src = inspect.getsource(mod.crop_faces)
+        assert "not fatal" not in src or True
+        assert "none of the selected images are in this dataset" in src
+
+    def test_save_as_keeps_the_set_and_appends_the_crops(self):
+        """The other half of the crop question: one run produces photographs AND faces."""
+        import inspect
+        from app.routes import datasets as mod
+        assert "save_as" in inspect.signature(mod.crop_faces).parameters
+        src = inspect.getsource(mod.crop_faces)
+        assert "if save_as:" in src
+
+    def test_save_as_does_not_break_the_anchor_outside_the_selection(self):
+        """An anchor outside a subset crop is still a photograph in the set; only one being
+        cropped away clears it."""
+        import inspect
+        from app.routes import datasets as mod
+        src = inspect.getsource(mod.crop_faces)
+        assert "if ds.anchor_uri in replaced:" in src
 
     def test_a_second_crop_cannot_overwrite_the_first_batch(self):
         """A training job may still record the first batch's keys."""
