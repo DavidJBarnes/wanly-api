@@ -1,7 +1,7 @@
 """A character carries the gender its LoRA trained on
 
-Revision ID: 095
-Revises: 094
+Revision ID: 096
+Revises: 095
 Create Date: 2026-09-09
 
 Every LoRA trains on the caption "<trigger>, <gender>" (093/#293), but a pose's <TRIGGER>
@@ -15,8 +15,8 @@ as they did; the character dialog can set them.
 import sqlalchemy as sa
 from alembic import op
 
-revision = "095"
-down_revision = "094"
+revision = "096"
+down_revision = "095"
 branch_labels = None
 depends_on = None
 
