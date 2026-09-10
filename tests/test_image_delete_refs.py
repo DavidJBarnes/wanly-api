@@ -21,7 +21,7 @@ from app.auth import get_current_user
 from app.database import get_db
 from app.enums import JobStatus
 from app.main import app
-from app.models import Job, Segment, User
+from app.models import Dataset, Job, Segment, User
 
 _fake_user = User(id=uuid.uuid4(), username="testuser", password_hash="x")
 
@@ -45,10 +45,16 @@ class _FakeSession:
     It reads the selected columns and the bound IN values off the statement rather than
     matching a hardcoded query, so it does not have to be rewritten every time the helper's
     column list widens — which is exactly the change this ticket is about.
+
+    Rows are returned when any STRING column value is in the statement's wanted set. A
+    datasets row is returned unconditionally: its `images` is a JSON list the helper matches
+    in Python, so there is no string column for the row filter to key on — the helper itself
+    does the narrowing via _hold.
     """
 
-    def __init__(self, jobs=(), segments=()):
-        self._rows = {"jobs": list(jobs), "segments": list(segments)}
+    def __init__(self, jobs=(), segments=(), datasets=()):
+        self._rows = {"jobs": list(jobs), "segments": list(segments),
+                      "datasets": list(datasets)}
 
     async def execute(self, query):
         table = query.get_final_froms()[0].name
@@ -63,7 +69,8 @@ class _FakeSession:
         rows = []
         for obj in self._rows.get(table, []):
             values = tuple(getattr(obj, name, None) for name in columns)
-            if any(isinstance(v, str) and v in wanted for v in values):
+            if table == "datasets" or any(
+                    isinstance(v, str) and v in wanted for v in values):
                 rows.append(values)
         return _FakeResult(rows)
 
@@ -164,6 +171,52 @@ class TestDeleteRefusesReferencedImages:
 
         assert resp.status_code == 200
         deleter.assert_called_once_with(LOOSE)
+
+    @pytest.mark.asyncio
+    async def test_dataset_membership_returns_409(self):
+        """A photograph in a dataset that could be deleted from the repo silently vanished
+        from every set holding it: the set kept a dead URI and training fetched a 404."""
+        ds = Dataset(id=uuid.uuid4(), name="set", images=[FACE])
+        _override(_FakeSession(datasets=[ds]))
+
+        resp, deleter = await _delete(FACE)
+
+        assert resp.status_code == 409
+        assert str(ds.id) in resp.json()["detail"]["dataset_ids"]
+        deleter.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_dataset_membership_names_the_set_in_the_409(self):
+        """The point of the body is to say what to fix — the set is the thing to go look at."""
+        ds = Dataset(id=uuid.uuid4(), name="set", images=["s3://b/other.png", FACE])
+        _override(_FakeSession(datasets=[ds]))
+
+        resp, _ = await _delete(FACE)
+
+        detail = resp.json()["detail"]
+        assert detail["dataset_ids"] == [str(ds.id)]
+
+    @pytest.mark.asyncio
+    async def test_force_still_deletes_a_dataset_member(self):
+        """Membership is ordinary state, not a run in flight: rebuilding a set legitimately
+        wants the originals gone afterwards. force=true stays the escape."""
+        ds = Dataset(id=uuid.uuid4(), name="set", images=[FACE])
+        _override(_FakeSession(datasets=[ds]))
+
+        resp, deleter = await _delete(FACE, force="true")
+
+        assert resp.status_code == 200
+        deleter.assert_called_once_with(FACE)
+
+    @pytest.mark.asyncio
+    async def test_a_dataset_holding_other_images_does_not_gate_this_one(self):
+        ds = Dataset(id=uuid.uuid4(), name="set", images=["s3://b/other.png"])
+        _override(_FakeSession(datasets=[ds]))
+
+        resp, deleter = await _delete(FACE)
+
+        assert resp.status_code == 200
+        deleter.assert_called_once_with(FACE)
 
     @pytest.mark.asyncio
     async def test_wrong_bucket_still_rejected_before_any_db_work(self):
