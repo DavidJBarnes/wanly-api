@@ -474,13 +474,22 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
     )).scalar_one_or_none()
     gender = (job.config or {}).get("gender") or None
     # A JOINT RUN (#102) publishes its SECOND identity's trigger too. The row carries ONE
-    # trigger, and a joint LoRA trained on two caption pairs must announce both, or a pose
-    # fills <TRIGGER> with one and the second face renders unbound. The row's trigger
-    # becomes BOTH, " & "-separated -- the same token list the captions taught -- and a
-    # recipe renders the joint LoRA in one slot with the prompt naming both triggers.
+    # trigger and ONE gender slot, and a joint LoRA trained on two caption pairs must
+    # announce BOTH PAIRS — the phrase the render path fills <TRIGGER> with is
+    # "<trigger>, <gender>" (wanly-console#487), so "p@y & d@vid" + the group-0 gender
+    # would render "d@vid, woman", a token pair that was never trained: group 1's face
+    # bound to "man". The row's trigger becomes the full joint phrase, "p@y, woman &
+    # d@vid, man" — exactly what the captions taught, in the order the datasets trained —
+    # and the gender slot is left holding the phrase too (readers that use the bare
+    # trigger get the same tokens). The joint phrase rides the trigger column because
+    # trigger_phrase() concatenates trigger + gender onto whatever the row carries; a
+    # separate "both pairs" column would be a second read of the same shape.
     joint = job.second_identity
     if joint:
-        trigger = f"{job.trigger} & {joint['trigger']}"
+        g0 = (job.config or {}).get("gender")
+        g1 = joint.get("gender")
+        trigger = f"{job.trigger}, {g0} & {joint['trigger']}, {g1}"
+        gender = None
     else:
         trigger = job.trigger
     if existing:
