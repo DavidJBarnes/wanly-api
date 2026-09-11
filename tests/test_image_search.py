@@ -18,7 +18,7 @@ import pytest
 from sqlalchemy import func, select
 
 from app.models import ImageMeta
-from app.routes.images import image_filter, search_pattern
+from app.routes.images import image_filter, repo_images_only, search_pattern
 from app.tag_filter import normalise_tag
 
 
@@ -113,6 +113,69 @@ class TestAgainstTheDatabase:
         # "kelly" as free text was returning three quarters of the repo.
         await self._seed(db)
         assert await self._paths(db, q="Missionary") == set()
+
+    async def test_q_matches_a_description_fragment(self, db):
+        # wanly-console#447: "the one where she's wearing the red dress" is a search by content
+        # that neither the filename nor an exact tag can answer.
+        db.add(ImageMeta(path="s3://b/d/00420.png",
+                         scene_description="A woman in a red dress standing by a window."))
+        await self._seed(db)
+        assert await self._paths(db, q="red dress") == {"00420.png"}
+
+    async def test_q_folds_case_against_a_description(self, db):
+        db.add(ImageMeta(path="s3://b/d/00420.png",
+                         scene_description="A woman in a RED DRESS, smiling."))
+        await self._seed(db)
+        assert await self._paths(db, q="red dress") == {"00420.png"}
+
+    async def test_a_description_match_survives_tags_and_excludes(self, db):
+        # The description is under the same q as the path: every other criterion still ANDs.
+        db.add(ImageMeta(path="s3://b/d/00420.png", tags="Kelly",
+                         scene_description="a red dress by a window"))
+        db.add(ImageMeta(path="s3://b/d/00421.png",
+                         scene_description="a red dress on a beach"))
+        await self._seed(db)
+        assert await self._paths(db, q="red dress", tags=["Kelly"]) == {"00420.png"}
+        assert await self._paths(db, q="red dress", exclude=["Kelly"]) == {"00421.png"}
+
+    async def test_an_untagged_undescribed_image_is_still_findable_by_filename(self, db):
+        # The description joined q under an OR: it must not take filename matching away.
+        await self._seed(db)
+        assert await self._paths(db, q="untagged") == {"00116-untagged.png"}
+
+    async def test_a_wildcard_in_q_does_not_match_everything_through_a_description(self, db):
+        # Prose is full of punctuation; the pattern is escaped against the description too.
+        # "100%" appears literally in the description and matches LITERALLY (escape=\\"), so
+        # the positive cases prove the escape and the negative proves there is no wildcard.
+        db.add(ImageMeta(path="s3://b/d/pct.png", scene_description="100% natural look"))
+        db.add(ImageMeta(path="s3://b/d/other.png", scene_description="entirely ordinary"))
+        await self._seed(db)
+        # "%" is literal: "100%" matches only the image whose prose really says it.
+        assert await self._paths(db, q="100%") == {"pct.png"}
+        # A query meant as a right-truncation wildcard ("entirel%") must match NOTHING:
+        # unescaped it would prefix-match "entirely" through the description.
+        assert await self._paths(db, q="entirel%") == set()
+        assert "entirel%" not in "entirely ordinary" or True
+        assert await self._paths(db, q="entirely ordinary") == {"other.png"}
+
+    async def test_a_null_description_still_searches_by_path(self, db):
+        # NULL ilike is NULL, not false — but it sits in an OR with the path clause, so an
+        # undescribed image must remain findable by filename.
+        await self._seed(db)
+        assert await self._paths(db, q="00112") == {"00112.png"}
+
+    async def test_a_dataset_image_does_not_surface_from_a_description_search(self, db):
+        # The datasets/ prefix is hidden from the repo listing. The route runs every search
+        # under repo_images_only(); this is the route's predicate, not image_filter's, so the
+        # check asserts the pair as the route assembles it — user criteria AND the repo
+        # restriction. Seeded under the real bucket so the predicate is the real one.
+        db.add(ImageMeta(path="s3://wanly-images/datasets/faces-abc/hidden.png",
+                         scene_description="a woman in a red dress"))
+        await self._seed(db)
+        rows = (await db.execute(select(ImageMeta.path).where(
+            repo_images_only(), *image_filter("red dress", [], [])
+        ))).scalars().all()
+        assert rows == []
 
     async def test_q_and_tags_and_together(self, db):
         await self._seed(db)

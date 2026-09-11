@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
-from sqlalchemy import func, not_, or_, select, true
+from sqlalchemy import and_, func, not_, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
@@ -597,14 +597,27 @@ def search_pattern(q: str) -> str:
 
 
 def path_clause(q: str):
-    """Match the S3 key as a substring.
+    """Match the S3 key OR the description as a substring.
 
     Fragment matching is right here and wrong for tags. Images arrive named
     "00111-1696092597-swapped.png" and get referred to by that number in job configs and notes,
     so "which folder was 00111 in" has to be answerable -- and a partially remembered filename is
-    the only handle there is. Tags have exact controls of their own, so they no longer share this.
+    the only handle there is.
+
+    The description joins under the same OR (wanly-console#447): a description is prose saying
+    WHAT is in the image, and "the one where she's wearing the red dress" is a search by content
+    that neither the filename nor an exact tag can answer. Descriptions are ~40 words of
+    JoyCaption output, so substring is right and no index or tsvector is warranted at repo scale.
+    Tags still do not share this clause -- they have exact controls of their own, and a tag
+    matching by substring is the #kelly/2,057 mistake measured on 2026-08-14.
+
+    NULL descriptions (never described) fall out of the OR naturally: the path clause still
+    matches, so an undescribed image remains findable by filename.
     """
-    return ImageMeta.path.ilike(search_pattern(q), escape="\\")
+    return or_(
+        ImageMeta.path.ilike(search_pattern(q), escape="\\"),
+        ImageMeta.scene_description.ilike(search_pattern(q), escape="\\"),
+    )
 
 
 def tag_clause(tag: str):
@@ -646,11 +659,20 @@ def repo_images_only():
     a filename search would HEAD one, find it, and put a render's intermediate frame in the
     Image Repo, which is why console#427 refused to store them at all.
 
+    Training datasets share the images bucket and are excluded too: the folder listing hides
+    the datasets/ prefix (wanly-console#464), so a search that still returned them would make
+    the two look connected -- and with descriptions now searched by content (wanly-console#447),
+    a described dataset staging copy would fill results from the repo search box. Narrows rather
+    than excludes: repo folders keep their s3:// path, so one LIKE still covers every real image.
+
     Separate from image_filter deliberately: that function returns the USER's criteria, and
     an empty list is how the route knows nothing was asked for and answers 400 rather than
     serving the whole repo. Folding this in would make it never empty.
     """
-    return ImageMeta.path.like(f"s3://{settings.s3_images_bucket}/%")
+    return and_(
+        ImageMeta.path.like(f"s3://{settings.s3_images_bucket}/%"),
+        not_(ImageMeta.path.like(f"s3://{settings.s3_images_bucket}/{DATASETS_PREFIX}/%")),
+    )
 
 
 @router.get("/images/search", dependencies=[Depends(get_current_user)])
@@ -663,12 +685,12 @@ async def search_images(
     db: AsyncSession = Depends(get_db),
     user = Depends(get_current_user),
 ):
-    """Find images by whole tags (AND) and/or a filename fragment.
+    """Find images by whole tags (AND) and/or a filename or description fragment.
 
     Two controls with two different jobs. `tags` and `exclude` match a tag in full, so Kelly
-    stops dragging in KellyYoung; `q` matches the S3 key as a substring, because a half-recalled
-    filename is often the only handle there is, and it is the only way an untagged image can be
-    found at all.
+    stops dragging in KellyYoung; `q` matches the S3 key or the description as a substring --
+    a half-recalled filename is one handle on an image, what is IN the image is the other, and
+    the filename is the only way an untagged, undescribed image can be found at all.
 
     Everything given ANDs. `tags=Kelly&tags=Missionary` is the 102 images carrying both, not the
     2,057 that a substring search for "kelly" used to return.
