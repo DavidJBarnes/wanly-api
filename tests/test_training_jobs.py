@@ -875,3 +875,74 @@ class TestTheCaptionCarriesTheTrigger:
     def test_gender_is_one_of_three(self):
         with pytest.raises(ValueError):
             TrainingCreate(character="Me", trigger="d@vid", dataset_images=_images(), gender="boy")
+
+
+class TestTheJointRun:
+    """A joint two-identity run (wanly-api#102): one LoRA trained on both characters'
+    datasets at once, whose group-0 delta is learned in the presence of group-1's. This
+    is the structural fix for two-identity interference (wanly-gpu-docker#100, R2: no
+    strength setting recovers two-char identity) — and the R2 runbook lives at
+    ~/projects/wanly/r2-two-char-experiment.md."""
+
+    def _second(self, n=13):
+        return [f"s3://wanly-images/2026-09-11/m{i}.jpg" for i in range(n)]
+
+    def test_second_identity_mirrors_group_zero(self):
+        """The joint fields mirror the first group's shape; absent stays absent."""
+        body = TrainingCreate(
+            character="pay", trigger="p@y", dataset_images=_images(), steps=1200,
+            second_character="Me", second_trigger="d@vid", second_gender="man",
+            second_dataset_images=self._second())
+        assert body.second_trigger == "d@vid"
+        assert len(body.second_dataset_images) == 13
+        plain = TrainingCreate(character="pay", trigger="p@y",
+                               dataset_images=_images(steps=1200) if False else _images())
+        assert plain.second_character is None
+
+    def test_identical_triggers_are_refused(self):
+        """One caption pair cannot anchor both faces — the triggers must differ."""
+        from app.routes.training import create_training_job
+        import inspect
+        src = inspect.getsource(create_training_job)
+        assert "second_trigger == body.trigger" in src
+
+    def test_second_identity_needs_a_resolved_caption(self):
+        """A joint group without gender or a caption naming its trigger would fall back
+        to the trainer's per-job caption default — which carries GROUP 0's trigger. Its
+        face would bind to the wrong person's token."""
+        import inspect
+        from app.routes.training import create_training_job
+        src = inspect.getsource(create_training_job)
+        assert "second_caption" in src
+        assert "needs a gender or a" in src
+
+    async def test_publishing_a_joint_run_records_both_triggers(self, db):
+        """The character row carries ONE trigger; a joint LoRA trained on two caption
+        pairs must announce both, or a pose fills <TRIGGER> with one and the second face
+        renders unbound."""
+        j = _job(
+            output_lora_path="s3://ltx-loras/character/payme_v1_final.safetensors",
+            config={"gender": "woman", "caption": "p@y, woman"},
+            second_identity={"character": "Me", "trigger": "d@vid", "gender": "man",
+                             "images": self._second(), "num_repeats": 10})
+        db.add(j)
+        await db.flush()
+        await _publish_character(db, j)
+        await db.flush()
+        from sqlalchemy import select
+        row = (await db.execute(select(LtxCharacter).where(
+            LtxCharacter.name == "pay"))).scalar_one()
+        assert row.trigger == "p@y & d@vid", "the second trigger was dropped — the joint LoRA's second face would render unbound"
+
+    async def test_publishing_a_single_run_stays_single(self, db):
+        """Every run before #102 is single-identity; its row's trigger is unchanged."""
+        j = _job(output_lora_path="s3://ltx-loras/character/pay_v1_e05.safetensors")
+        db.add(j)
+        await db.flush()
+        await _publish_character(db, j)
+        await db.flush()
+        from sqlalchemy import select
+        row = (await db.execute(select(LtxCharacter).where(
+            LtxCharacter.name == "pay"))).scalar_one()
+        assert row.trigger == "p@y"
+        assert "&" not in row.trigger

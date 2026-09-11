@@ -97,6 +97,73 @@ async def create_training_job(
     if len(set(images)) != len(images):
         raise HTTPException(status_code=422, detail="the dataset contains duplicates")
 
+    # THE JOINT GROUP (#102). Resolved the same way group 0 is: a dataset or a raw list for
+    # the images, the trigger rule for the caption, its own num_repeats. ABSENT stays
+    # absent -- a half-given second identity (a trigger with no images) would build a
+    # half-configured dataset silently, so all-or-nothing is enforced here rather than on
+    # the schema, because it straddles the dataset resolution that only the route can do.
+    second = None
+    if body.second_character:
+        second_images = list(body.second_dataset_images)
+        second_thumbnail = None
+        if body.second_dataset_id:
+            sds = await db.get(Dataset, body.second_dataset_id)
+            if not sds:
+                raise HTTPException(status_code=404, detail="Second dataset not found")
+            second_images = list(sds.images)
+            second_thumbnail = sds.anchor_uri or (sds.images[0] if sds.images else None)
+        if len(second_images) < MIN_DATASET_IMAGES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{len(second_images)} second-identity images — at least "
+                       f"{MIN_DATASET_IMAGES} are needed")
+        if len(set(second_images)) != len(second_images):
+            raise HTTPException(status_code=422, detail="the second dataset contains duplicates")
+        if body.second_dataset_id and body.second_dataset_id == body.dataset_id:
+            # One dataset training both identities captions every image per group -- the
+            # same file cannot carry two triggers at once, and the parity of images across
+            # groups would be accidental rather than intended.
+            raise HTTPException(
+                status_code=422,
+                detail="group 0 and the second identity cannot share one dataset; give each "
+                       "its own (the datasets balance through num_repeats, not by sharing)")
+        if not body.second_trigger:
+            raise HTTPException(
+                status_code=422,
+                detail=f"the second identity ({body.second_character}) has no trigger; its "
+                       f"caption would bind to nothing")
+        if body.second_trigger == body.trigger:
+            raise HTTPException(
+                status_code=422,
+                detail="the two identities' triggers must differ — one caption pair cannot "
+                       "anchor both faces")
+        # THE SAME CAPTION RULE, PER GROUP. Group 0's caption learns "<trigger>,
+        # <gender>"; group 1's must say the same thing about its own trigger, or the joint
+        # LoRA's second face binds to whatever the text happens to be.
+        second_caption = None
+        if body.second_gender:
+            second_caption = f"{body.second_trigger}, {body.second_gender}"
+        elif not body.second_caption:
+            # A joint group without a resolved caption would fall back to the TRAINER's
+            # per-job caption default -- which carries GROUP 0's trigger. Its face would
+            # bind to the wrong person's token and the interference this run exists to
+            # escape would arrive through the captions instead. A free caption naming the
+            # second trigger is accepted; anything else is refused.
+            raise HTTPException(
+                status_code=422,
+                detail=f"the second identity ({body.second_character}) needs a gender or a "
+                       f"caption that names its trigger — otherwise the joint LoRA's second "
+                       f"face binds to nothing")
+        second = {
+            "character": body.second_character,
+            "trigger": body.second_trigger,
+            "gender": body.second_gender,
+            "images": second_images,
+            "num_repeats": body.second_num_repeats,
+        }
+        if second_thumbnail and not thumbnail:
+            thumbnail = second_thumbnail
+
     dupe = (await db.execute(
         select(TrainingJob).where(
             TrainingJob.character == body.character,
@@ -123,18 +190,27 @@ async def create_training_job(
     elif caption and body.trigger not in caption:
         caption = f"{body.trigger}, {caption}"
 
+    # A joint run's steps field is the TOTAL across both groups: the trainer's epoch math
+    # reads images x repeats across the two datasets. The combined set is bigger, so the
+    # same steps value means fewer passes over each image -- the console states per-image
+    # epochs in its estimate, so that is visible to the caller rather than papered over.
+    # The dialog scales its default up for a joint run; the API holds one number for both.
+    steps = body.steps
+
     job = TrainingJob(
         user_id=user.id,
         character=body.character,
         trigger=body.trigger,
         version=body.version,
         dataset_images=images,
-        config={**RECIPE_DEFAULTS, "steps": body.steps, "caption": caption,
+        config={**RECIPE_DEFAULTS, "steps": steps, "caption": caption,
+                "second_caption": second_caption if second else None,
                 "gender": body.gender,
                 "lora_name": body.lora_name or _default_lora_name(body.character),
                 "publish": body.publish},
+        second_identity=second,
         status=TrainingStatus.PENDING,
-        total_steps=body.steps,
+        total_steps=steps,
         thumbnail_uri=thumbnail,
     )
     db.add(job)
@@ -207,6 +283,14 @@ async def claim_next_training_job(
     try:
         urls = await asyncio.to_thread(
             lambda: [s3.generate_presigned_url(u) for u in job.dataset_images])
+        # THE JOINT GROUP, PRESIGNED WITH GROUP 0. One presign pass so a failure in either
+        # leaves the row untouched -- the lost-claim-response rule above applies to the
+        # second dataset the same as the first, and a joint run that delivered group 0
+        # only would stage a single-identity dataset silently, which is worse than a 503.
+        second_urls = None
+        if job.second_identity:
+            second_urls = await asyncio.to_thread(
+                lambda: [s3.generate_presigned_url(u) for u in job.second_identity["images"]])
     except Exception as e:
         logger.error("could not presign the dataset for %s v%d: %s",
                      job.character, job.version, e)
@@ -224,8 +308,13 @@ async def claim_next_training_job(
     await db.commit()
     await db.refresh(job)
     logger.info("training %s v%d claimed by %s", job.character, job.version, job.worker_name)
-    return TrainingClaimResponse(**TrainingResponse.model_validate(job).model_dump(),
-                                 download_urls=urls)
+    claim = TrainingClaimResponse(**TrainingResponse.model_validate(job).model_dump(),
+                                  download_urls=urls)
+    if job.second_identity:
+        claim.second_download_urls = second_urls
+        claim.second_caption = (job.config or {}).get("second_caption")
+        claim.second_num_repeats = job.second_identity.get("num_repeats")
+    return claim
 
 
 async def _reclaim_orphans(db: AsyncSession) -> None:
@@ -384,16 +473,26 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
         select(LtxCharacter).where(LtxCharacter.name == job.character)
     )).scalar_one_or_none()
     gender = (job.config or {}).get("gender") or None
+    # A JOINT RUN (#102) publishes its SECOND identity's trigger too. The row carries ONE
+    # trigger, and a joint LoRA trained on two caption pairs must announce both, or a pose
+    # fills <TRIGGER> with one and the second face renders unbound. The row's trigger
+    # becomes BOTH, " & "-separated -- the same token list the captions taught -- and a
+    # recipe renders the joint LoRA in one slot with the prompt naming both triggers.
+    joint = job.second_identity
+    if joint:
+        trigger = f"{job.trigger} & {joint['trigger']}"
+    else:
+        trigger = job.trigger
     if existing:
         existing.char_lora = basename
-        existing.trigger = job.trigger
+        existing.trigger = trigger
         if gender:
             existing.gender = gender
         if job.thumbnail_uri:
             existing.image_uri = job.thumbnail_uri
         logger.info("character %s now points at %s", job.character, basename)
     else:
-        db.add(LtxCharacter(name=job.character, char_lora=basename, trigger=job.trigger,
+        db.add(LtxCharacter(name=job.character, char_lora=basename, trigger=trigger,
                             gender=gender, image_uri=job.thumbnail_uri))
         logger.info("created character %s -> %s", job.character, basename)
 

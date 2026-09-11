@@ -71,6 +71,24 @@ class TrainingCreate(BaseModel):
     #: outlast the training, for epochs that mostly go unused. "all" uploads every one.
     #: Either way every epoch stays on the trainer and can be published afterwards.
     publish: Literal["final", "all"] = "final"
+    #: A SECOND identity, making this a JOINT run (#102): one LoRA trained on both
+    #: characters' datasets simultaneously, whose group-0 delta is learned in the presence
+    #: of group-1's data. This is the structural fix for two-identity interference (#100,
+    #: R2: no strength setting recovers two-char identity; two independently-trained deltas
+    #: fight in the shared modules). ABSENT means single-identity, which every run before
+    #: this is.
+    #:
+    #: The fields mirror group 0's, with its own images and num_repeats: the two datasets
+    #: balance through repeats, not by truncating the smaller set.
+    second_character: str | None = Field(default=None, min_length=1, max_length=64)
+    second_trigger: str | None = Field(default=None, min_length=1, max_length=64)
+    second_gender: Literal["woman", "man", "person"] | None = None
+    second_dataset_images: list[str] = Field(default_factory=list, max_length=MAX_DATASET_IMAGES)
+    second_dataset_id: uuid.UUID | None = None
+    second_num_repeats: int | None = Field(default=None, ge=1, le=100)
+    #: A free caption for the second group, used when second_gender is absent. Must name
+    #: the second trigger, or the face binds to nothing — the route enforces that.
+    second_caption: str | None = Field(default=None, max_length=500)
 
     @field_validator("character")
     @classmethod
@@ -78,6 +96,15 @@ class TrainingCreate(BaseModel):
         # It becomes a directory name and an output filename on the trainer.
         if "/" in v or v.startswith(".") or any(c.isspace() for c in v):
             raise ValueError("character cannot contain slashes, whitespace, or start with a dot")
+        return v
+
+    @field_validator("second_character")
+    @classmethod
+    def _second_no_path_tricks(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if "/" in v or v.startswith(".") or any(c.isspace() for c in v):
+            raise ValueError("second_character cannot contain slashes, whitespace, or start with a dot")
         return v
 
     @field_validator("dataset_images")
@@ -90,6 +117,16 @@ class TrainingCreate(BaseModel):
             # Duplicates train the same image twice under two sel_NNN names, silently
             # reweighting the set.
             raise ValueError("dataset_images contains duplicates")
+        return v
+
+    @field_validator("second_dataset_images")
+    @classmethod
+    def _second_s3_uris_only(cls, v: list[str]) -> list[str]:
+        bad = [x for x in v if not x.startswith("s3://")]
+        if bad:
+            raise ValueError(f"second_dataset_images must be s3:// URIs, got {bad[0]!r}")
+        if len(set(v)) != len(v):
+            raise ValueError("second_dataset_images contains duplicates")
         return v
 
 
@@ -135,9 +172,13 @@ class TrainingClaimResponse(TrainingResponse):
 
     `download_urls` pairs 1:1 with dataset_images, in order, so the trainer never needs S3
     credentials -- it fetches through the API's own proxy, the same way the render daemon gets
-    its LoRAs.
+    its LoRAs. second_* carry the joint group the same way: ABSENT for every single-identity
+    run, so a trainer that predates #102 sees nothing.
     """
     download_urls: list[str]
+    second_download_urls: list[str] | None = None
+    second_caption: str | None = None
+    second_num_repeats: int | None = None
 
 
 class TrainingProgress(BaseModel):
