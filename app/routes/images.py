@@ -274,18 +274,31 @@ async def list_folder_images(
     ]
 
 
+def _is_dataset_path(uri: str) -> bool:
+    """Is this s3:// URI inside the datasets prefix? The key is everything after the bucket."""
+    return _is_dataset_key(uri.split("/", 3)[-1])
+
+
 @router.get("/images/favorites", dependencies=[Depends(get_current_user)])
 async def list_favorite_images(
     user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return all favorited images across all folders with metadata."""
+    """Return all favorited images across all folders with metadata.
+
+    A dataset URI that was favorited is filtered rather than rendered: datasets are training
+    input (wanly-console#464's split), the search and folder listing already exclude them, and
+    one leaked view makes the Image Repo look connected to the datasets. A stale favorite on a
+    dataset image drops out here rather than surfacing as a grid entry; the Favorite row itself
+    stays — this endpoint renders, it does not curate.
+    """
     result = await db.execute(
         select(Favorite.item_ref)
         .where(Favorite.user_id == user.id, Favorite.item_type == "image")
         .order_by(Favorite.created_at.desc())
     )
     refs = [row[0] for row in result.all()]
+    refs = [r for r in refs if not _is_dataset_path(r)]
 
     async def _meta(uri: str) -> dict | None:
         obj = await asyncio.to_thread(head_object, uri)
@@ -311,6 +324,13 @@ async def list_favorite_images(
     return [item for item in items if item is not None]
 
 
+def _is_dataset_key(key: str) -> bool:
+    """Is this S3 key inside the datasets prefix? DATASETS_PREFIX with no trailing slash is
+    the folder boundary question: "datasets-extra/" is a repo folder, "datasets/" is not.
+    """
+    return key.startswith(f"{DATASETS_PREFIX}/")
+
+
 @router.get("/images/untagged", dependencies=[Depends(get_current_user)])
 async def list_untagged_images(
     db: AsyncSession = Depends(get_db),
@@ -319,7 +339,9 @@ async def list_untagged_images(
 
     "Untagged" means no image_meta row at all, or a row with empty/whitespace tags.
     Since never-tagged images have no row, this is a cross-folder scan minus the
-    set of paths with non-empty tags.
+    set of paths with non-empty tags. Dataset staging images are skipped entirely:
+    they are training input (wanly-console#464's split), tags do not apply to them,
+    and showing them here made the Image Repo look connected to the datasets.
     """
     bucket = settings.s3_images_bucket
     prefixes = await asyncio.to_thread(list_common_prefixes, bucket)
@@ -330,7 +352,7 @@ async def list_untagged_images(
         obj
         for sublist in object_lists
         for obj in sublist
-        if not obj["Key"].endswith("/.folder")
+        if not obj["Key"].endswith("/.folder") and not _is_dataset_key(obj["Key"])
     ]
     paths = [f"s3://{bucket}/{obj['Key']}" for obj in objects]
 
