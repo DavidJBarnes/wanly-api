@@ -597,27 +597,40 @@ def search_pattern(q: str) -> str:
 
 
 def path_clause(q: str):
-    """Match the S3 key OR the description as a substring.
+    """Match the S3 key as a substring.
 
     Fragment matching is right here and wrong for tags. Images arrive named
     "00111-1696092597-swapped.png" and get referred to by that number in job configs and notes,
     so "which folder was 00111 in" has to be answerable -- and a partially remembered filename is
-    the only handle there is.
-
-    The description joins under the same OR (wanly-console#447): a description is prose saying
-    WHAT is in the image, and "the one where she's wearing the red dress" is a search by content
-    that neither the filename nor an exact tag can answer. Descriptions are ~40 words of
-    JoyCaption output, so substring is right and no index or tsvector is warranted at repo scale.
-    Tags still do not share this clause -- they have exact controls of their own, and a tag
-    matching by substring is the #kelly/2,057 mistake measured on 2026-08-14.
-
-    NULL descriptions (never described) fall out of the OR naturally: the path clause still
-    matches, so an undescribed image remains findable by filename.
+    the only handle there is. Tags have exact controls of their own, so they no longer share this.
     """
-    return or_(
-        ImageMeta.path.ilike(search_pattern(q), escape="\\"),
-        ImageMeta.scene_description.ilike(search_pattern(q), escape="\\"),
-    )
+    return ImageMeta.path.ilike(search_pattern(q), escape="\\")
+
+
+def description_clause(q: str):
+    """Match WHOLE WORDS inside a description, case-folded. None when the query is blank.
+
+    Prose is words, and whole-word matching is the whole point here: `%red%` matched "textured"
+    on production the day description search shipped (wanly-console#447's first pass) — red is a
+    substring of texture, character, hundred and a dozen other words, so substring is the wrong
+    shape for prose. A user typing "red" means the colour, and "textured skin" should not answer.
+
+    ilike cannot express a word boundary, so this is a case-insensitive regular expression
+    (`~*`) with boundaries around the escaped query. Escape for REGEX metacharacters, not LIKE
+    ones: prose searches are words, and "(" or "?" in a description must not break the pattern.
+    A known limit of \\y: it needs a word character on one side, so a query that begins or ends
+    in punctuation ("(top-down)" or "100%") matches nothing through a description — the bare
+    word ("top-down", "100") is the search that works, and that is the honest failure: a
+    punctuation-edge query is a filename-shaped question, not a content one.
+
+    Multi-word queries match the phrase as words joined by whitespace ("red dress"), which is
+    the natural reading.
+    """
+    words = q.split()
+    if not words:
+        return None
+    pattern = r"\y" + r"\s+".join(re.escape(w) for w in words) + r"\y"
+    return ImageMeta.scene_description.op("~*")(pattern)
 
 
 def tag_clause(tag: str):
@@ -646,7 +659,10 @@ def image_filter(q: str | None, tags: list[str], exclude: list[str]) -> list:
         if t.strip()
     ]
     if q and q.strip():
-        clauses.append(path_clause(q.strip()))
+        q = q.strip()
+        # The description joins q under an OR with the filename (wanly-console#447): the
+        # filename matches as a fragment, the description as whole words.
+        clauses.append(or_(path_clause(q), description_clause(q)))
     return clauses
 
 
