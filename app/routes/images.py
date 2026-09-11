@@ -22,6 +22,7 @@ from app.tag_filter import like_escape
 from app.tag_filter import tag_clause as _tag_clause
 from app.s3 import (
     delete_object,
+    delete_prefix,
     download_bytes,
     get_folder_info,
     head_object,
@@ -468,6 +469,68 @@ async def delete_image(
             )
     await asyncio.to_thread(delete_object, path)
     return {"ok": True}
+
+
+@router.delete("/images/folder")
+async def delete_folder(
+    name: str = Query(...),
+    force: bool = Query(False),
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+    _api_key: None = Depends(verify_api_key_or_bearer),
+):
+    """Delete an image folder, refusing while any image in it is still referenced.
+
+    All items in the directory are deleted and are unrecoverable — that is what force
+    confirms. The check is the same gate DELETE /images uses (jobs, segments, archived
+    jobs, datasets), applied to every image in the folder at once: one reference check and
+    one batch S3 delete beat N x per-image calls on a folder of hundreds. The 409 names
+    every holding job/segment/dataset, so the warning the console pops can say exactly
+    what will dangle.
+
+    A query param, not a path segment: folder names are dates but the datasets check has
+    to be reachable for the names that are not -- and a path param cannot span the "/" in
+    "datasets/faces-abc" ({name} matches one segment only). DELETE /images takes its path
+    the same way.
+
+    The datasets/ prefix is not deletable here: dataset removal is the Datasets page's job,
+    and a folder delete that could reach training input would make the repo split (wanly-
+    console#464) lie. The empty prefix itself matches nothing.
+    """
+    bucket = settings.s3_images_bucket
+    if not name or name.strip() != name or not name.strip():
+        raise HTTPException(status_code=400, detail="Folder name is required")
+    prefix = name.strip().rstrip("/") + "/"
+    if _is_dataset_key(prefix):
+        raise HTTPException(
+            status_code=400,
+            detail="Dataset folders are not deleted here — remove them from the Datasets page",
+        )
+    if prefix == "/":
+        raise HTTPException(status_code=400, detail="Folder name is required")
+
+    objects = await asyncio.to_thread(list_objects, bucket, prefix)
+    paths = [f"s3://{bucket}/{obj['Key']}" for obj in objects]
+    if not paths:
+        raise HTTPException(status_code=404, detail=f"Folder '{name}' not found or empty")
+
+    refs = await find_image_references(db, paths)
+    if refs and not force:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Folder has images still referenced; pass force=true to delete anyway",
+                "folder": name,
+                "image_count": len(paths),
+                "referenced_count": len(refs),
+                "paths": {p: {"job_ids": r["job_ids"], "segment_ids": r["segment_ids"],
+                              "dataset_ids": r["dataset_ids"]}
+                          for p, r in refs.items()},
+            },
+        )
+
+    deleted = await asyncio.to_thread(delete_prefix, prefix, bucket)
+    return {"ok": True, "deleted": deleted, "folder": name.strip()}
 
 
 @router.patch("/images/tags", dependencies=[Depends(get_current_user)])
