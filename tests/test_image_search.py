@@ -122,6 +122,22 @@ class TestAgainstTheDatabase:
         await self._seed(db)
         assert await self._paths(db, q="red dress") == {"00420.png"}
 
+    async def test_a_word_does_not_match_inside_a_longer_word(self, db):
+        # Seen on production the day description search shipped: "red" matched "textured" —
+        # red is a substring of texture, character, hundred and a dozen other words, so
+        # substring is the wrong shape for prose. Descriptions match WHOLE WORDS; the filename
+        # keeps fragment matching, because a partially typed filename is the only handle there.
+        # The discriminating row's description contains "red" ONLY as a substring of another
+        # word, and its filename contains neither "red" nor the query fragments below.
+        db.add(ImageMeta(path="s3://b/d/00421-coarse.png", scene_description="textured skin"))
+        db.add(ImageMeta(path="s3://b/d/00422.png", scene_description="a red coat"))
+        await self._seed(db)
+        # "red" must NOT match "textured skin" — but must still match "a red coat".
+        assert await self._paths(db, q="red") == {"00422.png"}
+        # But the filename still matches as a fragment: "coars" finds 00421-coarse.png even
+        # though its description ("textured skin") does not contain the word at all.
+        assert await self._paths(db, q="coars") == {"00421-coarse.png"}
+
     async def test_q_folds_case_against_a_description(self, db):
         db.add(ImageMeta(path="s3://b/d/00420.png",
                          scene_description="A woman in a RED DRESS, smiling."))
@@ -144,19 +160,18 @@ class TestAgainstTheDatabase:
         assert await self._paths(db, q="untagged") == {"00116-untagged.png"}
 
     async def test_a_wildcard_in_q_does_not_match_everything_through_a_description(self, db):
-        # Prose is full of punctuation; the pattern is escaped against the description too.
-        # "100%" appears literally in the description and matches LITERALLY (escape=\\"), so
-        # the positive cases prove the escape and the negative proves there is no wildcard.
-        db.add(ImageMeta(path="s3://b/d/pct.png", scene_description="100% natural look"))
-        db.add(ImageMeta(path="s3://b/d/other.png", scene_description="entirely ordinary"))
+        # Whole-word matching means regex metacharacters in the query are literal, not
+        # patterns: a "." or "(" in prose must be matched as itself, and a query that is
+        # punctuation-adjacent must match the word it names.
+        db.add(ImageMeta(path="s3://b/d/pct.png", scene_description="100% natural (top-down) view"))
         await self._seed(db)
-        # "%" is literal: "100%" matches only the image whose prose really says it.
-        assert await self._paths(db, q="100%") == {"pct.png"}
-        # A query meant as a right-truncation wildcard ("entirel%") must match NOTHING:
-        # unescaped it would prefix-match "entirely" through the description.
-        assert await self._paths(db, q="entirel%") == set()
-        assert "entirel%" not in "entirely ordinary" or True
-        assert await self._paths(db, q="entirely ordinary") == {"other.png"}
+        # Whole word: "top-down" is matched as a whole word, hyphen and all.
+        assert await self._paths(db, q="top-down") == {"pct.png"}
+        # A regex wildcard in the query must be literal, not a pattern: ".*" would otherwise
+        # match everything.
+        assert await self._paths(db, q=".*") == set()
+        # "100" is a whole word in the prose even though "100%" is not matchable by boundary.
+        assert await self._paths(db, q="100") == {"pct.png"}
 
     async def test_a_null_description_still_searches_by_path(self, db):
         # NULL ilike is NULL, not false — but it sits in an OR with the path clause, so an
