@@ -22,6 +22,42 @@ TRIGGER2_PLACEHOLDER = "<TRIGGER2>"
 TRIGGER_PLACEHOLDERS = (TRIGGER_PLACEHOLDER, TRIGGER2_PLACEHOLDER)
 MAX_CHARACTERS = len(TRIGGER_PLACEHOLDERS)
 
+#: A JOINT character (wanly-api#102) carries BOTH identities in one trigger: the publish
+#: joins the two caption pairs with this. The render splits it back apart so each pair can
+#: fill its own placeholder.
+#:
+#: " and ", not "&". The phrase reaches the text encoder as a token sequence, and the
+#: captions a joint run trains on never contained "&" -- it is out of distribution in the
+#: exact place the binding happens. "and" is at least language the encoder has seen, and it
+#: reads as the sentence it is: "p@yton, woman and d@vid, man".
+JOINT_SEPARATOR = " and "
+#: What publishes before #314 wrote. Read so a row that already carries one still splits;
+#: never written again.
+_LEGACY_JOINT_SEPARATOR = " & "
+
+
+def split_joint_phrase(phrase: str | None) -> list[str | None]:
+    """One phrase per identity. A joint character's phrase carries TWO, joined by the
+    separator; a single phrase comes back as a one-element list.
+
+    A COMMA IS REQUIRED on top of the separator. The joint phrase is built from caption
+    pairs -- "<trigger>, <gender>" -- so it always carries one; requiring it means a plain
+    trigger that happens to contain " and " (a free-text field) is not mangled. A joint run
+    that recorded no genders at all produces "t0 and t1" and will not split; that is the
+    price of not guessing, and it is visible in the rendered prompt.
+    """
+    if not phrase:
+        return [phrase]
+    if "," not in phrase:
+        return [phrase]
+    for sep in (JOINT_SEPARATOR, _LEGACY_JOINT_SEPARATOR):
+        if sep in phrase:
+            parts = [p.strip() for p in phrase.split(sep) if p.strip()]
+            if len(parts) > 1:
+                return parts
+    return [phrase]
+
+
 
 def recipe_characters(ltx_recipe: dict[str, Any] | None) -> list[dict[str, Any]]:
     """The people in a recipe blob, `[{name, trigger, gender, char_lora, s1, s2}, ...]`.
@@ -78,11 +114,23 @@ def render_prompt(template: str, triggers: str | Sequence[str | None]) -> str:
     placeholder in place: rendering the literal text is bad, but silently dropping the token
     that anchors a character LoRA is worse and much harder to notice. A template with no
     placeholder at all is returned unchanged rather than rejected.
+
+    A JOINT character (#102) carries two caption pairs in one trigger. When the pose has a
+    second placeholder, its phrase is SPLIT so each pair fills its own -- the pose's
+    per-person sentences then put each trigger next to its person, which is the whole point
+    of splitting. A one-person pose keeps the whole phrase in <TRIGGER>: splitting there
+    would leave the second identity's token nowhere to go and DROP it.
     """
     if isinstance(triggers, str):
         triggers = [triggers]
+    if TRIGGER2_PLACEHOLDER in template:
+        expanded: list[str | None] = []
+        for trigger in triggers:
+            expanded.extend(split_joint_phrase(trigger))
+    else:
+        expanded = list(triggers)
     out = template
-    for placeholder, trigger in zip(TRIGGER_PLACEHOLDERS, triggers):
+    for placeholder, trigger in zip(TRIGGER_PLACEHOLDERS, expanded):
         if trigger:
             out = out.replace(placeholder, trigger)
     return out

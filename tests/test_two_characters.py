@@ -172,3 +172,41 @@ class TestResolveTrigger:
         ]}
         out = await _resolve_trigger(db, "<TRIGGER> and <TRIGGER2>", blob)
         assert out == "p@y, woman and d@vid, man"
+
+
+class TestJointPhrase:
+    """A JOINT character (wanly-api#102) carries BOTH identities in ONE trigger, joined by
+    " and ". The render splits it back apart so each pair fills its own placeholder.
+
+    The bug this fixes: the whole joint phrase landed in <TRIGGER> and <TRIGGER2> was left
+    empty, so a two-person pose read "p@yton, woman and d@vid, man and . <scene>" -- both
+    triggers dumped in one place instead of each beside its person, and the model favoured
+    the first (Payton held, David drifted)."""
+
+    JOINT = "p@yton, woman and d@vid, man"
+
+    def test_a_two_person_pose_splits_each_pair_to_its_own_placeholder(self):
+        out = render_prompt("<TRIGGER> and <TRIGGER2>, a scene", [self.JOINT])
+        assert out == "p@yton, woman and d@vid, man, a scene"
+
+    def test_the_split_places_each_trigger_beside_its_person(self):
+        out = render_prompt("<TRIGGER> grips <TRIGGER2>", [self.JOINT])
+        assert out == "p@yton, woman grips d@vid, man"
+
+    def test_a_one_person_pose_keeps_the_whole_phrase(self):
+        """Splitting here would leave the second identity nowhere to go -- DROPPING it."""
+        out = render_prompt("<TRIGGER>, a scene", [self.JOINT])
+        assert out == "p@yton, woman and d@vid, man, a scene"
+
+    def test_the_legacy_ampersand_phrase_still_splits(self):
+        out = render_prompt("<TRIGGER> and <TRIGGER2>", ["p@yton, woman & d@vid, man"])
+        assert out == "p@yton, woman and d@vid, man"
+
+    def test_a_single_phrase_is_untouched(self):
+        assert render_prompt("<TRIGGER> and <TRIGGER2>", ["p@yton, woman"]) == \
+            "p@yton, woman and <TRIGGER2>"
+
+    def test_a_trigger_containing_and_is_not_mangled(self):
+        """" and " in a normal phrase must not split unless it yields two real parts."""
+        assert render_prompt("<TRIGGER> and <TRIGGER2>", ["rock and roll"]) == \
+            "rock and roll and <TRIGGER2>"

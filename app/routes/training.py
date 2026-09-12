@@ -476,19 +476,27 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
     # A JOINT RUN (#102) publishes its SECOND identity's trigger too. The row carries ONE
     # trigger and ONE gender slot, and a joint LoRA trained on two caption pairs must
     # announce BOTH PAIRS — the phrase the render path fills <TRIGGER> with is
-    # "<trigger>, <gender>" (wanly-console#487), so "p@y & d@vid" + the group-0 gender
-    # would render "d@vid, woman", a token pair that was never trained: group 1's face
-    # bound to "man". The row's trigger becomes the full joint phrase, "p@y, woman &
+    # "<trigger>, <gender>" (wanly-console#487), so a bare "p@y and d@vid" + the group-0
+    # gender would render "d@vid, woman", a token pair that was never trained: group 1's
+    # face bound to "man". The row's trigger becomes the full joint phrase, "p@y, woman and
     # d@vid, man" — exactly what the captions taught, in the order the datasets trained —
-    # and the gender slot is left holding the phrase too (readers that use the bare
-    # trigger get the same tokens). The joint phrase rides the trigger column because
-    # trigger_phrase() concatenates trigger + gender onto whatever the row carries; a
-    # separate "both pairs" column would be a second read of the same shape.
+    # and the gender slot is left None (the phrase carries both). The joint phrase rides
+    # the trigger column because trigger_phrase() concatenates trigger + gender onto
+    # whatever the row carries; a separate "both pairs" column would be a second read of
+    # the same shape.
+    #
+    # " and " (JOINT_SEPARATOR) is the split point the render reads back: a two-person pose
+    # fills <TRIGGER> with the first pair and <TRIGGER2> with the second, so each trigger
+    # lands next to its person. Not "&": the captions never contained it.
     joint = job.second_identity
     if joint:
         g0 = (job.config or {}).get("gender")
         g1 = joint.get("gender")
-        trigger = f"{job.trigger}, {g0} & {joint['trigger']}, {g1}"
+        # Each side is the caption pair it trained on, with the gender only when one was
+        # recorded -- never the literal "None".
+        p0 = f"{job.trigger}, {g0}" if g0 else job.trigger
+        p1 = f"{joint['trigger']}, {g1}" if g1 else joint["trigger"]
+        trigger = f"{p0} and {p1}"
         gender = None
     else:
         trigger = job.trigger

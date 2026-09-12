@@ -932,10 +932,11 @@ class TestTheJointRun:
         from sqlalchemy import select
         row = (await db.execute(select(LtxCharacter).where(
             LtxCharacter.name == "pay"))).scalar_one()
-        assert row.trigger == "p@y, woman & d@vid, man", (
+        assert row.trigger == "p@y, woman and d@vid, man", (
             "the joint phrase was wrong — the render path fills <TRIGGER> with "
-            "'<trigger>, <gender>' (wanly-console#487), so 'p@y & d@vid' + the group-0 "
-            "gender would render 'd@vid, woman', a token pair that was never trained")
+            "'<trigger>, <gender>' (wanly-console#487) and SPLITS this phrase on ' and ' "
+            "across <TRIGGER>/<TRIGGER2> for a two-person pose, so each pair lands beside "
+            "its person. '&' is not the separator: the captions never contained it.")
 
     async def test_publishing_a_single_run_stays_single(self, db):
         """Every run before #102 is single-identity; its row's trigger is unchanged."""
