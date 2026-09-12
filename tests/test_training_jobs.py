@@ -878,53 +878,97 @@ class TestTheCaptionCarriesTheTrigger:
 
 
 class TestTheJointRun:
-    """A joint two-identity run (wanly-api#102): one LoRA trained on both characters'
-    datasets at once, whose group-0 delta is learned in the presence of group-1's. This
-    is the structural fix for two-identity interference (wanly-gpu-docker#100, R2: no
-    strength setting recovers two-char identity) — and the R2 runbook lives at
-    ~/projects/wanly/r2-two-char-experiment.md."""
+    """A joint run (wanly-api#102, #106): one LoRA trained on several groups at once.
 
-    def _second(self, n=13):
-        return [f"s3://wanly-images/2026-09-11/m{i}.jpg" for i in range(n)]
+    #102 was two identities; #106 added COMPOSITION groups -- frames containing BOTH
+    characters, captioned with both triggers. That is the group that teaches the model the
+    identities appear together; a run of solo sets alone produced a LoRA that held one face
+    and dropped the other (wanly-gpu-docker#100/#102)."""
 
-    def test_second_identity_mirrors_group_zero(self):
-        """The joint fields mirror the first group's shape; absent stays absent."""
+    def _imgs(self, prefix, n=13):
+        return [f"s3://wanly-images/2026-09-11/{prefix}{i}.jpg" for i in range(n)]
+
+    def test_the_legacy_second_identity_is_still_accepted(self):
+        """An old console must not silently drop its second group by sending fields a new
+        API no longer reads."""
         body = TrainingCreate(
             character="pay", trigger="p@y", dataset_images=_images(), steps=1200,
             second_character="Me", second_trigger="d@vid", second_gender="man",
-            second_dataset_images=self._second())
-        assert body.second_trigger == "d@vid"
-        assert len(body.second_dataset_images) == 13
-        plain = TrainingCreate(character="pay", trigger="p@y",
-                               dataset_images=_images(steps=1200) if False else _images())
-        assert plain.second_character is None
+            second_dataset_images=self._imgs("m"))
+        g = body.legacy_second_group()
+        assert g is not None and g.trigger == "d@vid" and g.gender == "man"
+        plain = TrainingCreate(character="pay", trigger="p@y", dataset_images=_images())
+        assert plain.legacy_second_group() is None
+
+    def test_identities_take_identity_and_composition_groups(self):
+        body = TrainingCreate(
+            character="pay", trigger="p@y", dataset_images=_images(), steps=1200,
+            identities=[
+                # identity group: a trigger -> caption "<trigger>, <gender>"
+                {"character": "Me", "trigger": "d@vid", "gender": "man",
+                 "dataset_images": self._imgs("m")},
+                # composition group: no trigger, a free caption naming both
+                {"caption": "p@y, woman and d@vid, man",
+                 "dataset_images": self._imgs("c")},
+            ])
+        assert [g.trigger for g in body.identities] == ["d@vid", None]
+        assert body.identities[1].caption == "p@y, woman and d@vid, man"
 
     def test_identical_triggers_are_refused(self):
-        """One caption pair cannot anchor both faces — the triggers must differ."""
-        from app.routes.training import create_training_job
+        """One caption pair cannot anchor two faces -- the triggers must differ."""
         import inspect
+        from app.routes.training import create_training_job
         src = inspect.getsource(create_training_job)
-        assert "second_trigger == body.trigger" in src
+        assert "already used by another" in src
 
-    def test_second_identity_needs_a_resolved_caption(self):
-        """A joint group without gender or a caption naming its trigger would fall back
-        to the trainer's per-job caption default — which carries GROUP 0's trigger. Its
-        face would bind to the wrong person's token."""
+    def test_an_identity_group_needs_a_resolved_caption(self):
+        """A group without gender or a caption naming its trigger would fall back to the
+        trainer's per-job caption default -- which carries GROUP 0's trigger. Its face
+        would bind to the wrong person's token."""
         import inspect
         from app.routes.training import create_training_job
         src = inspect.getsource(create_training_job)
-        assert "second_caption" in src
-        assert "needs a gender or a" in src
+        assert "needs a gender or a caption that names its trigger" in src
+
+    def test_a_composition_group_needs_a_caption(self):
+        """No trigger means the caption is the only thing that can name the people in the
+        frames; without one the group trains nothing the solo sets did not."""
+        import inspect
+        from app.routes.training import create_training_job
+        src = inspect.getsource(create_training_job)
+        assert "needs a caption naming the people" in src
 
     async def test_publishing_a_joint_run_records_both_triggers(self, db):
-        """The character row carries ONE trigger; a joint LoRA trained on two caption
-        pairs must announce both, or a pose fills <TRIGGER> with one and the second face
-        renders unbound."""
+        """The character row carries ONE trigger; a LoRA trained on several caption pairs
+        must announce them all, split across <TRIGGER>/<TRIGGER2> by the render."""
         j = _job(
             output_lora_path="s3://ltx-loras/character/payme_v1_final.safetensors",
             config={"gender": "woman", "caption": "p@y, woman"},
-            second_identity={"character": "Me", "trigger": "d@vid", "gender": "man",
-                             "images": self._second(), "num_repeats": 10})
+            identities=[{"character": "Me", "trigger": "d@vid", "gender": "man",
+                         "caption": "d@vid, man", "images": self._imgs("m"),
+                         "num_repeats": 10}])
+        db.add(j)
+        await db.flush()
+        await _publish_character(db, j)
+        await db.flush()
+        from sqlalchemy import select
+        row = (await db.execute(select(LtxCharacter).where(
+            LtxCharacter.name == "pay"))).scalar_one()
+        assert row.trigger == "p@y, woman and d@vid, man"
+
+    async def test_a_composition_group_does_not_add_a_pair(self, db):
+        """#106: the composition group's caption repeats the identity pairs. Including it
+        in the phrase would say the same face twice."""
+        j = _job(
+            output_lora_path="s3://ltx-loras/character/payme_v1_final.safetensors",
+            config={"gender": "woman"},
+            identities=[
+                {"character": "Me", "trigger": "d@vid", "gender": "man",
+                 "caption": "d@vid, man", "images": self._imgs("m")},
+                # composition: no trigger, caption names both
+                {"character": None, "trigger": None, "gender": None,
+                 "caption": "p@y, woman and d@vid, man", "images": self._imgs("c")},
+            ])
         db.add(j)
         await db.flush()
         await _publish_character(db, j)
@@ -933,10 +977,7 @@ class TestTheJointRun:
         row = (await db.execute(select(LtxCharacter).where(
             LtxCharacter.name == "pay"))).scalar_one()
         assert row.trigger == "p@y, woman and d@vid, man", (
-            "the joint phrase was wrong — the render path fills <TRIGGER> with "
-            "'<trigger>, <gender>' (wanly-console#487) and SPLITS this phrase on ' and ' "
-            "across <TRIGGER>/<TRIGGER2> for a two-person pose, so each pair lands beside "
-            "its person. '&' is not the separator: the captions never contained it.")
+            "the composition group's pair leaked into the phrase")
 
     async def test_publishing_a_single_run_stays_single(self, db):
         """Every run before #102 is single-identity; its row's trigger is unchanged."""
@@ -950,3 +991,32 @@ class TestTheJointRun:
             LtxCharacter.name == "pay"))).scalar_one()
         assert row.trigger == "p@y"
         assert "&" not in row.trigger
+
+
+class TestTheClaimDeliversEveryGroup:
+    """#106: a claim must carry every group's URLs, not just group 0's. A joint run that
+    delivered group 0 only would stage a single-identity dataset silently -- worse than a
+    503, because it trains and reports success."""
+
+    def test_the_presign_loop_covers_every_identity_group(self):
+        import inspect
+        from app.routes import training as mod
+        src = inspect.getsource(mod.claim_next_training_job)
+        assert "for g in (job.identities or [])" in src
+        assert '"download_urls": g_urls' in src
+
+    def test_a_presign_failure_anywhere_aborts_the_whole_claim(self):
+        """All groups presign inside the one try, so a failure leaves the row untouched
+        rather than claiming a job whose second dataset never arrived."""
+        import inspect
+        from app.routes import training as mod
+        src = inspect.getsource(mod.claim_next_training_job)
+        presign = src.index("group_payload = []")
+        mutate = src.index("job.status = TrainingStatus.CLAIMED")
+        assert presign < mutate
+
+    def test_the_claim_response_carries_the_group_list(self):
+        from app.schemas.training import TrainingClaimResponse
+        fields = TrainingClaimResponse.model_fields
+        assert "identities" in fields
+        assert "second_download_urls" not in fields

@@ -488,13 +488,16 @@ class TrainingJob(Base):
     # when the job was created, so a later change to the defaults cannot retroactively alter
     # what a queued job will do.
     config = mapped_column(JSONB, nullable=False, default=dict)
-    # A SECOND identity for a joint run (#102): {character, trigger, gender, images: [s3],
-    # num_repeats}. NULL means single-identity, which every run before this is. The two
-    # groups stay paired because they travel together: one LoRA whose Payton delta is
-    # learned in the presence of David's data is exactly what escaping two-identity
-    # interference (#100, R2) requires, and two separate rows cannot express that -- the
-    # network trains one dataset config, not one per identity.
-    second_identity = mapped_column(JSONB, nullable=True)
+    # ADDITIONAL identity groups for a joint run (#102, #106): a list of
+    # {character, trigger, gender, caption, images: [s3], num_repeats}. Group 0 is the flat
+    # columns above; this holds groups 1..N, so one LoRA can be trained on both solo sets
+    # AND two-person frames -- the frames are what teach the model the two identities
+    # appear TOGETHER, which solo sets alone cannot (#106). NULL or [] means
+    # single-identity, which every run before #102 is.
+    #
+    # A list rather than a second_identity column plus a third: "how many extra groups"
+    # is a property of the experiment, not of the schema.
+    identities = mapped_column(JSONB, nullable=True)
 
     # ---- who is doing it
     status = mapped_column(String(20), nullable=False, default=TrainingStatus.PENDING)
