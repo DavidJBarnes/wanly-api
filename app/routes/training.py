@@ -97,72 +97,86 @@ async def create_training_job(
     if len(set(images)) != len(images):
         raise HTTPException(status_code=422, detail="the dataset contains duplicates")
 
-    # THE JOINT GROUP (#102). Resolved the same way group 0 is: a dataset or a raw list for
-    # the images, the trigger rule for the caption, its own num_repeats. ABSENT stays
-    # absent -- a half-given second identity (a trigger with no images) would build a
-    # half-configured dataset silently, so all-or-nothing is enforced here rather than on
-    # the schema, because it straddles the dataset resolution that only the route can do.
-    second = None
-    if body.second_character:
-        second_images = list(body.second_dataset_images)
-        second_thumbnail = None
-        if body.second_dataset_id:
-            sds = await db.get(Dataset, body.second_dataset_id)
-            if not sds:
-                raise HTTPException(status_code=404, detail="Second dataset not found")
-            second_images = list(sds.images)
-            second_thumbnail = sds.anchor_uri or (sds.images[0] if sds.images else None)
-        if len(second_images) < MIN_DATASET_IMAGES:
+    # THE EXTRA GROUPS (#102, #106). Resolved the same way group 0 is: a dataset or a raw
+    # list for the images, the trigger rule for the caption, its own num_repeats. The list
+    # may hold IDENTITY groups (a trigger -> "<trigger>, <gender>") and COMPOSITION groups
+    # (no trigger -> a free caption naming the people in the frames). The latter is what
+    # teaches the model the identities appear TOGETHER (#106): solo sets alone cannot, and a
+    # run with only solo groups produced a LoRA that held one face and dropped the other.
+    #
+    # The pre-#106 single second identity is folded in as a group when the console has not
+    # shipped the list form yet -- dropping it would silently make a joint run single.
+    extra = list(body.identities)
+    legacy = body.legacy_second_group()
+    if legacy is not None and not extra:
+        extra = [legacy]
+
+    groups: list[dict] = []
+    seen_dataset_ids = {body.dataset_id} if body.dataset_id else set()
+    seen_triggers = {body.trigger}
+    for i, g in enumerate(extra):
+        label = f"identity {i + 2}"  # 1-based: group 0 is the first
+        g_images = list(g.dataset_images)
+        if g.dataset_id:
+            gds = await db.get(Dataset, g.dataset_id)
+            if not gds:
+                raise HTTPException(status_code=404, detail=f"{label}: dataset not found")
+            g_images = list(gds.images)
+            if g.dataset_id in seen_dataset_ids:
+                # One dataset captioned two ways would train every image under both
+                # captions, which is not what any group is asking for.
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label}: this dataset is already used by another group; give "
+                           f"each group its own set (repeats balance them, not sharing)")
+            seen_dataset_ids.add(g.dataset_id)
+            if gds.anchor_uri and not thumbnail:
+                thumbnail = gds.anchor_uri
+        if len(g_images) < MIN_DATASET_IMAGES:
             raise HTTPException(
                 status_code=422,
-                detail=f"{len(second_images)} second-identity images — at least "
-                       f"{MIN_DATASET_IMAGES} are needed")
-        if len(set(second_images)) != len(second_images):
-            raise HTTPException(status_code=422, detail="the second dataset contains duplicates")
-        if body.second_dataset_id and body.second_dataset_id == body.dataset_id:
-            # One dataset training both identities captions every image per group -- the
-            # same file cannot carry two triggers at once, and the parity of images across
-            # groups would be accidental rather than intended.
-            raise HTTPException(
-                status_code=422,
-                detail="group 0 and the second identity cannot share one dataset; give each "
-                       "its own (the datasets balance through num_repeats, not by sharing)")
-        if not body.second_trigger:
-            raise HTTPException(
-                status_code=422,
-                detail=f"the second identity ({body.second_character}) has no trigger; its "
-                       f"caption would bind to nothing")
-        if body.second_trigger == body.trigger:
-            raise HTTPException(
-                status_code=422,
-                detail="the two identities' triggers must differ — one caption pair cannot "
-                       "anchor both faces")
-        # THE SAME CAPTION RULE, PER GROUP. Group 0's caption learns "<trigger>,
-        # <gender>"; group 1's must say the same thing about its own trigger, or the joint
-        # LoRA's second face binds to whatever the text happens to be.
-        second_caption = None
-        if body.second_gender:
-            second_caption = f"{body.second_trigger}, {body.second_gender}"
-        elif not body.second_caption:
-            # A joint group without a resolved caption would fall back to the TRAINER's
-            # per-job caption default -- which carries GROUP 0's trigger. Its face would
-            # bind to the wrong person's token and the interference this run exists to
-            # escape would arrive through the captions instead. A free caption naming the
-            # second trigger is accepted; anything else is refused.
-            raise HTTPException(
-                status_code=422,
-                detail=f"the second identity ({body.second_character}) needs a gender or a "
-                       f"caption that names its trigger — otherwise the joint LoRA's second "
-                       f"face binds to nothing")
-        second = {
-            "character": body.second_character,
-            "trigger": body.second_trigger,
-            "gender": body.second_gender,
-            "images": second_images,
-            "num_repeats": body.second_num_repeats,
-        }
-        if second_thumbnail and not thumbnail:
-            thumbnail = second_thumbnail
+                detail=f"{label}: {len(g_images)} images — at least {MIN_DATASET_IMAGES} "
+                       f"are needed")
+        if len(set(g_images)) != len(g_images):
+            raise HTTPException(status_code=422, detail=f"{label}: dataset contains duplicates")
+
+        if g.trigger:
+            # AN IDENTITY GROUP. Its pair joins the published phrase, and the triggers must
+            # differ -- one caption pair cannot anchor two faces.
+            if g.trigger in seen_triggers:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label}: trigger {g.trigger!r} is already used by another "
+                           f"group — one caption pair cannot anchor two faces")
+            seen_triggers.add(g.trigger)
+            if g.gender:
+                g_caption = f"{g.trigger}, {g.gender}"
+            elif g.caption:
+                g_caption = g.caption
+            else:
+                # Falls back to the trainer's per-job caption default, which carries GROUP
+                # 0's trigger -- the wrong face's token.
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label}: needs a gender or a caption that names its trigger — "
+                           f"otherwise its face binds to nothing")
+        else:
+            # A COMPOSITION GROUP. No trigger: the caption is used verbatim and must name
+            # at least two triggers, or the frames teach nothing the solo sets did not.
+            g_caption = (g.caption or "").strip() or None
+            if not g_caption:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"{label}: no trigger, so it needs a caption naming the people "
+                           f"in its frames (e.g. \"p@yton, woman and d@vid, man\")")
+        groups.append({
+            "character": g.character,
+            "trigger": g.trigger,
+            "gender": g.gender,
+            "caption": g_caption,
+            "images": g_images,
+            "num_repeats": g.num_repeats,
+        })
 
     dupe = (await db.execute(
         select(TrainingJob).where(
@@ -204,11 +218,10 @@ async def create_training_job(
         version=body.version,
         dataset_images=images,
         config={**RECIPE_DEFAULTS, "steps": steps, "caption": caption,
-                "second_caption": second_caption if second else None,
                 "gender": body.gender,
                 "lora_name": body.lora_name or _default_lora_name(body.character),
                 "publish": body.publish},
-        second_identity=second,
+        identities=groups or None,
         status=TrainingStatus.PENDING,
         total_steps=steps,
         thumbnail_uri=thumbnail,
@@ -283,14 +296,22 @@ async def claim_next_training_job(
     try:
         urls = await asyncio.to_thread(
             lambda: [s3.generate_presigned_url(u) for u in job.dataset_images])
-        # THE JOINT GROUP, PRESIGNED WITH GROUP 0. One presign pass so a failure in either
-        # leaves the row untouched -- the lost-claim-response rule above applies to the
-        # second dataset the same as the first, and a joint run that delivered group 0
-        # only would stage a single-identity dataset silently, which is worse than a 503.
-        second_urls = None
-        if job.second_identity:
-            second_urls = await asyncio.to_thread(
-                lambda: [s3.generate_presigned_url(u) for u in job.second_identity["images"]])
+        # THE EXTRA GROUPS, PRESIGNED WITH GROUP 0. One presign pass so a failure anywhere
+        # leaves the row untouched -- the lost-claim-response rule above applies to every
+        # dataset the same as the first, and a joint run that delivered group 0 only would
+        # stage a single-identity dataset silently, which is worse than a 503.
+        group_payload = []
+        for g in (job.identities or []):
+            g_urls = await asyncio.to_thread(
+                lambda imgs=g["images"]: [s3.generate_presigned_url(u) for u in imgs])
+            group_payload.append({
+                "character": g.get("character"),
+                "trigger": g.get("trigger"),
+                "gender": g.get("gender"),
+                "caption": g.get("caption"),
+                "num_repeats": g.get("num_repeats"),
+                "download_urls": g_urls,
+            })
     except Exception as e:
         logger.error("could not presign the dataset for %s v%d: %s",
                      job.character, job.version, e)
@@ -309,11 +330,7 @@ async def claim_next_training_job(
     await db.refresh(job)
     logger.info("training %s v%d claimed by %s", job.character, job.version, job.worker_name)
     claim = TrainingClaimResponse(**TrainingResponse.model_validate(job).model_dump(),
-                                  download_urls=urls)
-    if job.second_identity:
-        claim.second_download_urls = second_urls
-        claim.second_caption = (job.config or {}).get("second_caption")
-        claim.second_num_repeats = job.second_identity.get("num_repeats")
+                                  download_urls=urls, identities=group_payload or None)
     return claim
 
 
@@ -473,30 +490,34 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
         select(LtxCharacter).where(LtxCharacter.name == job.character)
     )).scalar_one_or_none()
     gender = (job.config or {}).get("gender") or None
-    # A JOINT RUN (#102) publishes its SECOND identity's trigger too. The row carries ONE
-    # trigger and ONE gender slot, and a joint LoRA trained on two caption pairs must
-    # announce BOTH PAIRS — the phrase the render path fills <TRIGGER> with is
-    # "<trigger>, <gender>" (wanly-console#487), so a bare "p@y and d@vid" + the group-0
-    # gender would render "d@vid, woman", a token pair that was never trained: group 1's
-    # face bound to "man". The row's trigger becomes the full joint phrase, "p@y, woman and
-    # d@vid, man" — exactly what the captions taught, in the order the datasets trained —
-    # and the gender slot is left None (the phrase carries both). The joint phrase rides
-    # the trigger column because trigger_phrase() concatenates trigger + gender onto
-    # whatever the row carries; a separate "both pairs" column would be a second read of
-    # the same shape.
+    # A JOINT RUN (#102, #106) publishes EVERY identity's trigger. The row carries ONE
+    # trigger and ONE gender slot, and a LoRA trained on several caption pairs must announce
+    # them all — the phrase the render path fills <TRIGGER> with is "<trigger>, <gender>"
+    # (wanly-console#487), so a bare "p@y and d@vid" + one gender would render a pair that
+    # was never trained. The row's trigger becomes the full phrase, "p@y, woman and d@vid,
+    # man" — exactly what the captions taught, in the order the groups were given — and the
+    # gender slot is left None (the phrase carries them all).
+    #
+    # Only IDENTITY groups contribute a pair. A COMPOSITION group (#106) has no trigger: its
+    # caption repeats pairs already here, and including it would say the same face twice.
     #
     # " and " (JOINT_SEPARATOR) is the split point the render reads back: a two-person pose
     # fills <TRIGGER> with the first pair and <TRIGGER2> with the second, so each trigger
     # lands next to its person. Not "&": the captions never contained it.
-    joint = job.second_identity
-    if joint:
-        g0 = (job.config or {}).get("gender")
-        g1 = joint.get("gender")
-        # Each side is the caption pair it trained on, with the gender only when one was
-        # recorded -- never the literal "None".
-        p0 = f"{job.trigger}, {g0}" if g0 else job.trigger
-        p1 = f"{joint['trigger']}, {g1}" if g1 else joint["trigger"]
-        trigger = f"{p0} and {p1}"
+    pairs: list[str] = []
+
+    def _add_pair(trig: str | None, gen: str | None) -> None:
+        if not trig:
+            return
+        pair = f"{trig}, {gen}" if gen else trig
+        if pair not in pairs:
+            pairs.append(pair)
+
+    _add_pair(job.trigger, gender)
+    for g in (job.identities or []):
+        _add_pair(g.get("trigger"), g.get("gender"))
+    if len(pairs) > 1:
+        trigger = " and ".join(pairs)
         gender = None
     else:
         trigger = job.trigger

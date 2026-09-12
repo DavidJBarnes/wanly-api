@@ -28,6 +28,51 @@ MIN_DATASET_IMAGES = 8
 MAX_DATASET_IMAGES = 400
 
 
+class IdentityGroup(BaseModel):
+    """One EXTRA dataset trained alongside group 0 (wanly-api#102, #106).
+
+    Two shapes, and the difference is whether a trigger is given:
+
+      identity group    character/trigger/gender set -> every image captioned
+                        "<trigger>, <gender>", exactly like group 0. Its pair joins the
+                        published trigger phrase.
+      composition group NO trigger -> `caption` is used verbatim. The images contain BOTH
+                        characters and the caption names both ("p@yton, woman and d@vid,
+                        man"). This is what teaches the model the two identities appear
+                        TOGETHER, which solo sets alone cannot (#106) -- and its caption
+                        repeats triggers the identity groups already carry, so it does NOT
+                        add to the published phrase.
+    """
+    character: str | None = Field(default=None, max_length=64)
+    trigger: str | None = Field(default=None, max_length=64)
+    gender: Literal["woman", "man", "person"] | None = None
+    #: Free caption for a composition group. When a trigger+gender are given this is
+    #: ignored, the same way group 0's `caption` is.
+    caption: str | None = Field(default=None, max_length=500)
+    dataset_images: list[str] = Field(default_factory=list, max_length=MAX_DATASET_IMAGES)
+    dataset_id: uuid.UUID | None = None
+    num_repeats: int | None = Field(default=None, ge=1, le=100)
+
+    @field_validator("character")
+    @classmethod
+    def _no_path_tricks(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        if "/" in v or v.startswith(".") or any(c.isspace() for c in v):
+            raise ValueError("character cannot contain slashes, whitespace, or start with a dot")
+        return v
+
+    @field_validator("dataset_images")
+    @classmethod
+    def _s3_uris_only(cls, v: list[str]) -> list[str]:
+        bad = [x for x in v if not x.startswith("s3://")]
+        if bad:
+            raise ValueError(f"dataset_images must be s3:// URIs, got {bad[0]!r}")
+        if len(set(v)) != len(v):
+            raise ValueError("dataset_images contains duplicates")
+        return v
+
+
 class TrainingCreate(BaseModel):
     #: THE LtxCharacter NAME, not a filesystem-safe version of it. `p@y` is correct here.
     #:
@@ -71,23 +116,20 @@ class TrainingCreate(BaseModel):
     #: outlast the training, for epochs that mostly go unused. "all" uploads every one.
     #: Either way every epoch stays on the trainer and can be published afterwards.
     publish: Literal["final", "all"] = "final"
-    #: A SECOND identity, making this a JOINT run (#102): one LoRA trained on both
-    #: characters' datasets simultaneously, whose group-0 delta is learned in the presence
-    #: of group-1's data. This is the structural fix for two-identity interference (#100,
-    #: R2: no strength setting recovers two-char identity; two independently-trained deltas
-    #: fight in the shared modules). ABSENT means single-identity, which every run before
-    #: this is.
-    #:
-    #: The fields mirror group 0's, with its own images and num_repeats: the two datasets
-    #: balance through repeats, not by truncating the smaller set.
+    #: ADDITIONAL groups (wanly-api#102, #106), each an IdentityGroup -- an identity set
+    #: or a composition set. Empty means single-identity. The route resolves and validates
+    #: them the same way it does group 0.
+    identities: list[IdentityGroup] = Field(default_factory=list, max_length=8)
+    #: LEGACY (#102): the one-second-identity fields, before #106 made it a list. Accepted
+    #: so an old console cannot silently drop its second group by sending fields a new API
+    #: no longer reads; folded into `identities` in the route. Never written by the console
+    #: once it ships the list form.
     second_character: str | None = Field(default=None, min_length=1, max_length=64)
     second_trigger: str | None = Field(default=None, min_length=1, max_length=64)
     second_gender: Literal["woman", "man", "person"] | None = None
     second_dataset_images: list[str] = Field(default_factory=list, max_length=MAX_DATASET_IMAGES)
     second_dataset_id: uuid.UUID | None = None
     second_num_repeats: int | None = Field(default=None, ge=1, le=100)
-    #: A free caption for the second group, used when second_gender is absent. Must name
-    #: the second trigger, or the face binds to nothing — the route enforces that.
     second_caption: str | None = Field(default=None, max_length=500)
 
     @field_validator("character")
@@ -106,6 +148,16 @@ class TrainingCreate(BaseModel):
         if "/" in v or v.startswith(".") or any(c.isspace() for c in v):
             raise ValueError("second_character cannot contain slashes, whitespace, or start with a dot")
         return v
+
+    def legacy_second_group(self) -> IdentityGroup | None:
+        """The pre-#106 second identity as an IdentityGroup, or None when absent."""
+        if not self.second_character:
+            return None
+        return IdentityGroup(
+            character=self.second_character, trigger=self.second_trigger,
+            gender=self.second_gender, caption=self.second_caption,
+            dataset_images=list(self.second_dataset_images),
+            dataset_id=self.second_dataset_id, num_repeats=self.second_num_repeats)
 
     @field_validator("dataset_images")
     @classmethod
@@ -172,13 +224,15 @@ class TrainingClaimResponse(TrainingResponse):
 
     `download_urls` pairs 1:1 with dataset_images, in order, so the trainer never needs S3
     credentials -- it fetches through the API's own proxy, the same way the render daemon gets
-    its LoRAs. second_* carry the joint group the same way: ABSENT for every single-identity
-    run, so a trainer that predates #102 sees nothing.
+    its LoRAs.
+
+    `identities` carries the extra groups (#102, #106) the same way: each is
+    {character, trigger, gender, caption, num_repeats, download_urls}. ABSENT for every
+    single-identity run, so a trainer that predates this sees nothing. A COMPOSITION group
+    (#106) has a trigger of None and a caption naming the people in its frames.
     """
     download_urls: list[str]
-    second_download_urls: list[str] | None = None
-    second_caption: str | None = None
-    second_num_repeats: int | None = None
+    identities: list[dict] | None = None
 
 
 class TrainingProgress(BaseModel):

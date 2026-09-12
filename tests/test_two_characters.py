@@ -5,10 +5,10 @@ and the scalar keys stay mirrored from slot 0 so nothing written before the list
 """
 import pytest
 
-from app.model_requirements import LORA, Artifact, required_artifacts
+from app.model_requirements import LORA, required_artifacts
 from app.models import LtxCharacter
 from app.recipe_blob import (
-    MAX_CHARACTERS, TRIGGER2_PLACEHOLDER, character_phrase, recipe_characters, recipe_problem,
+    MAX_CHARACTERS, character_phrase, recipe_characters, recipe_problem,
     render_prompt, trigger_phrase,
 )
 from app.routes.wildcards import RESERVED_WILDCARD_NAMES
