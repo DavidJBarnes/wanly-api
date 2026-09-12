@@ -98,7 +98,12 @@ class TrainingCreate(BaseModel):
     #: Explicit because a free caption field was filled in with "man" alone and the trigger
     #: was never learned. When given, it decides the caption.
     gender: Literal["woman", "man", "person"] | None = None
-    steps: int = Field(default=1200, ge=100, le=6000)
+    #: Total training steps. The ceiling was 6000 while runs were single small sets; a
+    #: joint run over three datasets at the proven ~5-8 passes per image legitimately
+    #: exceeds it (8 epochs x 105 images x 10 repeats = 8400). Raised rather than the
+    #: epochs redefined: the trainer's epoch math is steps // (images x repeats), and a
+    #: cap below a real configuration would refuse the configuration silently.
+    steps: int = Field(default=1200, ge=100, le=30000)
     #: The filename stem the LoRA installs under. ASKED, NOT DERIVED.
     #:
     #: A LoRA is served over HTTP and lands in JSON and URLs, so `p@y` cannot be a filename --
