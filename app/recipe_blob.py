@@ -1,72 +1,40 @@
-"""The recipe blob's people, read one way everywhere (wanly-console#473).
+"""The recipe blob's person, read one way everywhere (wanly-console#473).
 
-A segment's `ltx_recipe` names the people in the shot as
+A segment's `ltx_recipe` names the person in the shot as
 
-    characters: [{name, trigger, gender, char_lora, s1, s2}, ...]   # ordered, at most two
+    characters: [{name, trigger, gender, char_lora, s1, s2}]   # ONE entry
 
 with the older scalar keys -- `character`, `trigger`, `char_lora`, `char_s1`, `char_s2` --
-mirrored from the first entry so that everything written before the list existed, and
-everything that has not learned about it, keeps working. Slot 0 fills `<TRIGGER>` in a
-pose's prompt, slot 1 fills `<TRIGGER2>`; a pose is a two-person pose exactly when its
-template uses `<TRIGGER2>`.
+mirrored from that entry so that everything written before the list existed, and everything
+that has not learned about it, keeps working.
+
+ONE person per render, always. The two-person slot (<TRIGGER2> / characters[1], the
+pre-#102 way of putting two people in a shot with two stacked LoRAs) was removed along with
+its placeholder: a two-person shot is now a JOINT character -- one LoRA trained on both
+identities, whose trigger phrase carries both caption pairs -- plus scene text naming who is
+who. The list shape stays (a list of one) because the blob is a record and older readers
+still expect the list.
 
 This module is the one reader of that shape. Three places used to each read the scalars on
 their own (the trigger fill, the claim's requirements, the console's mirror of both); a
-second person would have meant three copies of the list-or-scalar rule.
+second reader would have meant three copies of the list-or-scalar rule.
 """
-from typing import Any, Sequence
+from typing import Any
 
 TRIGGER_PLACEHOLDER = "<TRIGGER>"
-TRIGGER2_PLACEHOLDER = "<TRIGGER2>"
-#: In slot order. Index i is filled by characters[i].
-TRIGGER_PLACEHOLDERS = (TRIGGER_PLACEHOLDER, TRIGGER2_PLACEHOLDER)
-MAX_CHARACTERS = len(TRIGGER_PLACEHOLDERS)
-
-#: A JOINT character (wanly-api#102) carries BOTH identities in one trigger: the publish
-#: joins the two caption pairs with this. The render splits it back apart so each pair can
-#: fill its own placeholder.
-#:
-#: " and ", not "&". The phrase reaches the text encoder as a token sequence, and the
-#: captions a joint run trains on never contained "&" -- it is out of distribution in the
-#: exact place the binding happens. "and" is at least language the encoder has seen, and it
-#: reads as the sentence it is: "p@yton, woman and d@vid, man".
-JOINT_SEPARATOR = " and "
-#: What publishes before #314 wrote. Read so a row that already carries one still splits;
-#: never written again.
-_LEGACY_JOINT_SEPARATOR = " & "
-
-
-def split_joint_phrase(phrase: str | None) -> list[str | None]:
-    """One phrase per identity. A joint character's phrase carries TWO, joined by the
-    separator; a single phrase comes back as a one-element list.
-
-    A COMMA IS REQUIRED on top of the separator. The joint phrase is built from caption
-    pairs -- "<trigger>, <gender>" -- so it always carries one; requiring it means a plain
-    trigger that happens to contain " and " (a free-text field) is not mangled. A joint run
-    that recorded no genders at all produces "t0 and t1" and will not split; that is the
-    price of not guessing, and it is visible in the rendered prompt.
-    """
-    if not phrase:
-        return [phrase]
-    if "," not in phrase:
-        return [phrase]
-    for sep in (JOINT_SEPARATOR, _LEGACY_JOINT_SEPARATOR):
-        if sep in phrase:
-            parts = [p.strip() for p in phrase.split(sep) if p.strip()]
-            if len(parts) > 1:
-                return parts
-    return [phrase]
-
+#: One placeholder. A tuple so the zip-based fill and `placeholders_in` keep their shape.
+TRIGGER_PLACEHOLDERS = (TRIGGER_PLACEHOLDER,)
 
 
 def recipe_characters(ltx_recipe: dict[str, Any] | None) -> list[dict[str, Any]]:
-    """The people in a recipe blob, `[{name, trigger, gender, char_lora, s1, s2}, ...]`.
+    """The person in a recipe blob, `[{name, trigger, gender, char_lora, s1, s2}]`.
 
     `gender` is recorded since wanly-console#487 and absent before; readers use `.get`.
 
     The list when it is there, else one entry synthesised from the scalars, else nothing.
     Entries are returned as recorded -- including a `char_lora` of "none", which is a real
-    choice (render this slot on the base model) that the callers filter for themselves.
+    choice (render on the base model) that the callers filter for themselves. A legacy blob
+    may carry two entries from the pre-joint era; only the first is rendered.
     """
     if not ltx_recipe:
         return []
@@ -89,8 +57,8 @@ def trigger_phrase(trigger: str | None, gender: str | None) -> str | None:
 
     Every run captions its images "<trigger>, <gender>" (wanly-api#293), so "p@yton, woman"
     is the token pair the identity actually learned, and the render prompt has to say the
-    same thing. With two identity LoRAs summed into the same weights this pair is the only
-    thing that says which face goes on which body (wanly-console#487).
+    same thing. A JOINT character's trigger already carries every pair ("p@yton, woman and
+    d@vid, man") and renders whole -- nothing splits it anymore.
 
     No trigger means no phrase -- the "no character" slot never grows a gender -- and no
     gender means the bare trigger, which is exactly what every character rendered before.
@@ -107,53 +75,23 @@ def character_phrase(person: dict[str, Any]) -> str | None:
     return trigger_phrase(person.get("trigger"), person.get("gender"))
 
 
-def render_prompt(template: str, triggers: str | Sequence[str | None]) -> str:
-    """Fill a pose's placeholders with the characters' trigger words, slot by slot.
+def render_prompt(template: str, triggers: str | Any) -> str:
+    """Fill a pose's <TRIGGER> with the character's trigger phrase.
 
-    A single string is the one-person shorthand. A slot with no trigger leaves its
-    placeholder in place: rendering the literal text is bad, but silently dropping the token
-    that anchors a character LoRA is worse and much harder to notice. A template with no
-    placeholder at all is returned unchanged rather than rejected.
+    A single string is the shorthand; a list is accepted for callers built around the old
+    two-slot shape, and its first entry wins. No trigger leaves the placeholder in place:
+    rendering the literal text is bad, but silently dropping the token that anchors a
+    character LoRA is worse and much harder to notice. A template with no placeholder at all
+    is returned unchanged rather than rejected.
 
-    A JOINT character (#102) carries two caption pairs in one trigger. When the pose has a
-    second placeholder, its phrase is SPLIT so each pair fills its own -- the pose's
-    per-person sentences then put each trigger next to its person, which is the whole point
-    of splitting. A one-person pose keeps the whole phrase in <TRIGGER>: splitting there
-    would leave the second identity's token nowhere to go and DROP it.
+    The JOINT character's whole phrase lands in the one placeholder, and the scene text
+    names who is who -- that is the post-#102 design, after <TRIGGER2> was removed.
     """
-    if isinstance(triggers, str):
-        triggers = [triggers]
-    if TRIGGER2_PLACEHOLDER in template:
-        expanded: list[str | None] = []
-        for trigger in triggers:
-            expanded.extend(split_joint_phrase(trigger))
-    else:
-        expanded = list(triggers)
-    out = template
-    for placeholder, trigger in zip(TRIGGER_PLACEHOLDERS, expanded):
-        if trigger:
-            out = out.replace(placeholder, trigger)
-    return out
+    first = triggers[0] if isinstance(triggers, (list, tuple)) else triggers
+    if first:
+        template = template.replace(TRIGGER_PLACEHOLDER, first)
+    return template
 
 
 def placeholders_in(text: str) -> list[str]:
     return [p for p in TRIGGER_PLACEHOLDERS if p in (text or "")]
-
-
-def recipe_problem(ltx_recipe: dict[str, Any] | None, prompt: str | None) -> str | None:
-    """Why this blob cannot render, or None.
-
-    Light on purpose: the blob stays an untyped record so that nothing written before this
-    is ever refused. Only the two things that would otherwise fail ten minutes into a
-    claimed segment are caught here -- more people than the engine has room for, and a
-    prompt still naming a second person the blob does not carry.
-    """
-    if not ltx_recipe:
-        return None
-    people = recipe_characters(ltx_recipe)
-    if len(people) > MAX_CHARACTERS:
-        return f"{len(people)} characters; a render takes at most {MAX_CHARACTERS}"
-    if TRIGGER2_PLACEHOLDER in (prompt or "") and len(people) < 2:
-        return (f"the prompt names a second person ({TRIGGER2_PLACEHOLDER}) but the recipe "
-                f"carries {len(people)} character{'' if len(people) == 1 else 's'}")
-    return None

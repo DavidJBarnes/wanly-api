@@ -27,8 +27,7 @@ from app.enums import JobStatus, SegmentStatus, VideoStatus, WorkerKind
 from app.ltx_stack import LTX_STACK
 from app.model_requirements import CHECKPOINT, canonical
 from app.recipe_blob import (
-    TRIGGER_PLACEHOLDERS, character_phrase, placeholders_in, recipe_characters, recipe_problem,
-    render_prompt, trigger_phrase,
+    character_phrase, placeholders_in, recipe_characters, render_prompt, trigger_phrase,
 )
 from app.models import (
     AppSetting, ImageMeta, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker,
@@ -285,17 +284,18 @@ def _drop_scene(prompt: str) -> str:
 
 
 async def _resolve_trigger(db: AsyncSession, prompt: str, ltx_recipe: dict | None) -> str:
-    """Fill a pose's <TRIGGER> (and <TRIGGER2>) with the characters' trigger words.
+    """Fill a pose's <TRIGGER> with the character's trigger phrase.
 
     Runs BEFORE _resolve_wildcards, and that order is the safeguard: the placeholders share
     syntax with wildcards, so a Wildcard named TRIGGER would otherwise substitute a random
     option and the render would quietly name the wrong character. Doing it first means the
-    resolver never sees a placeholder. (Both names are also reserved in the wildcard routes.)
+    resolver never sees a placeholder. (The name is also reserved in the wildcard routes.)
 
-    Slot i is characters[i] (wanly-console#473): the row's current trigger when the row
+    ONE character (wanly-console#473, post-#102): the row's current trigger when the row
     still exists, else the trigger the blob recorded, else the placeholder is left in place
     -- rendering the literal text is bad, but silently dropping the token that anchors a
-    character LoRA is worse and much harder to notice.
+    character LoRA is worse and much harder to notice. A JOINT character's phrase carries
+    every pair and lands whole.
 
     What is filled in is the trigger PHRASE, "p@yton, woman" -- the caption the LoRA trained
     on, gender included (wanly-console#487). The row's gender when the row exists, else the
@@ -309,16 +309,14 @@ async def _resolve_trigger(db: AsyncSession, prompt: str, ltx_recipe: dict | Non
     if not present:
         return prompt
     people = recipe_characters(ltx_recipe)
-    triggers: list[str | None] = []
-    for person in people[:len(TRIGGER_PLACEHOLDERS)]:
-        row = None
-        if person.get("name"):
-            row = (await db.execute(
-                select(LtxCharacter).where(LtxCharacter.name == person["name"])
-            )).scalar_one_or_none()
-        triggers.append(trigger_phrase(row.trigger, row.gender) if row
-                        else character_phrase(person))
-    return render_prompt(prompt, triggers)
+    person = people[0] if people else {}
+    row = None
+    if person.get("name"):
+        row = (await db.execute(
+            select(LtxCharacter).where(LtxCharacter.name == person["name"])
+        )).scalar_one_or_none()
+    phrase = trigger_phrase(row.trigger, row.gender) if row else character_phrase(person)
+    return render_prompt(prompt, phrase)
 
 
 async def _resolve_wildcards(db: AsyncSession, prompt: str) -> tuple[str, str | None]:
@@ -405,9 +403,6 @@ async def add_segment(
 
     next_index = max((s.index for s in job.segments), default=-1) + 1
 
-    problem = recipe_problem(body.ltx_recipe, body.prompt)
-    if problem:
-        raise HTTPException(status_code=422, detail=problem)
     prompt = await _resolve_trigger(db, body.prompt, body.ltx_recipe)
     resolved_prompt, prompt_template = await _resolve_wildcards_outside_scene(db, prompt)
     # After wildcards, deliberately — see _resolve_scene. The console resolves this itself

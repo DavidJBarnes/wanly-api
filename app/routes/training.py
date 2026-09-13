@@ -501,9 +501,8 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
     # Only IDENTITY groups contribute a pair. A COMPOSITION group (#106) has no trigger: its
     # caption repeats pairs already here, and including it would say the same face twice.
     #
-    # " and " (JOINT_SEPARATOR) is the split point the render reads back: a two-person pose
-    # fills <TRIGGER> with the first pair and <TRIGGER2> with the second, so each trigger
-    # lands next to its person. Not "&": the captions never contained it.
+    # " and " is natural text: the whole phrase lands in the one <TRIGGER> placeholder and
+    # the scene text names who is who. Not "&": the captions never contained it.
     pairs: list[str] = []
 
     def _add_pair(trig: str | None, gen: str | None) -> None:
