@@ -60,13 +60,13 @@ async def _character(db: AsyncSession, character_id: uuid.UUID) -> LtxCharacter:
 # correctly-built prompt never reaches the resolver carrying this. And the name is reserved
 # in the wildcard routes, so the shadowing wildcard cannot be created in the first place.
 #
-# A second person is <TRIGGER2> (wanly-console#473). Both live in app/recipe_blob.py with
-# the one reader of the blob's people; re-exported here because this is where they were.
+# The placeholder lives in app/recipe_blob.py with the one reader of the blob's people;
+# re-exported here because this is where it was.
 from app.recipe_blob import (  # noqa: E402
-    TRIGGER2_PLACEHOLDER, TRIGGER_PLACEHOLDER, TRIGGER_PLACEHOLDERS, render_prompt,
+    TRIGGER_PLACEHOLDER, TRIGGER_PLACEHOLDERS, render_prompt,
 )
 
-__all__ = ["router", "TRIGGER_PLACEHOLDER", "TRIGGER2_PLACEHOLDER", "TRIGGER_PLACEHOLDERS",
+__all__ = ["router", "TRIGGER_PLACEHOLDER", "TRIGGER_PLACEHOLDERS",
            "render_prompt"]
 
 

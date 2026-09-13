@@ -940,7 +940,7 @@ class TestTheJointRun:
 
     async def test_publishing_a_joint_run_records_both_triggers(self, db):
         """The character row carries ONE trigger; a LoRA trained on several caption pairs
-        must announce them all, split across <TRIGGER>/<TRIGGER2> by the render."""
+        must announce them all in the one phrase that fills <TRIGGER>."""
         j = _job(
             output_lora_path="s3://ltx-loras/character/payme_v1_final.safetensors",
             config={"gender": "woman", "caption": "p@y, woman"},
