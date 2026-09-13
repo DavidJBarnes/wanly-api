@@ -81,13 +81,21 @@ async def create_training_job(
     # without creating one first.
     images = list(body.dataset_images)
     thumbnail = None
+    # PROVENANCE (snapshot at creation, stamped on the character at publish): which dataset,
+    # by id and NAME, each group's images came from. The name is recorded NOW because a
+    # rename later must not rewrite what trained; the id survives so the console can link.
+    # An ad-hoc raw list records id/name null -- still a count, still honest.
+    group0_dataset: dict | None = None
     if body.dataset_id:
         ds = await db.get(Dataset, body.dataset_id)
         if not ds:
             raise HTTPException(status_code=404, detail="Dataset not found")
         images = list(ds.images)
+        group0_dataset = {"id": str(ds.id), "name": ds.name, "count": len(images)}
         # The anchor is the face the set was checked against; failing that, the first image.
         thumbnail = ds.anchor_uri or (ds.images[0] if ds.images else None)
+    if group0_dataset is None:
+        group0_dataset = {"id": None, "name": None, "count": len(images)}
     # Checked here rather than on the schema, because it applies to whichever of the two was
     # given -- a schema minimum on dataset_images would reject every dataset_id request.
     if len(images) < MIN_DATASET_IMAGES:
@@ -117,11 +125,13 @@ async def create_training_job(
     for i, g in enumerate(extra):
         label = f"identity {i + 2}"  # 1-based: group 0 is the first
         g_images = list(g.dataset_images)
+        g_dataset: dict = {"id": None, "name": None, "count": 0}
         if g.dataset_id:
             gds = await db.get(Dataset, g.dataset_id)
             if not gds:
                 raise HTTPException(status_code=404, detail=f"{label}: dataset not found")
             g_images = list(gds.images)
+            g_dataset = {"id": str(gds.id), "name": gds.name, "count": len(g_images)}
             if g.dataset_id in seen_dataset_ids:
                 # One dataset captioned two ways would train every image under both
                 # captions, which is not what any group is asking for.
@@ -132,6 +142,7 @@ async def create_training_job(
             seen_dataset_ids.add(g.dataset_id)
             if gds.anchor_uri and not thumbnail:
                 thumbnail = gds.anchor_uri
+        g_dataset["count"] = len(g_images)
         if len(g_images) < MIN_DATASET_IMAGES:
             raise HTTPException(
                 status_code=422,
@@ -176,6 +187,8 @@ async def create_training_job(
             "caption": g_caption,
             "images": g_images,
             "num_repeats": g.num_repeats,
+            #: Provenance, snapshot at creation (see group0_dataset above).
+            "dataset": g_dataset,
         })
 
     dupe = (await db.execute(
@@ -219,6 +232,7 @@ async def create_training_job(
         dataset_images=images,
         config={**RECIPE_DEFAULTS, "steps": steps, "caption": caption,
                 "gender": body.gender,
+                "dataset": group0_dataset,
                 "lora_name": body.lora_name or _default_lora_name(body.character),
                 "publish": body.publish},
         identities=groups or None,
@@ -310,6 +324,8 @@ async def claim_next_training_job(
                 "gender": g.get("gender"),
                 "caption": g.get("caption"),
                 "num_repeats": g.get("num_repeats"),
+                #: So the trainer can say WHICH dataset it is staging, not just how many.
+                "dataset_name": (g.get("dataset") or {}).get("name"),
                 "download_urls": g_urls,
             })
     except Exception as e:
@@ -520,17 +536,32 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
         gender = None
     else:
         trigger = job.trigger
+    # THE DATASETS THIS LORA CAME FROM, in group order (migration 099). Built from what the
+    # job recorded at creation, not from live dataset rows: a rename must not rewrite what
+    # trained, and a deleted dataset keeps its name (its id is then dangling, and the
+    # console renders the entry as plain text). Stamped on every publish, so a retrain
+    # replaces v1's provenance with v2's.
+    trained_from = []
+    for raw in [dict((job.config or {}).get("dataset") or {"id": None, "name": None,
+                                                           "count": len(job.dataset_images)})
+                ] + [dict(g.get("dataset") or {"id": None, "name": None,
+                                               "count": len(g.get("images") or [])})
+                     for g in (job.identities or [])]:
+        trained_from.append({"dataset_id": raw.get("id"), "name": raw.get("name"),
+                             "count": raw.get("count")})
     if existing:
         existing.char_lora = basename
         existing.trigger = trigger
         if gender:
             existing.gender = gender
+        existing.trained_from = trained_from
         if job.thumbnail_uri:
             existing.image_uri = job.thumbnail_uri
         logger.info("character %s now points at %s", job.character, basename)
     else:
         db.add(LtxCharacter(name=job.character, char_lora=basename, trigger=trigger,
-                            gender=gender, image_uri=job.thumbnail_uri))
+                            gender=gender, image_uri=job.thumbnail_uri,
+                            trained_from=trained_from))
         logger.info("created character %s -> %s", job.character, basename)
 
 

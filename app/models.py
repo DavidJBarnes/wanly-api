@@ -580,6 +580,11 @@ class LtxCharacter(Base):
     # A face for the LoRA: the anchor image of the dataset that trained it. Set when a
     # training run publishes to this character, editable like everything else here.
     image_uri = mapped_column(Text, nullable=True)
+    # WHICH DATASETS trained this LoRA (migration 099): [{dataset_id, name, count}, ...] in
+    # group order. Stamped at publish from what the run recorded at creation, so a dataset
+    # renamed later does not rewrite what trained. NULL for characters that predate it
+    # (backfilled by a one-off pass).
+    trained_from = mapped_column(JSONB, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     # passive_deletes leaves the cascade to the database, where the FK already declares
