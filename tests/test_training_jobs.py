@@ -1020,3 +1020,74 @@ class TestTheClaimDeliversEveryGroup:
         fields = TrainingClaimResponse.model_fields
         assert "identities" in fields
         assert "second_download_urls" not in fields
+
+
+class TestTheProvenance:
+    """Which DATASETS trained a character's LoRA (migration 099). The names are snapshotted
+    at creation and stamped on the character at publish, so a rename later does not rewrite
+    what trained -- the question "where did this face come from" always has an answer."""
+
+    def _imgs(self, prefix, n=13):
+        return [f"s3://wanly-images/2026-09-11/{prefix}{i}.jpg" for i in range(n)]
+
+    def test_creation_records_the_dataset_per_group(self):
+        import inspect
+        from app.routes import training as mod
+        src = inspect.getsource(mod.create_training_job)
+        assert '"dataset": g_dataset' in src, "identity groups do not record their dataset"
+        assert '"dataset": group0_dataset' in src, "group 0 does not record its dataset"
+
+    async def test_publishing_stamps_every_group(self, db):
+        j = _job(
+            output_lora_path="s3://ltx-loras/character/payme_v1_final.safetensors",
+            config={"gender": "woman", "caption": "p@y, woman",
+                    "dataset": {"id": "ds-payton", "name": "Payton Synthetic", "count": 55}},
+            identities=[{"character": "Me", "trigger": "d@vid", "gender": "man",
+                         "caption": "d@vid, man", "images": self._imgs("m"),
+                         "dataset": {"id": "ds-me", "name": "Me Synthetic", "count": 50}}])
+        db.add(j)
+        await db.flush()
+        await _publish_character(db, j)
+        await db.flush()
+        from sqlalchemy import select
+        row = (await db.execute(select(LtxCharacter).where(
+            LtxCharacter.name == "pay"))).scalar_one()
+        assert row.trained_from == [
+            {"dataset_id": "ds-payton", "name": "Payton Synthetic", "count": 55},
+            {"dataset_id": "ds-me", "name": "Me Synthetic", "count": 50},
+        ]
+
+    async def test_a_run_without_recorded_names_counts_the_images(self, db):
+        """Pre-099 jobs recorded no dataset names. The stamp still says how many images,
+        with null names rather than a guess."""
+        j = _job(
+            output_lora_path="s3://ltx-loras/character/pay_v1_e05.safetensors",
+            config={"gender": "woman"},
+            identities=[{"character": "Me", "trigger": "d@vid",
+                         "images": self._imgs("m"), "num_repeats": 10}])
+        db.add(j)
+        await db.flush()
+        await _publish_character(db, j)
+        await db.flush()
+        from sqlalchemy import select
+        row = (await db.execute(select(LtxCharacter).where(
+            LtxCharacter.name == "pay"))).scalar_one()
+        assert [d["count"] for d in row.trained_from] == [13, 13]
+        assert all(d["name"] is None for d in row.trained_from)
+
+    async def test_a_retrain_replaces_the_provenance(self, db):
+        db.add(LtxCharacter(name="pay", char_lora="pay_v1_e05", trigger="p@y",
+                            trained_from=[{"id": "old", "name": "Old Set", "count": 13}]))
+        await db.flush()
+        j = _job(
+            output_lora_path="s3://ltx-loras/character/pay_v2_e03.safetensors",
+            config={"gender": "woman",
+                    "dataset": {"id": "new", "name": "New Set", "count": 40}})
+        db.add(j)
+        await db.flush()
+        await _publish_character(db, j)
+        await db.flush()
+        from sqlalchemy import select
+        row = (await db.execute(select(LtxCharacter).where(
+            LtxCharacter.name == "pay"))).scalar_one()
+        assert row.trained_from == [{"dataset_id": "new", "name": "New Set", "count": 40}]

@@ -16,7 +16,7 @@ import asyncio
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -144,6 +144,8 @@ async def get_recipe_book(
                 "gender": c.gender,
                 "strength_stage_1": c.strength_stage_1,
                 "strength_stage_2": c.strength_stage_2,
+                #: Which datasets trained this LoRA (migration 099), group order.
+                "trained_from": c.trained_from,
             }
             for c in chars
         ],

@@ -194,6 +194,11 @@ class TrainingResponse(BaseModel):
     version: int
     status: str
     dataset_images: list[str]
+    #: The extra groups (#102, #106), each carrying its caption, repeats and provenance
+    #: ({character, trigger, gender, caption, images, num_repeats, dataset}). ABSENT for
+    #: single-identity runs. The console needs it for the joint image total and the
+    #: per-group dataset names.
+    identities: list[dict] | None = None
     config: dict
     worker_name: str | None = None
     gpu_name: str | None = None
