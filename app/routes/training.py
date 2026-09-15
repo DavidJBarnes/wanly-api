@@ -345,8 +345,14 @@ async def claim_next_training_job(
     await db.commit()
     await db.refresh(job)
     logger.info("training %s v%d claimed by %s", job.character, job.version, job.worker_name)
-    claim = TrainingClaimResponse(**TrainingResponse.model_validate(job).model_dump(),
-                                  download_urls=urls, identities=group_payload or None)
+    # `identities` is present in the base dump because TrainingResponse declares it, and the
+    # claim re-declares it as the resolved, presigned override. Passing both collides on the
+    # keyword and 500s on EVERY claim (#322), so the base's copy is dropped and the resolved
+    # one wins. Exercised by TestTheClaimEndpoint below.
+    payload = TrainingResponse.model_validate(job).model_dump()
+    payload.pop("identities", None)
+    claim = TrainingClaimResponse(**payload, download_urls=urls,
+                                  identities=group_payload or None)
     return claim
 
 

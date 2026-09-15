@@ -1091,3 +1091,84 @@ class TestTheProvenance:
         row = (await db.execute(select(LtxCharacter).where(
             LtxCharacter.name == "pay"))).scalar_one()
         assert row.trained_from == [{"dataset_id": "new", "name": "New Set", "count": 40}]
+
+
+@pytest.mark.asyncio
+class TestTheClaimEndpoint:
+    """GET /training/next driven over HTTP against a real row (#322).
+
+    The rest of this file reads the source with inspect.getsource. That never builds the
+    response, so it could not see the bug that took training down for two days: the route
+    passed `identities` twice, once via the base dump and once as the resolved override, and
+    every claim 500'd after the row had already been committed CLAIMED. Nothing was exercised
+    end to end, so nothing caught it. These tests call the endpoint the way the poller does.
+    """
+
+    WORKER_ID = uuid.UUID("a1111111-1111-1111-1111-111111111111")
+
+    async def _trainer(self, db):
+        w = Worker(id=self.WORKER_ID, friendly_name="3090.zero", hostname="h",
+                   ip_address="10.0.0.9", kind=WorkerKind.RENDER, kinds=["render", "trainer"],
+                   status="online", last_heartbeat=datetime.now(timezone.utc),
+                   gpu_stats={"gpu_name": "RTX 3090"})
+        db.add(w)
+        await db.flush()
+        return w
+
+    async def _claim(self, db):
+        from httpx import ASGITransport, AsyncClient
+        from app.auth import verify_api_key
+        from app.database import get_db
+        from app.main import app
+
+        app.dependency_overrides[get_db] = lambda: db
+        app.dependency_overrides[verify_api_key] = lambda: None
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                return await client.get(
+                    "/training/next",
+                    params={"worker_id": str(self.WORKER_ID), "worker_name": "3090.zero"},
+                )
+        finally:
+            app.dependency_overrides.clear()
+
+    @pytest.fixture(autouse=True)
+    def _no_s3(self, monkeypatch):
+        # Presigning needs credentials this laptop/CI does not have; the URL's content is not
+        # what is under test, only that the response can be built at all and pairs 1:1.
+        from app.routes import training as mod
+        monkeypatch.setattr(mod.s3, "generate_presigned_url",
+                            lambda uri, expires=21600: f"https://presigned/{uri.rsplit('/', 1)[-1]}")
+
+    async def test_a_multi_identity_job_is_claimed_and_returns_its_groups(self, db):
+        """The exact shape that 500'd: `identities` non-empty, so the route both dumped it from
+        the base and passed the resolved override."""
+        await self._trainer(db)
+        db.add(_job(character="Karoline", trigger="k@roline",
+                    identities=[{"character": "Me", "trigger": "d@vid", "gender": "woman",
+                                 "caption": "a woman", "num_repeats": 10,
+                                 "images": ["s3://wanly-images/g1.jpg"],
+                                 "dataset": {"name": "Karoline set"}}]))
+        await db.flush()
+
+        resp = await self._claim(db)
+
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body is not None
+        assert len(body["download_urls"]) == len(body["dataset_images"])
+        assert body["identities"][0]["download_urls"] == ["https://presigned/g1.jpg"]
+        assert body["identities"][0]["dataset_name"] == "Karoline set"
+
+    async def test_a_single_identity_job_claims_with_no_groups(self, db):
+        """No extra groups must still produce a response — the collision happened even with
+        identities absent, because the base dump carries the key regardless."""
+        await self._trainer(db)
+        db.add(_job())
+        await db.flush()
+
+        resp = await self._claim(db)
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["identities"] is None
