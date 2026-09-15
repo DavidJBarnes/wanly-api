@@ -16,14 +16,27 @@ These tests hold the resolution order: pose override, then the setting, then the
 
 import importlib.util
 import hashlib
+import uuid
 from pathlib import Path
 
 import pytest
 import sqlalchemy as sa
 
 from app.ltx_stack import LTX_STACK
-from app.models import AppSetting, LtxRecipe
+from app.models import AppSetting, LtxBook, LtxRecipe
 from app.negative_prompt import SETTING_KEY, default_negative_prompt
+
+
+async def _book_id(db, name: str = "10eros") -> uuid.UUID:
+    """A book to file the poses these tests build directly.
+
+    `book_id` is NOT NULL with no ORM or server default (migration 100) — the route supplies
+    the default, and these tests bypass the route, so they must supply one too.
+    """
+    b = LtxBook(id=uuid.uuid4(), name=name)
+    db.add(b)
+    await db.flush()
+    return b.id
 
 
 async def _set(db, value: str) -> None:
@@ -66,7 +79,9 @@ class TestRecipeBook:
     @pytest.mark.asyncio
     async def test_a_pose_with_no_override_resolves_to_the_setting(self, db):
         await _set(db, "six fingers")
-        db.add(LtxRecipe(name="inheriting pose", prompt_template="<TRIGGER>, standing"))
+        book_id = await _book_id(db)
+        db.add(LtxRecipe(name="inheriting pose", prompt_template="<TRIGGER>, standing",
+                         book_id=book_id))
         await db.flush()
 
         pose = next(p for p in (await self._book(db))["poses"]
@@ -79,8 +94,9 @@ class TestRecipeBook:
     @pytest.mark.asyncio
     async def test_a_real_override_still_outranks_the_setting(self, db):
         await _set(db, "six fingers")
+        book_id = await _book_id(db)
         db.add(LtxRecipe(name="opinionated pose", prompt_template="<TRIGGER>, standing",
-                         negative_prompt="hands"))
+                         negative_prompt="hands", book_id=book_id))
         await db.flush()
 
         pose = next(p for p in (await self._book(db))["poses"]
@@ -117,13 +133,14 @@ class TestUnpinMigration:
     @pytest.mark.asyncio
     async def test_it_clears_the_copies_and_leaves_a_real_override_alone(self, db):
         pinned = self._migration()._PINNED
+        book_id = await _book_id(db)
         db.add_all([
             LtxRecipe(name="pinned pose", prompt_template="<TRIGGER>, a",
-                      negative_prompt=pinned),
+                      negative_prompt=pinned, book_id=book_id),
             LtxRecipe(name="hand written pose", prompt_template="<TRIGGER>, b",
-                      negative_prompt="hands, six fingers"),
+                      negative_prompt="hands, six fingers", book_id=book_id),
             LtxRecipe(name="nearly pinned pose", prompt_template="<TRIGGER>, c",
-                      negative_prompt=pinned + ", cross-eyed"),
+                      negative_prompt=pinned + ", cross-eyed", book_id=book_id),
         ])
         await db.flush()
 

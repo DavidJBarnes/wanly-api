@@ -58,6 +58,32 @@ class LtxCharacterUpdate(BaseModel):
     image_uri: Optional[str] = None
 
 
+class LtxBookCreate(BaseModel):
+    """A named shelf of poses."""
+
+    name: str = Field(min_length=1, max_length=64)
+    description: Optional[str] = None
+
+
+class LtxBookUpdate(BaseModel):
+    """Every field optional: a rename must not restate the description, and vice versa."""
+
+    name: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    description: Optional[str] = None
+
+
+class LtxBookResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    name: str
+    description: Optional[str]
+    #: How many poses are filed here. Not a column — assembled by the route so the console
+    #: can warn before a delete rather than discovering the 409.
+    recipe_count: int = 0
+    created_at: datetime
+
+
 class ContentLora(BaseModel):
     """One content LoRA in a pose's chain (console#410).
 
@@ -96,6 +122,9 @@ class LtxRecipeCreate(BaseModel):
     # Base model for this pose. NULL uses the stack's. A filename as ComfyUI lists it;
     # the engine appends .safetensors when missing.
     checkpoint: Optional[str] = Field(default=None, max_length=256)
+    # The book this pose is filed under. Absent means "the default book" — the route resolves
+    # it, so creating a pose can never 400 or 409 on a field the caller did not think about.
+    book_id: Optional[uuid.UUID] = None
     validated: bool = False
 
 
@@ -111,6 +140,8 @@ class LtxRecipeUpdate(BaseModel):
     # Base model for this pose. NULL uses the stack's. A filename as ComfyUI lists it;
     # the engine appends .safetensors when missing.
     checkpoint: Optional[str] = Field(default=None, max_length=256)
+    # Moving a pose between books. None leaves it where it is.
+    book_id: Optional[uuid.UUID] = None
     validated: Optional[bool] = None
 
 
@@ -125,6 +156,8 @@ class LtxRecipeResponse(BaseModel):
     img_compression: Optional[int]
     content_loras: List[ContentLora] = Field(default_factory=list)
     checkpoint: Optional[str]
+    book_id: uuid.UUID
+    book_name: Optional[str] = None
     validated: bool
     created_at: datetime
     updated_at: Optional[datetime]
