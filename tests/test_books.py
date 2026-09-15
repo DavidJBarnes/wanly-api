@@ -296,3 +296,33 @@ class TestFiltering:
         r = await _call(db, "get", "/recipes", params={"book_id": str(uuid.uuid4())})
         assert r.status_code == 200, r.text
         assert r.json()["poses"] == []
+
+
+class TestValidatedIsGone:
+    """`validated` was a boolean nobody set, read by the console as a quality signal it could
+    not support. It was dropped from the model, the schemas and the assembled payload in one
+    change; these pin the wire shape so it cannot creep back in on one side only."""
+
+    async def test_the_pose_payload_carries_no_validated_field(self, db):
+        b = await _book(db, "10eros")
+        db.add(LtxRecipe(id=uuid.uuid4(), name="p", prompt_template="<TRIGGER>, x",
+                         content_loras=[], book_id=b.id))
+        await db.flush()
+        r = await _call(db, "get", "/recipes", params={"book_id": str(b.id)})
+        assert r.status_code == 200, r.text
+        pose = r.json()["poses"][0]
+        assert "validated" not in pose
+
+    async def test_a_create_ignores_a_validated_body_field(self, db):
+        """An older console (or a stale cached build) may still POST `validated`. It must be
+        dropped quietly rather than becoming a 422 or a column write."""
+        await _book(db, DEFAULT_BOOK_NAME)
+        r = await _call(db, "post", "/ltx/recipes", json={
+            "name": "legacy caller",
+            "prompt_template": "<TRIGGER>, standing",
+            "content_loras": [],
+            "validated": True,
+        })
+        assert r.status_code == 201, r.text
+        assert "validated" not in r.json()
+

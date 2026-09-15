@@ -125,7 +125,6 @@ class LtxRecipeCreate(BaseModel):
     # The book this pose is filed under. Absent means "the default book" — the route resolves
     # it, so creating a pose can never 400 or 409 on a field the caller did not think about.
     book_id: Optional[uuid.UUID] = None
-    validated: bool = False
 
 
 class LtxRecipeUpdate(BaseModel):
@@ -142,7 +141,6 @@ class LtxRecipeUpdate(BaseModel):
     checkpoint: Optional[str] = Field(default=None, max_length=256)
     # Moving a pose between books. None leaves it where it is.
     book_id: Optional[uuid.UUID] = None
-    validated: Optional[bool] = None
 
 
 class LtxRecipeResponse(BaseModel):
@@ -158,6 +156,5 @@ class LtxRecipeResponse(BaseModel):
     checkpoint: Optional[str]
     book_id: uuid.UUID
     book_name: Optional[str] = None
-    validated: bool
     created_at: datetime
     updated_at: Optional[datetime]
