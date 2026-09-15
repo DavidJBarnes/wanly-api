@@ -587,10 +587,30 @@ class LtxCharacter(Base):
     trained_from = mapped_column(JSONB, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
-    # passive_deletes leaves the cascade to the database, where the FK already declares
-    # ON DELETE CASCADE. Without it the ORM tries to load every child row to delete them
-    # individually — which under asyncpg is a lazy load in the wrong context and raises
-    # MissingGreenlet, so deleting a character failed outright. Found by running it.
+    # There is NO cascade to recipes: `ltx_recipes` has no character_id and no relationship
+    # to this table (since #212), because a pose belongs to every character. The docstring
+    # here used to claim an FK with ON DELETE CASCADE; that constraint died in migration 072.
+
+
+class LtxBook(Base):
+    """A BOOK: a named collection of poses.
+
+    Poses were cloned from different base models — nine of the sixteen from 10Eros, six from
+    sulphur — and the flat list stopped saying which was which. A book is that grouping: a
+    name, a description, and the poses filed under it. A book MAY be empty.
+
+    Poses are unique per book, not globally (see LtxRecipe), so the same pose name can exist
+    in two books without the second being a duplicate. Deleting a book that still holds poses
+    is blocked at the database (ON DELETE RESTRICT) rather than silently taking them with it.
+    """
+    __tablename__ = "ltx_books"
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = mapped_column(String(64), nullable=False, unique=True)
+    description = mapped_column(Text, nullable=True)
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+    recipes = relationship("LtxRecipe", back_populates="book")
 
 
 class LtxRecipe(Base):
@@ -602,10 +622,15 @@ class LtxRecipe(Base):
     which two of them already had.
 
     The prompt carries a <TRIGGER> placeholder that the character's own trigger word fills.
+
+    A pose belongs to exactly one BOOK (migration 100). The FK is mandatory because a pose is
+    never meaningful without a shelf to sit on, and the route defaults it to the default book
+    so creating one can never be blocked by the very constraint that keeps it filed — the
+    shape that locked LoRAs out in 072.
     """
     __tablename__ = "ltx_recipes"
     __table_args__ = (
-        UniqueConstraint("name", name="uq_ltx_recipe_name"),
+        UniqueConstraint("book_id", "name", name="uq_ltx_recipe_book_name"),
     )
 
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -640,5 +665,16 @@ class LtxRecipe(Base):
     # stage 2 is a recorded lever and one flat number cannot express it.
     content_loras = mapped_column(JSONB, nullable=True)
     checkpoint = mapped_column(Text, nullable=True)
+    # The shelf this pose sits on. RESTRICT rather than CASCADE: deleting a populated book
+    # must fail loudly, not take its poses with it. The route checks first and returns 409,
+    # which is where the message lives; this is the backstop.
+    book_id = mapped_column(UUID(as_uuid=True), ForeignKey("ltx_books.id", ondelete="RESTRICT"),
+                            nullable=False, index=True)
+    book = relationship("LtxBook", back_populates="recipes", lazy="selectin")
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), nullable=True)
+
+    @property
+    def book_name(self) -> str | None:
+        """The shelf's name, for the response. Eager-loaded (selectin) so async never lazy-loads."""
+        return self.book.name if self.book is not None else None

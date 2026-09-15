@@ -186,7 +186,7 @@ from httpx import ASGITransport, AsyncClient
 from app.auth import get_current_user
 from app.database import get_db
 from app.main import app
-from app.models import LtxCharacter, LtxRecipe, User
+from app.models import LtxBook, LtxCharacter, LtxRecipe, User
 
 
 async def _user(db):
@@ -252,9 +252,11 @@ class TestUpdateCharacter:
         user = await _user(db)
         c = LtxCharacter(id=_uuid.uuid4(), name="doomed", char_lora="l", trigger="t",
                          strength_stage_1=0.8, strength_stage_2=1.5)
+        book = LtxBook(id=_uuid.uuid4(), name=f"book-{_uuid.uuid4().hex[:6]}")
         pose = LtxRecipe(id=_uuid.uuid4(), name=f"pose-{_uuid.uuid4().hex[:6]}",
-                         prompt_template="<TRIGGER>, standing", validated=True)
-        db.add_all([c, pose])
+                         prompt_template="<TRIGGER>, standing", validated=True,
+                         book_id=book.id)
+        db.add_all([c, book, pose])
         await db.flush()
 
         r = await _call(db, user, "delete", f"/ltx/characters/{c.id}")

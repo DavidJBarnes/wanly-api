@@ -15,9 +15,10 @@ import logging
 import asyncio
 import uuid
 from datetime import datetime, timezone
+from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -27,9 +28,12 @@ from app.auth import get_current_user, verify_api_key_or_bearer
 from app.database import get_db
 from app.checkpoint_sources import CHECKPOINT_SOURCES
 from app.ltx_stack import LTX_STACK
-from app.models import LtxCharacter, LtxRecipe, User, Worker
+from app.models import LtxBook, LtxCharacter, LtxRecipe, User, Worker
 from app.negative_prompt import default_negative_prompt
 from app.schemas.ltx import (
+    LtxBookCreate,
+    LtxBookResponse,
+    LtxBookUpdate,
     LtxCharacterCreate,
     LtxCharacterUpdate,
     LtxCharacterResponse,
@@ -40,6 +44,40 @@ from app.schemas.ltx import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# The book a new pose lands in when the caller names none. Must match the migration's default
+# (100_books) and the stack's checkpoint family: "10eros" holds the 10Eros poses, including
+# the NULL-checkpoint ones. A pose is NEVER refused for lack of a book — that is the whole
+# reason book_id is server-defaulted rather than required from the client.
+DEFAULT_BOOK_NAME = "10eros"
+
+
+async def _default_book(db: AsyncSession) -> LtxBook:
+    """The book a new pose is filed into when none is given.
+
+    Falls back to the first book by name if the default is somehow absent, so a create can
+    still succeed rather than 500 on a database whose books were rearranged.
+    """
+    book = (await db.execute(
+        select(LtxBook).where(LtxBook.name == DEFAULT_BOOK_NAME)
+    )).scalar_one_or_none()
+    if book is None:
+        book = (await db.execute(
+            select(LtxBook).order_by(LtxBook.name).limit(1)
+        )).scalar_one_or_none()
+    if book is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No books exist; create a book before creating a pose",
+        )
+    return book
+
+
+async def _book(db: AsyncSession, book_id: uuid.UUID) -> LtxBook:
+    b = await db.get(LtxBook, book_id)
+    if b is None:
+        raise HTTPException(status_code=404, detail="Book not found")
+    return b
 
 
 async def _character(db: AsyncSession, character_id: uuid.UUID) -> LtxCharacter:
@@ -72,6 +110,7 @@ __all__ = ["router", "TRIGGER_PLACEHOLDER", "TRIGGER_PLACEHOLDERS",
 
 @router.get("/recipes")
 async def get_recipe_book(
+    book_id: Annotated[uuid.UUID | None, Query(description="Limit poses to one book")] = None,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -84,15 +123,31 @@ async def get_recipe_book(
     chars = (await db.execute(
         select(LtxCharacter).order_by(LtxCharacter.name)
     )).scalars().all()
-    poses = (await db.execute(
-        select(LtxRecipe).order_by(LtxRecipe.name)
-    )).scalars().all()
 
     # The Settings field, not LTX_STACK['negative']. Resolving against the constant is what
     # made the setting unreachable: the console prefills its form from the resolved value,
     # so every segment was created carrying the constant and the claim-time fallback to the
     # setting never had a NULL to fire on (console#430).
     default_negative = await default_negative_prompt(db)
+
+    # Books, with a pose count each. The count is a query, not a column: adding a pose must
+    # not require remembering to increment a number, and the console wants it to grey out a
+    # delete before the API's 409 answers.
+    counts = dict((await db.execute(
+        select(LtxRecipe.book_id, func.count(LtxRecipe.id)).group_by(LtxRecipe.book_id)
+    )).all())
+
+    # Ordered by book then pose, so the console can render grouped headings straight from the
+    # list without sorting, and the same order holds whether or not it filters to one book.
+    poses_q = select(LtxRecipe).join(LtxBook).order_by(LtxBook.name, LtxRecipe.name)
+    if book_id is not None:
+        # An unknown book is an empty list, not a 404: the caller asked for a filter, and a
+        # filter that matches nothing is not an error. Somebody deleting the book while the
+        # console holds the id should show an empty page, not a failed request.
+        poses_q = poses_q.where(LtxRecipe.book_id == book_id)
+    poses = (await db.execute(poses_q)).scalars().all()
+
+    books = (await db.execute(select(LtxBook).order_by(LtxBook.name))).scalars().all()
 
     # Poses are character-agnostic, so EVERY pose is offered for EVERY character. That is the
     # point: a new LoRA is never locked out for want of rows in a table — add the character
@@ -103,6 +158,16 @@ async def get_recipe_book(
         # folded into it: `stack` is the constant configuration the image ships with, and
         # this one is a setting that can differ from it.
         "default_negative_prompt": default_negative,
+        # The shelves, so the console's picker can group without a second call.
+        "books": [
+            {
+                "id": str(b.id),
+                "name": b.name,
+                "description": b.description,
+                "recipe_count": counts.get(b.id, 0),
+            }
+            for b in books
+        ],
         "poses": [
             {
                 "id": str(r.id),
@@ -131,6 +196,8 @@ async def get_recipe_book(
                 # `or` is right here: NULL and "" both mean "not set", and there is no
                 # falsy checkpoint name that means something different.
                 "checkpoint": r.checkpoint or LTX_STACK["checkpoint"],
+                "book_id": str(r.book_id),
+                "book_name": r.book_name,
                 "validated": r.validated,
             }
             for r in poses
@@ -255,6 +322,96 @@ async def list_available_loras():
     return out
 
 
+@router.post("/ltx/books", response_model=LtxBookResponse, status_code=201)
+async def create_book(
+    body: LtxBookCreate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create an empty book. Poses are filed into it later, or never — an empty book is fine."""
+    b = LtxBook(**body.model_dump())
+    db.add(b)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail=f"A book named {body.name!r} already exists")
+    await db.refresh(b)
+    return b
+
+
+@router.get("/ltx/books", response_model=list[LtxBookResponse])
+async def list_books(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every book with its pose count, for the console's dropdown and management list."""
+    counts = dict((await db.execute(
+        select(LtxRecipe.book_id, func.count(LtxRecipe.id)).group_by(LtxRecipe.book_id)
+    )).all())
+    books = (await db.execute(select(LtxBook).order_by(LtxBook.name))).scalars().all()
+    out = []
+    for b in books:
+        dto = LtxBookResponse.model_validate(b)
+        dto.recipe_count = counts.get(b.id, 0)
+        out.append(dto)
+    return out
+
+
+@router.patch("/ltx/books/{book_id}", response_model=LtxBookResponse)
+async def update_book(
+    book_id: uuid.UUID,
+    body: LtxBookUpdate,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Rename or re-describe a book. Never touches its poses."""
+    b = await _book(db, book_id)
+    for k, v in body.model_dump(exclude_unset=True).items():
+        setattr(b, k, v)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409, detail="A book with that name already exists")
+    await db.refresh(b)
+    return b
+
+
+@router.delete("/ltx/books/{book_id}", status_code=204)
+async def delete_book(
+    book_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete an empty book. A non-empty one is refused.
+
+    The refusal is explicit rather than a cascade, because deleting a book is the one action
+    here that could silently destroy poses someone wrote. The FK is ON DELETE RESTRICT as a
+    second line of defence -- the count check answers the common case with a message the
+    console can show, and the constraint catches the race where a pose is added between the
+    two.
+    """
+    b = await _book(db, book_id)
+    n = (await db.execute(
+        select(func.count(LtxRecipe.id)).where(LtxRecipe.book_id == b.id)
+    )).scalar_one()
+    if n:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Book {b.name!r} still holds {n} pose(s); move or delete them first",
+        )
+    await db.delete(b)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="Book gained a pose while it was being deleted; try again",
+        )
+
+
 @router.post("/ltx/characters", response_model=LtxCharacterResponse, status_code=201)
 async def create_character(
     body: LtxCharacterCreate,
@@ -337,7 +494,16 @@ async def create_recipe(
     db: AsyncSession = Depends(get_db),
 ):
     """Create a pose. Not attached to a character — every character gets it."""
-    r = LtxRecipe(**body.model_dump())
+    data = body.model_dump()
+    if data.get("book_id") is None:
+        # The whole point of defaulting here rather than requiring it: a pose created by any
+        # caller that has not been taught about books still lands somewhere sensible. The
+        # column is NOT NULL with no server default, so this is the only place the default
+        # is applied -- any other construction path (tests, scripts) must supply one.
+        data["book_id"] = (await _default_book(db)).id
+    else:
+        await _book(db, data["book_id"])
+    r = LtxRecipe(**data)
     db.add(r)
     try:
         await db.commit()
@@ -345,7 +511,7 @@ async def create_recipe(
         await db.rollback()
         raise HTTPException(
             status_code=409,
-            detail=f"A pose named {body.name!r} already exists",
+            detail=f"A pose named {body.name!r} already exists in that book",
         )
     await db.refresh(r)
     return r
@@ -368,14 +534,19 @@ async def update_recipe(
     r = await db.get(LtxRecipe, recipe_id)
     if r is None:
         raise HTTPException(status_code=404, detail="Recipe not found")
-    for k, v in body.model_dump(exclude_unset=True).items():
+    data = body.model_dump(exclude_unset=True)
+    if data.get("book_id") is not None:
+        await _book(db, data["book_id"])
+    for k, v in data.items():
         setattr(r, k, v)
     r.updated_at = datetime.now(timezone.utc)
     try:
         await db.commit()
     except IntegrityError:
         await db.rollback()
-        raise HTTPException(status_code=409, detail="A recipe with that name already exists")
+        raise HTTPException(
+            status_code=409, detail="A recipe with that name already exists in that book"
+        )
     await db.refresh(r)
     return r
 
