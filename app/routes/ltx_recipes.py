@@ -198,7 +198,6 @@ async def get_recipe_book(
                 "checkpoint": r.checkpoint or LTX_STACK["checkpoint"],
                 "book_id": str(r.book_id),
                 "book_name": r.book_name,
-                "validated": r.validated,
             }
             for r in poses
         ],
@@ -526,10 +525,8 @@ async def update_recipe(
 ):
     """Edit a recipe.
 
-    Editing the prompt is editing the recipe — there is no separate "is this still the
-    validated one" state to keep in sync, because `validated` is a field the author sets
-    when they have watched it. Changing the prompt does NOT silently clear it: that would
-    be the system overruling a human's judgement about their own edit.
+    Editing the prompt is editing the recipe. There is no separate provenance or quality
+    state to keep in sync — a pose is just its prompt and its settings.
     """
     r = await db.get(LtxRecipe, recipe_id)
     if r is None:

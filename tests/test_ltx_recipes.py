@@ -254,7 +254,7 @@ class TestUpdateCharacter:
                          strength_stage_1=0.8, strength_stage_2=1.5)
         book = LtxBook(id=_uuid.uuid4(), name=f"book-{_uuid.uuid4().hex[:6]}")
         pose = LtxRecipe(id=_uuid.uuid4(), name=f"pose-{_uuid.uuid4().hex[:6]}",
-                         prompt_template="<TRIGGER>, standing", validated=True,
+                         prompt_template="<TRIGGER>, standing",
                          book_id=book.id)
         db.add_all([c, book, pose])
         await db.flush()
