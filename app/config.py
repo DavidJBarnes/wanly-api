@@ -19,47 +19,38 @@ class Settings(BaseSettings):
     api_key: str = ""
     civitai_api_token: str = ""
     # image-description, for the <SCENE> placeholder (console#405) and dataset tagging. Named
-    # for the capability (wanly-gpu-docker#83): today it is JoyCaption served by ollama inside
-    # the GPU container, and that can change without renaming anything here. The old
-    # JOYCAPTION_* names are still read from the environment.
+    # for the capability (wanly-gpu-docker#83). As of #326 it is Qwen2.5-VL served by ollama
+    # inside the wanly-services container on the 2070, chosen because one model does both
+    # halves of a video prompt: the static scene AND the motion paragraph. The old
+    # JOYCAPTION_* aliases still work.
     #
-    # It runs on the 3090 beside the render stack. A caption loads a ~6 GB vision model, and
-    # the card sits at ~23 of 24 GB while rendering -- so an interactive caption is REFUSED
-    # while that box is online-busy (see busy_render_beside_the_captioner in app/joycaption.py)
-    # rather than OOMing a segment ten minutes in.
+    # 2070-only, decided in #326: the 3090's captioner shares its card with the render stack,
+    # and the single model-name setting cannot serve two models; the 2070's card is shared
+    # with nothing that renders LTX. The 3090's joycaption stays installed, unused.
     image_description_url: str = Field(
-        "http://3090.zero:11434",
+        "http://2070.zero:11434",
         validation_alias=AliasChoices("image_description_url", "joycaption_url"))
-    # A second captioner used while the box above is rendering: the 2070's, which shares its
-    # card with nothing that renders LTX. Interactive captions go there when the 3090 is
-    # busy instead of being refused; claim-time captions go there first, because the box
-    # that claimed is about to load a render. Empty means "refuse while busy".
-    image_description_fallback_url: str = "http://2070.zero:11434"
+    # A second captioner, used while the box above is rendering. The 2070 is the primary
+    # now and nothing it shares its card with renders, so this is empty by default — the
+    # mechanism stays for anyone who points the primary back at the 3090.
+    image_description_fallback_url: str = ""
     image_description_model: str = Field(
-        "joycaption:beta-one",
+        "qwen2.5vl:7b-q4_K_M",
         validation_alias=AliasChoices("image_description_model", "joycaption_model"))
-    # Deliberately tiny. sd.service (Automatic1111) shares that GPU and spikes several GB
-    # generating SDXL, and a resident 5.5 GB JoyCaption would starve it. The two are never
-    # meant to run at once, so the model should hold the card only while it is actually
-    # working.
-    #
-    # This is cheap because a cold start is cheap. MEASURED on the 2070:
-    #
-    #   cold (not resident)   4.5 s total   2.9 s load, 0.5 s prompt, 0.9 s generate
-    #   warm (resident)       1.2 s total   0.2 s load, 1.0 s generate
-    #
-    # So releasing VRAM after every caption costs ~2.9 s on the next one. 5s still coalesces
-    # a burst of images captioned back to back, while giving SD the card back essentially as
-    # soon as captioning stops.
+    # Long, on purpose (#326). The 2070 measured: qwen2.5vl cold load is ~3 minutes of the
+    # 8 GB card, and a warm caption is 15-50 s. JoyCaption's 5s existed to hand the card
+    # back to A1111 (gone) between near-instant captions; with a 3-minute load, 5s would
+    # make every caption pay for the load. 15m keeps the model resident across a tagging
+    # session. The ComfyUI dev install on this box does not fit beside it — see the risk
+    # note in wanly-api#326.
     image_description_keep_alive: str = Field(
-        "5s", validation_alias=AliasChoices("image_description_keep_alive", "joycaption_keep_alive"))
-    # Generous next to a 4.5 s cold caption. It is here to stop a wedged or unreachable
-    # captioner holding a request open, not to bound normal work.
-    # 180, not 60: on the 3090 the vision model is read from disk on every caption (the
-    # renders evict it from the page cache) and a cold caption measured 46 s; the next one
-    # went past 60 and surfaced as "captioner unreachable ... ReadTimeout".
+        "15m", validation_alias=AliasChoices("image_description_keep_alive", "joycaption_keep_alive"))
+    # A cold qwen2.5vl caption (load included) measured 185-265 s on the 2070; a grounded
+    # warm motion caption up to ~50 s. 180 — the old JoyCaption number — timed the first
+    # cold call out. 600 leaves room for the load without letting a wedged captioner hold
+    # a request open forever.
     image_description_timeout_s: int = Field(
-        180, validation_alias=AliasChoices("image_description_timeout_s", "joycaption_timeout_s"))
+        600, validation_alias=AliasChoices("image_description_timeout_s", "joycaption_timeout_s"))
     # Automatic1111 on the same 2070, so a caption can ask it for the card back.
     #
     # The keep_alive above makes JoyCaption yield to A1111. Nothing made A1111 yield back,

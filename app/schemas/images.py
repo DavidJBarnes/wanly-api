@@ -12,11 +12,13 @@ class ImageSceneRequest(BaseModel):
     """Describe this image now. Both "first description" and "re-roll" are this call.
 
     Style and instruction mirror CaptionRequest so a one-off "try it shorter" is possible
-    without moving the global setting.
+    without moving the global setting. The motion pair overrides the same way (#326).
     """
 
     style: Optional[str] = None
     instruction: Optional[str] = Field(default=None, max_length=2000)
+    motion_style: Optional[str] = None
+    motion_instruction: Optional[str] = Field(default=None, max_length=2000)
 
 
 class ImageSceneResponse(BaseModel):
@@ -31,3 +33,14 @@ class ImageSceneResponse(BaseModel):
     # Length is the thing being judged: the description sits beside a ~100-word arc, and
     # whether it is 25 or 80 words changes the balance between scene and motion.
     words: int = 0
+    # The motion half (#326): the frame read as the first frame of a 10-second clip.
+    # None means "no motion caption" — either described before #326, or the motion call
+    # failed while the static half succeeded. Both render as an absent section; a re-roll
+    # regenerates both.
+    motion_description: Optional[str] = None
+    motion_instruction: Optional[str] = None
+    motion_described_at: Optional[datetime] = None
+    motion_words: int = 0
+    # Set when the static half succeeded and the motion half failed. The console shows it
+    # as a warning rather than letting a missing paragraph look intentional.
+    motion_error: Optional[str] = None

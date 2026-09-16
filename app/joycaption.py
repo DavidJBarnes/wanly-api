@@ -95,6 +95,104 @@ def instruction_for(style: str, custom: str = "") -> str:
     return CAPTION_STYLES.get(style, CAPTION_STYLES[DEFAULT_STYLE])
 
 
+# ---------------------------------------------------------------------------------------
+# Motion descriptions (wanly-api#326)
+#
+# The other half of the caption: the image read as the FIRST FRAME of a 10-second clip,
+# which is the prompt an image-to-video model actually wants. Prototyped on the 2070 with
+# qwen2.5vl on 2026-09-15/16; the findings below shaped these prompts and are load-bearing.
+#
+# 1. WITHOUT AN ANTI-HEDGE THE MODEL DESCRIBES A STILL PHOTO. Untuned it returned "her
+#    expression remains neutral... the camera remains steady" for every frame. "The action
+#    implied by the frame begins and continues throughout" plus an explicit ban on
+#    remains-still hedging is what produced real motion language.
+# 2. DIRECTION AND AMPLITUDE MUST BE ASKED FOR BY NAME ("up and down, deeper or shallower,
+#    in or out"). "Describe the motion" gets adjectives; the named axes get the verbs a
+#    video prompt needs.
+# 3. BEATS DON'T WORK. A 0-3s/3-7s/7-10s format reads beautifully but LTX has no timestamp
+#    syntax; one flowing paragraph is the form it can consume.
+# 4. STYLE TALK CROWDS OUT ACTION. The variant that asked the model to also choose a
+#    capture style answered with the man "remains still". The style sentence therefore sits
+#    at the END, after the action has claimed the word budget.
+# 5. GROUNDING ON THE STATIC CAPTION stops the two paragraphs contradicting each other
+#    (ungrounded, it invented hip motion on a hand-motion frame; grounded on a static half
+#    that says "holding his penis with both hands", the motion kept the hands).
+# ---------------------------------------------------------------------------------------
+
+MOTION_BASE = (
+    "Write a text-to-video prompt for a 10-second clip that begins with this exact frame. "
+    "The main action implied by the frame begins and continues throughout the clip. "
+    "Describe the action in explicit physical direction and amplitude: who moves, in which "
+    "direction (toward or away from the other person, deeper or shallower, up and down, "
+    "hips rocking in or out), how far and how fast, and how the rhythm changes over the ten "
+    "seconds. Cover how each person's body follows the motion - arching back, head tilting, "
+    "hands repositioning, gripping - and how expressions and eye contact evolve. Add "
+    "secondary motion: hair sway, skin, fabric stretching. "
+)
+
+MOTION_TAIL = (
+    " Single continuous shot, no cuts, no scene change. Do not hedge with 'remains still' "
+    "or 'slight shift' unless a person genuinely is static. One flowing paragraph, under "
+    "110 words, starting with the main subject."
+)
+
+#: Capture-style sentence, spliced in before the tail. Measured: a style preset changes the
+#: flavour of the output without stealing word budget from the action when it sits at the
+#: end ("none" exists for exactly that reason).
+MOTION_STYLE_PRESETS: dict[str, str] = {
+    # The house style for this material: consumer-cam realism.
+    "handheld": ("Render it as handheld footage with natural micro-shake and small "
+                 "reflexive reframing. "),
+    "amateur": ("Render it as amateur consumer-camera footage: micro-shake, available "
+                "indoor light, no cinematic polish. "),
+    "cinematic": ("Render it as cinematic footage: slow controlled push-in, shallow depth "
+                  "of field, filmic color. "),
+    "static": "Camera locked off on a tripod, no movement at all. ",
+    # No sentence at all — the model's own default, and the option that leaves the most
+    # words for the action.
+    "none": "",
+}
+MOTION_DEFAULT_STYLE = "handheld"
+
+#: Identity lock + the LTX-2.3 audio half. The soundscape sentence is free signal: LTX 2.3
+#: renders synced sound, and "soft gasps and moans, room tone" is promptable.
+MOTION_GROUNDING = "Keep both people's faces, bodies and wardrobe exactly as in the frame for the whole clip. End with one sentence on the soundscape over the ten seconds."
+
+
+def motion_instruction_for(style: str, custom: str = "", scene: str = "") -> str:
+    """The motion instruction, grounded on the static caption when one is given.
+
+    Same custom-wins rule as instruction_for: a non-empty custom instruction is the whole
+    prompt, grounding and all. Appending the identity lock to it would not be an escape
+    hatch, it would be a second opinion about a decision the caller already made.
+
+    `scene` is the static caption from the first call of the same session; it anchors
+    identity and wardrobe so the motion paragraph cannot contradict what the person just
+    read and accepted.
+    """
+    if custom and custom.strip():
+        return custom.strip()
+    style_sentence = MOTION_STYLE_PRESETS.get(style,
+                                              MOTION_STYLE_PRESETS[MOTION_DEFAULT_STYLE])
+    prompt = MOTION_BASE + style_sentence + MOTION_TAIL
+    if scene and scene.strip():
+        prompt = (f"Scene: {scene.strip()}\n\n{prompt}\n\n{MOTION_GROUNDING} "
+                  "Do not restate the scene description.")
+    return prompt
+
+
+async def describe_motion(image_bytes: bytes, scene_description: str, style: str,
+                          custom: str = "", base_url: str | None = None) -> tuple[str, str]:
+    """The motion paragraph for an image, grounded on its static caption.
+
+    Returns (motion, instruction_used) — same provenance rule as the static caption: the
+    row must say how each half was made. Raises CaptionError; callers treat that as
+    non-fatal to the static half.
+    """
+    instruction = motion_instruction_for(style, custom, scene_description)
+    return await describe(image_bytes, instruction, base_url), instruction
+
+
 def image_key(image_bytes: bytes, instruction: str) -> str:
     """Cache key: the image AND the instruction that will be applied to it.
 
