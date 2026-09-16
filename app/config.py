@@ -37,12 +37,12 @@ class Settings(BaseSettings):
     image_description_model: str = Field(
         "qwen2.5vl:7b-q4_K_M",
         validation_alias=AliasChoices("image_description_model", "joycaption_model"))
-    # Long, on purpose (#326). The 2070 measured: qwen2.5vl cold load is ~3 minutes of the
-    # 8 GB card, and a warm caption is 15-50 s. JoyCaption's 5s existed to hand the card
-    # back to A1111 (gone) between near-instant captions; with a 3-minute load, 5s would
-    # make every caption pay for the load. 15m keeps the model resident across a tagging
-    # session. The ComfyUI dev install on this box does not fit beside it — see the risk
-    # note in wanly-api#326.
+    # Long, on purpose (#326). A cold qwen2.5vl load on the 2070 is ~3 minutes and a warm
+    # CPU caption is 15-50 s, so 5s would make every caption pay for the load. Production
+    # currently pins 5s by env because the deployment is back on joycaption:beta-one, whose
+    # GPU load is ~3 s and which must yield the 8 GB card to A1111 (sd.service) promptly.
+    # The ComfyUI dev install on this box does not fit beside the 15m residency — see the
+    # runtime record in wanly-api#326.
     image_description_keep_alive: str = Field(
         "15m", validation_alias=AliasChoices("image_description_keep_alive", "joycaption_keep_alive"))
     # A cold qwen2.5vl caption (load included) measured 185-265 s on the 2070; a grounded
@@ -51,6 +51,14 @@ class Settings(BaseSettings):
     # a request open forever.
     image_description_timeout_s: int = Field(
         600, validation_alias=AliasChoices("image_description_timeout_s", "joycaption_timeout_s"))
+    # The motion half of a description (#326) is an env kill-switch, and it exists because
+    # the 2070's 8 GB cannot GPU-run qwen2.5vl:7b: measured with the card empty at 2048 ctx,
+    # ollama offloads 1/29 layers and the model runs 100% CPU at 0.3-5 tok/s — a caption
+    # takes minutes, and ~13 GB of system RAM the box does not have while A1111 holds a
+    # checkpoint. With a JoyCaption-class model on the card the motion prompt is answered by
+    # a model that cannot do it, producing plausible junk persisted as authoritative. Flip
+    # this back to true when the captioner model can actually do the motion half.
+    motion_caption_enabled: bool = True
     # Automatic1111 on the same 2070, so a caption can ask it for the card back.
     #
     # The keep_alive above makes JoyCaption yield to A1111. Nothing made A1111 yield back,

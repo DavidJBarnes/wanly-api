@@ -225,6 +225,74 @@ class TestMotionHalf:
         assert "handheld" in p
 
 
+class TestMotionKillSwitch:
+    """MOTION_CAPTION_ENABLED=false: the motion call is not made at all (#326).
+
+    The flag exists because joycaption on the 2070 will answer the motion prompt with
+    plausible junk, and a persisted half is exactly as authoritative as a real one. The
+    response must therefore read "no motion half, no failure" — not an error and not an
+    empty paragraph.
+    """
+
+    def _pair(self, db, monkeypatch, enabled, calls):
+        from app.config import settings
+        from app.routes import captions
+
+        monkeypatch.setattr(settings, "motion_caption_enabled", enabled)
+
+        async def fake_describe(image, instruction, base_url=None):
+            calls.append("static")
+            return "a woman on a sofa"
+
+        async def fake_motion(image, scene, style, custom="", base_url=None):
+            calls.append("motion")
+            return "she leans back", "the motion instruction"
+
+        async def fake_busy(db):
+            return None
+
+        async def fake_base(db, interactive):
+            return "http://captioner.test:11434"
+
+        monkeypatch.setattr(captions, "describe", fake_describe)
+        monkeypatch.setattr(captions, "describe_motion", fake_motion)
+        monkeypatch.setattr(captions, "busy_render_beside_the_captioner", fake_busy)
+        monkeypatch.setattr(captions, "_get_all_settings",
+                            lambda db: _empty_settings())
+
+    @pytest.mark.asyncio
+    async def test_disabled_skips_the_motion_call(self, db, monkeypatch):
+        from app.routes.captions import caption_image_pair
+
+        calls = []
+        self._pair(db, monkeypatch, enabled=False, calls=calls)
+        pair = await caption_image_pair(db, b"png")
+        assert calls == ["static"], "the motion call fired against the flag"
+        assert pair.motion is None
+        assert pair.motion_error is None, "a disabled feature must not look like a failure"
+
+    @pytest.mark.asyncio
+    async def test_enabled_makes_the_motion_call(self, db, monkeypatch):
+        from app.routes.captions import caption_image_pair
+
+        calls = []
+        self._pair(db, monkeypatch, enabled=True, calls=calls)
+        pair = await caption_image_pair(db, b"png")
+        assert calls == ["static", "motion"]
+        assert pair.motion == "she leans back"
+
+    def test_the_flag_defaults_to_enabled(self):
+        from app.config import Settings
+
+        assert Settings(_env_file=None).motion_caption_enabled is True
+
+
+async def _empty_settings():
+    return {"caption_style": "standard", "caption_instruction": "",
+            "motion_style": "handheld", "motion_instruction": "",
+            "negative_prompt": ""}
+
+
 class TestMoveCarriesTheRow:
     """A move used to drop the row, and with it the tags. Survivable for a tag; not for a
     description that cost GPU time and cannot be reproduced word for word."""

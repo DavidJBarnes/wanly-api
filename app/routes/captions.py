@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import s3
 from app.auth import get_current_user
+from app.config import settings
 from app.database import get_db
 from app.joycaption import (CaptionError, CaptionerBusy, busy_render_beside_the_captioner,
                             captioner_for, describe, describe_motion, instruction_for)
@@ -102,6 +103,13 @@ async def caption_image_pair(db: AsyncSession, image: bytes,
         instruction = instruction_for(style or cfg.get("caption_style", ""),
                                       cfg.get("caption_instruction", ""))
     scene = await describe(image, instruction, base_url=base)
+
+    # Kill-switch (#326): with a captioner whose model cannot do the motion half
+    # (joycaption on the 2070 answers the directional prompt with plausible junk), the
+    # motion call is skipped and motion stays None WITHOUT an error — an absent section,
+    # not a failure, and the lightbox renders it that way.
+    if not settings.motion_caption_enabled:
+        return ScenePair(scene=scene, scene_instruction=instruction)
 
     custom = (motion_instruction if motion_instruction is not None
               else cfg.get("motion_instruction", ""))
