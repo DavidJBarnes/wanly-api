@@ -16,7 +16,7 @@ from app.database import get_db
 from app.joycaption import CaptionError
 from app.enums import TRAINING_TERMINAL
 from app.models import Dataset, Favorite, ImageMeta, Job, Segment, TrainingJob, User
-from app.routes.captions import caption_image_bytes
+from app.routes.captions import caption_image_pair
 from app.schemas.images import ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate
 from app.tag_filter import like_escape
 from app.tag_filter import tag_clause as _tag_clause
@@ -54,7 +54,8 @@ async def _meta_by_path(db: AsyncSession, paths: list[str]) -> dict[str, dict]:
         return {}
     rows = (await db.execute(
         select(ImageMeta.path, ImageMeta.tags,
-               ImageMeta.scene_description, ImageMeta.scene_described_at)
+               ImageMeta.scene_description, ImageMeta.scene_described_at,
+               ImageMeta.motion_description, ImageMeta.motion_described_at)
         .where(ImageMeta.path.in_(paths))
     )).all()
     return {
@@ -62,12 +63,15 @@ async def _meta_by_path(db: AsyncSession, paths: list[str]) -> dict[str, dict]:
             "tags": row[1] or None,
             "scene_description": row[2] or None,
             "scene_described_at": row[3],
+            "motion_description": row[4] or None,
+            "motion_described_at": row[5],
         }
         for row in rows
     }
 
 
-_NO_META = {"tags": None, "scene_description": None, "scene_described_at": None}
+_NO_META = {"tags": None, "scene_description": None, "scene_described_at": None,
+            "motion_description": None, "motion_described_at": None}
 
 
 def _meta_fields(meta) -> dict:
@@ -433,6 +437,9 @@ async def move_images(body: dict, db: AsyncSession = Depends(get_db)):
             scene_description=meta.scene_description,
             scene_instruction=meta.scene_instruction,
             scene_described_at=meta.scene_described_at,
+            motion_description=meta.motion_description,
+            motion_instruction=meta.motion_instruction,
+            motion_described_at=meta.motion_described_at,
         ))
         await db.delete(meta)
     await db.commit()
@@ -578,14 +585,21 @@ async def update_image_tags(
 # ---------------------------------------------------------------------------------------
 
 
-def _scene_response(path: str, meta: ImageMeta | None) -> ImageSceneResponse:
+def _scene_response(path: str, meta: ImageMeta | None,
+                    motion_error: str | None = None) -> ImageSceneResponse:
     description = (meta.scene_description if meta else None) or None
+    motion = (meta.motion_description if meta else None) or None
     return ImageSceneResponse(
         path=path,
         scene_description=description,
         scene_instruction=(meta.scene_instruction if meta else None) or None,
         scene_described_at=meta.scene_described_at if meta else None,
         words=len(description.split()) if description else 0,
+        motion_description=motion,
+        motion_instruction=(meta.motion_instruction if meta else None) or None,
+        motion_described_at=meta.motion_described_at if meta else None,
+        motion_words=len(motion.split()) if motion else 0,
+        motion_error=motion_error,
     )
 
 
@@ -644,15 +658,16 @@ async def describe_image_scene(
         raise HTTPException(status_code=404, detail=f"could not read {path}: {e}") from e
 
     try:
-        caption, instruction = await caption_image_bytes(
-            db, image, style=body.style, instruction=body.instruction)
+        pair = await caption_image_pair(
+            db, image, style=body.style, instruction=body.instruction,
+            motion_style=body.motion_style, motion_instruction=body.motion_instruction)
     except CaptionError as e:
         # 503, as /captions/describe does: the captioner being down is a temporary condition
         # on another host, not a bug in this request. "Try again" is honest advice.
         logger.warning("scene description failed for %s: %s", path, e)
         raise HTTPException(status_code=503, detail=str(e)) from e
 
-    caption = caption.strip()
+    caption = pair.scene.strip()
     if not caption:
         # A blank caption is a failure wearing a success's clothes. Storing it would mark the
         # image described and stop anything ever asking again.
@@ -663,13 +678,20 @@ async def describe_image_scene(
     if meta is None:
         meta = ImageMeta(path=path)
         db.add(meta)
+    now = datetime.now(timezone.utc)
     meta.scene_description = caption
-    meta.scene_instruction = instruction
-    meta.scene_described_at = datetime.now(timezone.utc)
+    meta.scene_instruction = pair.scene_instruction
+    meta.scene_described_at = now
+    # Both halves always come from the same call, so an absent motion half clears any
+    # previous one: motion from an old session would pair, invisibly, with a static half
+    # from this one.
+    meta.motion_description = (pair.motion or "").strip() or None
+    meta.motion_instruction = pair.motion_instruction
+    meta.motion_described_at = now if pair.motion else None
     await db.commit()
     await db.refresh(meta)
 
-    return _scene_response(path, meta)
+    return _scene_response(path, meta, motion_error=pair.motion_error)
 
 
 def search_pattern(q: str) -> str:

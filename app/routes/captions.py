@@ -7,6 +7,7 @@ _resolve_trigger already documents for <TRIGGER>.
 """
 import asyncio
 import logging
+from dataclasses import dataclass
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,13 +16,34 @@ from app import s3
 from app.auth import get_current_user
 from app.database import get_db
 from app.joycaption import (CaptionError, CaptionerBusy, busy_render_beside_the_captioner,
-                            captioner_for, describe, instruction_for)
+                            captioner_for, describe, describe_motion, instruction_for)
 from app.models import User
 from app.routes.app_settings import _get_all_settings
 from app.schemas.captions import CaptionRequest, CaptionResponse
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+
+async def _caption_base(db: AsyncSession, interactive: bool) -> str:
+    """Where to send a caption, refusing if the sharing box is rendering.
+
+    THE CAPTIONER SHARES A CARD WITH A RENDER WORKER (wanly-gpu-docker#83). Loading the
+    vision model beside a 720p render OOMs one of them. While the box is rendering an
+    interactive caption goes to the fallback captioner when one is configured, and is
+    otherwise refused with the box's name. Claim-time <SCENE> resolution passes
+    interactive=False and prefers the fallback outright: the claiming box is about to load
+    the render. See captioner_for.
+    """
+    busy = await busy_render_beside_the_captioner(db) if interactive else None
+    base = captioner_for(busy, interactive)
+    if base is None:
+        raise CaptionerBusy(
+            f"{busy} is rendering, and the captioner shares its GPU. "
+            f"Try again when the render finishes.")
+    if busy:
+        logger.info("%s is rendering; captioning on the fallback captioner %s", busy, base)
+    return base
 
 
 async def caption_image_bytes(db: AsyncSession, image: bytes,
@@ -34,25 +56,64 @@ async def caption_image_bytes(db: AsyncSession, image: bytes,
     described, not just what was said. A caption written under "terse" and one written under
     "rich" are different artefacts, and a rated panel should be able to tell them apart.
     """
-    # THE CAPTIONER SHARES A CARD WITH A RENDER WORKER (wanly-gpu-docker#83). Loading the
-    # vision model beside a 720p render OOMs one of them. While the box is rendering an
-    # interactive caption goes to the fallback captioner (the 2070's) when one is
-    # configured, and is otherwise refused with the box's name. Claim-time <SCENE>
-    # resolution passes interactive=False and prefers the fallback outright: the claiming
-    # box is about to load the render. See captioner_for.
-    busy = await busy_render_beside_the_captioner(db) if interactive else None
-    base = captioner_for(busy, interactive)
-    if base is None:
-        raise CaptionerBusy(
-            f"{busy} is rendering, and the captioner shares its GPU. "
-            f"Try again when the render finishes.")
-    if busy:
-        logger.info("%s is rendering; captioning on the fallback captioner %s", busy, base)
+    base = await _caption_base(db, interactive)
     if instruction is None:
         cfg = await _get_all_settings(db)
         instruction = instruction_for(style or cfg.get("caption_style", ""),
                                       cfg.get("caption_instruction", ""))
     return await describe(image, instruction, base_url=base), instruction
+
+
+@dataclass
+class ScenePair:
+    """What one describe call produced. Motion None + error set is a partial success.
+
+    A plain tuple of five was rejected: two of the four strings are instructions and a swap
+    is invisible at the call site and in the response.
+    """
+    scene: str
+    scene_instruction: str
+    motion: str | None = None
+    motion_instruction: str | None = None
+    motion_error: str | None = None
+
+
+async def caption_image_pair(db: AsyncSession, image: bytes,
+                             style: str | None = None,
+                             instruction: str | None = None,
+                             motion_style: str | None = None,
+                             motion_instruction: str | None = None,
+                             interactive: bool = True) -> ScenePair:
+    """Caption bytes twice: the static scene, then the motion half grounded on it.
+
+    Two sequential Ollama calls, not one combined one: the combined-call motion half
+    measurably degraded in the #326 prototype, and two calls keep per-output instruction
+    provenance the way the static half already has it. Both calls go to the same captioner
+    in the same keep_alive window, so the model is warm for the second one.
+
+    A motion failure is NOT this call's failure. The static half is what <SCENE> consumes
+    today and what claim-time resolution reuses; a captioner hiccup on the second call must
+    not throw away the first (the ticket's partial-failure rule). The caller persists what
+    came back and surfaces the gap.
+    """
+    base = await _caption_base(db, interactive)
+    cfg = await _get_all_settings(db)
+    if instruction is None:
+        instruction = instruction_for(style or cfg.get("caption_style", ""),
+                                      cfg.get("caption_instruction", ""))
+    scene = await describe(image, instruction, base_url=base)
+
+    custom = (motion_instruction if motion_instruction is not None
+              else cfg.get("motion_instruction", ""))
+    try:
+        motion, motion_instr = await describe_motion(
+            image, scene, style=motion_style or cfg.get("motion_style", ""),
+            custom=custom, base_url=base)
+    except CaptionError as e:
+        logger.warning("motion caption failed (static half kept): %s", e)
+        return ScenePair(scene=scene, scene_instruction=instruction, motion_error=str(e))
+    return ScenePair(scene=scene, scene_instruction=instruction,
+                     motion=motion, motion_instruction=motion_instr)
 
 
 @router.post("/captions/describe", response_model=CaptionResponse)

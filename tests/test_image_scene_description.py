@@ -143,13 +143,96 @@ class TestGetEndpoint:
         assert body["words"] == 5
 
 
+class TestMotionHalf:
+    """#326: the describe call produces a motion half, and losing it is survivable."""
+
+    @pytest.mark.asyncio
+    async def test_both_halves_are_stored_and_returned(self, db):
+        resp = await _post_scene(db, PATH, caption="a woman on a sofa",
+                                 motion="she leans back slowly, her hair swaying")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["motion_description"] == "she leans back slowly, her hair swaying"
+        assert body["motion_words"] == 7
+        assert body["motion_described_at"] is not None
+        assert body["motion_error"] is None
+
+        meta = await db.get(ImageMeta, PATH)
+        assert meta.motion_description == "she leans back slowly, her hair swaying"
+        assert meta.motion_instruction
+
+    @pytest.mark.asyncio
+    async def test_a_motion_failure_keeps_the_static_half(self, db):
+        """The ticket's partial-failure rule: <SCENE> consumes the static half today; a
+        hiccup on the second call must not throw away the first."""
+        resp = await _post_scene(db, PATH, caption="a woman on a sofa",
+                                 motion_error="captioner unreachable")
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["scene_description"] == "a woman on a sofa"
+        assert body["motion_description"] is None
+        assert body["motion_error"] == "captioner unreachable"
+
+        meta = await db.get(ImageMeta, PATH)
+        assert meta.scene_description == "a woman on a sofa"
+        assert meta.motion_description is None
+        assert meta.motion_described_at is None
+
+    @pytest.mark.asyncio
+    async def test_a_motion_reroll_replaces_only_the_motion(self, db):
+        await _post_scene(db, PATH, caption="first", motion="motion one")
+        await _post_scene(db, PATH, caption="second", motion="motion two")
+
+        meta = await db.get(ImageMeta, PATH)
+        assert meta.motion_description == "motion two"
+        assert meta.scene_description == "second"
+
+    @pytest.mark.asyncio
+    async def test_an_absent_motion_clears_the_previous_one(self, db):
+        """Both halves always come from the same call. Keeping motion from an old session
+        beside a static half from this one would pair words minutes apart with words
+        produced months apart, invisibly."""
+        await _post_scene(db, PATH, caption="first", motion="motion one")
+        await _post_scene(db, PATH, caption="second")  # motion call failed
+
+        meta = await db.get(ImageMeta, PATH)
+        assert meta.motion_description is None
+        assert meta.motion_described_at is None
+
+    @pytest.mark.asyncio
+    async def test_a_row_holding_only_a_motion_caption_is_not_empty(self):
+        meta = ImageMeta(path=PATH, motion_description="she leans back")
+        assert not meta.is_empty()
+
+    def test_the_motion_prompt_grounds_on_the_scene(self):
+        from app.joycaption import motion_instruction_for
+
+        p = motion_instruction_for("handheld", "", "A woman on a sofa.")
+        assert p.startswith("Scene: A woman on a sofa.")
+        assert "handheld" in p
+        assert "remains still" in p  # the anti-hedge clause, measured necessary
+
+    def test_a_custom_motion_instruction_wins_entirely(self):
+        from app.joycaption import motion_instruction_for
+
+        p = motion_instruction_for("handheld", "my own words", "A woman on a sofa.")
+        assert p == "my own words"
+
+    def test_unknown_style_falls_back_to_the_default_preset(self):
+        from app.joycaption import motion_instruction_for
+
+        p = motion_instruction_for("not-a-style")
+        assert "handheld" in p
+
+
 class TestMoveCarriesTheRow:
     """A move used to drop the row, and with it the tags. Survivable for a tag; not for a
     description that cost GPU time and cannot be reproduced word for word."""
 
     @pytest.mark.asyncio
     async def test_the_description_follows_the_object(self, db):
-        db.add(ImageMeta(path=PATH, tags="Kelly", scene_description="a woman on a sofa"))
+        db.add(ImageMeta(path=PATH, tags="Kelly", scene_description="a woman on a sofa",
+                         motion_description="she leans back"))
         await db.flush()
 
         resp = await _move(db, ["2026-09-05/00001.png"], "2026-09-06")
@@ -160,6 +243,8 @@ class TestMoveCarriesTheRow:
         assert moved is not None
         assert moved.tags == "Kelly"
         assert moved.scene_description == "a woman on a sofa"
+        # #326: the motion half cost the same GPU session and must not be dropped by a move.
+        assert moved.motion_description == "she leans back"
 
     @pytest.mark.asyncio
     async def test_an_image_with_no_row_moves_without_inventing_one(self, db):
@@ -203,12 +288,23 @@ async def _get_scene(db, path):
         app.dependency_overrides.clear()
 
 
-async def _post_scene(db, path, caption=None, error=None):
+async def _post_scene(db, path, caption=None, error=None, motion=None, motion_error=None):
+    """POST /images/scene with S3 and the captioner patched out.
+
+    #326: the route calls caption_image_pair, which returns the static half and the motion
+    half. A test that names only a static caption gets motion=None — the shape the real
+    endpoint produces when the motion call failed.
+    """
     client, app = await _client(db)
+    from app.routes.captions import ScenePair
+
+    pair = ScenePair(scene=caption or "", scene_instruction="an instruction",
+                     motion=motion,
+                     motion_instruction="a motion instruction" if motion else None,
+                     motion_error=motion_error)
     describe = (
-        patch("app.routes.images.caption_image_bytes", side_effect=error) if error
-        else patch("app.routes.images.caption_image_bytes",
-                   return_value=(caption, "an instruction"))
+        patch("app.routes.images.caption_image_pair", side_effect=error) if error
+        else patch("app.routes.images.caption_image_pair", return_value=pair)
     )
     try:
         with patch("app.routes.images.download_bytes", return_value=b"png"), describe:
