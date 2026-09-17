@@ -17,8 +17,8 @@ from app.joycaption import CaptionError
 from app.enums import TRAINING_TERMINAL
 from app.models import Dataset, Favorite, ImageMeta, Job, Segment, TrainingJob, User
 from app.routes.captions import caption_image_pair
-from app.schemas.images import ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate
-from app.tag_filter import like_escape
+from app.schemas.images import BulkImageTagsUpdate, ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate
+from app.tag_filter import like_escape, normalise_tag
 from app.tag_filter import tag_clause as _tag_clause
 from app.s3 import (
     delete_object,
@@ -573,6 +573,109 @@ async def update_image_tags(
 
     await db.commit()
     return {"path": path, "tags": tags_val}
+
+
+def _split_tags(blob: str | None) -> list[str]:
+    """Split a stored tag blob into its trimmed members, dropping empties."""
+    return [t.strip() for t in (blob or "").split(",") if t.strip()]
+
+
+@router.post("/images/tags", dependencies=[Depends(get_current_user)])
+async def bulk_update_image_tags(
+    body: BulkImageTagsUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """Add or remove the same tags across many images at once (console#517).
+
+    Server-side merge rather than a client loop over PATCH /images/tags: that endpoint
+    replaces the whole blob with what the browser last saw, so N read-modify-writes race
+    the lightbox and each other. Merging here, in one transaction, means dedupe runs
+    against the row as it is now, not as it was when the list was fetched.
+
+    Dedupe is normalise_tag (case- and space-insensitive), the same folding the search
+    clause uses — adding "Kelly" to a row already holding "kelly " must not create a
+    second chip for it.
+
+    Remove keeps the row when it still holds a description (the console#414 rule): the
+    row's primary key is the path and it carries GPU-produced captions, so "tags became
+    empty" only deletes it when is_empty() agrees.
+
+    All-or-nothing: a merged blob that would not fit the 500-char column refuses the whole
+    request with the offending paths, rather than half-tagging the selection.
+    """
+    bucket = settings.s3_images_bucket
+    bad = [p for p in body.paths if not p.startswith(f"s3://{bucket}/")]
+    if bad:
+        raise HTTPException(status_code=400, detail="Every path must be in the images bucket")
+
+    wanted = _split_tags(body.tags)
+    if not wanted:
+        raise HTTPException(status_code=400, detail="No usable tags provided")
+    # Dedupe the incoming set itself, first spelling wins: "Kelly, kelly" is one tag.
+    seen: set[str] = set()
+    new_tags: list[str] = []
+    for t in wanted:
+        key = normalise_tag(t)
+        if key and key not in seen:
+            seen.add(key)
+            new_tags.append(t)
+    if not new_tags:
+        raise HTTPException(status_code=400, detail="No usable tags provided")
+
+    metas = (await db.execute(
+        select(ImageMeta).where(ImageMeta.path.in_(body.paths))
+    )).scalars().all()
+    meta_map = {m.path: m for m in metas}
+
+    over_limit: list[str] = []
+    planned: dict[str, str | None] = {}
+    remove_keys = {normalise_tag(t) for t in new_tags}
+
+    for path in body.paths:
+        meta = meta_map.get(path)
+        existing = _split_tags(meta.tags if meta else None)
+        if body.mode == "add":
+            have = {normalise_tag(t) for t in existing}
+            merged = existing + [t for t in new_tags if normalise_tag(t) not in have]
+        else:
+            merged = [t for t in existing if normalise_tag(t) not in remove_keys]
+        merged_val = ", ".join(merged) if merged else None
+        if merged_val is not None and len(merged_val) > 500:
+            over_limit.append(path)
+            continue
+        planned[path] = merged_val
+
+    if over_limit:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Adding these tags would overflow the 500-character limit",
+                "paths": over_limit,
+            },
+        )
+
+    results = []
+    for path, merged_val in planned.items():
+        meta = meta_map.get(path)
+        if meta is None:
+            # "No row" means "never tagged" to the untagged view, so a remove that changes
+            # nothing must not create an empty row — only an add materialises one.
+            if merged_val is not None:
+                db.add(ImageMeta(path=path, tags=merged_val))
+                results.append({"path": path, "tags": merged_val, "changed": True})
+            else:
+                results.append({"path": path, "tags": None, "changed": False})
+            continue
+        before = _split_tags(meta.tags)
+        after = _split_tags(merged_val)
+        meta.tags = merged_val
+        if meta.is_empty():
+            await db.delete(meta)
+        results.append({"path": path, "tags": merged_val,
+                        "changed": before != after})
+
+    await db.commit()
+    return {"results": results, "mode": body.mode}
 
 
 # ---------------------------------------------------------------------------------------

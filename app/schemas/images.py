@@ -8,6 +8,19 @@ class ImageTagsUpdate(BaseModel):
     tags: Optional[str] = Field(None, max_length=500, description="Comma-separated tags")
 
 
+class BulkImageTagsUpdate(BaseModel):
+    """Apply the same tag set to many images at once (console#517).
+
+    mode "add" merges the tags into each image's existing string; mode "remove" drops every
+    whole-tag match. Both dedupe through tag_filter.normalise_tag on the server, which the
+    per-image PATCH cannot do — it replaces the whole blob from what the browser last saw.
+    """
+
+    paths: list[str] = Field(..., min_length=1, description="s3:// URIs in the images bucket")
+    tags: str = Field(..., min_length=1, max_length=500, description="Comma-separated tags")
+    mode: str = Field("add", pattern="^(add|remove)$")
+
+
 class ImageSceneRequest(BaseModel):
     """Describe this image now. Both "first description" and "re-roll" are this call.
 
