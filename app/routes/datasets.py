@@ -176,7 +176,11 @@ async def delete_dataset(
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
     if purge and ds.prefix:
-        await asyncio.to_thread(s3.delete_prefix, settings.s3_images_bucket, ds.prefix + "/")
+        # Positional order is (prefix, bucket) — the other three call sites pass it that way.
+        # Swapping them makes botocore reject the PREFIX as an invalid bucket name, which is
+        # how every purge-delete 500'd: a legacy prefix like "dataset-test-faces" is not a
+        # bucket.
+        await asyncio.to_thread(s3.delete_prefix, ds.prefix + "/", settings.s3_images_bucket)
     await db.delete(ds)
     await db.commit()
 
