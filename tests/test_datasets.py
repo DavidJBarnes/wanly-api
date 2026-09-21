@@ -113,6 +113,37 @@ class TestUploadSemantics:
         src = inspect.getsource(mod.delete_dataset)
         assert "purge" in src and "if purge" in src
 
+    async def test_a_purge_deletes_the_prefix_not_a_bucket_named_after_the_prefix(self):
+        """Every purge delete 500'd: the call site passed (bucket, prefix) into
+        s3.delete_prefix(prefix, bucket), so botocore validated the PREFIX as a bucket name
+        and raised ParamValidationError — for a legacy name-keyed prefix like
+        "dataset-test-faces" that is not a valid bucket at all. The fake asserts the
+        positional contract the three other call sites already honour."""
+        from unittest.mock import patch
+        from app import s3
+        from app.config import settings
+        from app.routes import datasets as mod
+
+        ds = Dataset(id=uuid.uuid4(), name="Me", prefix="dataset-test-faces", images=[])
+        calls = []
+
+        def fake_delete_prefix(prefix, bucket):
+            calls.append((prefix, bucket))
+            return 0
+
+        class FakeDb:
+            async def get(self, model, _id):
+                return ds
+            async def delete(self, row):
+                pass
+            async def commit(self):
+                pass
+
+        with patch.object(s3, "delete_prefix", fake_delete_prefix):
+            await mod.delete_dataset(ds.id, purge=True, _user=None, db=FakeDb())
+
+        assert calls == [(ds.prefix + "/", settings.s3_images_bucket)]
+
     def test_renaming_does_not_move_the_prefix(self):
         """A finished training job's dataset_images point at the old keys."""
         import inspect
