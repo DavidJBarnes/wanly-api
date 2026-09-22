@@ -80,16 +80,34 @@ router = APIRouter()
 
 
 SCENE_PLACEHOLDER = "<SCENE>"
+MOTION_PLACEHOLDER = "<MOTION>"
+
+# Both caption placeholders, matched in one non-rescanning pass (see _resolve_scene).
+_CAPTION_PLACEHOLDERS = re.compile(
+    "|".join(re.escape(p) for p in (SCENE_PLACEHOLDER, MOTION_PLACEHOLDER)))
 
 
 async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
                          *, final: bool = False) -> str:
-    """Fill a pose's <SCENE> with a description of the frame this segment starts from.
+    """Fill a pose's <SCENE>/<MOTION> from the frame this segment starts from.
 
     Recipes are start-frame-agnostic by design — one pose serves every character — so their
     static half is a generic guess about an image they have never seen. A validated pose
     reads "a woman kneeling in front of a nude man" while the actual start frame is a
-    clothed woman sitting on a sofa. <SCENE> lets the pose defer that half to the frame.
+    clothed woman sitting on a sofa. <SCENE> lets the pose defer that half to the frame;
+    <MOTION> (wanly-api#335) defers the OTHER half — the frame read as the first frame of a
+    ten-second clip, which is what the video model actually wants.
+
+    THE TWO HALVES RESOLVE DIFFERENTLY, and the difference is the whole of #335.
+      * <SCENE> is live-captioned: on a cache miss it asks the captioner for the frame,
+        because a person reviewed that flow and a static caption is cheap (1.2-4.5s).
+      * <MOTION> is CACHE-ONLY. It fills from ImageMeta.motion_description and, on a miss,
+        defers to the claim and then drops — it NEVER triggers a caption call. Three reasons,
+        each sufficient: the daemon's claim poll has a 10s HTTP timeout and a warm motion
+        caption is ~50s (it would cost the claim); production runs MOTION_CAPTION_ENABLED=false
+        because the 2070's captioner cannot answer the directional prompt at all; and the
+        paragraph's value is that a person read it in the lightbox — a fresh claim-time
+        caption would render words nobody saw, which is what #427's cache test exists to stop.
 
     ORDER: this runs AFTER _resolve_wildcards, the opposite of _resolve_trigger, and the
     reason is the caption text. A caption is model output that may contain bracketed tokens,
@@ -97,68 +115,119 @@ async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
     the caption is never re-scanned.
 
     That ordering removes the protection _resolve_trigger gets for free — a wildcard named
-    SCENE would be substituted before we ever look — so SCENE is RESERVED in the wildcard
-    routes. For <TRIGGER> the reservation is belt-and-braces; here it is the only guard.
+    SCENE would be substituted before we ever look — so SCENE and MOTION are RESERVED in the
+    wildcard routes. For <TRIGGER> the reservation is belt-and-braces; here it is the only
+    guard.
+
+    BOTH PLACEHOLDERS ARE FILLED IN A SINGLE PASS. re.sub does not rescan what it inserted,
+    so words put in for one half can never be picked up as the other half's placeholder — a
+    static caption that happened to contain the literal string "<MOTION>" stays words rather
+    than becoming a second substitution. Same principle as _resolve_wildcards_outside_scene,
+    pointed the other way.
 
     FAILURE INVERTS FROM <TRIGGER>. _resolve_trigger deliberately leaves the literal
     placeholder when it cannot resolve, because silently dropping the token that anchors the
     character LoRA is worse and harder to notice. Here the reasoning flips: a literal
-    "<SCENE>" is garbage tokens fed to the text encoder, while dropping it leaves a valid if
-    generic prompt. So it is dropped, and the drop is logged.
+    "<SCENE>"/"<MOTION>" is garbage tokens fed to the text encoder, while dropping it leaves a
+    valid if generic prompt. So an unresolved placeholder is dropped, and the drop is logged.
 
     `final` is which of the two resolution points this is. At SUBMIT (final=False) a missing
-    image means "not yet" — a continuation is routinely created before the segment it
-    follows has rendered — so the placeholder survives for the claim to resolve. At CLAIM
-    (final=True) the start image is as known as it will ever be, so an unresolved
-    placeholder is dropped rather than shipped to the encoder.
+    image means "not yet" — a continuation is routinely created before the segment it follows
+    has rendered — so a placeholder survives for the claim to resolve. At CLAIM (final=True)
+    the start image is as known as it will ever be, so an unresolved placeholder is dropped
+    rather than shipped to the encoder. MOTION defers on a miss even when an image is known,
+    because the claim is the last moment the console's describe dialog could still have
+    filled it, and deferring costs nothing a caption-only placeholder does not pay.
     """
     # Before anything else: a prompt may arrive with a region the console filled and failed
     # to strip, and the words inside it are the scene — there is nothing left to resolve.
     prompt = _unwrap_scene(prompt)
 
-    if SCENE_PLACEHOLDER not in prompt:
+    needs_scene = SCENE_PLACEHOLDER in prompt
+    needs_motion = MOTION_PLACEHOLDER in prompt
+    if not needs_scene and not needs_motion:
         return prompt
 
-    if not image_uri:
+    scene_text: str | None = None
+    motion_text: str | None = None
+
+    # <MOTION> first: a pure cache read, keyed on the frame, no captioner regardless of what
+    # else the prompt needs. On a miss it stays None and is kept literal (deferred) or dropped
+    # below depending on `final`.
+    if needs_motion and image_uri:
+        motion_text = await _cached_motion(db, image_uri)
+
+    if needs_scene:
+        if not image_uri:
+            if final:
+                # Last responsible moment and still no image: a text-to-video segment, or a
+                # continuation whose predecessor produced no last frame. Nothing to describe;
+                # the scene is dropped below. MOTION has no frame to key on either, so if it
+                # was wanted it is deferred (submit) or dropped (claim) alongside.
+                logger.info("Dropping %s: no start image to describe", SCENE_PLACEHOLDER)
+            else:
+                # A continuation submitted before its predecessor has rendered. The frame it
+                # will start from does not exist yet, so BOTH placeholders are LEFT IN PLACE
+                # and resolved at claim time, when the previous segment's last frame is known.
+                #
+                # Dropping here would be unrecoverable: the placeholder would be gone from the
+                # stored prompt and no later step could tell a description was ever wanted.
+                # Continuations are the case this feature helps most — they condition on a
+                # generated frame nobody has ever described — so losing them silently is the
+                # worst available outcome.
+                logger.info("Deferring caption placeholders: start image not known until claim")
+                return prompt
+        else:
+            # The frame may already have been described — by the person who tagged it, by the
+            # Next Segment dialog opening, or by an earlier claim (console#414, #438). Reusing
+            # those words costs a SELECT instead of 1.2-4.5s on the 2070, and it means the
+            # render uses the description that was actually shown rather than a fresh one.
+            scene_text = await _cached_scene(db, image_uri)
+            if scene_text:
+                logger.info("Resolved %s from %s (saved description)",
+                            SCENE_PLACEHOLDER, image_uri)
+            else:
+                try:
+                    image = await asyncio.to_thread(s3.download_bytes, image_uri)
+                    scene_text, instruction = await caption_image_bytes(db, image, interactive=False)
+                except Exception as e:
+                    # Never fatal. A captioner that is down must not stop a render — the pose
+                    # still has its arc, and a generic scene is what every pose used before
+                    # this existed. scene_text stays None and the placeholder is dropped below.
+                    logger.warning("Dropping %s: could not describe %s (%s)",
+                                   SCENE_PLACEHOLDER, image_uri, e)
+                    scene_text = None
+                else:
+                    await _save_scene(db, image_uri, scene_text, instruction)
+                    logger.info("Resolved %s from %s: %r",
+                                SCENE_PLACEHOLDER, image_uri, scene_text[:80])
+
+    # Single non-rescanning fill. A token whose words are in hand becomes them; a token still
+    # without words stays literal here and is dealt with next.
+    def fill(m: re.Match) -> str:
+        text = scene_text if m.group(0) == SCENE_PLACEHOLDER else motion_text
+        return text if text is not None else m.group(0)
+
+    out = _CAPTION_PLACEHOLDERS.sub(fill, prompt)
+
+    if scene_text is None and SCENE_PLACEHOLDER in out:
+        out = _drop_scene(out)
+    # MOTION drops only at the claim. At submit a miss defers: the console may still describe
+    # the frame before it is claimed, and a literal placeholder in a stored prompt is exactly
+    # what the claim gate knows how to finish.
+    if motion_text is None and MOTION_PLACEHOLDER in out:
         if final:
-            # Last responsible moment and still no image: a text-to-video segment, or a
-            # continuation whose predecessor produced no last frame. Nothing to describe.
-            logger.info("Dropping %s: no start image to describe", SCENE_PLACEHOLDER)
-            return _drop_scene(prompt)
-        # A continuation submitted before its predecessor has rendered. The frame it will
-        # start from does not exist yet, so the placeholder is LEFT IN PLACE and resolved at
-        # claim time, when the previous segment's last frame is known.
-        #
-        # Dropping it here instead would be unrecoverable: the placeholder would be gone
-        # from the stored prompt and no later step could tell that a description was ever
-        # wanted. Continuations are the case this feature helps most — they condition on a
-        # generated frame nobody has ever described — so losing them silently is the worst
-        # available outcome.
-        logger.info("Deferring %s: start image not known until claim", SCENE_PLACEHOLDER)
-        return prompt
-
-    # The frame may already have been described — by the person who tagged it, by the Next
-    # Segment dialog opening, or by an earlier claim (console#414, #438). Reusing those words
-    # costs a SELECT instead of 1.2-4.5s on the 2070, and it means the render uses the
-    # description that was actually shown rather than a fresh, different one.
-    cached = await _cached_scene(db, image_uri)
-    if cached:
-        logger.info("Resolved %s from %s (saved description)", SCENE_PLACEHOLDER, image_uri)
-        return prompt.replace(SCENE_PLACEHOLDER, cached)
-
-    try:
-        image = await asyncio.to_thread(s3.download_bytes, image_uri)
-        caption, instruction = await caption_image_bytes(db, image, interactive=False)
-    except Exception as e:
-        # Never fatal. A captioner that is down must not stop a render — the pose still has
-        # its arc, and a generic scene is what every pose used before this existed.
-        logger.warning("Dropping %s: could not describe %s (%s)",
-                       SCENE_PLACEHOLDER, image_uri, e)
-        return _drop_scene(prompt)
-
-    await _save_scene(db, image_uri, caption, instruction)
-    logger.info("Resolved %s from %s: %r", SCENE_PLACEHOLDER, image_uri, caption[:80])
-    return prompt.replace(SCENE_PLACEHOLDER, caption)
+            logger.info("Dropping %s: no saved motion description for %s",
+                        MOTION_PLACEHOLDER, image_uri)
+        else:
+            logger.info("Deferring %s: no saved motion description for %s yet",
+                        MOTION_PLACEHOLDER, image_uri)
+    if final:
+        # The last responsible moment: a literal token must not reach the encoder even one
+        # embedded inside inserted caption text, where a single-pass fill could not see it as
+        # a placeholder to replace. No-op unless a literal is actually present.
+        out = _drop_motion(_drop_scene(out))
+    return out
 
 
 def _is_describable(uri: str | None) -> bool:
@@ -186,6 +255,19 @@ async def _cached_scene(db: AsyncSession, image_uri: str) -> str | None:
         return None
     meta = await db.get(ImageMeta, image_uri)
     return (meta.scene_description or None) if meta else None
+
+
+async def _cached_motion(db: AsyncSession, image_uri: str) -> str | None:
+    """The saved motion paragraph for a frame — the ONLY source <MOTION> ever fills from.
+
+    Deliberately not a description-then-save like _cached_scene: see _resolve_scene. The row
+    is the same one the lightbox pair call wrote (wanly-api#326), so what renders is what was
+    reviewed.
+    """
+    if not _is_describable(image_uri):
+        return None
+    meta = await db.get(ImageMeta, image_uri)
+    return (meta.motion_description or None) if meta else None
 
 
 async def _save_scene(db: AsyncSession, image_uri: str, caption: str, instruction: str) -> None:
@@ -272,15 +354,24 @@ async def _resolve_wildcards_outside_scene(
     return restore(resolved), (restore(template) if template is not None else None)
 
 
-def _drop_scene(prompt: str) -> str:
-    """Remove the placeholder and the comma-space that would be left dangling beside it.
+def _drop_placeholder(prompt: str, placeholder: str) -> str:
+    """Remove a caption placeholder and the comma-space that would dangle beside it.
 
     "<TRIGGER>, <SCENE>, she grips..." must not become "trigger, , she grips...", which
-    reaches the encoder as a stray empty clause.
+    reaches the encoder as a stray empty clause. Works for either caption token; the fill is
+    the same shape in either position.
     """
-    out = prompt.replace(f", {SCENE_PLACEHOLDER},", ",")
-    out = out.replace(f"{SCENE_PLACEHOLDER}, ", "").replace(f", {SCENE_PLACEHOLDER}", "")
-    return " ".join(out.replace(SCENE_PLACEHOLDER, "").split())
+    out = prompt.replace(f", {placeholder},", ",")
+    out = out.replace(f"{placeholder}, ", "").replace(f", {placeholder}", "")
+    return " ".join(out.replace(placeholder, "").split())
+
+
+def _drop_scene(prompt: str) -> str:
+    return _drop_placeholder(prompt, SCENE_PLACEHOLDER)
+
+
+def _drop_motion(prompt: str) -> str:
+    return _drop_placeholder(prompt, MOTION_PLACEHOLDER)
 
 
 async def _resolve_trigger(db: AsyncSession, prompt: str, ltx_recipe: dict | None) -> str:
@@ -764,8 +855,12 @@ async def claim_next_segment(
     # avoided the claim path on the strength of a 60-90s estimate that turned out to be
     # wall-clock on a multi-prompt script, and was wrong.
     # Either form: an unfilled placeholder to resolve, or a filled region whose markers must
-    # come off before the prompt reaches the encoder.
-    if SCENE_PLACEHOLDER in (segment.prompt or "") or _SCENE_REGION.search(segment.prompt or ""):
+    # come off before the prompt reaches the encoder. <MOTION> (wanly-api#335) joins the gate
+    # as a cache-only token — for a continuation its frame's paragraph exists only if the
+    # Next Segment dialog described the pair, which is exactly when it must be picked up here.
+    if (SCENE_PLACEHOLDER in (segment.prompt or "")
+            or MOTION_PLACEHOLDER in (segment.prompt or "")
+            or _SCENE_REGION.search(segment.prompt or "")):
         resolved = await _resolve_scene(db, segment.prompt, resolved_start_image, final=True)
         if resolved != segment.prompt:
             # Persisted, not just returned: the segment must record what it actually ran, so
