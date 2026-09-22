@@ -28,7 +28,10 @@ router = APIRouter()
 # placeholder first, and a wildcard named SCENE WOULD substitute a random option before the
 # captioner is ever called. The render would look plausible and be wrong. So for SCENE this
 # reservation is not belt-and-braces; it is the only guard there is.
-RESERVED_WILDCARD_NAMES = {"TRIGGER", "TRIGGER2", "SCENE"}
+#
+# MOTION (wanly-api#335) inherits SCENE's reasoning verbatim: same after-wildcards ordering,
+# same model-output-is-not-input rule, so the reservation is likewise its only guard.
+RESERVED_WILDCARD_NAMES = {"TRIGGER", "TRIGGER2", "SCENE", "MOTION"}
 
 
 @router.get("/wildcards", response_model=list[WildcardResponse])
