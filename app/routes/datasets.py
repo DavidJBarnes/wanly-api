@@ -15,7 +15,7 @@ import logging
 import uuid
 
 import httpx
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -189,7 +189,10 @@ async def delete_dataset(
 async def crop_faces(
     dataset_id: uuid.UUID,
     largest_only: bool = False,
-    uris: list[str] | None = None,
+    # Query(None), not a bare default: a non-scalar annotation with no Query marker is a BODY
+    # parameter, so the console's repeated `uris=` query keys were never read and every crop
+    # ran on the whole set no matter what was selected (api#336).
+    uris: list[str] | None = Query(None),
     save_as: bool = False,
     _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -280,9 +283,12 @@ async def crop_faces(
         return await asyncio.to_thread(
             s3.upload_bytes, base64.b64decode(f["png_b64"]), key, settings.s3_images_bucket)
 
-    uris = list(await asyncio.gather(*(put(i, f) for i, f in enumerate(faces))))
-    no_face = len(result.get("no_face", []))
+    # The scope BEFORE the new URIs are computed: `uris` gets rebound below, and comparing
+    # against the rebound value made every note claim "selected images" even when the whole
+    # set was cropped — the lie that hid api#336 in the production data.
     scope = "every image" if uris is None else f"{len(targets)} selected images"
+    crop_uris = list(await asyncio.gather(*(put(i, f) for i, f in enumerate(faces))))
+    no_face = len(result.get("no_face", []))
     note = (f"Cropped {len(faces)} faces from {scope} "
             f"({'largest only' if largest_only else 'every face'})"
             + (f", {no_face} with none detected" if no_face else "")
@@ -290,12 +296,12 @@ async def crop_faces(
     ds.notes = f"{ds.notes}\n{note}".strip() if ds.notes else note
     if save_as:
         # JSONB columns do not see an in-place mutation (see add_images); reassign.
-        ds.images = list(ds.images) + uris
+        ds.images = list(ds.images) + crop_uris
         # The anchor is still a photograph in the set; scoring against it still works.
     else:
         replaced = set(targets)
         kept_others = [u for u in ds.images if u not in replaced]
-        ds.images = kept_others + uris
+        ds.images = kept_others + crop_uris
         # The anchor was one of the cropped photographs; the set is faces now — but an anchor
         # outside the selection is still what it was.
         if ds.anchor_uri in replaced:
@@ -303,7 +309,8 @@ async def crop_faces(
     await db.commit()
     await db.refresh(ds)
     logger.info("cropped %s (save_as=%s): %d faces from %d of %d photos",
-                ds.name, save_as, len(uris), len(targets), len(ds.images) - (len(uris) if save_as else 0))
+                ds.name, save_as, len(crop_uris), len(targets),
+                len(ds.images) - (len(crop_uris) if save_as else 0))
     return ds
 
 

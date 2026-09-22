@@ -163,19 +163,26 @@ class TestCropping:
         import inspect
         from app.routes import datasets as mod
         src = inspect.getsource(mod.crop_faces)
-        assert "ds.images = kept_others + uris" in src
-        assert "ds.images = list(ds.images) + uris" in src
+        assert "ds.images = kept_others + crop_uris" in src
+        assert "ds.images = list(ds.images) + crop_uris" in src
         assert "out = Dataset(" not in src
 
     def test_it_crops_a_subset_when_uris_are_named(self):
         """A 25-image set that needed 5 faces re-cropped got all 25 re-cropped: the output is
         not deterministic, so the 20 good crops came back different. #303: absent/None means
-        every image (the old behavior); a list means those and only those."""
+        every image (the old behavior); a list means those and only those.
+
+        #336: this test asserted `sig["uris"].default is None` and passed the whole time the
+        selection was ignored — a bare `= None` on a list is exactly the body-param declaration
+        that dropped the query keys. The default is now a Query marker; the wire behaviour is
+        proven by TestCropSelectionOverTheWire, which is the only thing that can see the bug."""
         import inspect
+        from fastapi.params import Param
         from app.routes import datasets as mod
         src = inspect.getsource(mod.crop_faces)
-        sig = inspect.signature(mod.crop_faces).parameters
-        assert "uris" in sig and sig["uris"].default is None
+        default = inspect.signature(mod.crop_faces).parameters["uris"].default
+        assert isinstance(default, Param) and default.default is None, \
+            "uris must be a query param, or FastAPI reads it from the body and the selection is lost"
         assert "ds.images if uris is None else" in src
 
     def test_a_stale_selection_is_refused_not_fatal(self):
@@ -259,6 +266,155 @@ class TestCropping:
     def test_an_absent_embedding_scores_below_any_floor(self):
         from app.routes.datasets import _cos
         assert _cos([], [1.0]) < 0.4
+
+
+# -------------------------------------------------------------------------------------------
+# Selection over the wire (api#336).
+#
+# Every test above in this class asserts on `inspect.getsource` — and every one of them passed
+# while the selection was ignored in production. The line `ds.images if uris is None else …`
+# is correct source code; what was wrong is one layer above, in FastAPI's parameter binding:
+# `uris: list[str] | None = None` is a bare list-typed param, which FastAPI treats as a BODY
+# parameter. The console posts body `null` with the picks as repeated `uris=` query keys, so
+# the handler saw `None` and cropped every image. Access logs from 2026-09-22 show all three
+# crop requests for one dataset carrying 8 URIs each; the dataset notes show crops from 40 of
+# 40 and 29 of 51 — the full set, both times.
+#
+# Only a real HTTP request through the ASGI app can see a binding bug, so that is what these
+# are. They post exactly what axios posts (repeated keys, body `null`), with s3 and the
+# face-crop service stubbed at the module seam.
+# -------------------------------------------------------------------------------------------
+
+class _FakeS3:
+    """Records what the endpoint downloaded, which is what `targets` resolved to."""
+
+    def __init__(self):
+        self.downloaded: list[str] = []
+
+    def download_bytes(self, uri):
+        self.downloaded.append(uri)
+        return b"jpeg"
+
+    def upload_bytes(self, data, key, bucket):
+        return f"s3://{bucket}/{key}"
+
+
+class _CropResp:
+    def raise_for_status(self):
+        pass
+
+    def json(self):
+        # One face per image submitted, which is what a solo-face dataset produces.
+        return {"faces": [{"source_index": i, "face_index": 0,
+                           "png_b64": b"eA==", "format": "jpeg"}
+                          for i in range(self.n)],
+                "no_face": []}
+
+
+def _crop_client(n_images_seen_by_service):
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None):
+            _crop_client.last_payload = json
+            r = _CropResp()
+            r.n = len(json["images"])
+            return r
+
+    return _Client
+
+
+class _HttpxShim:
+    """Replaces `datasets.httpx` for one test. Patching the real module's AsyncClient would
+    replace the test's own client as well."""
+
+    def __init__(self, client):
+        import httpx
+        self.AsyncClient = client
+        self.HTTPError = httpx.HTTPError
+
+
+@pytest.mark.asyncio
+class TestCropSelectionOverTheWire:
+    """The crop honors the selection the dialog made. See the block comment above."""
+
+    IMGS = [f"s3://wanly-images/datasets/x/{n}.jpg" for n in ("a", "b", "c", "d")]
+
+    async def _ds(self, db):
+        from app.models import Dataset
+        d = Dataset(name=f"wire-{uuid.uuid4().hex[:6]}", images=list(self.IMGS), prefix="p")
+        db.add(d)
+        await db.flush()
+        return d
+
+    async def _crop(self, db, monkeypatch, ds, query=None):
+        from app.auth import get_current_user
+        from app.config import settings
+        from app.database import get_db
+        from app.main import app
+        from app.routes import datasets as mod
+
+        fake = _FakeS3()
+        monkeypatch.setattr(mod, "s3", fake)
+        monkeypatch.setattr(mod, "httpx", _HttpxShim(_crop_client(None)))
+        monkeypatch.setattr(settings, "face_crop_url", "http://crop.test")
+        app.dependency_overrides[get_current_user] = lambda: object()
+        app.dependency_overrides[get_db] = lambda: db
+        try:
+            from httpx import ASGITransport, AsyncClient
+            async with AsyncClient(transport=ASGITransport(app=app),
+                                   base_url="http://test") as c:
+                q = "" if query is None else "?" + "&".join(f"uris={u}" for u in query)
+                resp = await c.post(f"/datasets/{ds.id}/crop{q}",
+                                    content=None,
+                                    headers={"Content-Type": "application/json"})
+                return resp, fake
+        finally:
+            app.dependency_overrides.clear()
+
+    async def test_named_uris_crop_those_and_only_those(self, db, monkeypatch):
+        """8 picks on the wire used to crop 51. The downloads are what `targets` became —
+        assert on those, not on the response body."""
+        resp, fake = await self._crop(db, monkeypatch, await self._ds(db),
+                                      query=[self.IMGS[0], self.IMGS[2]])
+        assert resp.status_code == 200, resp.text
+        assert set(fake.downloaded) == {self.IMGS[0], self.IMGS[2]}
+
+    async def test_the_unselected_images_survive_the_crop(self, db, monkeypatch):
+        resp, _ = await self._crop(db, monkeypatch, await self._ds(db), query=[self.IMGS[1]])
+        assert resp.status_code == 200, resp.text
+        kept = [u for u in resp.json()["images"] if u in self.IMGS]
+        assert kept == [u for u in self.IMGS if u != self.IMGS[1]]
+
+    async def test_no_selection_crops_everything(self, db, monkeypatch):
+        """Absent means every image — the old behavior, kept on purpose."""
+        resp, fake = await self._crop(db, monkeypatch, await self._ds(db))
+        assert resp.status_code == 200, resp.text
+        assert set(fake.downloaded) == set(self.IMGS)
+
+    async def test_the_note_says_what_was_actually_cropped(self, db, monkeypatch):
+        """The note said "selected images" even when it cropped everything, because the
+        `uris` local was rebound to the new crops before the note was built. A note that
+        lies about its own scope is how #336 hid in the production data."""
+        ds = await self._ds(db)
+        resp, _ = await self._crop(db, monkeypatch, ds, query=[self.IMGS[3]])
+        assert "1 selected images" in resp.json()["notes"]
+        resp, _ = await self._crop(db, monkeypatch, ds)
+        assert "every image" in resp.json()["notes"]
+
+    async def test_a_selection_of_only_stale_uris_refuses_rather_than_cropping_all(self, db,
+                                                                                   monkeypatch):
+        resp, fake = await self._crop(db, monkeypatch, await self._ds(db),
+                                      query=["s3://wanly-images/gone.jpg"])
+        assert resp.status_code == 422
+        assert fake.downloaded == []
 
 
 class TestKeepEverythingByDefault:
