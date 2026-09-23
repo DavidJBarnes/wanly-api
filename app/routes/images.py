@@ -4,7 +4,7 @@ import re
 import uuid
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from sqlalchemy import and_, func, not_, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -12,11 +12,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
 from app.config import settings
 from app.routes.datasets import DATASETS_PREFIX
-from app.database import get_db
-from app.joycaption import CaptionError
+from app.database import async_session, get_db
+from app.joycaption import CaptionError, CaptionerBusy
 from app.enums import TRAINING_TERMINAL
 from app.models import Dataset, Favorite, ImageMeta, Job, Segment, TrainingJob, User
-from app.routes.captions import caption_image_pair
+from app.routes.captions import ScenePair, caption_image_pair
 from app.schemas.images import BulkImageTagsUpdate, ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate
 from app.tag_filter import like_escape, normalise_tag
 from app.tag_filter import tag_clause as _tag_clause
@@ -580,9 +580,72 @@ def _split_tags(blob: str | None) -> list[str]:
     return [t.strip() for t in (blob or "").split(",") if t.strip()]
 
 
+async def describe_untagged(db: AsyncSession, paths: list[str]) -> int:
+    """Describe each of `paths` that has no scene description yet, serially.
+
+    The captioning half of bulk tagging (api#340): tagging an image is the moment someone
+    decided it was worth keeping, which is the rule console#414 built single-image
+    auto-describe on — but the bulk endpoint has no client loop to hang it on, and a
+    client loop would die with the tab. So the description happens here, after the tag
+    commit, one image at a time: each caption is two sequential Ollama calls on a GPU
+    shared with the render stack, so parallelism buys nothing and OOMs something.
+
+    The loop stops at the first captioner refusal (render busy, box down) and leaves the
+    rest undescribed — visibly, in the lightbox. A later bulk-add re-queues them; retry
+    with backoff across a ~30-minute render is not worth a queue table for one user.
+
+    Returns the number described. The caller must have committed the tags already: a
+    failure here must never take a tag write with it.
+    """
+    described = 0
+    for path in paths:
+        meta = await db.get(ImageMeta, path)
+        if meta is None or (meta.scene_description or "").strip():
+            continue  # row gone, or someone described it in the meantime
+        try:
+            image = await asyncio.to_thread(download_bytes, path)
+            pair = await caption_image_pair(db, image)
+        except CaptionerBusy as e:
+            logger.info("auto-describe batch stopping at %s: %s", path, e)
+            break
+        except CaptionError as e:
+            # A box-wide refusal (unreachable) and a per-image refusal look the same from
+            # here, and the cost of guessing wrong is one wasted caption per image. Stop
+            # rather than hammer whatever is wrong.
+            logger.warning("auto-describe stopping at %s: %s", path, e)
+            break
+        except Exception:
+            # An unreadable image (deleted between commit and here) is that image's
+            # problem, not the batch's.
+            logger.exception("auto-describe could not read %s; skipping", path)
+            continue
+        if not pair.scene.strip():
+            logger.warning("auto-describe got an empty caption for %s; skipping", path)
+            continue
+        _apply_scene_pair(meta, pair)
+        await db.commit()
+        described += 1
+    return described
+
+
+async def describe_untagged_job(paths: list[str]) -> None:
+    """BackgroundTasks entry: describe_untagged on its own session.
+
+    Background tasks run after the response is sent and the request's session is closed,
+    so this opens one of its own, the way stitch_video does.
+    """
+    async with async_session() as db:
+        try:
+            n = await describe_untagged(db, paths)
+            logger.info("bulk-tag auto-describe: %d of %d described", n, len(paths))
+        except Exception:
+            logger.exception("bulk-tag auto-describe failed")
+
+
 @router.post("/images/tags", dependencies=[Depends(get_current_user)])
 async def bulk_update_image_tags(
     body: BulkImageTagsUpdate,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     """Add or remove the same tags across many images at once (console#517).
@@ -655,6 +718,7 @@ async def bulk_update_image_tags(
         )
 
     results = []
+    to_describe: list[str] = []
     for path, merged_val in planned.items():
         meta = meta_map.get(path)
         if meta is None:
@@ -663,11 +727,18 @@ async def bulk_update_image_tags(
             if merged_val is not None:
                 db.add(ImageMeta(path=path, tags=merged_val))
                 results.append({"path": path, "tags": merged_val, "changed": True})
+                to_describe.append(path)  # a new row has never been described
             else:
                 results.append({"path": path, "tags": None, "changed": False})
             continue
         before = _split_tags(meta.tags)
         after = _split_tags(merged_val)
+        # Checked before the merge writes: an add that moves the tags and has no scene
+        # description yet is exactly what single-image auto-describe would have captioned
+        # (console#414), so the batch captions it too (api#340). From the DB row, not the
+        # client's cache — the console has no way to say what the captioner has done.
+        if body.mode == "add" and before != after and not (meta.scene_description or "").strip():
+            to_describe.append(path)
         meta.tags = merged_val
         if meta.is_empty():
             await db.delete(meta)
@@ -675,7 +746,9 @@ async def bulk_update_image_tags(
                         "changed": before != after})
 
     await db.commit()
-    return {"results": results, "mode": body.mode}
+    if to_describe:
+        background_tasks.add_task(describe_untagged_job, to_describe)
+    return {"results": results, "mode": body.mode, "describing": len(to_describe)}
 
 
 # ---------------------------------------------------------------------------------------
@@ -704,6 +777,24 @@ def _scene_response(path: str, meta: ImageMeta | None,
         motion_words=len(motion.split()) if motion else 0,
         motion_error=motion_error,
     )
+
+
+def _apply_scene_pair(meta: ImageMeta, pair: ScenePair) -> None:
+    """Write one caption pair onto a row — the write half of POST /images/scene.
+
+    Extracted so the background task behind bulk tagging writes the same columns with the
+    same rules as the interactive endpoint: same provenance columns, same rule that both
+    halves come from one call (an absent motion half clears any previous one — motion
+    from an old session would pair, invisibly, with a static half from this one).
+    Callers own commit and the blank-caption refusal; this only writes.
+    """
+    now = datetime.now(timezone.utc)
+    meta.scene_description = pair.scene.strip()
+    meta.scene_instruction = pair.scene_instruction
+    meta.scene_described_at = now
+    meta.motion_description = (pair.motion or "").strip() or None
+    meta.motion_instruction = pair.motion_instruction
+    meta.motion_described_at = now if pair.motion else None
 
 
 def _describable_buckets() -> tuple[str, ...]:
@@ -781,16 +872,7 @@ async def describe_image_scene(
     if meta is None:
         meta = ImageMeta(path=path)
         db.add(meta)
-    now = datetime.now(timezone.utc)
-    meta.scene_description = caption
-    meta.scene_instruction = pair.scene_instruction
-    meta.scene_described_at = now
-    # Both halves always come from the same call, so an absent motion half clears any
-    # previous one: motion from an old session would pair, invisibly, with a static half
-    # from this one.
-    meta.motion_description = (pair.motion or "").strip() or None
-    meta.motion_instruction = pair.motion_instruction
-    meta.motion_described_at = now if pair.motion else None
+    _apply_scene_pair(meta, pair)
     await db.commit()
     await db.refresh(meta)
 
