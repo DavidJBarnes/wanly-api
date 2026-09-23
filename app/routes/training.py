@@ -857,3 +857,143 @@ async def cancel_training_job(
     await db.commit()
     await db.refresh(job)
     return job
+
+
+def _provenance_dataset_id(prov: dict) -> uuid.UUID | None:
+    """The recorded dataset id as a real UUID — the column is as_uuid, so asyncpg refuses
+    the string the JSONB holds. An id that does not parse is treated as absent: the
+    snapshot trains rather than a retry dying on a provenance field."""
+    raw = prov.get("id")
+    if not raw:
+        return None
+    try:
+        return uuid.UUID(str(raw))
+    except ValueError:
+        return None
+
+
+def _reresolve_images(label: str, images: list, ds: Dataset | None) -> tuple[list, dict | None]:
+    """Re-read one group's images from its dataset, when it has one and it still exists.
+
+    Returns (images, refreshed provenance-or-None). The dataset WINS over the snapshot:
+    a run that died on dead S3 objects is exactly the run whose images someone has just
+    fixed, and re-queuing the frozen list would die on the same 404s. A dataset that has
+    been deleted is not a retry-blocker — the snapshot may still train, and it is the
+    caller's judgment whether to — so provenance is kept as recorded then.
+    """
+    if ds is None:
+        return list(images), None
+    fresh = list(ds.images)
+    if len(fresh) < MIN_DATASET_IMAGES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}: dataset {ds.name!r} now has {len(fresh)} images — at least "
+                   f"{MIN_DATASET_IMAGES} are needed")
+    if len(set(fresh)) != len(fresh):
+        raise HTTPException(
+            status_code=422, detail=f"{label}: dataset {ds.name!r} contains duplicates")
+    provenance = {"id": str(ds.id), "name": ds.name, "count": len(fresh)}
+    return fresh, provenance
+
+
+@router.post("/training/{job_id}/retry", response_model=TrainingResponse)
+async def retry_training_job(
+    job_id: uuid.UUID,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Queue a failed run again, in place, after re-reading its datasets (api#342).
+
+    THE POINT IS THE RE-READ. A job snapshots its images at creation, which is right for a
+    claim (a worker must never look its data up for itself) and wrong for a retry: the run
+    failed, the human fixed the images, and the first retry died on the same dead URIs.
+    So each group's images come from its dataset now, when the dataset still exists —
+    the same provenance the console showed, trusted back for the second opinion it cannot
+    give (it cannot know what changed on S3). A group trained from an ad-hoc URI list has
+    no dataset to consult, and its snapshot stands.
+
+    In place, like POST /segments/{id}/retry: same row, same character vN, not a new
+    version. The attempt's artifacts (loss curve, recorded checkpoints, publish requests)
+    are cleared with the progress — the trainer writes the same version-named paths again,
+    so a stale list would only mislabel the new attempt's files. The human's notes stay.
+
+    Only FAILED is retryable. A cancelled run is work somebody decided they did not want;
+    re-creating it through the dialog is the way to change one's mind about that.
+    """
+    job = await db.get(TrainingJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Training job not found")
+    if job.status != TrainingStatus.FAILED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"only failed runs can be retried (this one is {job.status})")
+
+    # ALL re-resolution happens BEFORE any mutation: a 422 must leave the row exactly as
+    # it was — still failed, still showing its error — not half-rewritten.
+    config = dict(job.config or {})
+    group0 = dict(config.get("dataset") or {})
+    ds_id = _provenance_dataset_id(group0)
+    ds = await db.get(Dataset, ds_id) if ds_id else None
+    images, refreshed = _reresolve_images("group 1", job.dataset_images, ds)
+    if refreshed:
+        config["dataset"] = {**group0, **refreshed}
+
+    groups = [dict(g) for g in (job.identities or [])]
+    for i, g in enumerate(groups):
+        prov = dict(g.get("dataset") or {})
+        g_id = _provenance_dataset_id(prov)
+        gds = await db.get(Dataset, g_id) if g_id else None
+        g_images, g_refreshed = _reresolve_images(
+            f"identity {i + 2}", g.get("images") or [], gds)
+        g["images"] = g_images
+        if g_refreshed:
+            g["dataset"] = {**prov, **g_refreshed}
+
+    thumbnail = ds.anchor_uri if ds and ds.anchor_uri else job.thumbnail_uri
+
+    twin = (await db.execute(
+        select(TrainingJob).where(
+            TrainingJob.character == job.character,
+            TrainingJob.version == job.version,
+            TrainingJob.id != job.id,
+            TrainingJob.status.not_in(list(TRAINING_TERMINAL)),
+        )
+    )).scalar_one_or_none()
+    if twin:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{job.character} v{job.version} is already {twin.status}. "
+                   f"Cancel it first, or retry that one instead of this one.")
+
+    job.status = TrainingStatus.PENDING
+    job.dataset_images = images
+    job.config = config
+    job.identities = groups or None
+    job.thumbnail_uri = thumbnail
+    # Back to a pristine queue row, same columns as _reclaim_orphans plus the attempt's
+    # outputs and artifacts.
+    job.worker_id = None
+    job.worker_name = None
+    job.claimed_at = None
+    job.completed_at = None
+    job.progress_log = None
+    job.error_message = None
+    job.step = None
+    job.loss_log = None
+    job.epochs = None
+    job.checkpoints = None
+    job.output_lora_path = None
+    job.publish_requests = None
+    try:
+        await db.commit()
+    except Exception:
+        # The live-version unique index racing a dialog-created twin between the check and
+        # the commit; the query above catches the ordinary case and says it better.
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"{job.character} v{job.version} already has a live run") from None
+    await db.refresh(job)
+    logger.info("retried training %s v%d (%d images after re-reading its datasets)",
+                job.character, job.version, len(job.dataset_images))
+    return job

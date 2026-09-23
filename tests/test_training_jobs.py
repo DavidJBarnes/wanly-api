@@ -1172,3 +1172,168 @@ class TestTheClaimEndpoint:
 
         assert resp.status_code == 200, resp.text
         assert resp.json()["identities"] is None
+
+
+# ---------------------------------------------------------------------------------------
+# Retry (api#342). A failed run was a dead end — delete it and re-fill the whole dialog.
+# The failure that prompted it: a purge-delete wiped an S3 prefix, three combo runs died on
+# the dead URIs, and re-queuing the FROZEN snapshot died on the same 404s. So retry re-reads
+# each group's images from its dataset, and keeps the same row/version.
+# ---------------------------------------------------------------------------------------
+
+
+def _combo_failed(**kw):
+    """A failed joint run: group 0 from dataset A, an identity group from dataset B, both
+    with provenance and a snapshot, plus the debris of a dead attempt."""
+    from app.models import Dataset
+    a = Dataset(id=uuid.uuid4(), name="David", images=_images(9), prefix="p-a")
+    b = Dataset(id=uuid.uuid4(), name="Me", images=_images(10), prefix="p-b")
+    job = _job(
+        character="DavidMe", trigger="d@vid", version=1, status=TrainingStatus.FAILED,
+        dataset_images=_images(9),
+        config={"steps": 1200, "dataset": {"id": str(a.id), "name": "David", "count": 9}},
+        identities=[{"character": "Me", "trigger": "m3", "gender": "woman",
+                     "caption": "m3, woman", "images": _images(10), "num_repeats": None,
+                     "dataset": {"id": str(b.id), "name": "Me", "count": 10}}],
+        error_message="404 on a dataset image", worker_id=uuid.uuid4(), worker_name="3090",
+        claimed_at=datetime.now(timezone.utc), completed_at=datetime.now(timezone.utc),
+        step=42, progress_log="died", loss_log=[[10, 0.9]],
+        epochs=[{"label": "e01", "step": 80}], publish_requests=["final"],
+        checkpoints=["s3://ltx-loras/character/davidme_v1_e01.safetensors"],
+        output_lora_path="s3://ltx-loras/character/davidme_v1_final.safetensors",
+    )
+    return a, b, job
+
+
+class TestARunCanBeRetried:
+    async def test_only_a_failed_run_is_retryable(self, db):
+        from fastapi import HTTPException
+        from app.routes.training import retry_training_job
+        for status in (TrainingStatus.COMPLETED, TrainingStatus.CANCELLED,
+                       TrainingStatus.PENDING, TrainingStatus.RUNNING):
+            job = _job(status=status)
+            db.add(job)
+            await db.commit()
+            with pytest.raises(HTTPException) as e:
+                await retry_training_job(job.id, _user=None, db=db)
+            assert e.value.status_code == 400
+            await db.delete(job)
+            await db.commit()
+
+    async def test_an_unknown_id_is_404(self, db):
+        from fastapi import HTTPException
+        from app.routes.training import retry_training_job
+        with pytest.raises(HTTPException) as e:
+            await retry_training_job(uuid.uuid4(), _user=None, db=db)
+        assert e.value.status_code == 404
+
+    async def test_a_failed_run_comes_back_pending_in_place(self, db):
+        from app.routes.training import retry_training_job
+        _, _, job = _combo_failed()
+        db.add(job); await db.commit()
+        job_id = job.id
+
+        out = await retry_training_job(job_id, _user=None, db=db)
+
+        assert out.id == job_id, "retry must reuse the row, not clone it"
+        assert out.character == "DavidMe" and out.version == 1
+        assert out.status == TrainingStatus.PENDING
+        # every trace of the dead attempt is cleared...
+        assert out.error_message is None and out.progress_log is None
+        assert out.worker_id is None and out.worker_name is None
+        assert out.claimed_at is None and out.completed_at is None
+        assert out.step is None and out.loss_log is None and out.epochs is None
+        assert out.checkpoints is None and out.output_lora_path is None
+        assert out.publish_requests is None
+        # ...the recipe and the identity are not.
+        assert out.config["steps"] == 1200
+        assert out.trigger == "d@vid"
+
+    async def test_the_images_are_re_read_from_the_datasets(self, db):
+        """THE WHOLE POINT. A run that died on dead URIs must not be re-queud with them;
+        whatever the datasets hold now is what a retry trains on."""
+        from app.routes.training import retry_training_job
+        a, b, job = _combo_failed()
+        db.add(a); db.add(b); db.add(job); await db.commit()
+        # The human fixed the sets after the failure: David gained a face, Me lost the dead
+        # crops. The job's snapshot still lists the old ones.
+        a.images = _images(12)
+        b.images = [f"s3://wanly-images/2026-09-11/me{i}.jpg" for i in range(11)]
+        await db.commit()
+
+        out = await retry_training_job(job.id, _user=None, db=db)
+
+        assert out.dataset_images == _images(12)
+        assert out.identities[0]["images"] == [
+            f"s3://wanly-images/2026-09-11/me{i}.jpg" for i in range(11)]
+        # provenance counts follow the re-read, not the stale snapshot
+        assert out.config["dataset"]["count"] == 12
+        assert out.identities[0]["dataset"]["count"] == 11
+
+    async def test_the_snapshot_trains_when_its_dataset_is_gone(self, db):
+        """A deleted dataset is not a retry-blocker — the recorded images may still be fine.
+        Keep them and keep the provenance as it was recorded."""
+        from app.routes.training import retry_training_job
+        a, b, job = _combo_failed()
+        db.add(a); db.add(b); db.add(job); await db.commit()
+        await db.delete(b); await db.commit()
+
+        out = await retry_training_job(job.id, _user=None, db=db)
+
+        assert out.identities[0]["images"] == _images(10), "the snapshot should stand"
+        assert out.identities[0]["dataset"]["name"] == "Me"
+
+    async def test_a_group_trained_from_an_ad_hoc_list_keeps_its_snapshot(self, db):
+        """No dataset to consult, so the frozen URIs are all there is — exactly as created."""
+        from app.routes.training import retry_training_job
+        job = _job(character="adhoc", trigger="a", version=1, status=TrainingStatus.FAILED,
+                   dataset_images=_images(9),
+                   config={"steps": 1200, "dataset": {"id": None, "name": None, "count": 9}})
+        db.add(job); await db.commit()
+
+        out = await retry_training_job(job.id, _user=None, db=db)
+
+        assert out.dataset_images == _images(9)
+        assert out.config["dataset"] == {"id": None, "name": None, "count": 9}
+
+    async def test_a_shrunken_dataset_refuses_the_retry_and_leaves_the_row(self, db):
+        """Re-reading must not queue a run the trainer will reject at the floor — and a
+        refusal must not have rewritten anything, so the failed run still shows why it died."""
+        from fastapi import HTTPException
+        from app.routes.training import retry_training_job
+        a, b, job = _combo_failed()
+        db.add(a); db.add(b); db.add(job); await db.commit()
+        a.images = _images(3)   # below MIN_DATASET_IMAGES
+
+        with pytest.raises(HTTPException) as e:
+            await retry_training_job(job.id, _user=None, db=db)
+        assert e.value.status_code == 422 and "David" in e.value.detail
+
+        await db.refresh(job)
+        assert job.status == TrainingStatus.FAILED
+        assert job.error_message == "404 on a dataset image"
+        assert job.dataset_images == _images(9), "the snapshot must not have been touched"
+
+    async def test_a_live_twin_of_the_same_version_is_refused(self, db):
+        """The partial unique index would reject the commit anyway; say it as a sentence."""
+        from fastapi import HTTPException
+        from app.routes.training import retry_training_job
+        _, _, job = _combo_failed()
+        db.add(job)
+        db.add(_job(character="DavidMe", version=1, status=TrainingStatus.RUNNING))
+        await db.commit()
+
+        with pytest.raises(HTTPException) as e:
+            await retry_training_job(job.id, _user=None, db=db)
+        assert e.value.status_code == 409 and "already running" in e.value.detail
+
+    async def test_the_human_note_survives_a_retry(self, db):
+        """Notes are about the character, not one attempt; the attempt's own artifacts clear."""
+        from app.routes.training import retry_training_job
+        _, _, job = _combo_failed()
+        job.notes = "rank 16 was too weak"
+        db.add(job); await db.commit()
+
+        out = await retry_training_job(job.id, _user=None, db=db)
+
+        assert out.notes == "rank 16 was too weak"
