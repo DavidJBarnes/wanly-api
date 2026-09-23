@@ -9,6 +9,7 @@ transaction, deduped through tag_filter.normalise_tag.
 from unittest.mock import patch  # noqa: F401  (kept for parity with sibling tests)
 
 import pytest
+import pytest_asyncio
 
 from app.models import ImageMeta
 
@@ -16,6 +17,22 @@ BUCKET = "wanly-images"
 A = f"s3://{BUCKET}/2026-09-17/00001.png"
 B = f"s3://{BUCKET}/2026-09-17/00002.png"
 C = f"s3://{BUCKET}/2026-09-17/00003.png"
+
+
+@pytest_asyncio.fixture(autouse=True)
+def _no_real_describe_task(monkeypatch):
+    """Stub the background entry point for every test in this module.
+
+    Starlette runs BackgroundTasks inside the ASGI call, so without this every tagging
+    test would open a real session and reach for S3 and the captioner after its response.
+    Tests that care about the queue patch over this with their own fake.
+    """
+    from app.routes import images
+
+    async def noop(paths):
+        pass
+
+    monkeypatch.setattr(images, "describe_untagged_job", noop)
 
 
 class TestBulkAdd:
@@ -164,3 +181,193 @@ async def _bulk(db, paths, tags, mode="add"):
                                 json={"paths": paths, "tags": tags, "mode": mode})
     finally:
         app.dependency_overrides.clear()
+
+
+# ---------------------------------------------------------------------------------------
+# Auto-describe (api#340): tagging is the moment an image becomes worth keeping — the
+# rule console#414 built single-image auto-describe on — so a bulk add that newly tags a
+# never-described image queues its description server-side, serially, after the commit.
+# ---------------------------------------------------------------------------------------
+
+class TestAutoDescribeQueueing:
+    """What the endpoint puts on the background queue."""
+
+    @pytest.mark.asyncio
+    async def test_an_add_that_newly_tags_reports_the_describe_count(self, db):
+        resp = await _bulk(db, [A, B], "Kelly")
+        assert resp.json()["describing"] == 2
+
+    @pytest.mark.asyncio
+    async def test_an_already_described_image_is_not_queued_again(self, db):
+        db.add(ImageMeta(path=A, tags="Sofa", scene_description="a woman on a sofa"))
+        await db.flush()
+
+        resp = await _bulk(db, [A, B], "Kelly")
+        assert resp.json()["describing"] == 1
+
+    @pytest.mark.asyncio
+    async def test_an_add_that_changes_nothing_describes_nothing(self, db):
+        db.add(ImageMeta(path=A, tags="Kelly"))
+        await db.flush()
+
+        resp = await _bulk(db, [A], "Kelly")
+        assert resp.json()["describing"] == 0
+
+    @pytest.mark.asyncio
+    async def test_a_remove_never_describes(self, db):
+        db.add(ImageMeta(path=A, tags="Kelly, Sofa"))
+        await db.flush()
+
+        resp = await _bulk(db, [A], "Kelly", mode="remove")
+        assert resp.json()["describing"] == 0
+
+    @pytest.mark.asyncio
+    async def test_the_queued_paths_are_exactly_the_undescribed_ones(self, db, monkeypatch):
+        """Empty-string description counts as undescribed: storing "" is refused at the
+        describe endpoint, so a blank must not silence the batch."""
+        from app.routes import images
+
+        db.add(ImageMeta(path=A, tags="Sofa", scene_description="a woman on a sofa"))
+        db.add(ImageMeta(path=B, tags="Sofa", scene_description="   "))
+        await db.flush()
+
+        queued = []
+
+        async def fake_job(paths):
+            queued.extend(paths)
+
+        monkeypatch.setattr(images, "describe_untagged_job", fake_job)
+
+        await _bulk(db, [A, B, C], "Kelly")
+        assert queued == [B, C]
+
+
+class TestDescribeUntagged:
+    """The loop itself: serial, provenance-complete, and it stops at the first refusal."""
+
+    def _patch_captioner(self, monkeypatch, *, caption="a woman on a sofa",
+                         motion="she leans back", fail_with=None):
+        """Fake the download + caption pair; returns the list of caption calls."""
+        from app.routes import images as images_mod
+        from app.routes.captions import ScenePair
+
+        called = []
+
+        def fake_download(path):  # sync, like boto3: the loop runs it in a thread
+            return b"png bytes"
+
+        async def fake_pair(db, image, **kw):
+            called.append(image)
+            if fail_with is not None:
+                raise fail_with
+            return ScenePair(scene=caption, scene_instruction="the instruction",
+                             motion=motion, motion_instruction="the motion instruction")
+
+        monkeypatch.setattr(images_mod, "download_bytes", fake_download)
+        monkeypatch.setattr(images_mod, "caption_image_pair", fake_pair)
+        return called
+
+    @pytest.mark.asyncio
+    async def test_it_describes_a_newly_tagged_row_completely(self, db, monkeypatch):
+        from app.routes.images import describe_untagged
+
+        db.add(ImageMeta(path=A, tags="Kelly"))
+        await db.flush()
+        self._patch_captioner(monkeypatch)
+
+        assert await describe_untagged(db, [A]) == 1
+        meta = await db.get(ImageMeta, A)
+        assert meta.scene_description == "a woman on a sofa"
+        assert meta.scene_instruction == "the instruction"
+        assert meta.scene_described_at is not None
+        # Same call writes both halves, so the provenance matches POST /images/scene's.
+        assert meta.motion_description == "she leans back"
+        assert meta.motion_described_at is not None
+        # And it did not disturb the tags that queued it.
+        assert meta.tags == "Kelly"
+
+    @pytest.mark.asyncio
+    async def test_an_already_described_row_is_left_alone(self, db, monkeypatch):
+        """The queue is computed at commit time; a re-run must not re-roll a caption.
+        GPU work the user already accepted is not ours to replace."""
+        from app.routes.images import describe_untagged
+
+        db.add(ImageMeta(path=A, tags="Kelly", scene_description="a woman on a sofa"))
+        await db.flush()
+        called = self._patch_captioner(monkeypatch)
+
+        assert await describe_untagged(db, [A]) == 0
+        assert called == []
+        assert (await db.get(ImageMeta, A)).scene_description == "a woman on a sofa"
+
+    @pytest.mark.asyncio
+    async def test_a_busy_captioner_stops_the_batch_without_touching_anything(self, db,
+                                                                              monkeypatch):
+        from app.joycaption import CaptionerBusy
+        from app.routes.images import describe_untagged
+
+        db.add(ImageMeta(path=A, tags="Kelly"))
+        db.add(ImageMeta(path=B, tags="Kelly"))
+        await db.flush()
+        called = self._patch_captioner(
+            monkeypatch, fail_with=CaptionerBusy("3090 is rendering"))
+
+        assert await describe_untagged(db, [A, B]) == 0
+        assert len(called) == 1, "the batch must stop, not hammer a busy box"
+        assert (await db.get(ImageMeta, A)).scene_description is None
+        assert (await db.get(ImageMeta, B)).scene_description is None
+
+    @pytest.mark.asyncio
+    async def test_an_unreachable_captioner_also_stops_the_batch(self, db, monkeypatch):
+        from app.joycaption import CaptionError
+        from app.routes.images import describe_untagged
+
+        db.add(ImageMeta(path=A, tags="Kelly"))
+        await db.flush()
+        self._patch_captioner(monkeypatch, fail_with=CaptionError("captioner unreachable"))
+
+        assert await describe_untagged(db, [A]) == 0
+
+    @pytest.mark.asyncio
+    async def test_an_empty_caption_is_not_stored(self, db, monkeypatch):
+        """Storing "" marks the image described and stops anything ever asking again."""
+        from app.routes.images import describe_untagged
+
+        db.add(ImageMeta(path=A, tags="Kelly"))
+        await db.flush()
+        self._patch_captioner(monkeypatch, caption="   ")
+
+        assert await describe_untagged(db, [A]) == 0
+        assert (await db.get(ImageMeta, A)).scene_description is None
+
+    @pytest.mark.asyncio
+    async def test_one_unreadable_image_does_not_stop_the_rest(self, db, monkeypatch):
+        """A deleted file is that image's problem; the captioner is fine."""
+        from app.routes import images as images_mod
+        from app.routes.images import describe_untagged
+
+        db.add(ImageMeta(path=A, tags="Kelly"))
+        db.add(ImageMeta(path=B, tags="Kelly"))
+        await db.flush()
+        self._patch_captioner(monkeypatch)
+
+        def flaky_download(path):
+            if path == A:
+                raise FileNotFoundError("gone from s3")
+            return b"png bytes"
+
+        monkeypatch.setattr(images_mod, "download_bytes", flaky_download)
+
+        assert await describe_untagged(db, [A, B]) == 1
+        assert (await db.get(ImageMeta, B)).scene_description == "a woman on a sofa"
+
+    @pytest.mark.asyncio
+    async def test_a_row_deleted_after_the_commit_is_skipped_not_created(self, db,
+                                                                         monkeypatch):
+        """Tagged, then deleted between commit and the background task."""
+        from app.routes.images import describe_untagged
+
+        called = self._patch_captioner(monkeypatch)
+        assert await describe_untagged(db, [A]) == 0
+        assert called == []
+        assert await db.get(ImageMeta, A) is None
