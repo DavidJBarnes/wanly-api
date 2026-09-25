@@ -88,6 +88,14 @@ class CaptionQueue:
         """Everything not yet finished, including the one in progress."""
         return len(self._waiting) + (1 if self._running is not None else 0)
 
+    def running_path(self) -> str | None:
+        """The image being captioned right now, if any."""
+        return self._running
+
+    def waiting_paths(self) -> list[str]:
+        """Everything still in line, in the order it will be taken."""
+        return list(self._waiting)
+
 
 #: One queue per process, because there is one captioner.
 queue = CaptionQueue()

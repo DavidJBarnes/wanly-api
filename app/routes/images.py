@@ -17,7 +17,7 @@ from app.joycaption import CaptionError, CaptionerBusy
 from app.enums import TRAINING_TERMINAL
 from app.models import Dataset, Favorite, ImageMeta, Job, Segment, TrainingJob, User
 from app.routes.captions import ScenePair, caption_image_pair
-from app.schemas.images import BulkImageTagsUpdate, ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate
+from app.schemas.images import BulkImageTagsUpdate, CaptionQueueStatus, ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate
 from app.tag_filter import like_escape, normalise_tag
 from app.tag_filter import tag_clause as _tag_clause
 from app.s3 import (
@@ -828,6 +828,27 @@ def _require_known_bucket(path: str) -> None:
             status_code=400,
             detail="Path must be in the images bucket or the jobs bucket",
         )
+
+
+@router.get("/images/caption-queue", response_model=CaptionQueueStatus,
+            dependencies=[Depends(verify_api_key_or_bearer)])
+async def caption_queue_status():
+    """How the captioner's queue looks, without naming an image.
+
+    The per-image fields on /images/scene only help inside the modal of an image you are
+    already describing. This is the one a toolbar can ask: it needs no path, so it is a
+    single cheap poll that answers "is anything captioning, and how much is behind it"
+    whatever page you are on.
+
+    No database and no captioner call -- the queue is in this process.
+    """
+    from app.caption_queue import queue as caption_queue
+
+    return CaptionQueueStatus(
+        depth=caption_queue.depth(),
+        waiting=len(caption_queue.waiting_paths()),
+        running=caption_queue.running_path(),
+    )
 
 
 @router.get("/images/scene", response_model=ImageSceneResponse,
