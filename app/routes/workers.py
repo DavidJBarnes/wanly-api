@@ -267,6 +267,8 @@ async def get_worker_mode(worker_id: uuid.UUID, db: AsyncSession = Depends(get_d
         equipped=body.get("equipped") or [],
         services=[s.get("group") or s.get("name")
                   for s in body.get("services", []) if not s.get("stopped")],
+        pending_mode=body.get("pending_mode"),
+        mode_error=body.get("mode_error"),
     )
 
 
@@ -285,7 +287,11 @@ async def set_worker_mode(
     if worker.status == "offline":
         raise HTTPException(status_code=400, detail="Cannot set the mode of an offline worker")
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
+        # SHORT timeout, and that is now correct: the box ACCEPTS the switch and runs it
+        # behind the request, because stopping the render daemon lets the segment in flight
+        # finish (up to ~27 minutes). The old 120s wait reported a failure on a switch that
+        # was going perfectly well.
+        async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(f"{_control_url(worker)}/mode", json={"mode": body.mode})
     except Exception as e:
         raise HTTPException(
@@ -298,12 +304,16 @@ async def set_worker_mode(
         detail = r.json().get("detail") if r.headers.get("content-type", "").startswith("application/json") else r.text
         raise HTTPException(status_code=r.status_code, detail=detail or "the worker refused")
     out = r.json()
-    logger.info("Worker %s mode -> %s (%s)", worker.friendly_name,
-                out.get("mode"), ",".join(out.get("services") or []))
+    logger.info("Worker %s mode -> %s (%s)%s", worker.friendly_name,
+                out.get("pending_mode") or out.get("pending") or out.get("mode"),
+                ",".join(out.get("services") or []),
+                " (switching; a segment in flight finishes first)"
+                if out.get("pending") else "")
     return WorkerModeResponse(
         mode=out.get("mode") or body.mode,
         services=out.get("services") or [],
         changed=bool(out.get("changed")),
+        pending_mode=out.get("pending"),
     )
 
 

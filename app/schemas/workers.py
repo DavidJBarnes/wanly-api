@@ -94,6 +94,14 @@ class WorkerModeResponse(BaseModel):
     #: What is running right now, after the change.
     services: list[str] = []
     changed: bool = False
+    #: The mode being switched TO, while the switch is still running. A switch is not
+    #: instant: stopping the render daemon lets the segment in flight finish first, which is
+    #: up to ~27 minutes. The caller shows this as in-progress rather than as a mode the box
+    #: is not in yet.
+    pending_mode: str | None = None
+    #: Why the last switch failed, if it did. It fails after the request that asked for it
+    #: has been answered, so this is the only place it can be reported.
+    mode_error: str | None = None
 
 
 class QueueHealthResponse(BaseModel):

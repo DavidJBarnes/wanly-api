@@ -159,3 +159,53 @@ class TestReadingTheMode:
             cl.return_value.__aenter__.return_value.get = get
             out = await routes.get_worker_mode(w.id, db)
         assert out.mode == "ltx-engine"
+
+
+class TestASwitchThatIsStillRunning:
+    """Stopping the render daemon lets the segment in flight FINISH -- by design, so nothing
+    is destroyed -- and that is up to ~27 minutes. The box accepts and runs it behind the
+    request; this API must relay that rather than wait, or a working switch is reported as a
+    failure because the wait timed out."""
+
+    @pytest.mark.asyncio
+    async def test_pending_is_relayed_not_waited_on(self):
+        w = _worker()
+        db = AsyncMock()
+        db.get.return_value = w
+        post = AsyncMock(return_value=_Resp(body={
+            "mode": "ltx-engine", "pending": "caption",
+            "services": ["image-description"], "changed": True}))
+        with patch("httpx.AsyncClient") as cl:
+            cl.return_value.__aenter__.return_value.post = post
+            out = await routes.set_worker_mode(w.id, routes.WorkerMode(mode="caption"), db)
+        assert out.pending_mode == "caption"
+        assert out.mode == "ltx-engine", "it reported a mode the box is not in yet"
+
+    @pytest.mark.asyncio
+    async def test_the_read_carries_pending_and_the_last_error(self):
+        """A switch fails after the request that asked for it was answered, so /health is
+        the only place it can be reported."""
+        w = _worker()
+        db = AsyncMock()
+        db.get.return_value = w
+        get = AsyncMock(return_value=_Resp(body={
+            "mode": "ltx-engine", "pending_mode": "caption",
+            "mode_error": "ComfyUI would not stop", "equipped": [], "services": []}))
+        with patch("httpx.AsyncClient") as cl:
+            cl.return_value.__aenter__.return_value.get = get
+            out = await routes.get_worker_mode(w.id, db)
+        assert out.pending_mode == "caption"
+        assert "would not stop" in out.mode_error
+
+    @pytest.mark.asyncio
+    async def test_it_does_not_wait_minutes_for_the_box(self):
+        """The timeout is the bug this fixes: 120s against a switch that legitimately takes
+        up to ~27 minutes reported failure on every busy box."""
+        w = _worker()
+        db = AsyncMock()
+        db.get.return_value = w
+        post = AsyncMock(return_value=_Resp(body={"mode": "ltx-engine", "pending": "caption"}))
+        with patch("httpx.AsyncClient") as cl:
+            cl.return_value.__aenter__.return_value.post = post
+            await routes.set_worker_mode(w.id, routes.WorkerMode(mode="caption"), db)
+        assert cl.call_args[1]["timeout"] <= 30
