@@ -73,6 +73,11 @@ class Settings(BaseSettings):
     # Empty disables cropping from the console, which is the honest state anywhere the service
     # is not deployed — the button says so rather than timing out.
     face_crop_url: str = "http://3090.zero:8084"
+    #: The port a worker's container serves its control API on (/health, /mode). One number
+    #: for every box on purpose: it is set by run-worker.sh's CONTROL_PORT, which defaults to
+    #: 8081 everywhere, and a per-worker value would have to be reported at registration and
+    #: kept correct -- a lot of machinery for a constant.
+    worker_control_port: int = 8081
     # Generous. It is per REQUEST, and a request carries a whole dataset — 50 images at a
     # second or two each on CPU.
     face_crop_timeout_s: int = 300
