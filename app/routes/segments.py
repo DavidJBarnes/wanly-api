@@ -140,8 +140,9 @@ async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
     filled it, and deferring costs nothing a caption-only placeholder does not pay.
     """
     # Before anything else: a prompt may arrive with a region the console filled and failed
-    # to strip, and the words inside it are the scene — there is nothing left to resolve.
-    prompt = _unwrap_scene(prompt)
+    # to strip — scene or motion half — and the words inside it are the description; there is
+    # nothing left to resolve.
+    prompt = _unwrap_caption_regions(prompt)
 
     needs_scene = SCENE_PLACEHOLDER in prompt
     needs_motion = MOTION_PLACEHOLDER in prompt
@@ -291,9 +292,10 @@ async def _save_scene(db: AsyncSession, image_uri: str, caption: str, instructio
         logger.warning("Could not save the description for %s (%s)", image_uri, e)
 
 
-# `<scene>…</scene>` — a scene the console has already filled in (console#427).
+# `<scene>…</scene>` — a scene the console has already filled in (console#427) — and the
+# `<motion>…</motion>` the console fills the same way for the motion half (wanly-console#529).
 #
-# The console marks the filled region so it can be rewritten in place: re-describe, or
+# The console marks a filled region so it can be rewritten in place: re-describe, or
 # change the start frame, and only the inside changes. It strips the markers before it
 # sends. This strips them AGAIN, because a marker reaching the text encoder is garbage
 # tokens for exactly the reason _drop_scene exists, and "the client promised not to" is not
@@ -301,38 +303,42 @@ async def _save_scene(db: AsyncSession, image_uri: str, caption: str, instructio
 # post here too.
 #
 # Paired form first, then any leftover bare tag. That pairing, not letter case, is what
-# separates a filled region from the unfilled <SCENE> placeholder.
-_SCENE_REGION = re.compile(r"<scene>(.*?)</scene>", re.IGNORECASE | re.DOTALL)
+# separates a filled region from the unfilled <SCENE> placeholder. ONE pattern, two names,
+# with the closing tag as a BACKREFERENCE to the opening: `<scene>…</motion>` is not a
+# region, and a fixed-close alternative would let an unclosed opener swallow everything up
+# to the next close of either kind — deleting real words between two regions.
+_CAPTION_REGION = re.compile(r"<(scene|motion)>(.*?)</\1>", re.IGNORECASE | re.DOTALL)
 
 
-def _unwrap_scene(prompt: str) -> str:
-    """Keep the words, drop the markers. Leaves the bare <SCENE> placeholder alone."""
-    return _SCENE_REGION.sub(r"\1", prompt)
+def _unwrap_caption_regions(prompt: str) -> str:
+    """Keep the words, drop the markers. Leaves the bare <SCENE>/<MOTION> placeholders alone."""
+    return _CAPTION_REGION.sub(r"\2", prompt)
 
 
 # A stand-in the wildcard resolver cannot see. Its pattern is <([^<>]+)>, and this has no
 # angle brackets at all.
-def _scene_mask(i: int) -> str:
-    return f"\x00wanly-scene-{i}\x00"
+def _caption_mask(i: int) -> str:
+    return f"\x00wanly-caption-{i}\x00"
 
 
 async def _resolve_wildcards_outside_scene(
     db: AsyncSession, prompt: str
 ) -> tuple[str, str | None]:
-    """Resolve wildcards with any filled <scene> region held out of reach.
+    """Resolve wildcards with any filled caption region held out of reach.
 
     THE CAPTION MUST NEVER BE SCANNED FOR WILDCARDS. It is model output, and a description
     that happened to contain <colour> would have a random option spliced into it. The API's
     own ordering used to guarantee that for free — <SCENE> is filled AFTER wildcards, so the
     words were not there yet — but the console now fills the region before it sends
     (console#427), so the caption arrives inside the prompt and the guarantee has to be
-    enforced rather than inherited.
+    enforced rather than inherited. The <motion> region (wanly-console#529) gets the same
+    protection: it is just as much model output.
 
-    Masking also keeps the MARKERS away from the resolver. `<scene>` and `</scene>` both
-    match its pattern, as names "scene" and "/scene". Neither can be substituted today —
-    "scene" is reserved case-insensitively, and nothing is named "/scene" — but a match with
-    no substitution still makes _resolve_wildcards return a non-NULL template, which is the
-    record of "this prompt had wildcards in it" and would then be wrong.
+    Masking also keeps the MARKERS away from the resolver. `<scene>`/`</scene>` and
+    `<motion>`/`</motion>` all match its pattern. None can be substituted today — "scene"
+    and "motion" are reserved case-insensitively, and nothing is named "/scene" — but a
+    match with no substitution still makes _resolve_wildcards return a non-NULL template,
+    which is the record of "this prompt had wildcards in it" and would then be wrong.
 
     Returns the caption UNWRAPPED in both the resolved prompt and the template: the markers
     are a console editing affordance and have no meaning once a segment is stored.
@@ -340,15 +346,15 @@ async def _resolve_wildcards_outside_scene(
     captions: list[str] = []
 
     def take(m: re.Match) -> str:
-        captions.append(m.group(1))
-        return _scene_mask(len(captions) - 1)
+        captions.append(m.group(2))
+        return _caption_mask(len(captions) - 1)
 
-    masked = _SCENE_REGION.sub(take, prompt)
+    masked = _CAPTION_REGION.sub(take, prompt)
     resolved, template = await _resolve_wildcards(db, masked)
 
     def restore(text: str) -> str:
         for i, caption in enumerate(captions):
-            text = text.replace(_scene_mask(i), caption)
+            text = text.replace(_caption_mask(i), caption)
         return text
 
     return restore(resolved), (restore(template) if template is not None else None)
@@ -860,7 +866,7 @@ async def claim_next_segment(
     # Next Segment dialog described the pair, which is exactly when it must be picked up here.
     if (SCENE_PLACEHOLDER in (segment.prompt or "")
             or MOTION_PLACEHOLDER in (segment.prompt or "")
-            or _SCENE_REGION.search(segment.prompt or "")):
+            or _CAPTION_REGION.search(segment.prompt or "")):
         resolved = await _resolve_scene(db, segment.prompt, resolved_start_image, final=True)
         if resolved != segment.prompt:
             # Persisted, not just returned: the segment must record what it actually ran, so
