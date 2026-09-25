@@ -293,13 +293,64 @@ def render_worker_beside_the_captioner(workers) -> "object | None":
     return None
 
 
+#: The box's MODE, cached for a moment. A caption asks once per request and a batch is
+#: dozens of requests; the mode changes on a human action, so a few seconds of staleness
+#: costs nothing and a call per caption would put the control API in the hot path.
+_MODE_CACHE: dict[str, tuple[float, str | None]] = {}
+_MODE_TTL_S = 5.0
+
+
+async def _render_mode(worker) -> str | None:
+    """What mode the box beside the captioner is in, or None if it will not say.
+
+    Unreadable is NOT treated as render mode: an older container has no /mode at all, and
+    refusing every caption on a box that simply cannot answer would be worse than the
+    contention this prevents.
+    """
+    import time
+
+    import httpx
+
+    from app.config import settings
+
+    name = worker.friendly_name
+    hit = _MODE_CACHE.get(name)
+    now = time.monotonic()
+    if hit and now - hit[0] < _MODE_TTL_S:
+        return hit[1]
+    mode = None
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(
+                f"http://{name}:{settings.worker_control_port}/health")
+        # A degraded box answers 503 and its body is still the truth -- a container with a
+        # service deliberately stopped is exactly that shape.
+        mode = (r.json() or {}).get("mode")
+    except Exception:
+        mode = None
+    _MODE_CACHE[name] = (now, mode)
+    return mode
+
+
 async def busy_render_beside_the_captioner(db) -> str | None:
-    """The friendly_name of the render worker sharing the captioner's card, if it is
-    rendering right now; else None. The interactive caption routes refuse on it.
+    """The friendly_name of the render worker sharing the captioner's card, when captioning
+    on it would collide with rendering; else None. The interactive caption routes refuse on it.
+
+    TWO REASONS TO REFUSE, and the second is the one that makes a MODE mean anything.
+
+        online-busy   a segment is being rendered right now.
+
+        render mode   the box is SET to render. One GPU does one job at a time -- that is
+                      the entire point of the mode, not a side effect of which processes
+                      happen to be up. Keying only on online-busy left render mode with no
+                      teeth: between claims the box looked idle, captions were accepted, and
+                      they raced the render stack for the card. Caption mode has always
+                      blocked renders (there is no daemon to claim), so this is the missing
+                      half of the same rule, not a new one.
 
     Refuse, not wait: a 720p render is ~30 minutes and the request sits behind a 60 s proxy
     timeout, so a wait would surface as a 504 that reads like a dead captioner. A clear
-    "3090.zero is rendering" the person can act on is worth more. Claim-time <SCENE>
+    "3090.zero is in render mode" the person can act on is worth more. Claim-time <SCENE>
     resolution does NOT go through this: the worker has just been handed the segment and
     has not loaded the render yet, and a failed caption there is non-fatal by design.
     """
@@ -307,7 +358,11 @@ async def busy_render_beside_the_captioner(db) -> str | None:
     from app.models import Worker
     rows = (await db.execute(select(Worker).where(Worker.status != "offline"))).scalars().all()
     w = render_worker_beside_the_captioner(rows)
-    if w is not None and w.status == "online-busy":
+    if w is None:
+        return None
+    if w.status == "online-busy":
+        return w.friendly_name
+    if await _render_mode(w) == "ltx-engine":
         return w.friendly_name
     return None
 

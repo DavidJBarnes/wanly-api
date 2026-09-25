@@ -78,8 +78,20 @@ class TestTheRefusal:
         from app.joycaption import CaptionError, CaptionerBusy
         assert issubclass(CaptionerBusy, CaptionError)
 
-    async def test_a_busy_box_is_named_and_an_idle_one_is_not(self, db):
+    async def test_a_busy_box_is_named_and_an_idle_one_is_not(self, db, monkeypatch):
+        """The status half of the rule, isolated from the mode half.
+
+        _render_mode is stubbed to "cannot say" ON PURPOSE. Without it this test reaches a
+        real box over HTTP -- it passed for months and then started asserting against
+        whatever 3090.zero happened to be doing, which is not a test.
+        """
+        from app import joycaption as jc
         from app.joycaption import busy_render_beside_the_captioner
+
+        async def no_mode(_w):
+            return None
+        monkeypatch.setattr(jc, "_render_mode", no_mode)
+
         box = _w("3090.zero", status="online-busy", kinds=["render", "trainer"],
                  provides=["ltx-engine", "image-description"])
         db.add(box); await db.commit()
@@ -132,3 +144,81 @@ class TestWhichCaptionerIsUsed:
         src = inspect.getsource(joycaption.describe)
         assert 'base = (base_url or settings.image_description_url).rstrip("/")' in src
         assert 'url = f"{base}/api/generate"' in src
+
+
+class TestAModeIsMutualExclusion:
+    """ONE GPU DOES ONE JOB AT A TIME. That is what a mode is for, not a side effect of
+    which processes happen to be up.
+
+    Keying the refusal only on `online-busy` left render mode with no teeth: BETWEEN claims
+    the box looked idle, captions were accepted, and they raced the render stack for the
+    card. Caption mode has always blocked renders -- there is no daemon there to claim --
+    so this is the missing half of the same rule.
+    """
+
+    @pytest.mark.asyncio
+    async def test_render_mode_refuses_a_caption_even_when_no_segment_is_running(
+            self, db, monkeypatch):
+        from app import joycaption as jc
+
+        w = Worker(friendly_name="3090.zero", hostname="h", ip_address="1.2.3.4",
+                   status="online-idle")
+        db.add(w)
+        await db.flush()
+
+        monkeypatch.setattr(jc, "render_worker_beside_the_captioner", lambda rows: w)
+        async def mode(_w): return "ltx-engine"
+        monkeypatch.setattr(jc, "_render_mode", mode)
+
+        assert await jc.busy_render_beside_the_captioner(db) == "3090.zero"
+
+    @pytest.mark.asyncio
+    async def test_caption_mode_lets_captions_through(self, db, monkeypatch):
+        from app import joycaption as jc
+
+        w = Worker(friendly_name="3090.zero", hostname="h", ip_address="1.2.3.4",
+                   status="online-idle")
+        db.add(w)
+        await db.flush()
+
+        monkeypatch.setattr(jc, "render_worker_beside_the_captioner", lambda rows: w)
+        async def mode(_w): return "caption"
+        monkeypatch.setattr(jc, "_render_mode", mode)
+
+        assert await jc.busy_render_beside_the_captioner(db) is None
+
+    @pytest.mark.asyncio
+    async def test_a_box_that_will_not_say_its_mode_is_not_treated_as_rendering(
+            self, db, monkeypatch):
+        """An older container has no /mode at all. Refusing every caption on a box that
+        simply cannot answer would be worse than the contention this prevents."""
+        from app import joycaption as jc
+
+        w = Worker(friendly_name="3090.zero", hostname="h", ip_address="1.2.3.4",
+                   status="online-idle")
+        db.add(w)
+        await db.flush()
+
+        monkeypatch.setattr(jc, "render_worker_beside_the_captioner", lambda rows: w)
+        async def mode(_w): return None
+        monkeypatch.setattr(jc, "_render_mode", mode)
+
+        assert await jc.busy_render_beside_the_captioner(db) is None
+
+    @pytest.mark.asyncio
+    async def test_a_rendering_box_is_still_refused_whatever_the_mode_says(
+            self, db, monkeypatch):
+        """The older signal does not go away: a segment in flight is a collision now,
+        regardless of what mode the box believes it is in."""
+        from app import joycaption as jc
+
+        w = Worker(friendly_name="3090.zero", hostname="h", ip_address="1.2.3.4",
+                   status="online-busy")
+        db.add(w)
+        await db.flush()
+
+        monkeypatch.setattr(jc, "render_worker_beside_the_captioner", lambda rows: w)
+        async def mode(_w): raise AssertionError("it should not have needed the mode")
+        monkeypatch.setattr(jc, "_render_mode", mode)
+
+        assert await jc.busy_render_beside_the_captioner(db) == "3090.zero"

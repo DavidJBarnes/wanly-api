@@ -831,7 +831,7 @@ def _require_known_bucket(path: str) -> None:
 
 
 @router.get("/images/caption-queue", response_model=CaptionQueueStatus,
-            dependencies=[Depends(get_current_user)])
+            dependencies=[Depends(verify_api_key_or_bearer)])
 async def caption_queue_status():
     """How the captioner's queue looks, without naming an image.
 

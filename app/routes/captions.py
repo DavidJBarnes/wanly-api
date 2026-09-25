@@ -39,7 +39,15 @@ async def _caption_base(db: AsyncSession, interactive: bool) -> str:
     busy = await busy_render_beside_the_captioner(db) if interactive else None
     base = captioner_for(busy, interactive)
     if base is None:
+        # Name the REASON, because the two are fixed by different actions: a render in
+        # flight is waited out, a mode is switched.
+        from app.joycaption import _render_mode
+        in_render_mode = busy and await _render_mode(
+            type("W", (), {"friendly_name": busy})()) == "ltx-engine"
         raise CaptionerBusy(
+            f"{busy} is in render mode, and the GPU does one job at a time. "
+            f"Switch it to captions on the Workers page."
+            if in_render_mode else
             f"{busy} is rendering, and the captioner shares its GPU. "
             f"Try again when the render finishes.")
     if busy:
