@@ -57,3 +57,10 @@ class ImageSceneResponse(BaseModel):
     # Set when the static half succeeded and the motion half failed. The console shows it
     # as a warning rather than letting a missing paragraph look intentional.
     motion_error: Optional[str] = None
+    # THE QUEUE IN FRONT OF THE CAPTIONER (app/caption_queue.py). ollama is one slot, so
+    # describes run strictly one at a time; these say where this image sits in that line so
+    # the UI can show "3rd of 7" rather than a spinner indistinguishable from a hang.
+    # All null/0 when the path is not queued, which is the normal idle case.
+    queue_status: Optional[str] = None
+    queue_position: Optional[int] = None
+    queue_depth: int = 0

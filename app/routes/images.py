@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, UploadFile
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import and_, func, not_, or_, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -776,7 +776,21 @@ def _scene_response(path: str, meta: ImageMeta | None,
         motion_described_at=meta.motion_described_at if meta else None,
         motion_words=len(motion.split()) if motion else 0,
         motion_error=motion_error,
+        **_queue_fields(path),
     )
+
+
+def _queue_fields(path: str) -> dict:
+    """Where this image sits in the caption queue, for any response that mentions it.
+
+    Read at response time rather than stored: a position recorded a moment ago is wrong as
+    soon as anything ahead of it finishes.
+    """
+    from app.caption_queue import queue as caption_queue
+
+    st = caption_queue.status(path)
+    return {"queue_status": st["status"], "queue_position": st["position"],
+            "queue_depth": st["depth"]}
 
 
 def _apply_scene_pair(meta: ImageMeta, pair: ScenePair) -> None:
@@ -842,39 +856,45 @@ async def describe_image_scene(
     "only if missing" rule here would be a second opinion about a decision the UI has
     already made, and would make re-roll impossible to express.
     """
+    from app.caption_queue import queue as caption_queue
+
     _require_known_bucket(path)
     body = body or ImageSceneRequest()
 
-    try:
-        # boto3 is synchronous; off the event loop so one slow fetch cannot stall the API.
-        image = await asyncio.to_thread(download_bytes, path)
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"could not read {path}: {e}") from e
+    # TAKE A TURN. ollama is one slot, so concurrent callers were always serialised -- they
+    # just did their waiting at the captioner, inside an HTTP request that could time out,
+    # with the two halves of one image landing on opposite sides of the cliff. Waiting here
+    # instead makes the order known and the position reportable.
+    async with caption_queue.turn(path):
+        try:
+            # boto3 is synchronous; off the event loop so one slow fetch cannot stall the API.
+            image = await asyncio.to_thread(download_bytes, path)
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=f"could not read {path}: {e}") from e
 
-    try:
-        pair = await caption_image_pair(
-            db, image, style=body.style, instruction=body.instruction,
-            motion_style=body.motion_style, motion_instruction=body.motion_instruction)
-    except CaptionError as e:
-        # 503, as /captions/describe does: the captioner being down is a temporary condition
-        # on another host, not a bug in this request. "Try again" is honest advice.
-        logger.warning("scene description failed for %s: %s", path, e)
-        raise HTTPException(status_code=503, detail=str(e)) from e
+        try:
+            pair = await caption_image_pair(
+                db, image, style=body.style, instruction=body.instruction,
+                motion_style=body.motion_style, motion_instruction=body.motion_instruction)
+        except CaptionError as e:
+            # 503, as /captions/describe does: the captioner being down is a temporary
+            # condition on another host, not a bug in this request.
+            logger.warning("scene description failed for %s: %s", path, e)
+            raise HTTPException(status_code=503, detail=str(e)) from e
 
-    caption = pair.scene.strip()
-    if not caption:
-        # A blank caption is a failure wearing a success's clothes. Storing it would mark the
-        # image described and stop anything ever asking again.
-        raise HTTPException(status_code=503,
-                            detail="the captioner returned nothing for this image")
+        if not pair.scene.strip():
+            # A blank caption is a failure wearing a success's clothes. Storing it would
+            # mark the image described and stop anything ever asking again.
+            raise HTTPException(status_code=503,
+                                detail="the captioner returned nothing for this image")
 
-    meta = await db.get(ImageMeta, path)
-    if meta is None:
-        meta = ImageMeta(path=path)
-        db.add(meta)
-    _apply_scene_pair(meta, pair)
-    await db.commit()
-    await db.refresh(meta)
+        meta = await db.get(ImageMeta, path)
+        if meta is None:
+            meta = ImageMeta(path=path)
+            db.add(meta)
+        _apply_scene_pair(meta, pair)
+        await db.commit()
+        await db.refresh(meta)
 
     return _scene_response(path, meta, motion_error=pair.motion_error)
 
