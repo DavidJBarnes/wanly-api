@@ -34,6 +34,21 @@ class ImageSceneRequest(BaseModel):
     motion_instruction: Optional[str] = Field(default=None, max_length=2000)
 
 
+class CaptionQueueStatus(BaseModel):
+    """The captioner's queue, for a view that is not about one image.
+
+    Asked for because the per-image position only exists inside the modal of an image you
+    are already describing -- there was no answer to "how is the queue looking?" without
+    opening one.
+    """
+    #: Everything unfinished, including the one in progress.
+    depth: int = 0
+    #: How many are still waiting to start.
+    waiting: int = 0
+    #: The image being captioned right now, so the view can name it rather than just count.
+    running: Optional[str] = None
+
+
 class ImageSceneResponse(BaseModel):
     path: str
     # None means never described. Distinct from "" which nothing writes -- a blank caption

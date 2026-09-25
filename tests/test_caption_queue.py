@@ -164,3 +164,61 @@ async def test_a_cancelled_waiter_leaves_no_phantom_in_the_line():
 
     release.set()
     await t1
+
+
+class TestTheQueueIsVisibleWithoutNamingAnImage:
+    """The per-image fields only help inside the modal of an image you are already
+    describing. There was no answer to "how is the queue looking?" without opening one --
+    which is what was actually asked for."""
+
+    @pytest.mark.asyncio
+    async def test_an_idle_captioner_reports_nothing_running(self):
+        from app.routes.images import caption_queue_status
+        from app.caption_queue import queue
+
+        # The process-wide queue, idle between tests.
+        assert queue.depth() == 0
+        out = await caption_queue_status()
+        assert out.depth == 0 and out.waiting == 0 and out.running is None
+
+    @pytest.mark.asyncio
+    async def test_it_names_what_is_captioning_and_counts_what_waits(self):
+        """A count alone cannot say whether the thing you are waiting on is the one being
+        worked; naming it is what makes the toolbar worth looking at."""
+        from app.routes.images import caption_queue_status
+        from app.caption_queue import queue
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def hold():
+            async with queue.turn("s3://b/running.png"):
+                started.set()
+                await release.wait()
+
+        async def waiter(p):
+            async with queue.turn(p):
+                pass
+
+        t1 = asyncio.create_task(hold())
+        await started.wait()
+        t2 = asyncio.create_task(waiter("s3://b/next.png"))
+        await asyncio.sleep(0.01)
+
+        out = await caption_queue_status()
+        assert out.running == "s3://b/running.png"
+        assert out.waiting == 1
+        assert out.depth == 2, "depth must count the one in progress, not just the line"
+
+        release.set()
+        await asyncio.gather(t1, t2)
+
+    @pytest.mark.asyncio
+    async def test_it_asks_neither_the_database_nor_the_captioner(self):
+        """It is a toolbar poll: it runs every few seconds on a page that is already busy,
+        so it must cost nothing but a function call. The signature is the proof -- no db
+        dependency to inject."""
+        import inspect
+        from app.routes.images import caption_queue_status
+
+        assert list(inspect.signature(caption_queue_status).parameters) == []
