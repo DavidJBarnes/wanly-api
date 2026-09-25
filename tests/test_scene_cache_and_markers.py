@@ -18,7 +18,7 @@ from app.routes.segments import (
     SCENE_PLACEHOLDER,
     _is_describable,
     _resolve_scene,
-    _unwrap_scene,
+    _unwrap_caption_regions,
 )
 
 REPO = f"s3://{settings.s3_images_bucket}/2026-09-05/00001.png"
@@ -31,24 +31,46 @@ class TestUnwrapMarkers:
     the daemon, a retried older prompt and anything that is not the console post here too."""
 
     def test_it_keeps_the_words_and_drops_the_markers(self):
-        assert _unwrap_scene("k3llydw, <scene>a woman on a sofa</scene>, she grips") == (
+        assert _unwrap_caption_regions("k3llydw, <scene>a woman on a sofa</scene>, she grips") == (
             "k3llydw, a woman on a sofa, she grips"
         )
 
     def test_it_leaves_an_unfilled_placeholder_alone(self):
         # That one is _resolve_scene's job: it gets described, or dropped.
-        assert _unwrap_scene(TEMPLATE) == TEMPLATE
+        assert _unwrap_caption_regions(TEMPLATE) == TEMPLATE
 
     def test_it_is_case_insensitive_and_spans_newlines(self):
-        assert _unwrap_scene("a <SCENE>two\nlines</SCENE> b") == "a two\nlines b"
+        assert _unwrap_caption_regions("a <SCENE>two\nlines</SCENE> b") == "a two\nlines b"
 
     def test_two_regions_do_not_merge_into_one(self):
         # A greedy match would swallow everything between the first open and the last close,
         # taking the words in between with it.
-        assert _unwrap_scene("<scene>a</scene> and <scene>b</scene>") == "a and b"
+        assert _unwrap_caption_regions("<scene>a</scene> and <scene>b</scene>") == "a and b"
 
     def test_a_prompt_with_no_markers_is_untouched(self):
-        assert _unwrap_scene("k3llydw, a woman on a sofa") == "k3llydw, a woman on a sofa"
+        assert _unwrap_caption_regions("k3llydw, a woman on a sofa") == "k3llydw, a woman on a sofa"
+
+    # The console fills the motion half the same marked way (wanly-console#529), so the
+    # same defenses apply to it — same shape, same reasons.
+
+    def test_a_motion_region_unwraps_the_same_way(self):
+        assert _unwrap_caption_regions("k3llydw, <motion>she turns toward the camera</motion>, she grips") == (
+            "k3llydw, she turns toward the camera, she grips"
+        )
+
+    def test_scene_and_motion_regions_unwrap_in_one_pass(self):
+        assert _unwrap_caption_regions("<scene>a woman on a sofa</scene> and then "
+                             "<motion>she reaches for the lamp</motion>") == (
+            "a woman on a sofa and then she reaches for the lamp"
+        )
+
+    def test_a_scene_tag_never_pairs_with_a_motion_tag(self):
+        # The backreference is the whole point: a lazy match with a fixed close would let an
+        # open <scene> reach past a </motion> (or an unclosed <scene> swallow the motion
+        # region beside it) and delete real words in between.
+        assert _unwrap_caption_regions("<scene>keep me unclosed <motion>she reaches</motion>") == (
+            "<scene>keep me unclosed she reaches"
+        )
 
 
 class TestWhichFramesMayBeKept:
@@ -154,6 +176,18 @@ class TestResolveUsesTheCache:
         assert out == "k3llydw, a woman on a sofa, she grips"
 
     @pytest.mark.asyncio
+    async def test_a_filled_motion_region_needs_no_cache_and_no_captioner(self, db):
+        """The motion half behaves the same way (wanly-console#529): markers off, words stay.
+        A filled region is not the placeholder — no ImageMeta read, no captioner, nothing
+        dropped or deferred, even though the cache for this frame was empty."""
+        filled = "k3llydw, <motion>she reaches for the lamp</motion>, close-up"
+        with patch("app.routes.segments.caption_image_bytes", new=AsyncMock()) as captioner:
+            out = await _resolve_scene(db, filled, REPO, final=True)
+
+        captioner.assert_not_called()
+        assert out == "k3llydw, she reaches for the lamp, close-up"
+
+    @pytest.mark.asyncio
     async def test_a_captioner_that_is_down_still_drops_the_placeholder(self, db):
         """Unchanged, and the reason it matters is unchanged: a literal <SCENE> is garbage
         tokens, while dropping it leaves a valid if generic prompt."""
@@ -246,3 +280,58 @@ class TestSceneAndWildcardsDoNotCollide:
         resolved, _ = await _resolve_wildcards_outside_scene(
             db, "<scene>first</scene> then <scene>second</scene>")
         assert resolved == "first then second"
+
+    # The motion half is model output too (wanly-console#529), so it is held out of reach
+    # the same way. These are not duplicates of the scene tests: they are the evidence that
+    # the second name is actually wired into the mask, not just into the unwrap.
+
+    @pytest.mark.asyncio
+    async def test_a_motion_paragraph_containing_a_wildcard_name_is_left_alone(self, db):
+        from app.routes.segments import _resolve_wildcards_outside_scene
+
+        await self._wildcard(db, "color", ["scarlet"])
+        prompt = "k3llydw, <motion>she reaches for the <color> lamp</motion>, close-up"
+
+        resolved, _ = await _resolve_wildcards_outside_scene(db, prompt)
+
+        assert resolved == "k3llydw, she reaches for the <color> lamp, close-up"
+        assert "scarlet" not in resolved, "the motion paragraph was scanned for wildcards"
+
+    @pytest.mark.asyncio
+    async def test_the_motion_markers_do_not_count_as_wildcards(self, db):
+        """Same trap as <scene>: "motion" and "/motion" both match the resolver's pattern,
+        and a match that substitutes nothing still sets the template."""
+        from app.routes.segments import _resolve_wildcards_outside_scene
+
+        resolved, template = await _resolve_wildcards_outside_scene(
+            db, "k3llydw, <motion>she reaches for the lamp</motion>, close-up")
+
+        assert resolved == "k3llydw, she reaches for the lamp, close-up"
+        assert template is None, "the markers were counted as wildcards"
+
+    @pytest.mark.asyncio
+    async def test_a_scene_and_a_motion_region_are_masked_independently(self, db):
+        """Both regions protected in one prompt, and the wildcard BETWEEN them still
+        resolves -- the two masks must not merge or swallow the words separating them."""
+        from app.routes.segments import _resolve_wildcards_outside_scene
+
+        await self._wildcard(db, "color", ["scarlet"])
+        prompt = ("<scene>a woman in a <color> dress</scene>, a <color> light, "
+                  "<motion>she turns toward the <color> lamp</motion>")
+
+        resolved, template = await _resolve_wildcards_outside_scene(db, prompt)
+
+        assert resolved == ("a woman in a <color> dress, a scarlet light, "
+                            "she turns toward the <color> lamp")
+        assert template == ("a woman in a <color> dress, a <color> light, "
+                            "she turns toward the <color> lamp")
+
+    @pytest.mark.asyncio
+    async def test_an_unfilled_motion_placeholder_still_reaches_the_resolver_untouched(self, db):
+        """<MOTION> is not a region: it must survive masking to be described later."""
+        from app.routes.segments import _resolve_wildcards_outside_scene
+        from app.routes.segments import MOTION_PLACEHOLDER
+
+        resolved, _ = await _resolve_wildcards_outside_scene(
+            db, f"k3llydw, {MOTION_PLACEHOLDER}, close-up")
+        assert MOTION_PLACEHOLDER in resolved
