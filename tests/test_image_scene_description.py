@@ -457,3 +457,28 @@ class TestSceneEndpointsAcceptAGeneratedFrame:
     async def test_an_unknown_bucket_is_still_refused(self, db):
         resp = await _post_scene(db, "s3://someone-elses-bucket/x.png", caption="nope")
         assert resp.status_code == 400
+
+
+class TestTheQueueIsVisible:
+    """The UI needs a number, not a spinner. A spinner during a 7-deep queue is
+    indistinguishable from a hang, which is how a working batch gets abandoned."""
+
+    @pytest.mark.asyncio
+    async def test_the_scene_response_carries_the_queue_fields(self, db):
+        resp = await _post_scene(db, PATH, caption="a woman on a sofa")
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        # Idle is the normal case: the turn is released before the response is built, so
+        # nothing is queued, there is no position, and the depth is zero.
+        assert body["queue_status"] is None
+        assert body["queue_position"] is None
+        assert body["queue_depth"] == 0
+
+    @pytest.mark.asyncio
+    async def test_the_read_carries_them_too(self, db):
+        """One endpoint answers both "is it done" and "how much is in front of it", so a
+        poller does not need two calls to render one chip."""
+        resp = await _get_scene(db, PATH)
+        assert resp.status_code == 200, resp.text
+        for k in ("queue_status", "queue_position", "queue_depth"):
+            assert k in resp.json()
