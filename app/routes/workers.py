@@ -1,5 +1,7 @@
 import logging
 import uuid
+
+import httpx
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -11,7 +13,8 @@ from app.database import get_db
 from app.enums import JobStatus, SegmentStatus, WorkerKind, WorkerStatus, ordered_kinds
 from app.models import Job, Segment, Worker
 from app.queue_health import COUNTED_KINDS, assess
-from app.schemas.workers import QueueHealthResponse, WorkerDrain, WorkerHeartbeat, WorkerRegister, WorkerRename, WorkerResponse, WorkerStatusUpdate
+from app.config import settings
+from app.schemas.workers import QueueHealthResponse, WorkerDrain, WorkerHeartbeat, WorkerMode, WorkerModeResponse, WorkerRegister, WorkerRename, WorkerResponse, WorkerStatusUpdate
 
 logger = logging.getLogger(__name__)
 
@@ -216,6 +219,92 @@ async def cancel_drain(
     await db.commit()
     await db.refresh(worker)
     return worker
+
+
+def _control_url(worker: Worker) -> str:
+    """Where this box's container serves its control API.
+
+    BY FRIENDLY NAME, not by `ip_address`. The address on the row is whatever the daemon saw
+    from inside the container -- on the 3090 that is 172.17.0.2, a docker-internal address
+    this process cannot reach. The friendly name is the box's real hostname and is already
+    how this API reaches its other services (image_description_url, face_crop_url).
+    """
+    return f"http://{worker.friendly_name}:{settings.worker_control_port}"
+
+
+async def _worker_or_404(db: AsyncSession, worker_id: uuid.UUID) -> Worker:
+    worker = await db.get(Worker, worker_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    return worker
+
+
+@router.get("/workers/{worker_id}/mode", response_model=WorkerModeResponse,
+            dependencies=[Depends(verify_api_key_or_bearer)])
+async def get_worker_mode(worker_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """What the box is running, asked of the box.
+
+    Not stored here: the container is the only thing that knows, it can be restarted or
+    flipped by a call that never came through this API, and a column would be a second copy
+    free to disagree with it.
+    """
+    worker = await _worker_or_404(db, worker_id)
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{_control_url(worker)}/health")
+        # A degraded box answers 503 and its body is still the truth -- a container in
+        # caption mode with a service deliberately off is exactly that shape.
+        body = r.json()
+    except Exception as e:
+        # 502, not 500: this API is fine, the box is not answering. The Workers page shows
+        # the row either way and just cannot offer the toggle.
+        raise HTTPException(
+            status_code=502,
+            detail=f"{worker.friendly_name} did not answer on "
+                   f":{settings.worker_control_port} ({e})") from e
+    return WorkerModeResponse(
+        mode=body.get("mode") or "ltx-engine",
+        equipped=body.get("equipped") or [],
+        services=[s.get("group") or s.get("name")
+                  for s in body.get("services", []) if not s.get("stopped")],
+    )
+
+
+@router.post("/workers/{worker_id}/mode", response_model=WorkerModeResponse,
+             dependencies=[Depends(verify_api_key_or_bearer)])
+async def set_worker_mode(
+    worker_id: uuid.UUID, body: WorkerMode, db: AsyncSession = Depends(get_db)
+):
+    """Flip a box between rendering and captioning, in place.
+
+    A relay, deliberately thin: the container owns what a mode means (which services, in
+    what order, and the GPU-sharing rules between them). Duplicating that here would give
+    two definitions free to drift, and the one on the box is the one that is true.
+    """
+    worker = await _worker_or_404(db, worker_id)
+    if worker.status == "offline":
+        raise HTTPException(status_code=400, detail="Cannot set the mode of an offline worker")
+    try:
+        async with httpx.AsyncClient(timeout=120) as client:
+            r = await client.post(f"{_control_url(worker)}/mode", json={"mode": body.mode})
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"{worker.friendly_name} did not answer on "
+                   f":{settings.worker_control_port} ({e})") from e
+    if r.status_code >= 400:
+        # The box's own refusal, passed through verbatim: "MODE=caption leaves nothing to
+        # run" is text a person can act on, and rewording it here would lose that.
+        detail = r.json().get("detail") if r.headers.get("content-type", "").startswith("application/json") else r.text
+        raise HTTPException(status_code=r.status_code, detail=detail or "the worker refused")
+    out = r.json()
+    logger.info("Worker %s mode -> %s (%s)", worker.friendly_name,
+                out.get("mode"), ",".join(out.get("services") or []))
+    return WorkerModeResponse(
+        mode=out.get("mode") or body.mode,
+        services=out.get("services") or [],
+        changed=bool(out.get("changed")),
+    )
 
 
 @router.post("/workers/{worker_id}/heartbeat", response_model=WorkerResponse, dependencies=[Depends(verify_api_key)])

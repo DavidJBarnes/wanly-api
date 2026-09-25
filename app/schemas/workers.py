@@ -74,6 +74,28 @@ class WorkerDrain(BaseModel):
     after_jobs: int | None = None
 
 
+class WorkerMode(BaseModel):
+    """Which half of its capability a box should be running (wanly-gpu-docker#131)."""
+    mode: str
+
+
+class WorkerModeResponse(BaseModel):
+    """What the box is doing, read from the box itself.
+
+    NOT stored on the worker row, and that is deliberate. The container is the only thing
+    that knows what is actually running -- it can be restarted, or flipped by a curl that
+    never came through here -- and a column would be a second copy free to disagree. The
+    Workers page asks the box.
+    """
+    mode: str
+    #: Everything SERVICES says this box can run. The caller needs it to know whether the
+    #: other mode is even offerable: a box with no captioner has no caption mode.
+    equipped: list[str] = []
+    #: What is running right now, after the change.
+    services: list[str] = []
+    changed: bool = False
+
+
 class QueueHealthResponse(BaseModel):
     """Work waiting versus workers able to take it.
 
