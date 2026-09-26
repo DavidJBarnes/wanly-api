@@ -395,6 +395,10 @@ async def describe(image_bytes: bytes, instruction: str, base_url: str | None = 
         "images": [base64.b64encode(image_bytes).decode()],
         "stream": False,
         "keep_alive": settings.image_description_keep_alive,
+        # num_ctx is not a tuning knob here, it is the difference between the model being
+        # resident and not -- see image_description_num_ctx. Sending nothing let ollama size
+        # the context from VRAM and push a third of the layers onto the CPU.
+        "options": {"num_ctx": settings.image_description_num_ctx},
     }
     url = f"{base}/api/generate"
     try:

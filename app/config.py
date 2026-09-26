@@ -49,6 +49,22 @@ class Settings(BaseSettings):
     # warm motion caption up to ~50 s. 180 — the old JoyCaption number — timed the first
     # cold call out. 600 leaves room for the load without letting a wedged captioner hold
     # a request open forever.
+    #: THE CONTEXT WINDOW FOR A CAPTION, and the single biggest thing about caption speed.
+    #:
+    #: Sending no options lets ollama size the context from VRAM: on the 3090 it picks
+    #: 32768, which needs 8 GB of KV cache, which does not fit beside a 20 GB model on a
+    #: 24 GB card -- so 11 of 65 layers run on the CPU and every generated token crosses
+    #: them. Measured, same image, same prompt, warm both times:
+    #:
+    #:     default (32768)   7.6s   7.8 tok/s   11 layers on CPU
+    #:     4096              1.5s  37.3 tok/s   all layers on GPU
+    #:
+    #: A caption does not want 32k. The static prompt measured 451 tokens INCLUDING the
+    #: image, and the motion prompt adds the scene paragraph -- so 4096 is roughly eight
+    #: times what the job needs, and every byte above that is paid for in offloaded layers.
+    image_description_num_ctx: int = Field(
+        4096, validation_alias=AliasChoices("image_description_num_ctx",
+                                            "joycaption_num_ctx"))
     image_description_timeout_s: int = Field(
         600, validation_alias=AliasChoices("image_description_timeout_s", "joycaption_timeout_s"))
     # The motion half of a description (#326) is an env kill-switch, and it exists because
