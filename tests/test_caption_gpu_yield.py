@@ -144,3 +144,48 @@ async def _boom(self, url):
 @pytest.fixture(autouse=True)
 def _point_at_a_test_captioner(monkeypatch):
     monkeypatch.setattr(settings, "image_description_url", "http://2070.test:11434")
+
+
+class TestTheContextIsSentExplicitly:
+    """num_ctx is not a tuning knob here -- it is whether the model is resident at all.
+
+    Sending no options lets ollama size the context from VRAM. On the 3090 it picks 32768,
+    which needs 8 GB of KV cache, which does not fit beside a 20 GB model on a 24 GB card --
+    so 11 of 65 layers run on the CPU and every generated token crosses them. Measured, same
+    image and prompt, warm both times:
+
+        default (32768)   7.6s    7.8 tok/s
+        4096              1.5s   37.3 tok/s
+    """
+
+    @pytest.mark.asyncio
+    async def test_describe_sends_num_ctx(self, monkeypatch):
+        from app import joycaption as jc
+
+        seen = {}
+
+        class _Resp:
+            status_code = 200
+            def json(self):
+                return {"response": "a woman on a sofa"}
+
+        class _Client:
+            async def __aenter__(self):
+                return self
+            async def __aexit__(self, *a):
+                return False
+            async def post(self, url, json=None):
+                seen.update(json or {})
+                return _Resp()
+
+        monkeypatch.setattr(jc.httpx, "AsyncClient", lambda **kw: _Client())
+        await jc.describe(b"jpegbytes", "describe this", base_url="http://box:11434")
+
+        assert seen["options"]["num_ctx"] == jc.settings.image_description_num_ctx
+
+    def test_the_default_leaves_room_without_costing_layers(self):
+        """The static prompt measured 451 tokens INCLUDING the image, and the motion prompt
+        adds the scene paragraph. 4096 is ~8x the job; 32768 is what pushed layers to CPU."""
+        from app.config import settings
+
+        assert 2048 <= settings.image_description_num_ctx <= 8192
