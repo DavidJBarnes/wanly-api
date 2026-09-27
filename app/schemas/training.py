@@ -15,7 +15,7 @@ from datetime import datetime
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from app.enums import TrainingStatus
 
@@ -28,163 +28,113 @@ MIN_DATASET_IMAGES = 8
 MAX_DATASET_IMAGES = 400
 
 
-class IdentityGroup(BaseModel):
-    """One EXTRA dataset trained alongside group 0 (wanly-api#102, #106).
+#: The fields of the request shape before #352. A body carrying any of them is an old console
+#: (or a script) that still thinks it chooses the trigger, gender, images or caption. It is
+#: refused with a sentence rather than having those fields silently ignored -- a run that
+#: quietly trained under the registry's trigger instead of the one somebody typed would be
+#: the worst kind of surprise. Jobs created in the old shape stay claimable and retryable:
+#: that is read from the job row, not from a request.
+LEGACY_FIELDS = frozenset({
+    "trigger", "dataset_id", "dataset_images", "caption", "gender", "identities",
+    "second_character", "second_trigger", "second_gender", "second_dataset_images",
+    "second_dataset_id", "second_num_repeats", "second_caption",
+})
 
-    Two shapes, and the difference is whether a trigger is given:
 
-      identity group    character/trigger/gender set -> every image captioned
-                        "<trigger>, <gender>", exactly like group 0. Its pair joins the
-                        published trigger phrase.
-      composition group NO trigger -> `caption` is used verbatim. The images contain BOTH
-                        characters and the caption names both ("p@yton, woman and d@vid,
-                        man"). This is what teaches the model the two identities appear
-                        TOGETHER, which solo sets alone cannot (#106) -- and its caption
-                        repeats triggers the identity groups already carry, so it does NOT
-                        add to the published phrase.
-    """
-    character: str | None = Field(default=None, max_length=64)
-    trigger: str | None = Field(default=None, max_length=64)
-    gender: Literal["woman", "man", "person"] | None = None
-    #: Free caption for a composition group. When a trigger+gender are given this is
-    #: ignored, the same way group 0's `caption` is.
-    caption: str | None = Field(default=None, max_length=500)
-    dataset_images: list[str] = Field(default_factory=list, max_length=MAX_DATASET_IMAGES)
-    dataset_id: uuid.UUID | None = None
-    num_repeats: int | None = Field(default=None, ge=1, le=100)
-
-    @field_validator("character")
-    @classmethod
-    def _no_path_tricks(cls, v: str | None) -> str | None:
-        if v is None:
-            return v
-        if "/" in v or v.startswith(".") or any(c.isspace() for c in v):
-            raise ValueError("character cannot contain slashes, whitespace, or start with a dot")
-        return v
-
-    @field_validator("dataset_images")
-    @classmethod
-    def _s3_uris_only(cls, v: list[str]) -> list[str]:
-        bad = [x for x in v if not x.startswith("s3://")]
-        if bad:
-            raise ValueError(f"dataset_images must be s3:// URIs, got {bad[0]!r}")
-        if len(set(v)) != len(v):
-            raise ValueError("dataset_images contains duplicates")
-        return v
+def _path_safe(v: str | None, what: str) -> str | None:
+    # It becomes a directory name and an output filename on the trainer.
+    if v is not None and ("/" in v or v.startswith(".") or any(c.isspace() for c in v)):
+        raise ValueError(f"{what} cannot contain slashes, whitespace, or start with a dot")
+    return v
 
 
 class TrainingCreate(BaseModel):
-    #: THE LtxCharacter NAME, not a filesystem-safe version of it. `p@y` is correct here.
-    #:
-    #: This is what the finished LoRA is published against, and it upserts on the name -- so
-    #: passing `pay` for a character the system already knows as `p@y` creates a SECOND
-    #: character row pointing at the same LoRA, and recipes keep using the old one. The
-    #: filename is sanitised separately at upload (`pay_v3_e04.safetensors`), because a LoRA
-    #: is served over HTTP and lands in JSON and URLs; the name and the trigger are not.
+    """A training request since #352: WHO to train, and the knobs. Nothing else.
+
+    Triggers and genders come from the registry, images from each member's character
+    dataset, captions from the datasets' stored bodies, regularization from the pools --
+    see app/training_plan.py, which resolves all of it and says what is missing. The same
+    body goes to POST /training/preflight and POST /training.
+
+        solo  {mode: "solo", character: "David", ...}
+        pair  {mode: "pair", character: "DavidKelly-2026", members: ["David", "Kelly-2026"],
+               composition_dataset_id: ..., ...}
+    """
+    mode: Literal["solo", "pair"]
+    #: THE LtxCharacter NAME the LoRA publishes to: the person for solo, the PAIR's own
+    #: name for pair (never a member's -- that is the #352 bug where a joint run replaced
+    #: what its first member rendered with). `p@y` is correct here; the filename is
+    #: sanitised separately (`lora_name`).
     character: str = Field(min_length=1, max_length=64)
-    trigger: str = Field(min_length=1, max_length=64)
+    #: Pair only: the two solo characters, group 0 first. Optional when the pair is already
+    #: registered with its members.
+    members: list[str] | None = Field(default=None, max_length=2)
+    #: {member name: dataset id}, only needed when a member owns several character sets.
+    datasets: dict[str, uuid.UUID] = Field(default_factory=dict)
+    #: Pair only. Omitted: the pair's one composition set, if it has exactly one.
+    composition_dataset_id: uuid.UUID | None = None
+    #: Pair only: train without a composition set, knowingly. A warning, not a default.
+    allow_no_composition: bool = False
     version: int = Field(default=1, ge=1, le=99)
-    #: Either give the images, or name a dataset and let the API resolve them. The dataset is
-    #: the normal path now -- a set worth training is a set worth being able to re-open. The
-    #: minimum is enforced in the route rather than here, because it applies to whichever of
-    #: the two was used.
-    dataset_images: list[str] = Field(default_factory=list, max_length=MAX_DATASET_IMAGES)
-    dataset_id: uuid.UUID | None = None
-    #: One caption for every image. Per-image captions come from the dataset instead, and are
-    #: the better answer -- all 13 of p@y's read "p@y, woman" over close-ups, so the trigger
-    #: carries close-up framing as part of its identity.
-    caption: str | None = Field(default=None, max_length=500)
-    #: The console's way of saying the caption: every image is captioned "<trigger>, <gender>".
-    #: Explicit because a free caption field was filled in with "man" alone and the trigger
-    #: was never learned. When given, it decides the caption.
-    gender: Literal["woman", "man", "person"] | None = None
-    #: Total training steps. The ceiling was 6000 while runs were single small sets; a
-    #: joint run over three datasets at the proven ~5-8 passes per image legitimately
-    #: exceeds it (8 epochs x 105 images x 10 repeats = 8400). Raised rather than the
-    #: epochs redefined: the trainer's epoch math is steps // (images x repeats), and a
-    #: cap below a real configuration would refuse the configuration silently.
+    #: Total training steps across every group, regularization included. The ceiling is a
+    #: guard against a typo, not a quality opinion: a pair at the proven passes-per-image
+    #: with its regularization legitimately runs well past the old 6000.
     steps: int = Field(default=1200, ge=100, le=30000)
-    #: The filename stem the LoRA installs under. ASKED, NOT DERIVED.
-    #:
-    #: A LoRA is served over HTTP and lands in JSON and URLs, so `p@y` cannot be a filename --
-    #: but stripping the character it cannot carry gives `py`, and the file this project has
-    #: actually been rendering with is `pay_v2_e05.safetensors`. A human read `@` as `a`. There
-    #: is no rule that produces that: `@`->`a` is a transliteration, and inventing a table for
-    #: it generalises badly (k3lly2026 keeps its digits, so `3`->`e` is wrong).
-    #:
-    #: So it is a field, defaulted to the stripped form and visible in the dialog, rather than
-    #: a guess made silently at upload time.
-    lora_name: str | None = Field(default=None, max_length=64,
-                                  pattern=r"^[A-Za-z0-9._-]+$")
+    #: The filename stem the LoRA installs under. ASKED, NOT DERIVED: `p@y` cannot be a
+    #: filename, and stripping gives `py` while the file this project renders is `pay_...` --
+    #: a human read `@` as `a`, and no rule produces that.
+    lora_name: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
     #: Which checkpoints to upload as they are written. "final" is the default: a 650 MB
-    #: checkpoint takes ~18 minutes to leave the 3090 and a five-epoch run's uploads
-    #: outlast the training, for epochs that mostly go unused. "all" uploads every one.
-    #: Either way every epoch stays on the trainer and can be published afterwards.
+    #: checkpoint takes ~18 minutes to leave the 3090. Every epoch stays on the trainer and
+    #: can be published afterwards.
     publish: Literal["final", "all"] = "final"
-    #: ADDITIONAL groups (wanly-api#102, #106), each an IdentityGroup -- an identity set
-    #: or a composition set. Empty means single-identity. The route resolves and validates
-    #: them the same way it does group 0.
-    identities: list[IdentityGroup] = Field(default_factory=list, max_length=8)
-    #: LEGACY (#102): the one-second-identity fields, before #106 made it a list. Accepted
-    #: so an old console cannot silently drop its second group by sending fields a new API
-    #: no longer reads; folded into `identities` in the route. Never written by the console
-    #: once it ships the list form.
-    second_character: str | None = Field(default=None, min_length=1, max_length=64)
-    second_trigger: str | None = Field(default=None, min_length=1, max_length=64)
-    second_gender: Literal["woman", "man", "person"] | None = None
-    second_dataset_images: list[str] = Field(default_factory=list, max_length=MAX_DATASET_IMAGES)
-    second_dataset_id: uuid.UUID | None = None
-    second_num_repeats: int | None = Field(default=None, ge=1, le=100)
-    second_caption: str | None = Field(default=None, max_length=500)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _not_the_legacy_shape(cls, data):
+        if isinstance(data, dict):
+            legacy = sorted(LEGACY_FIELDS & set(data))
+            if legacy:
+                raise ValueError(
+                    f"the pre-#352 training request is no longer accepted ({', '.join(legacy)}): "
+                    f"triggers, genders, images and captions now come from the character "
+                    f"registry and the datasets. Send {{mode, character, members?, ...}}.")
+        return data
 
     @field_validator("character")
     @classmethod
     def _no_path_tricks(cls, v: str) -> str:
-        # It becomes a directory name and an output filename on the trainer.
-        if "/" in v or v.startswith(".") or any(c.isspace() for c in v):
-            raise ValueError("character cannot contain slashes, whitespace, or start with a dot")
-        return v
+        return _path_safe(v, "character")
 
-    @field_validator("second_character")
-    @classmethod
-    def _second_no_path_tricks(cls, v: str | None) -> str | None:
-        if v is None:
-            return v
-        if "/" in v or v.startswith(".") or any(c.isspace() for c in v):
-            raise ValueError("second_character cannot contain slashes, whitespace, or start with a dot")
-        return v
 
-    def legacy_second_group(self) -> IdentityGroup | None:
-        """The pre-#106 second identity as an IdentityGroup, or None when absent."""
-        if not self.second_character:
-            return None
-        return IdentityGroup(
-            character=self.second_character, trigger=self.second_trigger,
-            gender=self.second_gender, caption=self.second_caption,
-            dataset_images=list(self.second_dataset_images),
-            dataset_id=self.second_dataset_id, num_repeats=self.second_num_repeats)
+class TrainingProblem(BaseModel):
+    code: str
+    message: str
 
-    @field_validator("dataset_images")
-    @classmethod
-    def _s3_uris_only(cls, v: list[str]) -> list[str]:
-        bad = [x for x in v if not x.startswith("s3://")]
-        if bad:
-            raise ValueError(f"dataset_images must be s3:// URIs, got {bad[0]!r}")
-        if len(set(v)) != len(v):
-            # Duplicates train the same image twice under two sel_NNN names, silently
-            # reweighting the set.
-            raise ValueError("dataset_images contains duplicates")
-        return v
 
-    @field_validator("second_dataset_images")
-    @classmethod
-    def _second_s3_uris_only(cls, v: list[str]) -> list[str]:
-        bad = [x for x in v if not x.startswith("s3://")]
-        if bad:
-            raise ValueError(f"second_dataset_images must be s3:// URIs, got {bad[0]!r}")
-        if len(set(v)) != len(v):
-            raise ValueError("second_dataset_images contains duplicates")
-        return v
+class TrainingPlanGroup(BaseModel):
+    """One group as the preflight shows it. `sample_captions` are FINAL captions, prefix
+    included, exactly as the trainer will write them."""
+    kind: Literal["identity", "composition", "regularization"]
+    character: str | None = None
+    trigger: str | None = None
+    gender: str | None = None
+    dataset_id: str | None = None
+    dataset_name: str | None = None
+    images: int
+    num_repeats: int
+    sample_captions: list[str]
+
+
+class TrainingPreflight(BaseModel):
+    ok: bool
+    problems: list[TrainingProblem]
+    warnings: list[TrainingProblem]
+    groups: list[TrainingPlanGroup]
+    steps: int
+    samples_per_epoch: int
+    passes_per_image: float
+    base_checkpoint: str
 
 
 class TrainingResponse(BaseModel):
@@ -236,12 +186,19 @@ class TrainingClaimResponse(TrainingResponse):
     credentials -- it fetches through the API's own proxy, the same way the render daemon gets
     its LoRAs.
 
-    `identities` carries the extra groups (#102, #106) the same way: each is
-    {character, trigger, gender, caption, num_repeats, download_urls}. ABSENT for every
-    single-identity run, so a trainer that predates this sees nothing. A COMPOSITION group
-    (#106) has a trigger of None and a caption naming the people in its frames.
+    `captions` (#352) pairs 1:1 with them too: group 0's final per-image captions, prefix
+    included. None for a job created before #352, which trains under config.caption alone.
+    `config.base_checkpoint` names the base model (bare, e.g. 10Eros_v1.5_bf16); absent on
+    those older jobs, where the trainer keeps its own default.
+
+    `identities` carries groups 1..N the same way, each
+    {character, trigger, gender, caption, captions, kind, num_repeats, dataset_name,
+    download_urls}. `kind` is identity | composition | regularization; trigger is None for
+    the latter two; `caption` is the legacy single string (the first caption) for a trainer
+    that predates `captions`. ABSENT for a run with one group.
     """
     download_urls: list[str]
+    captions: list[str] | None = None
     identities: list[dict] | None = None
 
 

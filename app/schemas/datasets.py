@@ -2,8 +2,15 @@
 import re
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
+
+#: What a set is for (migration 103). See Dataset.kind.
+DatasetKind = Literal["character", "composition", "regularization"]
+#: The class words a regularization pool can stand in for. Not "person": no character is
+#: registered under it, so a pool for it would be a pool nothing trains against.
+RegClass = Literal["woman", "man"]
 
 #: Same character class the image folders use, because a dataset's uploads land in one and an S3
 #: prefix that needs escaping is a prefix nobody can type.
@@ -14,6 +21,11 @@ class DatasetCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     tags: str | None = Field(default=None, max_length=500)
     notes: str | None = None
+    #: Optional at creation: a set is often created before anyone decides whose it is.
+    #: Validated the same way as on PATCH when given.
+    kind: DatasetKind | None = None
+    character: str | None = Field(default=None, max_length=64)
+    reg_class: RegClass | None = None
 
     @field_validator("name")
     @classmethod
@@ -33,6 +45,51 @@ class DatasetUpdate(BaseModel):
     #: The image every other one is scored against. Settable directly so the console can clear
     #: it, or set it without immediately paying for a scoring pass.
     anchor_uri: str | None = None
+    #: Ownership (migration 103). Unlike the fields above, an explicit null CLEARS these --
+    #: "unassign this set" has to be sayable, and "" is not a kind. The route tells an
+    #: absent field from a null through model_fields_set.
+    kind: DatasetKind | None = None
+    character: str | None = Field(default=None, max_length=64)
+    reg_class: RegClass | None = None
+
+
+class DatasetCaptionsRun(BaseModel):
+    """POST /datasets/{id}/captions. Fills only missing captions unless `overwrite`."""
+    overwrite: bool = False
+
+
+class DatasetCaptionEdit(BaseModel):
+    """PATCH /datasets/{id}/captions: one image's body, by URI. Blank deletes it."""
+    uri: str
+    caption: str = Field(max_length=2000)
+
+
+class DatasetCaptionStatus(BaseModel):
+    """Progress of a dataset's captioning. `running` is this process's view of it."""
+    total: int
+    captioned: int
+    running: bool
+    error: str | None = None
+
+
+class DatasetRegularize(BaseModel):
+    """POST /datasets/{id}/regularize: how many text-to-video renders to queue."""
+    count: int = Field(ge=1, le=300)
+
+
+class DatasetRegularizeStatus(BaseModel):
+    """Where a regularization pool's renders are, and what this poll collected.
+
+    requested = done + failed + running. `done` renders have had their frame collected into
+    the set; `running` is queued or rendering (`pending` is the queued part of it).
+    """
+    requested: int
+    done: int
+    failed: int
+    running: int
+    pending: int = 0
+    collected_now: int = 0
+    images: int = 0
 
 
 class DatasetResponse(BaseModel):
@@ -43,8 +100,21 @@ class DatasetResponse(BaseModel):
     images: list[str]
     prefix: str | None = None
     anchor_uri: str | None = None
+    kind: str | None = None
+    character: str | None = None
+    reg_class: str | None = None
+    #: {uri: body}, without the trigger prefix (migration 103).
+    captions: dict[str, str] = Field(default_factory=dict)
+    #: {uri: cos} against the anchor as of the last scoring pass; null = no face found.
+    scores: dict[str, float | None] = Field(default_factory=dict)
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+    @field_validator("captions", "scores", mode="before")
+    @classmethod
+    def _none_is_empty(cls, v):
+        # A row created by the ORM before its server default is read back holds None.
+        return v or {}
 
     @property
     def image_count(self) -> int:

@@ -452,6 +452,27 @@ class Dataset(Base):
     #: A URI, not an index. The list is reordered by removal, so an index would silently come
     #: to mean a different photograph.
     anchor_uri = mapped_column(Text, nullable=True)
+    #: WHAT THE SET IS FOR, and WHOSE it is (migration 103). Before these a dataset was a bag
+    #: of images with a name, and the "David" LoRA trained on 14 images of somebody else with
+    #: nothing able to notice. The training route reads them rather than trusting a request:
+    #:
+    #:   character       one person's face; `character` is that registered solo character
+    #:   composition     two people in frame; `character` is the PAIR's name
+    #:   regularization  generic people, nobody in particular; `reg_class` is woman | man
+    #:
+    #: NULL kind is "unassigned", which the console flags and training refuses.
+    kind = mapped_column(String(20), nullable=True)
+    character = mapped_column(String(64), nullable=True)
+    reg_class = mapped_column(String(16), nullable=True)
+    #: {uri: body}. The training caption of each image WITHOUT the trigger -- the
+    #: "<trigger>, <gender>, " prefix is added when a run is created, so the same set can
+    #: never be trained under the wrong trigger by a caption that already names one. Keyed by
+    #: URI for the same reason the anchor is: the list is reordered by removal.
+    captions = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    #: {uri: cos} against the anchor, as of the last POST /score (None = no face found).
+    #: Kept rather than recomputed because the training route refuses a character set with a
+    #: face below the floor, and that must not depend on the face-crop box being up.
+    scores = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
                                onupdate=lambda: datetime.now(timezone.utc))
@@ -575,7 +596,10 @@ class LtxCharacter(Base):
     # The token that fills a pose's <TRIGGER> placeholder. "Adding a character costs a LoRA
     # and a trigger swap" — this is the trigger half, and it is why a new LoRA is never
     # locked out: every pose works for it the moment the row exists.
-    trigger = mapped_column(String(64), nullable=False)
+    #
+    # 255 since migration 103: a PAIR's trigger is the joined phrase its captions taught,
+    # "d@vid, man and k3lly2026, woman", and 64 does not hold two real names.
+    trigger = mapped_column(String(255), nullable=False)
     # The other half of the caption this LoRA trained on. Every run captions its images
     # "<trigger>, <gender>", so the identity is bound to the PAIR; filling <TRIGGER> with
     # the trigger alone left the binding word out of every render prompt, which is what
@@ -595,6 +619,16 @@ class LtxCharacter(Base):
     # renamed later does not rewrite what trained. NULL for characters that predate it
     # (backfilled by a one-off pass).
     trained_from = mapped_column(JSONB, nullable=True)
+    # SOLO OR PAIR (migration 103). A solo row is one person: one trigger, one gender, owned
+    # by the registry and locked once it has trained. A pair row is a joint LoRA over two
+    # solo characters (`members`, by name) whose trigger is the joined phrase. They are
+    # separate rows because a joint run used to publish over its first member's solo row,
+    # and training "DavidKelly" then replaced what "David" rendered with.
+    kind = mapped_column(String(16), nullable=False, default="solo", server_default="solo")
+    members = mapped_column(JSONB, nullable=True)
+    # The base model this LoRA was TRAINED against, as the trainer was told it. A LoRA
+    # trained on dev and rendered on 10Eros is the mismatch that forced stage-2 to 1.5.
+    base_checkpoint = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     # There is NO cascade to recipes: `ltx_recipes` has no character_id and no relationship

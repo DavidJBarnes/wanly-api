@@ -47,25 +47,13 @@ class TestNaming:
         assert "already exists" in src
 
 class TestTraining:
-    def test_a_job_can_name_a_dataset_instead_of_listing_images(self):
-        t = TrainingCreate(character="p@y", trigger="p@y", dataset_id=uuid.uuid4())
-        assert t.dataset_images == []
-        assert t.dataset_id is not None
-
-    def test_a_raw_list_still_works(self):
-        """A CLI or a curl should not have to create a dataset first."""
-        imgs = [f"s3://b/{i}.jpg" for i in range(13)]
-        assert TrainingCreate(character="x", trigger="x", dataset_images=imgs).dataset_id is None
-
-    def test_the_minimum_is_enforced_in_the_route_not_the_schema(self):
-        """A schema minimum on dataset_images would reject every dataset_id request, which is
-        the normal path."""
-        import inspect
-        from app.routes import training as mod
-        src = inspect.getsource(mod.create_training_job)
-        assert "len(images) < MIN_DATASET_IMAGES" in src
-        # and it resolves the dataset before checking
-        assert src.index("body.dataset_id") < src.index("len(images) < MIN_DATASET_IMAGES")
+    def test_a_job_names_a_character_not_a_dataset(self):
+        """#352: which set trains is the SERVER's call -- the member's own character set --
+        so a request can no longer point at an arbitrary one (or a raw list of URIs)."""
+        t = TrainingCreate(mode="solo", character="p@y")
+        assert not hasattr(t, "dataset_id") and not hasattr(t, "dataset_images")
+        with pytest.raises(ValueError, match="no longer accepted"):
+            TrainingCreate(mode="solo", character="x", dataset_id=str(uuid.uuid4()))
 
 
 @pytest.mark.asyncio
@@ -562,3 +550,373 @@ class TestTheCropRoundTripFitsThroughTheWire:
         import inspect
         from app.routes import datasets as mod
         assert "asyncio.gather" in inspect.getsource(mod._embed_all)
+
+
+# -------------------------------------------------------------------------------------------
+# #352: ownership, per-image captions and scores, and regularization pools.
+# -------------------------------------------------------------------------------------------
+
+def _imgs(n, prefix="x"):
+    return [f"s3://wanly-images/datasets/{prefix}/{i}.jpg" for i in range(n)]
+
+
+async def _ds(db, **kw):
+    from app.models import Dataset
+    base = dict(name=f"set-{uuid.uuid4().hex[:6]}", images=_imgs(4), prefix="datasets/p",
+                captions={}, scores={})
+    base.update(kw)
+    d = Dataset(**base)
+    db.add(d)
+    await db.commit()
+    return d
+
+
+async def _patch(db, ds, **fields):
+    from app.routes.datasets import update_dataset
+    from app.schemas.datasets import DatasetUpdate
+    return await update_dataset(ds.id, DatasetUpdate(**fields), _user=None, db=db)
+
+
+@pytest.mark.asyncio
+class TestCaptionsAndScoresFollowTheImages:
+    """Both are keyed by URI. An entry for an image that left the set is a caption nobody
+    can see, and a crop reusing a filename would inherit a stranger's."""
+
+    async def test_removing_an_image_drops_its_caption_and_score(self, db):
+        imgs = _imgs(3)
+        ds = await _ds(db, images=imgs, anchor_uri=imgs[0],
+                       captions={u: f"c{i}" for i, u in enumerate(imgs)},
+                       scores={u: 0.9 for u in imgs})
+        out = await _patch(db, ds, images=[imgs[0], imgs[2]])
+        assert set(out.captions) == {imgs[0], imgs[2]}
+        assert set(out.scores) == {imgs[0], imgs[2]}
+
+    async def test_reordering_keeps_them(self, db):
+        imgs = _imgs(3)
+        ds = await _ds(db, images=imgs, captions={u: "c" for u in imgs})
+        out = await _patch(db, ds, images=list(reversed(imgs)))
+        assert set(out.captions) == set(imgs)
+
+    async def test_a_new_anchor_clears_the_scores(self, db):
+        """Scores are likeness to THE anchor; against another face they are about someone
+        else, and training would pass or refuse the set on them."""
+        imgs = _imgs(3)
+        ds = await _ds(db, images=imgs, anchor_uri=imgs[0], scores={u: 0.9 for u in imgs})
+        out = await _patch(db, ds, anchor_uri=imgs[1])
+        assert out.scores == {}
+
+    async def test_an_unrelated_edit_keeps_the_scores(self, db):
+        imgs = _imgs(3)
+        ds = await _ds(db, images=imgs, anchor_uri=imgs[0], scores={u: 0.9 for u in imgs})
+        out = await _patch(db, ds, notes="hello")
+        assert len(out.scores) == 3
+
+    async def test_scoring_persists_what_it_returns(self, db, monkeypatch):
+        from app.config import settings
+        from app.routes import datasets as mod
+        imgs = _imgs(3)
+        ds = await _ds(db, images=imgs)
+
+        async def _embed(uris):
+            return [[1.0, 0.0], [0.6, 0.8], []]  # anchor, a match, no face
+        monkeypatch.setattr(mod, "_embed_all", _embed)
+        monkeypatch.setattr(settings, "face_crop_url", "http://crop.test")
+        out = await mod.score_against_anchor(ds.id, anchor_uri=imgs[0], _user=None, db=db)
+        await db.refresh(ds)
+        assert ds.scores == {imgs[0]: 1.0, imgs[1]: 0.6, imgs[2]: None}
+        assert [s.cos for s in out.scores] == [1.0, 0.6, None]
+        assert ds.anchor_uri == imgs[0]
+
+    async def test_a_crop_in_place_drops_the_photographs_annotations(self, db, monkeypatch):
+        from app.config import settings
+        from app.routes import datasets as mod
+        imgs = _imgs(2)
+        ds = await _ds(db, images=imgs, anchor_uri=imgs[0],
+                       captions={u: "photo" for u in imgs}, scores={u: 0.9 for u in imgs})
+        monkeypatch.setattr(mod, "s3", _FakeS3())
+        monkeypatch.setattr(mod, "httpx", _HttpxShim(_crop_client(None)))
+        monkeypatch.setattr(settings, "face_crop_url", "http://crop.test")
+        out = await mod.crop_faces(ds.id, largest_only=False, uris=None, save_as=False,
+                                   _user=None, db=db)
+        assert out.captions == {} and out.scores == {}
+
+    async def test_a_reupload_over_the_same_name_drops_the_stale_caption(self, db, monkeypatch):
+        from app.routes import datasets as mod
+        ds = await _ds(db, images=["s3://wanly-images/datasets/p/a.jpg"],
+                       captions={"s3://wanly-images/datasets/p/a.jpg": "old picture"})
+        monkeypatch.setattr(mod, "s3", _FakeS3())
+
+        class _F:
+            filename = "a.jpg"
+
+            async def read(self):
+                return b"new bytes"
+        out = await mod.add_images(ds.id, files=[_F()], _user=None, db=db)
+        assert out.captions == {}
+
+
+@pytest.mark.asyncio
+class TestOwnership:
+    async def _chars(self, db):
+        from app.models import LtxCharacter
+        db.add_all([LtxCharacter(name="David", trigger="d@vid", gender="man", char_lora="none"),
+                    LtxCharacter(name="DavidKelly-2026", kind="pair", trigger="x",
+                                 char_lora="none", members=["David", "Kelly-2026"])])
+        await db.flush()
+
+    async def test_a_character_set_belongs_to_a_registered_solo_character(self, db):
+        from fastapi import HTTPException
+        await self._chars(db)
+        ds = await _ds(db)
+        out = await _patch(db, ds, kind="character", character="david")
+        assert (out.kind, out.character) == ("character", "David"), (
+            "the owner is matched case-insensitively and stored as the registry spells it")
+        with pytest.raises(HTTPException) as e:
+            await _patch(db, ds, kind="character", character="Nobody")
+        assert e.value.status_code == 422
+
+    async def test_a_composition_set_belongs_to_a_pair_never_a_person(self, db):
+        from fastapi import HTTPException
+        await self._chars(db)
+        ds = await _ds(db)
+        out = await _patch(db, ds, kind="composition", character="DavidKelly-2026")
+        assert out.character == "DavidKelly-2026"
+        # Not registered yet is fine -- a pair row is created by its first publish.
+        out = await _patch(db, ds, kind="composition", character="DavidKelly-2000")
+        assert out.character == "DavidKelly-2000"
+        with pytest.raises(HTTPException) as e:
+            await _patch(db, ds, kind="composition", character="David")
+        assert e.value.status_code == 422
+
+    async def test_a_regularization_pool_has_a_class_and_no_owner(self, db):
+        from fastapi import HTTPException
+        ds = await _ds(db)
+        out = await _patch(db, ds, kind="regularization", reg_class="woman", character=None)
+        assert (out.kind, out.character, out.reg_class) == ("regularization", None, "woman")
+        with pytest.raises(HTTPException):
+            await _patch(db, ds, kind="regularization", reg_class=None)
+
+    async def test_kind_null_unassigns_everything(self, db):
+        await self._chars(db)
+        ds = await _ds(db, kind="character", character="David")
+        out = await _patch(db, ds, kind=None)
+        assert (out.kind, out.character, out.reg_class) == (None, None, None)
+
+    async def test_an_absent_kind_changes_nothing(self, db):
+        ds = await _ds(db, kind="regularization", reg_class="man")
+        out = await _patch(db, ds, notes="x")
+        assert (out.kind, out.reg_class) == ("regularization", "man")
+
+    async def test_ownership_is_locked_while_a_run_trains_on_the_set(self, db):
+        from fastapi import HTTPException
+        from app.enums import TrainingStatus
+        from app.models import TrainingJob
+        await self._chars(db)
+        ds = await _ds(db, kind="character", character="David")
+        db.add(TrainingJob(character="David", trigger="d@vid", version=1,
+                           dataset_images=ds.images, status=TrainingStatus.RUNNING,
+                           config={"dataset": {"id": str(ds.id), "name": ds.name}}))
+        await db.commit()
+        with pytest.raises(HTTPException) as e:
+            await _patch(db, ds, kind=None)
+        assert e.value.status_code == 409
+        # ...while everything else is still editable.
+        assert (await _patch(db, ds, notes="fine")).notes == "fine"
+
+
+@pytest.mark.asyncio
+class TestTrainingCaptions:
+    """Per-image caption BODIES, through the captioner's queue, with the training
+    instruction -- never the trigger."""
+
+    def test_the_instruction_forbids_identity(self):
+        from app.joycaption import TRAINING_CAPTION
+        low = TRAINING_CAPTION.lower()
+        for must in ("framing", "pose", "head angle", "expression", "clothing", "hair",
+                     "lighting", "background"):
+            assert must in low
+        for banned in ("facial features", "age", "ethnicity", "body type", "names",
+                       "the image shows"):
+            assert banned in low
+
+    async def _fake_captioner(self, monkeypatch, texts=None, fail_at=None):
+        from app.joycaption import CaptionerBusy
+        from app.routes import captions as cap_mod
+        from app.routes import datasets as mod
+        seen = []
+
+        async def _caption(db, image, style=None, instruction=None, interactive=True):
+            seen.append(instruction)
+            if fail_at is not None and len(seen) == fail_at:
+                raise CaptionerBusy("3090.zero is in render mode")
+            return f"caption {len(seen)}", instruction
+        monkeypatch.setattr(cap_mod, "caption_image_bytes", _caption)
+        monkeypatch.setattr(mod, "s3", _FakeS3())
+        return seen
+
+    async def test_missing_captions_are_filled_and_existing_kept(self, db, monkeypatch):
+        from app.joycaption import TRAINING_CAPTION
+        from app.routes.datasets import caption_dataset_images
+        imgs = _imgs(3)
+        ds = await _ds(db, images=imgs, captions={imgs[1]: "hand written"})
+        seen = await self._fake_captioner(monkeypatch)
+        n = await caption_dataset_images(db, ds.id, overwrite=False)
+        await db.refresh(ds)
+        assert n == 2
+        assert ds.captions[imgs[1]] == "hand written"
+        assert set(ds.captions) == set(imgs)
+        assert seen == [TRAINING_CAPTION, TRAINING_CAPTION]
+
+    async def test_overwrite_redoes_every_one(self, db, monkeypatch):
+        from app.routes.datasets import caption_dataset_images
+        imgs = _imgs(3)
+        ds = await _ds(db, images=imgs, captions={imgs[1]: "hand written"})
+        await self._fake_captioner(monkeypatch)
+        assert await caption_dataset_images(db, ds.id, overwrite=True) == 3
+
+    async def test_a_refusal_stops_the_run_and_says_why(self, db, monkeypatch):
+        from app.routes import datasets as mod
+        imgs = _imgs(4)
+        ds = await _ds(db, images=imgs)
+        await self._fake_captioner(monkeypatch, fail_at=2)
+        mod._CAPTION_RUNS[ds.id] = {"running": True, "error": None}
+        n = await mod.caption_dataset_images(db, ds.id, overwrite=False)
+        await db.refresh(ds)
+        assert n == 1 and len(ds.captions) == 1
+        status = mod._caption_status(ds)
+        assert status.total == 4 and status.captioned == 1
+        assert "render mode" in status.error
+        mod._CAPTION_RUNS.pop(ds.id, None)
+
+    async def test_a_hand_edit_is_by_uri_and_blank_deletes(self, db):
+        from fastapi import HTTPException
+        from app.routes.datasets import edit_dataset_caption
+        from app.schemas.datasets import DatasetCaptionEdit
+        imgs = _imgs(2)
+        ds = await _ds(db, images=imgs)
+        out = await edit_dataset_caption(
+            ds.id, DatasetCaptionEdit(uri=imgs[0], caption="  close-up,\n smiling "),
+            _user=None, db=db)
+        assert out.captions == {imgs[0]: "close-up, smiling"}
+        out = await edit_dataset_caption(ds.id, DatasetCaptionEdit(uri=imgs[0], caption=""),
+                                         _user=None, db=db)
+        assert out.captions == {}
+        with pytest.raises(HTTPException) as e:
+            await edit_dataset_caption(ds.id, DatasetCaptionEdit(uri="s3://gone", caption="x"),
+                                       _user=None, db=db)
+        assert e.value.status_code == 422
+
+    async def test_the_endpoints_over_http(self, db, monkeypatch):
+        from httpx import ASGITransport, AsyncClient
+        from app.auth import get_current_user, verify_api_key_or_bearer
+        from app.database import get_db
+        from app.main import app
+        from app.routes import datasets as mod
+        ds = await _ds(db, images=_imgs(2))
+        started = []
+        monkeypatch.setattr(mod, "caption_dataset_job",
+                            lambda ds_id, overwrite: started.append((ds_id, overwrite)))
+        app.dependency_overrides[get_db] = lambda: db
+        app.dependency_overrides[get_current_user] = lambda: object()
+        app.dependency_overrides[verify_api_key_or_bearer] = lambda: None
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+                r = await c.post(f"/datasets/{ds.id}/captions", json={"overwrite": True})
+                st = await c.get(f"/datasets/{ds.id}/captions/status")
+        finally:
+            app.dependency_overrides.clear()
+            mod._CAPTION_RUNS.pop(ds.id, None)
+        assert r.status_code == 202
+        assert r.json() == {"total": 2, "captioned": 0, "running": True, "error": None}
+        assert st.json()["running"] is True
+        assert started == [(ds.id, True)]
+
+
+@pytest.mark.asyncio
+class TestRegularizationPools:
+    async def test_only_a_regularization_set_can_be_generated_into(self, db):
+        from fastapi import HTTPException
+        from app.routes.datasets import regularize_dataset
+        from app.schemas.datasets import DatasetRegularize
+        ds = await _ds(db)
+        with pytest.raises(HTTPException) as e:
+            await regularize_dataset(ds.id, DatasetRegularize(count=3), user=_Usr(), db=db)
+        assert e.value.status_code == 422
+
+    async def test_renders_are_text_to_video_with_no_character(self, db):
+        from sqlalchemy import select
+        from app.models import Job, Segment, User
+        from app.regularization import REG_FRAMES, REG_PRIORITY_BASE
+        from app.routes.datasets import regularize_dataset
+        from app.schemas.datasets import DatasetRegularize
+        user = User(username=f"u{uuid.uuid4().hex[:6]}", password_hash="x")
+        db.add(user)
+        await db.flush()
+        ds = await _ds(db, images=[], kind="regularization", reg_class="woman")
+        out = await regularize_dataset(ds.id, DatasetRegularize(count=6), user=user, db=db)
+        assert (out.requested, out.running, out.done) == (6, 6, 0)
+        jobs = (await db.execute(select(Job).where(Job.user_id == user.id))).scalars().all()
+        assert len(jobs) == 6
+        assert all(j.priority >= REG_PRIORITY_BASE for j in jobs), "a pool queues behind real work"
+        assert all(j.starting_image is None for j in jobs)
+        assert all(j.width % 64 == 0 and j.height % 64 == 0 for j in jobs)
+        segs = (await db.execute(select(Segment).where(
+            Segment.job_id.in_([j.id for j in jobs])))).scalars().all()
+        for s in segs:
+            assert s.index == 0 and s.start_image is None
+            r = s.ltx_recipe
+            assert r["recipe"], "the engine renders text-to-video only on the recipe path"
+            assert r["characters"] == [] and r["char_lora"] == "none"
+            assert r["frames"] == REG_FRAMES == 25
+            assert r["checkpoint"] == "10Eros_v1.5_bf16"
+            assert " woman " in s.prompt
+        assert len({s.prompt for s in segs}) > 1, "a pool of one prompt regularizes to one face"
+
+    async def test_a_new_job_still_lands_ahead_of_the_pool(self, db):
+        import inspect
+        from app.routes import jobs as mod
+        assert "Job.priority < REG_PRIORITY_BASE" in inspect.getsource(mod.create_job)
+
+    async def test_finished_frames_are_collected_once(self, db, monkeypatch):
+        from app.enums import JobStatus, SegmentStatus
+        from app.models import Job, Segment, User
+        from app.regularization import reg_tag
+        from app.routes import datasets as mod
+        user = User(username=f"u{uuid.uuid4().hex[:6]}", password_hash="x")
+        db.add(user)
+        await db.flush()
+        ds = await _ds(db, images=[], kind="regularization", reg_class="man",
+                       prefix="datasets/pool")
+        segs = []
+        for status in (SegmentStatus.COMPLETED, SegmentStatus.PENDING, SegmentStatus.FAILED,
+                       SegmentStatus.PROCESSING):
+            j = Job(user_id=user.id, name="r", width=832, height=1216, fps=24, seed=1,
+                    tags=f"regularization, {reg_tag(ds.id)}", status=JobStatus.PROCESSING)
+            db.add(j)
+            await db.flush()
+            s = Segment(job_id=j.id, index=0, prompt="p", status=status,
+                        last_frame_path=(f"s3://wanly-jobs/{j.id}/last_frame.png"
+                                         if status == SegmentStatus.COMPLETED else None))
+            db.add(s)
+            segs.append((j, s))
+        await db.commit()
+        monkeypatch.setattr(mod, "s3", _FakeS3())
+
+        first = await mod.regularize_status(ds.id, _user=None, db=db)
+        assert (first.requested, first.done, first.failed, first.running) == (4, 1, 1, 2)
+        assert first.collected_now == 1
+        await db.refresh(ds)
+        done_seg = segs[0][1]
+        assert ds.images == [f"s3://wanly-images/datasets/pool/reg/{done_seg.id}.png"]
+        assert segs[0][0].status == JobStatus.ARCHIVED
+
+        # A human removes the frame as a bad render; the next poll must not bring it back.
+        await _patch(db, ds, images=[])
+        again = await mod.regularize_status(ds.id, _user=None, db=db)
+        assert again.collected_now == 0 and again.done == 1
+        await db.refresh(ds)
+        assert ds.images == []
+
+
+class _Usr:
+    id = None

@@ -84,6 +84,38 @@ CAPTION_STYLES: dict[str, str] = {
 DEFAULT_STYLE = "standard"
 
 
+#: The instruction for a LoRA TRAINING caption (wanly-api#352). Not one of CAPTION_STYLES:
+#: those describe a start frame for a render prompt and are chosen in Settings, while this
+#: one is fixed, because what a training caption must leave out is not a matter of taste.
+#:
+#: WHY THESE FIELDS. Every image used to train under the one caption "<trigger>, <gender>",
+#: so everything the caption did not name -- close-up framing, the same jumper, window
+#: light -- was learned AS PART OF the trigger. Naming the variable things (shot scale,
+#: pose, head angle, expression, clothing, hair styling, lighting, background) is what lets
+#: the model attribute them to the words rather than to the person, so a prompt can change
+#: them later.
+#:
+#: WHY THE BANS. The inverse holds: anything the caption DOES name is attributed to the
+#: words and not the trigger. Describing the face, age, ethnicity or build would teach the
+#: model that the identity lives in those words, which is the part the trigger must carry
+#: alone. A name would be worse -- a second, competing token for the same face.
+#:
+#: WHY A PHRASE LIST. The body is spliced after "<trigger>, <gender>, " when a run is
+#: created, and render prompts are comma-separated phrases in the same order. "The image
+#: shows" would also read as an instruction to render a picture of a picture; _tidy strips
+#: it if the model says it anyway.
+TRAINING_CAPTION = (
+    "Write a training caption for this photo as one line of short comma-separated phrases, "
+    "in this order: shot scale and framing (close-up, medium shot, full body, and so on), "
+    "pose, head angle and gaze direction, facial expression, clothing, hair styling, "
+    "lighting, and the setting or background. Describe ONLY those things. Do NOT describe "
+    "who the person is or what they look like: no facial features, no eye or skin colour, "
+    "no age, no ethnicity, no body type or build, and no names. Do not start with 'The "
+    "image shows' or any other preamble, and do not mention the photograph, the camera, "
+    "image quality, or any text in the image."
+)
+
+
 def instruction_for(style: str, custom: str = "") -> str:
     """The instruction to send. A non-empty custom instruction always wins.
 

@@ -18,6 +18,7 @@ from app.auth import get_current_user
 from app.config import settings
 from app.database import get_db
 from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStatus
+from app.regularization import REG_PRIORITY_BASE
 from app.seeds import new_seed
 from app.estimation import estimate_segment_time, get_estimation_rates, sum_estimated_queue_time
 from app.models import Job, Segment, User, Video, Worker
@@ -101,9 +102,11 @@ async def create_job(
     # Jobs created before this keep their large seeds; nothing can recover what those displayed.
     seed = body.seed if body.seed is not None else new_seed()
 
-    # New jobs go to bottom of queue
+    # New jobs go to bottom of queue -- but ahead of any regularization pool, which parks its
+    # renders past REG_PRIORITY_BASE precisely so real work is never stuck behind them.
     max_priority_result = await db.execute(
-        select(func.coalesce(func.max(Job.priority), -1)).where(Job.user_id == user.id)
+        select(func.coalesce(func.max(Job.priority), -1)).where(
+            Job.user_id == user.id, Job.priority < REG_PRIORITY_BASE)
     )
     next_priority = max_priority_result.scalar_one() + 1
 

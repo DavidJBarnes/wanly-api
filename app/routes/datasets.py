@@ -14,19 +14,31 @@ import base64
 import logging
 import uuid
 
+import random
+
 import httpx
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from sqlalchemy import select
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import s3
 from app.auth import get_current_user, verify_api_key_or_bearer
 from app.config import settings
-from app.database import get_db
-from app.models import Dataset, User
-from app.schemas.datasets import (
-    DatasetCreate, DatasetResponse, DatasetScore, DatasetScores, DatasetUpdate,
+from app.database import async_session, get_db
+from app.enums import TRAINING_TERMINAL, JobStatus, SegmentStatus
+from app.joycaption import TRAINING_CAPTION, CaptionError
+from app.models import Dataset, Job, LtxCharacter, Segment, TrainingJob, User
+from app.ltx_stack import LTX_STACK
+from app.regularization import (
+    REG_FRAMES, REG_PRIORITY_BASE, reg_prompt, reg_recipe, reg_size, reg_tag,
 )
+from app.schemas.datasets import (
+    DatasetCaptionEdit, DatasetCaptionStatus, DatasetCaptionsRun, DatasetCreate,
+    DatasetRegularize, DatasetRegularizeStatus, DatasetResponse, DatasetScore, DatasetScores,
+    DatasetUpdate,
+)
+from app.seeds import new_seed
+from app.tag_filter import tag_clause
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -50,6 +62,95 @@ def _prefix(ds_id: uuid.UUID) -> str:
     return f"{DATASETS_PREFIX}/{ds_id}"
 
 
+def _prune_annotations(ds: Dataset, also_drop: set[str] | None = None) -> None:
+    """Drop captions and scores for URIs that are no longer in the set (#352).
+
+    Both are keyed by URI, so an entry for a removed or cropped-away image is not harmful on
+    its own -- but it is a caption nobody can see or edit, and a crop that reuses a filename
+    would inherit a stranger's. `also_drop` names URIs that are still in the set but whose
+    CONTENT changed (a re-upload over the same key), whose old caption and score describe a
+    different picture.
+
+    Reassigned, never mutated: JSONB does not see an in-place change (see add_images).
+    """
+    keep = set(ds.images) - (also_drop or set())
+    captions = {u: c for u, c in (ds.captions or {}).items() if u in keep}
+    scores = {u: v for u, v in (ds.scores or {}).items() if u in keep}
+    if captions != (ds.captions or {}):
+        ds.captions = captions
+    if scores != (ds.scores or {}):
+        ds.scores = scores
+
+
+async def _validate_ownership(db: AsyncSession, kind: str | None, character: str | None,
+                              reg_class: str | None) -> tuple[str | None, str | None, str | None]:
+    """The (kind, character, reg_class) a set may be stored with, or a 422 saying why not.
+
+    The rules are the design, not validation for its own sake. A character set belongs to a
+    REGISTERED solo character, because the training route reads the owner's trigger from
+    the registry; a composition set belongs to a pair name, which must not also be a solo
+    character (the pair would then publish over that person's row, the bug #352 removes);
+    a regularization pool belongs to nobody and says which class word it stands in for.
+    """
+    if kind is None:
+        # Unassigned is a real state, and it is ALL unassigned -- an owner without a kind
+        # would be read by nothing and mislead whoever looks.
+        return None, None, None
+    if kind == "regularization":
+        if character:
+            raise HTTPException(status_code=422,
+                                detail="a regularization pool belongs to no character")
+        if not reg_class:
+            raise HTTPException(status_code=422,
+                                detail="a regularization pool needs its class: woman or man")
+        return kind, None, reg_class
+    if reg_class:
+        raise HTTPException(status_code=422, detail="only a regularization pool has a class")
+    if not character:
+        raise HTTPException(status_code=422,
+                            detail=f"a {kind} set needs an owner (a character name)")
+    # CASE-INSENSITIVE, and stored as the registry spells it. "david" and "David" are one
+    # person to whoever typed them; two spellings of one owner would split its sets between
+    # a name the training route finds and one it does not.
+    row = (await db.execute(select(LtxCharacter).where(
+        func.lower(LtxCharacter.name) == character.lower()))).scalars().first()
+    if row is not None:
+        character = row.name
+    if kind == "character":
+        if row is None:
+            raise HTTPException(status_code=422,
+                                detail=f"{character!r} is not a registered character — "
+                                       f"register it first, with its trigger and gender")
+        if (row.kind or "solo") != "solo":
+            raise HTTPException(status_code=422,
+                                detail=f"{character!r} is a pair; a pair owns a composition "
+                                       f"set, not a character set")
+    else:  # composition
+        if row is not None and (row.kind or "solo") == "solo":
+            raise HTTPException(status_code=422,
+                                detail=f"{character!r} is a solo character; a composition "
+                                       f"set is owned by a PAIR name (e.g. DavidKelly-2026)")
+    return kind, character, None
+
+
+async def _live_runs_using(db: AsyncSession, ds_id: uuid.UUID) -> list[str]:
+    """"<character> vN" for every queued or running training job that trains on this set.
+
+    Read from each job's recorded provenance, group by group. A handful of live rows at
+    most, so filtered here rather than in a JSONB query.
+    """
+    jobs = (await db.execute(select(TrainingJob).where(
+        TrainingJob.status.not_in(list(TRAINING_TERMINAL))))).scalars().all()
+    out = []
+    for j in jobs:
+        ids = {((j.config or {}).get("dataset") or {}).get("id")}
+        ids |= {(g.get("dataset") or {}).get("id") for g in (j.identities or [])
+                if isinstance(g, dict)}
+        if str(ds_id) in ids:
+            out.append(f"{j.character} v{j.version}")
+    return out
+
+
 @router.post("/datasets", response_model=DatasetResponse, status_code=201)
 async def create_dataset(
     body: DatasetCreate,
@@ -59,9 +160,12 @@ async def create_dataset(
     dupe = (await db.execute(select(Dataset).where(Dataset.name == body.name))).scalar_one_or_none()
     if dupe:
         raise HTTPException(status_code=409, detail=f"a dataset called {body.name!r} already exists")
+    kind, character, reg_class = await _validate_ownership(
+        db, body.kind, body.character, body.reg_class)
     ds_id = uuid.uuid4()
     ds = Dataset(id=ds_id, user_id=user.id, name=body.name, tags=body.tags, notes=body.notes,
-                 images=[], prefix=_prefix(ds_id))
+                 images=[], prefix=_prefix(ds_id), kind=kind, character=character,
+                 reg_class=reg_class, captions={}, scores={})
     db.add(ds)
     await db.commit()
     await db.refresh(ds)
@@ -108,15 +212,41 @@ async def update_dataset(
         ds.tags = body.tags
     if body.notes is not None:
         ds.notes = body.notes
+    anchor_before = ds.anchor_uri
     if body.images is not None:
         ds.images = body.images
         # An anchor that was just removed would silently score everything against nothing.
         if ds.anchor_uri and ds.anchor_uri not in body.images:
             ds.anchor_uri = None
+        _prune_annotations(ds)
     if body.anchor_uri is not None:
         # "" clears it. None means the field was not sent, which must not clear anything --
         # the same distinction every other field here makes.
         ds.anchor_uri = body.anchor_uri or None
+    if ds.anchor_uri != anchor_before:
+        # Scores are likeness TO THE ANCHOR. Against a different face they are numbers about
+        # somebody else, and the training route would pass or refuse the set on them.
+        ds.scores = {}
+    owner_fields = {"kind", "character", "reg_class"} & body.model_fields_set
+    if owner_fields:
+        new = {f: getattr(body, f) if f in owner_fields else getattr(ds, f)
+               for f in ("kind", "character", "reg_class")}
+        if new["kind"] is None and "kind" in owner_fields:
+            new = {"kind": None, "character": None, "reg_class": None}
+        kind, character, reg_class = await _validate_ownership(
+            db, new["kind"], new["character"], new["reg_class"])
+        if (kind, character, reg_class) != (ds.kind, ds.character, ds.reg_class):
+            # A live run snapshotted its captions and owner's trigger at creation, so this
+            # would not corrupt it -- but the set would then say it is somebody else's while
+            # a LoRA of the old owner is being trained from it, and the publish would stamp
+            # a provenance that no longer matches the set. Finish or cancel the run first.
+            live = await _live_runs_using(db, ds.id)
+            if live:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"{', '.join(live)} is training on this set; its kind and owner "
+                           f"cannot change until that run finishes or is cancelled")
+            ds.kind, ds.character, ds.reg_class = kind, character, reg_class
     await db.commit()
     await db.refresh(ds)
     return ds
@@ -135,6 +265,7 @@ async def add_images(
         raise HTTPException(status_code=404, detail="Dataset not found")
 
     added: list[str] = []
+    replaced: set[str] = set()
     for f in files:
         name = (f.filename or "image.jpg").rsplit("/", 1)[-1]
         ext = ("." + name.rsplit(".", 1)[1].lower()) if "." in name else ".jpg"
@@ -148,12 +279,19 @@ async def add_images(
             s3.upload_bytes, data, f"{ds.prefix}/{name}", settings.s3_images_bucket)
         if uri not in ds.images:
             added.append(uri)
+        else:
+            # Same key, NEW BYTES: the object was just overwritten, so its caption and score
+            # describe a picture that no longer exists.
+            replaced.add(uri)
 
+    if replaced:
+        _prune_annotations(ds, also_drop=replaced)
     if added:
         # Reassigned rather than appended in place: JSONB columns do not see a mutation of the
         # existing list, so `ds.images.append(...)` writes nothing and the upload silently
         # vanishes on the next read.
         ds.images = list(ds.images) + added
+    if added or replaced:
         await db.commit()
         await db.refresh(ds)
     logger.info("dataset %s: added %d image(s), now %d", ds.name, len(added), len(ds.images))
@@ -306,6 +444,10 @@ async def crop_faces(
         # outside the selection is still what it was.
         if ds.anchor_uri in replaced:
             ds.anchor_uri = None
+            # Scores were likeness to a photograph that is no longer in the set.
+            ds.scores = {}
+        # The photographs' captions and scores do not describe their crops.
+        _prune_annotations(ds)
     await db.commit()
     await db.refresh(ds)
     logger.info("cropped %s (save_as=%s): %d faces from %d of %d photos",
@@ -379,10 +521,13 @@ async def score_against_anchor(
         for u, e in zip(ds.images, embeddings)
     ]
 
-    # Remembered only once it has been shown to work on this set.
-    if ds.anchor_uri != uri:
-        ds.anchor_uri = uri
-        await db.commit()
+    # Remembered only once it has been shown to work on this set -- the anchor AND what the
+    # set scored against it (#352). The training route reads the scores to refuse a
+    # character set with somebody else's face in it; computing them and throwing them away
+    # made that impossible without the face-crop box being up at the moment of training.
+    ds.anchor_uri = uri
+    ds.scores = {sc.uri: sc.cos for sc in scores}
+    await db.commit()
 
     return DatasetScores(anchor_uri=uri, cos_floor=floor, scores=scores)
 
@@ -400,3 +545,290 @@ def _cos(a: list[float], b: list[float]) -> float:
     if not a or not b:
         return -2.0
     return sum(x * y for x, y in zip(a, b))
+
+
+# ---------------------------------------------------------------------------------------
+# Training captions (wanly-api#352)
+#
+# Every image used to train under the one caption "<trigger>, <gender>", so framing,
+# clothing, lighting and background were absorbed into the trigger. Each image now gets its
+# own caption BODY -- what varies in the frame, never who is in it (joycaption.
+# TRAINING_CAPTION) -- stored per URI without the trigger. The training route adds the
+# prefix when a run is created.
+# ---------------------------------------------------------------------------------------
+
+#: The captioning runs THIS PROCESS is doing, by dataset id: {"running": bool, "error": str}.
+#: In memory, deliberately: a run is a loop in this process, so a restart ends it -- and the
+#: progress that matters (which images have captions) is on the row, not here. After a
+#: restart `running` reads false and the button can simply be pressed again; it fills only
+#: what is missing.
+_CAPTION_RUNS: dict[uuid.UUID, dict] = {}
+
+
+def _caption_status(ds: Dataset) -> DatasetCaptionStatus:
+    run = _CAPTION_RUNS.get(ds.id) or {}
+    caps = ds.captions or {}
+    return DatasetCaptionStatus(
+        total=len(ds.images),
+        captioned=sum(1 for u in ds.images if (caps.get(u) or "").strip()),
+        running=bool(run.get("running")),
+        error=run.get("error"),
+    )
+
+
+async def caption_dataset_images(db: AsyncSession, ds_id: uuid.UUID, overwrite: bool) -> int:
+    """Caption a set's images one at a time, through the captioner's queue. Returns how many.
+
+    SERIAL, through app/caption_queue.py, like bulk tagging's describe (images.
+    describe_untagged): the captioner is one ollama slot, so parallel requests only wait
+    inside it -- and inside an HTTP timeout. Taking a turn per image puts the set in line
+    with every other caption, in a known order, and a toolbar can see it.
+
+    INTERACTIVE, so the render gate applies: on the 3090 the captioner shares the card with
+    the render stack, and a caption while it renders OOMs one of them. A refusal (the box is
+    rendering, or in render mode, or the captioner is down) STOPS the loop and is recorded
+    as the run's error, which the status endpoint shows. Nothing is lost: the captions
+    already written are on the row, and the next run fills only what is missing.
+
+    Each write re-reads the row first, so a caption edited by hand while the loop runs, or an
+    image removed, is not overwritten from a stale copy.
+    """
+    from app.caption_queue import queue as caption_queue
+    from app.routes.captions import caption_image_bytes
+
+    ds = await db.get(Dataset, ds_id)
+    if ds is None:
+        return 0
+    have = ds.captions or {}
+    todo = [u for u in ds.images if overwrite or not (have.get(u) or "").strip()]
+    done = 0
+    for uri in todo:
+        try:
+            async with caption_queue.turn(uri):
+                image = await asyncio.to_thread(s3.download_bytes, uri)
+                text, _ = await caption_image_bytes(db, image, instruction=TRAINING_CAPTION)
+        except CaptionError as e:
+            # Box-wide (busy, render mode, unreachable) and per-image refusals look alike
+            # from here; stopping costs one press of the button, hammering costs the box.
+            logger.warning("dataset %s: captioning stopped at %s: %s", ds.name, uri, e)
+            (_CAPTION_RUNS.setdefault(ds_id, {}))["error"] = str(e)
+            break
+        except Exception:
+            # An unreadable image is that image's problem, not the set's.
+            logger.exception("dataset %s: could not caption %s; skipping", ds.name, uri)
+            continue
+        text = (text or "").strip()
+        if not text:
+            logger.warning("dataset %s: empty caption for %s; skipping", ds.name, uri)
+            continue
+        await db.refresh(ds)
+        if uri not in ds.images:
+            continue
+        ds.captions = {**(ds.captions or {}), uri: text}
+        await db.commit()
+        done += 1
+    logger.info("dataset %s: captioned %d of %d", ds.name, done, len(todo))
+    return done
+
+
+async def caption_dataset_job(ds_id: uuid.UUID, overwrite: bool) -> None:
+    """BackgroundTasks entry: its own session, because the request's is closed by now."""
+    async with async_session() as db:
+        try:
+            await caption_dataset_images(db, ds_id, overwrite)
+        except Exception as e:
+            logger.exception("captioning dataset %s failed", ds_id)
+            (_CAPTION_RUNS.setdefault(ds_id, {}))["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            (_CAPTION_RUNS.setdefault(ds_id, {}))["running"] = False
+
+
+@router.post("/datasets/{dataset_id}/captions", response_model=DatasetCaptionStatus,
+             status_code=202)
+async def caption_dataset(
+    dataset_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    body: DatasetCaptionsRun | None = None,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Caption every image in the set that has no caption yet (all of them with `overwrite`).
+
+    Returns at once with the progress so far; poll GET .../captions/status. A second press
+    while a run is going returns that run's progress rather than starting another -- two
+    loops would caption the same images twice, and the second would win.
+    """
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    if not ds.images:
+        raise HTTPException(status_code=422, detail="this dataset has no images")
+    run = _CAPTION_RUNS.get(ds.id)
+    if run and run.get("running"):
+        return _caption_status(ds)
+    _CAPTION_RUNS[ds.id] = {"running": True, "error": None}
+    background_tasks.add_task(caption_dataset_job, ds.id, bool(body and body.overwrite))
+    return _caption_status(ds)
+
+
+@router.get("/datasets/{dataset_id}/captions/status", response_model=DatasetCaptionStatus,
+            dependencies=[Depends(verify_api_key_or_bearer)])
+async def caption_dataset_status(dataset_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return _caption_status(ds)
+
+
+@router.patch("/datasets/{dataset_id}/captions", response_model=DatasetResponse)
+async def edit_dataset_caption(
+    dataset_id: uuid.UUID,
+    body: DatasetCaptionEdit,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Replace one image's caption body by hand. A blank one deletes it.
+
+    The body only -- no trigger, no gender. They are added when a run is created, from the
+    registry; typed in here they would appear twice in the final caption.
+    """
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    if body.uri not in ds.images:
+        raise HTTPException(status_code=422,
+                            detail="that image is not in this dataset — it may have been removed")
+    text = " ".join(body.caption.split())
+    caps = dict(ds.captions or {})
+    if text:
+        caps[body.uri] = text
+    else:
+        caps.pop(body.uri, None)
+    ds.captions = caps
+    await db.commit()
+    await db.refresh(ds)
+    return ds
+
+
+# ---------------------------------------------------------------------------------------
+# Regularization pools (wanly-api#352) -- see app/regularization.py for why they exist and
+# why they are rendered from the base model.
+#
+# HOW A RENDER BECOMES AN IMAGE IN THE POOL. Each render is an ordinary Job with one
+# segment 0, no start image and no character LoRA, claimed and rendered by the normal
+# segment path; the daemon uploads its last frame as it does for every LTX segment. Nothing
+# in that path knows about pools. The status endpoint COLLECTS: every completed segment of a
+# job tagged for this pool has its last frame copied into the dataset's own prefix, and the
+# job is archived, which is the mark that it has been collected. Polling is the console's
+# job anyway (it shows progress), so the collection costs no new hook in the segment
+# report path -- and a copy that fails is simply retried on the next poll.
+# ---------------------------------------------------------------------------------------
+
+
+@router.post("/datasets/{dataset_id}/regularize", response_model=DatasetRegularizeStatus,
+             status_code=202)
+async def regularize_dataset(
+    dataset_id: uuid.UUID,
+    body: DatasetRegularize,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Queue `count` text-to-video renders of generic people for a regularization pool."""
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    if ds.kind != "regularization" or not ds.reg_class:
+        raise HTTPException(
+            status_code=422,
+            detail="only a regularization dataset (kind=regularization, with a class) can be "
+                   "generated into")
+    fps = LTX_STACK["frame_rate"]
+    tag = reg_tag(ds.id)
+    rng = random.Random()
+    # Behind everything, and behind any pool already queued, in the order asked for.
+    top = (await db.execute(select(func.coalesce(func.max(Job.priority), REG_PRIORITY_BASE - 1))
+                            .where(Job.priority >= REG_PRIORITY_BASE))).scalar_one()
+    for i in range(body.count):
+        w, h = reg_size(rng)
+        job = Job(user_id=user.id, name=f"Reg {ds.reg_class} · {ds.name}",
+                  width=w, height=h, fps=fps, seed=new_seed(), priority=top + 1 + i,
+                  tags=f"regularization, {tag}", status=JobStatus.PENDING)
+        db.add(job)
+        await db.flush()
+        db.add(Segment(job_id=job.id, index=0, prompt=reg_prompt(ds.reg_class, rng),
+                       duration_seconds=REG_FRAMES / fps, speed=1.0, start_image=None,
+                       ltx_recipe=reg_recipe(ds.reg_class), auto_finalize=False))
+    await db.commit()
+    logger.info("dataset %s: queued %d %s regularization render(s)",
+                ds.name, body.count, ds.reg_class)
+    return await _collect_regularization(db, ds)
+
+
+async def _collect_regularization(db: AsyncSession, ds: Dataset) -> DatasetRegularizeStatus:
+    """Copy every finished, uncollected render's last frame into the pool; count the rest.
+
+    Idempotent: the destination key is the segment's id, the URI is added only if absent,
+    and a collected job is archived so it is never looked at again -- including after a
+    human removes its frame from the pool as a bad render, which must not bring it back.
+    """
+    jobs = (await db.execute(select(Job).where(tag_clause(Job.tags, reg_tag(ds.id))))
+            ).scalars().all()
+    requested = len(jobs)
+    pending = rendering = failed = collected = collected_now = 0
+    for job in jobs:
+        if job.status == JobStatus.ARCHIVED:
+            collected += 1
+            continue
+        seg = (await db.execute(
+            select(Segment).where(Segment.job_id == job.id, Segment.discarded.is_(False))
+            .order_by(Segment.index.asc()).limit(1))).scalar_one_or_none()
+        if seg is None or seg.status == SegmentStatus.FAILED:
+            failed += 1
+            continue
+        if seg.status == SegmentStatus.PENDING:
+            pending += 1
+            continue
+        if seg.status != SegmentStatus.COMPLETED or not seg.last_frame_path:
+            rendering += 1
+            continue
+        ext = seg.last_frame_path.rsplit(".", 1)[-1].lower() if "." in seg.last_frame_path \
+            else "png"
+        key = f"{ds.prefix}/reg/{seg.id}.{ext}"
+        try:
+            data = await asyncio.to_thread(s3.download_bytes, seg.last_frame_path)
+            uri = await asyncio.to_thread(s3.upload_bytes, data, key, settings.s3_images_bucket)
+        except Exception as e:
+            logger.warning("dataset %s: could not collect %s (%s); will retry on the next poll",
+                           ds.name, seg.last_frame_path, e)
+            rendering += 1
+            continue
+        if uri not in ds.images:
+            # JSONB: reassigned, never appended (see add_images).
+            ds.images = list(ds.images) + [uri]
+        job.status = JobStatus.ARCHIVED
+        collected += 1
+        collected_now += 1
+    if collected_now:
+        await db.commit()
+        await db.refresh(ds)
+        logger.info("dataset %s: collected %d regularization frame(s)", ds.name, collected_now)
+    return DatasetRegularizeStatus(requested=requested, done=collected, failed=failed,
+                                   running=pending + rendering, pending=pending,
+                                   collected_now=collected_now, images=len(ds.images))
+
+
+@router.get("/datasets/{dataset_id}/regularize/status", response_model=DatasetRegularizeStatus)
+async def regularize_status(
+    dataset_id: uuid.UUID,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Where the pool's renders are -- and, as a side effect, collect the finished ones.
+
+    A GET that writes is unusual; it is the least invasive place for it (see the section
+    comment), and it is idempotent, which is what GET actually promises.
+    """
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return await _collect_regularization(db, ds)
