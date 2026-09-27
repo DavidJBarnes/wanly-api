@@ -179,3 +179,130 @@ class TestResolveTrigger:
         await db.commit()
         out = await _resolve_trigger(db, "<TRIGGER>, a scene", TWO_LEGACY)
         assert out == "p@y, woman, a scene"
+
+
+# -------------------------------------------------------------------------------------------
+# The registry (#352): a character is one person = one trigger + one gender, registered
+# before it trains and locked once it has. A pair is its own row over two of them.
+# -------------------------------------------------------------------------------------------
+
+async def _create(db, **body):
+    from app.routes.ltx_recipes import create_character
+    from app.schemas.ltx import LtxCharacterCreate
+    return await create_character(LtxCharacterCreate(**body), user=None, db=db)
+
+
+async def _update(db, c, **body):
+    from app.routes.ltx_recipes import update_character
+    from app.schemas.ltx import LtxCharacterUpdate
+    return await update_character(c.id, LtxCharacterUpdate(**body), user=None, db=db)
+
+
+@pytest.mark.asyncio
+class TestRegistration:
+    async def test_a_character_is_registered_before_it_has_a_lora(self, db):
+        c = await _create(db, name="David", trigger="d@vid", gender="man", kind="solo")
+        assert c.char_lora == "none", "'none' is what every reader already takes as no LoRA"
+        assert (c.trigger, c.gender, c.kind, c.members) == ("d@vid", "man", "solo", None)
+        assert not [a for a in required_artifacts({"char_lora": c.char_lora}) if a.kind == LORA]
+
+    async def test_a_pair_derives_its_phrase_from_its_members(self, db):
+        await _create(db, name="David", trigger="d@vid", gender="man")
+        await _create(db, name="Kelly-2026", trigger="k3lly2026", gender="woman")
+        p = await _create(db, name="DavidKelly-2026", kind="pair",
+                          members=["David", "Kelly-2026"], trigger="ignored", gender="man")
+        assert p.trigger == "d@vid, man and k3lly2026, woman"
+        assert p.gender is None
+        assert p.members == ["David", "Kelly-2026"]
+
+    async def test_a_pair_of_unregistered_or_genderless_members_is_refused(self, db):
+        from fastapi import HTTPException
+        await _create(db, name="David", trigger="d@vid")  # no gender
+        await _create(db, name="Kelly-2026", trigger="k3lly2026", gender="woman")
+        for members in (["David", "Kelly-2026"], ["Kelly-2026", "Nobody"],
+                        ["Kelly-2026", "Kelly-2026"]):
+            with pytest.raises(HTTPException) as e:
+                await _create(db, name="P", kind="pair", members=members)
+            assert e.value.status_code == 422
+
+    async def test_a_solo_character_has_no_members(self, db):
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException):
+            await _create(db, name="X", members=["A", "B"])
+
+
+@pytest.mark.asyncio
+class TestATrainedCharactersWordsAreLocked:
+    """Trigger and gender are the caption the LoRA learned. Changing them renders the
+    weights under words they never saw -- how David came to have a trigger per pair."""
+
+    async def _trained(self, db, **kw):
+        base = dict(name="David", trigger="d@vid", gender="man", char_lora="david_v1_final")
+        base.update(kw)
+        c = LtxCharacter(**base)
+        db.add(c)
+        await db.commit()
+        return c
+
+    async def test_changing_the_trigger_is_refused(self, db):
+        from fastapi import HTTPException
+        c = await self._trained(db)
+        with pytest.raises(HTTPException) as e:
+            await _update(db, c, trigger="dav1d")
+        assert e.value.status_code == 409 and "trigger" in e.value.detail
+
+    async def test_changing_the_gender_is_refused(self, db):
+        from fastapi import HTTPException
+        c = await self._trained(db)
+        with pytest.raises(HTTPException) as e:
+            await _update(db, c, gender="person")
+        assert e.value.status_code == 409
+
+    async def test_provenance_alone_counts_as_trained(self, db):
+        from fastapi import HTTPException
+        c = await self._trained(db, char_lora="none", trained_from=[{"name": "David"}])
+        with pytest.raises(HTTPException):
+            await _update(db, c, trigger="dav1d")
+
+    async def test_restating_the_same_words_is_fine(self, db):
+        """The console's 'Use this checkpoint' sends the trigger back unchanged."""
+        c = await self._trained(db)
+        out = await _update(db, c, trigger="d@vid", gender="man", char_lora="david_v2_final")
+        assert out.char_lora == "david_v2_final"
+
+    async def test_strengths_stay_editable(self, db):
+        c = await self._trained(db)
+        assert (await _update(db, c, strength_stage_2=1.2)).strength_stage_2 == 1.2
+
+    async def test_an_untrained_character_can_be_corrected(self, db):
+        c = await _create(db, name="Kelly-2026", trigger="k3lly", gender="woman")
+        assert (await _update(db, c, trigger="k3lly2026")).trigger == "k3lly2026"
+
+    async def test_detaching_the_lora_is_the_way_to_re_register(self, db):
+        """David's own case: re-register as d@vid before retraining. The row stops claiming
+        weights trained on the old words, so the new ones are honest."""
+        c = await self._trained(db, trigger="D@vidUdycz", trained_from=[{"name": "old"}],
+                                base_checkpoint="ltx-2.3-22b-dev")
+        out = await _update(db, c, trigger="d@vid", char_lora="none")
+        assert (out.trigger, out.char_lora) == ("d@vid", "none")
+        assert out.trained_from is None and out.base_checkpoint is None
+
+
+@pytest.mark.asyncio
+class TestAPairRowRenders:
+    async def test_its_phrase_fills_the_placeholder_whole(self, db):
+        """A #352 pair row carries gender None and the joined phrase: nothing is appended."""
+        from app.routes.segments import _resolve_trigger
+        db.add(LtxCharacter(name="DavidKelly-2026", kind="pair", char_lora="dk_v1_final",
+                            members=["David", "Kelly-2026"],
+                            trigger="d@vid, man and k3lly2026, woman"))
+        await db.commit()
+        blob = {"characters": [{"name": "DavidKelly-2026", "char_lora": "dk_v1_final"}]}
+        out = await _resolve_trigger(db, "<TRIGGER>, on a couch", blob)
+        assert out == "d@vid, man and k3lly2026, woman, on a couch"
+
+    async def test_a_phrase_longer_than_64_fits(self, db):
+        long = "a-very-long-trigger-name, woman and another-quite-long-trigger, man"
+        assert len(long) > 64
+        db.add(LtxCharacter(name="Long", kind="pair", char_lora="x", trigger=long))
+        await db.commit()

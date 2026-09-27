@@ -12,8 +12,23 @@ Gender = Literal["woman", "man", "person"]
 
 
 class LtxCharacterCreate(BaseModel):
+    """Register a character: the registry is where a trigger and a gender come from (#352).
+
+    `char_lora` is OPTIONAL since #352 and defaults to "none", the value that already means
+    "render on the base model" everywhere a character is read (recipe_blob, the claim's
+    model requirements, the daemon). A character is registered BEFORE it trains -- its
+    trigger and gender are what the training route captions with -- so there is no LoRA
+    to name yet, and "none" is the honest one.
+
+    A PAIR (`kind="pair"`) names its two solo `members`; its trigger is derived from theirs
+    as the joined phrase and its gender is None (the phrase carries both). Anything sent
+    for either is ignored rather than trusted: the phrase must be exactly what the captions
+    will teach.
+    """
     name: str = Field(min_length=1, max_length=64)
-    char_lora: str = Field(min_length=1)
+    #: Omitted or null: "none". Stored as "none" rather than NULL because every reader of
+    #: a character already treats that string as "no LoRA" (see the class docstring).
+    char_lora: Optional[str] = Field(default=None, min_length=1)
     # Fills every pose's <TRIGGER> placeholder. Defaults to the character's own name, which
     # is what all three seeded characters use.
     trigger: Optional[str] = Field(default=None, max_length=64)
@@ -23,6 +38,8 @@ class LtxCharacterCreate(BaseModel):
     strength_stage_1: float = 0.8
     strength_stage_2: float = 1.5
     image_uri: Optional[str] = None
+    kind: Literal["solo", "pair"] = "solo"
+    members: Optional[List[str]] = Field(default=None, max_length=2)
 
 
 class LtxCharacterResponse(BaseModel):
@@ -30,12 +47,17 @@ class LtxCharacterResponse(BaseModel):
 
     id: uuid.UUID
     name: str
-    char_lora: str
+    char_lora: Optional[str] = None
     trigger: str
     gender: Optional[Gender] = None
     strength_stage_1: float
     strength_stage_2: float
     image_uri: Optional[str] = None
+    #: solo | pair (migration 103). A row predating it reads solo.
+    kind: str = "solo"
+    members: Optional[List[str]] = None
+    base_checkpoint: Optional[str] = None
+    trained_from: Optional[list] = None
 
 
 class LtxCharacterUpdate(BaseModel):
@@ -45,17 +67,22 @@ class LtxCharacterUpdate(BaseModel):
     trigger means "no opinion", and the name is the best guess. On update an absent trigger
     means "leave it alone", and quietly rewriting it to the new name would silently change
     every pose's rendered prompt as a side effect of a rename.
+
+    Trigger, gender, kind and members are LOCKED once the character has trained (#352) --
+    see update_character for the one way to change them anyway.
     """
 
     name: Optional[str] = Field(default=None, min_length=1, max_length=64)
     char_lora: Optional[str] = Field(default=None, min_length=1)
-    trigger: Optional[str] = Field(default=None, min_length=1, max_length=64)
+    trigger: Optional[str] = Field(default=None, min_length=1, max_length=255)
     # Sent as null, it clears: a character whose LoRA trained on a bare caption should not
     # keep rendering a gender it never bound.
     gender: Optional[Gender] = None
     strength_stage_1: Optional[float] = Field(default=None, ge=0)
     strength_stage_2: Optional[float] = Field(default=None, ge=0)
     image_uri: Optional[str] = None
+    kind: Optional[Literal["solo", "pair"]] = None
+    members: Optional[List[str]] = Field(default=None, max_length=2)
 
 
 class LtxBookCreate(BaseModel):

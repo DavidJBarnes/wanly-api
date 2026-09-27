@@ -21,6 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import and_, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import s3
@@ -29,10 +30,12 @@ from app.config import settings
 from app.database import get_db
 from app.enums import TRAINING_TERMINAL, TrainingStatus, WorkerKind, worker_can
 from app.models import Dataset, LtxCharacter, TrainingJob, User, Worker
+from app.character_registry import identity_phrase
 from app.schemas.training import (
     MIN_DATASET_IMAGES, TrainingClaimResponse, TrainingCreate, TrainingNotes,
-    TrainingProgress, TrainingResponse,
+    TrainingPreflight, TrainingProgress, TrainingResponse,
 )
+from app.training_plan import REG_RATIO, plan_training
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -70,182 +73,116 @@ def _live_states() -> list[str]:
     return [TrainingStatus.CLAIMED, TrainingStatus.RUNNING]
 
 
+@router.post("/training/preflight", response_model=TrainingPreflight)
+async def preflight_training_job(
+    body: TrainingCreate,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """What POST /training would do with this body, and everything that stops it (#352).
+
+    The checklist the Train dialog renders: every problem at once (not the first), the
+    groups the server derived -- datasets, repeats, and the first final captions of each,
+    trigger prefix included -- and the epoch arithmetic. Writes nothing. The same function
+    decides POST /training, so a green checklist is a run the API will accept.
+    """
+    return (await plan_training(db, body)).public()
+
+
 @router.post("/training", response_model=TrainingResponse, status_code=201)
 async def create_training_job(
     body: TrainingCreate,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Queue a training run. The console's entry point."""
-    # A dataset is the normal path; a raw list stays supported so a CLI or a curl can train
-    # without creating one first.
-    images = list(body.dataset_images)
-    thumbnail = None
-    # PROVENANCE (snapshot at creation, stamped on the character at publish): which dataset,
-    # by id and NAME, each group's images came from. The name is recorded NOW because a
-    # rename later must not rewrite what trained; the id survives so the console can link.
-    # An ad-hoc raw list records id/name null -- still a count, still honest.
-    group0_dataset: dict | None = None
-    if body.dataset_id:
-        ds = await db.get(Dataset, body.dataset_id)
-        if not ds:
-            raise HTTPException(status_code=404, detail="Dataset not found")
-        images = list(ds.images)
-        group0_dataset = {"id": str(ds.id), "name": ds.name, "count": len(images)}
-        # The anchor is the face the set was checked against; failing that, the first image.
-        thumbnail = ds.anchor_uri or (ds.images[0] if ds.images else None)
-    if group0_dataset is None:
-        group0_dataset = {"id": None, "name": None, "count": len(images)}
-    # Checked here rather than on the schema, because it applies to whichever of the two was
-    # given -- a schema minimum on dataset_images would reject every dataset_id request.
-    if len(images) < MIN_DATASET_IMAGES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"{len(images)} images — at least {MIN_DATASET_IMAGES} are needed")
-    if len(set(images)) != len(images):
-        raise HTTPException(status_code=422, detail="the dataset contains duplicates")
+    """Queue a training run. The console's entry point.
 
-    # THE EXTRA GROUPS (#102, #106). Resolved the same way group 0 is: a dataset or a raw
-    # list for the images, the trigger rule for the caption, its own num_repeats. The list
-    # may hold IDENTITY groups (a trigger -> "<trigger>, <gender>") and COMPOSITION groups
-    # (no trigger -> a free caption naming the people in the frames). The latter is what
-    # teaches the model the identities appear TOGETHER (#106): solo sets alone cannot, and a
-    # run with only solo groups produced a LoRA that held one face and dropped the other.
-    #
-    # The pre-#106 single second identity is folded in as a group when the console has not
-    # shipped the list form yet -- dropping it would silently make a joint run single.
-    extra = list(body.identities)
-    legacy = body.legacy_second_group()
-    if legacy is not None and not extra:
-        extra = [legacy]
+    EVERYTHING BUT WHO IS DERIVED (#352) -- see app/training_plan.py. A request with any
+    problem is refused whole, 422 {detail: {problems, warnings}}, with the same list the
+    preflight shows.
 
-    groups: list[dict] = []
-    seen_dataset_ids = {body.dataset_id} if body.dataset_id else set()
-    seen_triggers = {body.trigger}
-    for i, g in enumerate(extra):
-        label = f"identity {i + 2}"  # 1-based: group 0 is the first
-        g_images = list(g.dataset_images)
-        g_dataset: dict = {"id": None, "name": None, "count": 0}
-        if g.dataset_id:
-            gds = await db.get(Dataset, g.dataset_id)
-            if not gds:
-                raise HTTPException(status_code=404, detail=f"{label}: dataset not found")
-            g_images = list(gds.images)
-            g_dataset = {"id": str(gds.id), "name": gds.name, "count": len(g_images)}
-            if g.dataset_id in seen_dataset_ids:
-                # One dataset captioned two ways would train every image under both
-                # captions, which is not what any group is asking for.
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"{label}: this dataset is already used by another group; give "
-                           f"each group its own set (repeats balance them, not sharing)")
-            seen_dataset_ids.add(g.dataset_id)
-            if gds.anchor_uri and not thumbnail:
-                thumbnail = gds.anchor_uri
-        g_dataset["count"] = len(g_images)
-        if len(g_images) < MIN_DATASET_IMAGES:
-            raise HTTPException(
-                status_code=422,
-                detail=f"{label}: {len(g_images)} images — at least {MIN_DATASET_IMAGES} "
-                       f"are needed")
-        if len(set(g_images)) != len(g_images):
-            raise HTTPException(status_code=422, detail=f"{label}: dataset contains duplicates")
+    CAPTIONS ARE SNAPSHOTTED HERE. Each group records its final per-image captions beside
+    its images, so the run trains on the words that were previewed -- a caption edited
+    after the Train button, or an owner's trigger re-registered, cannot change what a
+    queued job does. /retry reads the snapshot too, never the live captions.
 
-        if g.trigger:
-            # AN IDENTITY GROUP. Its pair joins the published phrase, and the triggers must
-            # differ -- one caption pair cannot anchor two faces.
-            if g.trigger in seen_triggers:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"{label}: trigger {g.trigger!r} is already used by another "
-                           f"group — one caption pair cannot anchor two faces")
-            seen_triggers.add(g.trigger)
-            if g.gender:
-                g_caption = f"{g.trigger}, {g.gender}"
-            elif g.caption:
-                g_caption = g.caption
-            else:
-                # Falls back to the trainer's per-job caption default, which carries GROUP
-                # 0's trigger -- the wrong face's token.
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"{label}: needs a gender or a caption that names its trigger — "
-                           f"otherwise its face binds to nothing")
-        else:
-            # A COMPOSITION GROUP. No trigger: the caption is used verbatim and must name
-            # at least two triggers, or the frames teach nothing the solo sets did not.
-            g_caption = (g.caption or "").strip() or None
-            if not g_caption:
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"{label}: no trigger, so it needs a caption naming the people "
-                           f"in its frames (e.g. \"p@yton, woman and d@vid, man\")")
-        groups.append({
-            "character": g.character,
-            "trigger": g.trigger,
-            "gender": g.gender,
-            "caption": g_caption,
-            "images": g_images,
-            "num_repeats": g.num_repeats,
-            #: Provenance, snapshot at creation (see group0_dataset above).
-            "dataset": g_dataset,
-        })
-
-    dupe = (await db.execute(
-        select(TrainingJob).where(
-            TrainingJob.character == body.character,
-            TrainingJob.version == body.version,
-            TrainingJob.status.not_in(list(TRAINING_TERMINAL)),
-        )
-    )).scalar_one_or_none()
-    if dupe:
-        # The database would refuse this anyway via the partial unique index; catching it here
-        # turns a 500 into a sentence.
-        raise HTTPException(
-            status_code=409,
-            detail=f"{body.character} v{body.version} is already {dupe.status}. "
-                   f"Cancel it, or pick another version.")
-
-    # THE CAPTION MUST CARRY THE TRIGGER, or the trigger is never learned. The first run
-    # trained with the caption "man" -- typed literally into a field whose placeholder
-    # said "trigger, woman" -- so its trigger word meant nothing to the model and the
-    # identity bound to "man" instead. A caption that does not mention the trigger gets it
-    # prepended here, the way the trainer's own default ("<trigger>, woman") is shaped.
-    caption = (body.caption or "").strip() or None
-    if body.gender:
-        caption = f"{body.trigger}, {body.gender}"
-    elif caption and body.trigger not in caption:
-        caption = f"{body.trigger}, {caption}"
-
-    # A joint run's steps field is the TOTAL across both groups: the trainer's epoch math
-    # reads images x repeats across the two datasets. The combined set is bigger, so the
-    # same steps value means fewer passes over each image -- the console states per-image
-    # epochs in its estimate, so that is visible to the caller rather than papered over.
-    # The dialog scales its default up for a joint run; the API holds one number for both.
-    steps = body.steps
-
+    GROUP 0 is the first member (solo: the character) and lives in the flat columns and
+    config, exactly where the trainer has always read it; groups 1..N -- the second member,
+    the composition set, the regularization pools -- go in `identities`.
+    """
+    plan = await plan_training(db, body)
+    if not plan.ok:
+        raise HTTPException(status_code=422,
+                            detail={"problems": plan.problems, "warnings": plan.warnings})
+    g0, rest = plan.groups[0], plan.groups[1:]
+    # The anchor is the face the set was checked against; failing that, the first image.
+    ds0 = g0.dataset
+    thumbnail = (ds0.anchor_uri if ds0 and ds0.anchor_uri else None) or \
+        (g0.images[0] if g0.images else None)
     job = TrainingJob(
         user_id=user.id,
         character=body.character,
-        trigger=body.trigger,
+        # Group 0's trigger. For a pair the row's trigger is the joined phrase, but that is
+        # the PUBLISHED phrase, assembled at publish from every identity group; this column
+        # has always been group 0's token, and the trainer reads it that way.
+        trigger=g0.trigger,
         version=body.version,
-        dataset_images=images,
-        config={**RECIPE_DEFAULTS, "steps": steps, "caption": caption,
-                "gender": body.gender,
-                "dataset": group0_dataset,
+        dataset_images=g0.images,
+        config={**RECIPE_DEFAULTS,
+                "steps": body.steps,
+                "num_repeats": g0.num_repeats,
+                "mode": body.mode,
+                "members": [m.name for m in plan.members],
+                "kind": g0.kind,
+                "gender": g0.gender,
+                # The legacy single caption, for a trainer that predates `captions`: it
+                # would train every image under the first one, which is wrong but not
+                # silent -- the per-image list is the contract.
+                "caption": g0.captions[0] if g0.captions else None,
+                "captions": g0.captions,
+                "base_checkpoint": plan.base_checkpoint,
+                "reg_ratio": REG_RATIO,
+                "allow_no_composition": body.allow_no_composition,
+                "dataset": g0.provenance(),
                 "lora_name": body.lora_name or _default_lora_name(body.character),
                 "publish": body.publish},
-        identities=groups or None,
+        identities=[_group_row(g) for g in rest] or None,
         status=TrainingStatus.PENDING,
-        total_steps=steps,
+        total_steps=body.steps,
         thumbnail_uri=thumbnail,
     )
     db.add(job)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # The live-version unique index racing another create between the plan's check
+        # and this commit.
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"{body.character} v{body.version} already has a live run") from None
     await db.refresh(job)
-    logger.info("queued training %s v%d (%d images) for %s",
-                job.character, job.version, len(job.dataset_images), user.username)
+    logger.info("queued %s training %s v%d: %s for %s", body.mode, job.character, job.version,
+                ", ".join(f"{g.kind} {g.dataset.name if g.dataset else '?'} "
+                          f"{len(g.images)}x{g.num_repeats}" for g in plan.groups),
+                user.username)
     return job
+
+
+def _group_row(g) -> dict:
+    """One extra group as the job stores it: the snapshot a claim and a retry both read."""
+    return {
+        "character": g.character,
+        "trigger": g.trigger,
+        "gender": g.gender,
+        "kind": g.kind,
+        "caption": g.captions[0] if g.captions else None,
+        "captions": g.captions,
+        "images": g.images,
+        "num_repeats": g.num_repeats,
+        #: Provenance, snapshot at creation: a rename must not rewrite what trained.
+        "dataset": g.provenance(),
+    }
 
 
 @router.get("/training", response_model=list[TrainingResponse],
@@ -323,6 +260,13 @@ async def claim_next_training_job(
                 "trigger": g.get("trigger"),
                 "gender": g.get("gender"),
                 "caption": g.get("caption"),
+                #: Per-image, parallel to download_urls (#352). None on a pre-#352 job,
+                #: whose single `caption` is the whole contract.
+                "captions": g.get("captions"),
+                #: identity | composition | regularization. Recorded since #352; before it
+                #: a group without a trigger was a composition group, which is exactly
+                #: how the trainer read it then.
+                "kind": g.get("kind") or ("identity" if g.get("trigger") else "composition"),
                 "num_repeats": g.get("num_repeats"),
                 #: So the trainer can say WHICH dataset it is staging, not just how many.
                 "dataset_name": (g.get("dataset") or {}).get("name"),
@@ -352,6 +296,7 @@ async def claim_next_training_job(
     payload = TrainingResponse.model_validate(job).model_dump()
     payload.pop("identities", None)
     claim = TrainingClaimResponse(**payload, download_urls=urls,
+                                  captions=(job.config or {}).get("captions"),
                                   identities=group_payload or None)
     return claim
 
@@ -503,6 +448,12 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
     """
     if not job.output_lora_path:
         return
+    if (job.config or {}).get("mode") in ("solo", "pair"):
+        await _publish_registered(db, job)
+        return
+    # ---- A PRE-#352 JOB, published exactly as it always was. Retrying an old failed run
+    # must not change what it publishes to.
+    #
     # THE STEM, NOT THE FILENAME. Every character row stores `pay_v2_e05`, the console's Use
     # button writes the stem, and the character editor says "without .safetensors" -- the
     # first auto-published character stored `david_v1_final.safetensors` and the page could
@@ -569,6 +520,68 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
                             gender=gender, image_uri=job.thumbnail_uri,
                             trained_from=trained_from))
         logger.info("created character %s -> %s", job.character, basename)
+
+
+def _lora_stem(job: TrainingJob) -> str:
+    # THE STEM, NOT THE FILENAME: see _publish_character.
+    return job.output_lora_path.rsplit("/", 1)[-1].removesuffix(".safetensors")
+
+
+def _trained_from(job: TrainingJob) -> list[dict]:
+    """[{dataset_id, name, count, kind}] in group order, from what creation recorded."""
+    cfg = job.config or {}
+    rows = [(cfg.get("dataset") or {}, cfg.get("kind") or "identity",
+             len(job.dataset_images))]
+    rows += [(g.get("dataset") or {}, g.get("kind"), len(g.get("images") or []))
+             for g in (job.identities or [])]
+    return [{"dataset_id": d.get("id"), "name": d.get("name"),
+             "count": d.get("count", n), "kind": kind} for d, kind, n in rows]
+
+
+async def _publish_registered(db: AsyncSession, job: TrainingJob) -> None:
+    """Publish a #352 run: to its OWN row, and never to anybody else's.
+
+    SOLO updates the character it trained: the LoRA, provenance, base model and face. The
+    trigger and gender are left alone -- the run captioned with the registry's values, so
+    they already are what this LoRA learned, and a publish is not the place to change them.
+
+    PAIR upserts the PAIR's row (kind=pair, members) and never touches a member's. A joint
+    run used to publish over its first member's solo row, so training "DavidKelly" replaced
+    what "David" rendered with -- and "David" then rendered a LoRA that carried two faces.
+    The pair row's trigger is the joined phrase of the identity groups in group order,
+    "d@vid, man and k3lly2026, woman" -- exactly the prefix the composition captions
+    carried, so <TRIGGER> renders the words the two-person frames taught. Its gender is
+    None: the phrase carries both. Rebuilt from the job's own snapshot, because that is
+    what trained, whatever the registry says now.
+
+    Strengths are left as they are on an existing row: they may have been tuned by hand.
+    """
+    cfg = job.config or {}
+    basename = _lora_stem(job)
+    existing = (await db.execute(
+        select(LtxCharacter).where(LtxCharacter.name == job.character)
+    )).scalar_one_or_none()
+    stamp = {"char_lora": basename, "trained_from": _trained_from(job),
+             "base_checkpoint": cfg.get("base_checkpoint")}
+    if cfg.get("mode") == "pair":
+        phrases = [identity_phrase(job.trigger, cfg.get("gender"))]
+        phrases += [identity_phrase(g.get("trigger"), g.get("gender"))
+                    for g in (job.identities or []) if g.get("kind") == "identity"]
+        stamp.update(kind="pair", members=list(cfg.get("members") or []),
+                     trigger=" and ".join(p for p in phrases if p), gender=None)
+    if existing:
+        for k, v in stamp.items():
+            setattr(existing, k, v)
+        if job.thumbnail_uri:
+            existing.image_uri = job.thumbnail_uri
+        logger.info("%s %s now points at %s", cfg.get("mode"), job.character, basename)
+    else:
+        # A solo row is registered before it trains, so this is a pair's first publish --
+        # or a solo row deleted mid-run, rebuilt from what the run captioned with.
+        stamp.setdefault("trigger", job.trigger)
+        stamp.setdefault("gender", cfg.get("gender"))
+        db.add(LtxCharacter(name=job.character, image_uri=job.thumbnail_uri, **stamp))
+        logger.info("created %s character %s -> %s", cfg.get("mode"), job.character, basename)
 
 
 #: Below this a "LoRA" is a truncated upload or an error page. A rank-32 character LoRA is
@@ -896,6 +909,31 @@ def _reresolve_images(label: str, images: list, ds: Dataset | None) -> tuple[lis
     return fresh, provenance
 
 
+def _reresolve_captioned(label: str, images: list, captions: list,
+                         ds: Dataset | None) -> tuple[list, list, dict | None]:
+    """`_reresolve_images` for a group with a caption snapshot (#352).
+
+    The dataset decides WHICH images (in its current order); the snapshot decides every
+    caption. An image the snapshot has no caption for is dropped -- it was never previewed,
+    and a retry is not the place to caption it. What is left must still clear the floor.
+    """
+    snap = dict(zip(images, captions))
+    if ds is None:
+        return list(images), list(captions), None
+    fresh = [u for u in ds.images if u in snap]
+    if len(fresh) < MIN_DATASET_IMAGES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"{label}: dataset {ds.name!r} now has {len(fresh)} of this run's captioned "
+                   f"images — at least {MIN_DATASET_IMAGES} are needed. Create a new run to "
+                   f"train on its current images and captions.")
+    if len(set(fresh)) != len(fresh):
+        raise HTTPException(
+            status_code=422, detail=f"{label}: dataset {ds.name!r} contains duplicates")
+    provenance = {"id": str(ds.id), "name": ds.name, "count": len(fresh)}
+    return fresh, [snap[u] for u in fresh], provenance
+
+
 @router.post("/training/{job_id}/retry", response_model=TrainingResponse)
 async def retry_training_job(
     job_id: uuid.UUID,
@@ -931,10 +969,21 @@ async def retry_training_job(
     # ALL re-resolution happens BEFORE any mutation: a 422 must leave the row exactly as
     # it was — still failed, still showing its error — not half-rewritten.
     config = dict(job.config or {})
+    # A #352 job carries per-image captions. Its retry re-reads each set's IMAGES (the
+    # point of retry) but takes every caption from the job's own SNAPSHOT, never the
+    # dataset: the run is re-queued as what was previewed and approved, and an image that
+    # arrived since has no approved caption, so it is left out rather than guessed at.
+    snapshotted = config.get("captions") is not None
     group0 = dict(config.get("dataset") or {})
     ds_id = _provenance_dataset_id(group0)
     ds = await db.get(Dataset, ds_id) if ds_id else None
-    images, refreshed = _reresolve_images("group 1", job.dataset_images, ds)
+    if snapshotted:
+        images, captions, refreshed = _reresolve_captioned(
+            "group 1", job.dataset_images, config["captions"], ds)
+        config["captions"] = captions
+        config["caption"] = captions[0] if captions else None
+    else:
+        images, refreshed = _reresolve_images("group 1", job.dataset_images, ds)
     if refreshed:
         config["dataset"] = {**group0, **refreshed}
 
@@ -943,8 +992,14 @@ async def retry_training_job(
         prov = dict(g.get("dataset") or {})
         g_id = _provenance_dataset_id(prov)
         gds = await db.get(Dataset, g_id) if g_id else None
-        g_images, g_refreshed = _reresolve_images(
-            f"identity {i + 2}", g.get("images") or [], gds)
+        if g.get("captions") is not None:
+            g_images, g_caps, g_refreshed = _reresolve_captioned(
+                f"group {i + 2}", g.get("images") or [], g["captions"], gds)
+            g["captions"] = g_caps
+            g["caption"] = g_caps[0] if g_caps else None
+        else:
+            g_images, g_refreshed = _reresolve_images(
+                f"identity {i + 2}", g.get("images") or [], gds)
         g["images"] = g_images
         if g_refreshed:
             g["dataset"] = {**prov, **g_refreshed}

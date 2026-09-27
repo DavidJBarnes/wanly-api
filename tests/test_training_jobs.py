@@ -41,38 +41,87 @@ def _worker(**kw):
     return Worker(**base)
 
 
+class _U:
+    """The console user a route is called as. Only its id and name are read."""
+    id = None
+    username = "t"
+
+
+def _set(prefix, n):
+    return [f"s3://wanly-images/datasets/{prefix}/{i:03d}.jpg" for i in range(n)]
+
+
+async def _world(db, *, floor_ok=True):
+    """The registry and datasets of a correctly set-up world (#352), from which each
+    guardrail test breaks exactly one thing.
+
+    David (d@vid, man) and Kelly-2026 (k3lly2026, woman) are registered solo characters,
+    each owning one anchored, scored, captioned character set; DavidKelly-2026 owns a
+    composition set; there is a regularization pool per gender.
+    """
+    from app.models import Dataset
+
+    def _ds(name, kind, owner, imgs, reg_class=None, scored=True):
+        return Dataset(
+            id=uuid.uuid4(), name=name, prefix=f"datasets/{name}", kind=kind,
+            character=owner, reg_class=reg_class, images=imgs,
+            anchor_uri=imgs[0] if kind == "character" else None,
+            captions={u: f"medium shot, standing, look {i}" for i, u in enumerate(imgs)},
+            scores=({u: (1.0 if i == 0 else 0.7) for i, u in enumerate(imgs)}
+                    if scored and kind == "character" else {}))
+
+    w = {
+        "david_c": LtxCharacter(name="David", trigger="d@vid", gender="man", char_lora="none"),
+        "kelly_c": LtxCharacter(name="Kelly-2026", trigger="k3lly2026", gender="woman",
+                                char_lora="none"),
+        "david": _ds("David", "character", "David", _set("david", 10)),
+        "kelly": _ds("Kelly-2026", "character", "Kelly-2026", _set("kelly", 12)),
+        "comp": _ds("DavidKelly-2026", "composition", "DavidKelly-2026", _set("comp", 9)),
+        "reg_woman": _ds("Reg-woman", "regularization", None, _set("regw", 40), "woman"),
+        "reg_man": _ds("Reg-man", "regularization", None, _set("regm", 30), "man"),
+    }
+    db.add_all(list(w.values()))
+    await db.flush()
+    return w
+
+
+def _codes(plan) -> set[str]:
+    return {p["code"] for p in (plan["problems"] if isinstance(plan, dict) else plan.problems)}
+
+
 class TestTheRequest:
-    def test_a_dataset_of_s3_uris_is_required(self):
-        """A local path would be meaningless to a trainer on another machine."""
-        with pytest.raises(ValueError, match="s3://"):
-            TrainingCreate(character="pay", trigger="p@y",
-                           dataset_images=["/home/david/img.jpg"] * 13)
+    """The request says WHO to train (#352). Triggers, genders, images and captions are the
+    server's to derive, so the fields that used to carry them are refused, not ignored."""
 
-    def test_duplicates_are_refused(self):
-        """A duplicate trains the same image twice under two sel_NNN names, silently
-        reweighting the set toward it."""
-        with pytest.raises(ValueError, match="duplicates"):
-            TrainingCreate(character="pay", trigger="p@y",
-                           dataset_images=["s3://b/a.jpg"] * 13)
+    def test_a_solo_request_names_a_mode_and_a_character(self):
+        t = TrainingCreate(mode="solo", character="David")
+        assert t.mode == "solo" and t.members is None and t.datasets == {}
 
-    def test_too_few_images_is_refused_by_the_route(self):
-        """The floor moved off the schema when dataset_id arrived: a schema minimum on
-        dataset_images would reject every dataset_id request, which is the normal path now."""
-        import inspect
-        from app.routes import training as mod
-        assert "at least {MIN_DATASET_IMAGES} are needed" in inspect.getsource(mod.create_training_job)
+    def test_a_pair_request_names_its_members(self):
+        t = TrainingCreate(mode="pair", character="DavidKelly-2026",
+                           members=["David", "Kelly-2026"])
+        assert t.members == ["David", "Kelly-2026"]
+
+    def test_the_mode_is_required(self):
+        with pytest.raises(ValueError):
+            TrainingCreate(character="David")
+
+    @pytest.mark.parametrize("legacy", [
+        {"trigger": "d@vid"}, {"gender": "man"}, {"caption": "d@vid, man"},
+        {"dataset_images": _images()}, {"dataset_id": str(uuid.uuid4())},
+        {"identities": []}, {"second_character": "Me"},
+    ])
+    def test_the_legacy_shape_is_refused_with_a_sentence(self, legacy):
+        """An old console still thinks it chooses the trigger. Silently ignoring what it
+        typed would train under different words than it showed."""
+        with pytest.raises(ValueError, match="no longer accepted"):
+            TrainingCreate(mode="solo", character="David", **legacy)
 
     def test_a_character_cannot_contain_a_path(self):
         """It becomes a directory name and an output filename on the trainer."""
         for bad in ("../etc", "a/b", ".hidden", "two words"):
             with pytest.raises(ValueError):
-                TrainingCreate(character=bad, trigger="t", dataset_images=_images())
-
-    def test_the_trigger_may_differ_from_the_character(self):
-        """p@y REQUIRES this: the LoRA is served over HTTP and lands in JSON and URLs, so the
-        filename cannot hold an @ — but the captions trained on one."""
-        t = TrainingCreate(character="pay", trigger="p@y", dataset_images=_images())
-        assert t.character == "pay" and t.trigger == "p@y"
+                TrainingCreate(mode="solo", character=bad)
 
 
 class TestTheClaimGate:
@@ -264,7 +313,7 @@ class TestCharacterNaming:
     """
 
     def test_an_at_sign_is_allowed_in_the_character(self):
-        t = TrainingCreate(character="p@y", trigger="p@y", dataset_images=_images())
+        t = TrainingCreate(mode="solo", character="p@y")
         assert t.character == "p@y"
 
     def test_the_filename_stem_is_decided_at_creation_not_at_upload(self):
@@ -316,16 +365,14 @@ class TestTheLoraFilename:
         assert _default_lora_name("@@@") == "lora"
 
     def test_an_explicit_name_is_accepted(self):
-        t = TrainingCreate(character="p@y", trigger="p@y", lora_name="pay",
-                           dataset_images=_images())
+        t = TrainingCreate(mode="solo", character="p@y", lora_name="pay")
         assert t.lora_name == "pay"
 
     def test_an_unsafe_explicit_name_is_refused(self):
         """Otherwise the field just moves the problem."""
         for bad in ("p@y", "a/b", "with space"):
             with pytest.raises(ValueError):
-                TrainingCreate(character="x", trigger="x", lora_name=bad,
-                               dataset_images=_images())
+                TrainingCreate(mode="solo", character="x", lora_name=bad)
 
     def test_the_upload_uses_the_stored_stem_not_a_fresh_guess(self):
         from app.routes.training import _artifact_key
@@ -741,15 +788,13 @@ class TestOnlyTheFinalGoesUpByDefault:
     epochs". Every epoch stays on the trainer; the rest are asked for."""
 
     def test_the_default_policy_is_final(self):
-        req = TrainingCreate(character="p@y", trigger="p@y", dataset_images=_images())
+        req = TrainingCreate(mode="solo", character="p@y")
         assert req.publish == "final"
 
     def test_all_is_the_other_choice_and_nothing_else_is(self):
-        assert TrainingCreate(character="p@y", trigger="p@y", dataset_images=_images(),
-                              publish="all").publish == "all"
+        assert TrainingCreate(mode="solo", character="p@y", publish="all").publish == "all"
         with pytest.raises(ValueError):
-            TrainingCreate(character="p@y", trigger="p@y", dataset_images=_images(),
-                           publish="some")
+            TrainingCreate(mode="solo", character="p@y", publish="some")
 
     def test_the_policy_reaches_the_job_config(self):
         import inspect
@@ -803,18 +848,11 @@ class TestThePublishedCharacterStoresTheStem:
 
 class TestTheLoraHasAFace:
     async def test_the_dataset_anchor_is_snapshotted_at_creation(self, db):
-        from app.models import Dataset
         from app.routes.training import create_training_job
-        ds = Dataset(name="faces", images=_images(), anchor_uri=_images()[3], prefix="x")
-        db.add(ds)
-        await db.commit()
-
-        class _U:
-            id = None
-            username = "t"
+        w = await _world(db)
         job = await create_training_job(
-            TrainingCreate(character="p@y", trigger="p@y", dataset_id=ds.id), user=_U(), db=db)
-        assert job.thumbnail_uri == _images()[3]
+            TrainingCreate(mode="solo", character="David"), user=_U(), db=db)
+        assert job.thumbnail_uri == w["david"].anchor_uri
 
     async def test_publishing_puts_the_face_on_the_character(self, db):
         job = _job(character="p@y", output_lora_path="s3://ltx-loras/character/pay_v3_final.safetensors",
@@ -834,51 +872,12 @@ class TestTheLoraHasAFace:
         assert '"loss_log", "epochs"' in inspect.getsource(mod.update_training_job)
 
 
-class TestTheCaptionCarriesTheTrigger:
-    """Me v1 trained with the caption "man": the trigger d@vid was never in a caption, so the
-    model never learned it and the identity bound to "man" instead."""
-
-    async def _create(self, db, caption):
-        from app.routes.training import create_training_job
-
-        class _U:
-            id = None
-            username = "t"
-        return await create_training_job(
-            TrainingCreate(character="Me", trigger="d@vid", dataset_images=_images(),
-                           caption=caption), user=_U(), db=db)
-
-    async def test_a_caption_without_the_trigger_gets_it_prepended(self, db):
-        job = await self._create(db, "man")
-        assert job.config["caption"] == "d@vid, man"
-
-    async def test_a_caption_that_names_it_is_left_alone(self, db):
-        job = await self._create(db, "portrait of d@vid, man")
-        assert job.config["caption"] == "portrait of d@vid, man"
-
-    async def test_no_caption_stays_none_for_the_trainers_default(self, db):
-        job = await self._create(db, "   ")
-        assert job.config["caption"] is None
-
-    async def test_gender_writes_the_whole_caption(self, db):
-        from app.routes.training import create_training_job
-
-        class _U:
-            id = None
-            username = "t"
-        job = await create_training_job(
-            TrainingCreate(character="Me", trigger="d@vid", dataset_images=_images(),
-                           gender="man"), user=_U(), db=db)
-        assert job.config["caption"] == "d@vid, man"
-        assert job.config["gender"] == "man"
-
-    def test_gender_is_one_of_three(self):
-        with pytest.raises(ValueError):
-            TrainingCreate(character="Me", trigger="d@vid", dataset_images=_images(), gender="boy")
-
-
 class TestTheJointRun:
-    """A joint run (wanly-api#102, #106): one LoRA trained on several groups at once.
+    """A PRE-#352 joint run (wanly-api#102, #106): one LoRA trained on several groups at once.
+
+    These jobs still exist, and retrying one must publish where it always did, so the old
+    publish path is kept for any job without a `mode` -- that is what these pin down. A
+    #352 pair publishes to its own row instead: see TestAPairPublishesToItsOwnRow.
 
     #102 was two identities; #106 added COMPOSITION groups -- frames containing BOTH
     characters, captioned with both triggers. That is the group that teaches the model the
@@ -887,56 +886,6 @@ class TestTheJointRun:
 
     def _imgs(self, prefix, n=13):
         return [f"s3://wanly-images/2026-09-11/{prefix}{i}.jpg" for i in range(n)]
-
-    def test_the_legacy_second_identity_is_still_accepted(self):
-        """An old console must not silently drop its second group by sending fields a new
-        API no longer reads."""
-        body = TrainingCreate(
-            character="pay", trigger="p@y", dataset_images=_images(), steps=1200,
-            second_character="Me", second_trigger="d@vid", second_gender="man",
-            second_dataset_images=self._imgs("m"))
-        g = body.legacy_second_group()
-        assert g is not None and g.trigger == "d@vid" and g.gender == "man"
-        plain = TrainingCreate(character="pay", trigger="p@y", dataset_images=_images())
-        assert plain.legacy_second_group() is None
-
-    def test_identities_take_identity_and_composition_groups(self):
-        body = TrainingCreate(
-            character="pay", trigger="p@y", dataset_images=_images(), steps=1200,
-            identities=[
-                # identity group: a trigger -> caption "<trigger>, <gender>"
-                {"character": "Me", "trigger": "d@vid", "gender": "man",
-                 "dataset_images": self._imgs("m")},
-                # composition group: no trigger, a free caption naming both
-                {"caption": "p@y, woman and d@vid, man",
-                 "dataset_images": self._imgs("c")},
-            ])
-        assert [g.trigger for g in body.identities] == ["d@vid", None]
-        assert body.identities[1].caption == "p@y, woman and d@vid, man"
-
-    def test_identical_triggers_are_refused(self):
-        """One caption pair cannot anchor two faces -- the triggers must differ."""
-        import inspect
-        from app.routes.training import create_training_job
-        src = inspect.getsource(create_training_job)
-        assert "already used by another" in src
-
-    def test_an_identity_group_needs_a_resolved_caption(self):
-        """A group without gender or a caption naming its trigger would fall back to the
-        trainer's per-job caption default -- which carries GROUP 0's trigger. Its face
-        would bind to the wrong person's token."""
-        import inspect
-        from app.routes.training import create_training_job
-        src = inspect.getsource(create_training_job)
-        assert "needs a gender or a caption that names its trigger" in src
-
-    def test_a_composition_group_needs_a_caption(self):
-        """No trigger means the caption is the only thing that can name the people in the
-        frames; without one the group trains nothing the solo sets did not."""
-        import inspect
-        from app.routes.training import create_training_job
-        src = inspect.getsource(create_training_job)
-        assert "needs a caption naming the people" in src
 
     async def test_publishing_a_joint_run_records_both_triggers(self, db):
         """The character row carries ONE trigger; a LoRA trained on several caption pairs
@@ -1030,12 +979,16 @@ class TestTheProvenance:
     def _imgs(self, prefix, n=13):
         return [f"s3://wanly-images/2026-09-11/{prefix}{i}.jpg" for i in range(n)]
 
-    def test_creation_records_the_dataset_per_group(self):
-        import inspect
-        from app.routes import training as mod
-        src = inspect.getsource(mod.create_training_job)
-        assert '"dataset": g_dataset' in src, "identity groups do not record their dataset"
-        assert '"dataset": group0_dataset' in src, "group 0 does not record its dataset"
+    async def test_creation_records_the_dataset_per_group(self, db):
+        from app.routes.training import create_training_job
+        w = await _world(db)
+        job = await create_training_job(
+            TrainingCreate(mode="pair", character="DavidKelly-2026",
+                           members=["David", "Kelly-2026"]), user=_U(), db=db)
+        assert job.config["dataset"] == {"id": str(w["david"].id), "name": "David",
+                                         "count": 10}
+        assert [g["dataset"]["name"] for g in job.identities] == [
+            "Kelly-2026", "DavidKelly-2026", "Reg-man", "Reg-woman"]
 
     async def test_publishing_stamps_every_group(self, db):
         j = _job(
@@ -1337,3 +1290,569 @@ class TestARunCanBeRetried:
         out = await retry_training_job(job.id, _user=None, db=db)
 
         assert out.notes == "rank 16 was too weak"
+
+
+# ---------------------------------------------------------------------------------------
+# #352: the server derives the run. One class per guardrail, each breaking exactly one
+# thing in an otherwise correct _world, so a failure names the rule that moved.
+# ---------------------------------------------------------------------------------------
+
+
+async def _preflight(db, **body):
+    from app.training_plan import plan_training
+    return (await plan_training(db, TrainingCreate(**body))).public()
+
+
+SOLO = {"mode": "solo", "character": "David"}
+PAIR = {"mode": "pair", "character": "DavidKelly-2026", "members": ["David", "Kelly-2026"]}
+
+
+class TestTheWellFormedRunsPass:
+    async def test_a_solo_run_is_clean(self, db):
+        await _world(db)
+        out = await _preflight(db, **SOLO)
+        assert out["ok"], out["problems"]
+        assert [g["kind"] for g in out["groups"]] == ["identity", "regularization"]
+
+    async def test_a_pair_run_is_clean(self, db):
+        await _world(db)
+        out = await _preflight(db, **PAIR)
+        assert out["ok"], out["problems"]
+        assert [(g["kind"], g["dataset_name"]) for g in out["groups"]] == [
+            ("identity", "David"), ("identity", "Kelly-2026"),
+            ("composition", "DavidKelly-2026"),
+            ("regularization", "Reg-man"), ("regularization", "Reg-woman")]
+
+
+class TestThePreflightOutput:
+    """What the Train dialog renders. The sample captions are FINAL -- prefix included --
+    because the preview exists to show what the trainer will actually write."""
+
+    async def test_the_shape(self, db):
+        await _world(db)
+        out = await _preflight(db, **SOLO, steps=2000)
+        assert set(out) == {"ok", "problems", "warnings", "groups", "steps",
+                            "samples_per_epoch", "passes_per_image", "base_checkpoint"}
+        g = out["groups"][0]
+        assert set(g) == {"kind", "character", "trigger", "gender", "dataset_id",
+                          "dataset_name", "images", "num_repeats", "sample_captions"}
+
+    async def test_identity_captions_carry_the_registrys_trigger_and_gender(self, db):
+        await _world(db)
+        g = (await _preflight(db, **SOLO))["groups"][0]
+        assert g["trigger"] == "d@vid" and g["gender"] == "man"
+        assert g["sample_captions"][0] == "d@vid, man, medium shot, standing, look 0"
+        assert len(g["sample_captions"]) == 5
+
+    async def test_composition_captions_name_both_people_in_member_order(self, db):
+        await _world(db)
+        comp = (await _preflight(db, **PAIR))["groups"][2]
+        assert comp["sample_captions"][0] == (
+            "d@vid, man and k3lly2026, woman, medium shot, standing, look 0")
+        assert comp["trigger"] is None
+
+    async def test_regularization_captions_carry_only_the_class_word(self, db):
+        await _world(db)
+        reg = (await _preflight(db, **SOLO))["groups"][1]
+        assert reg["sample_captions"][0] == "man, medium shot, standing, look 0"
+        assert reg["trigger"] is None and reg["character"] is None
+
+    async def test_regularization_repeats_match_the_character_samples(self, db):
+        """reg_ratio 1.0: as many generic "man" samples per epoch as "d@vid, man" ones."""
+        await _world(db)
+        out = await _preflight(db, **SOLO)
+        ident, reg = out["groups"]
+        assert ident["images"] * ident["num_repeats"] == 100
+        assert reg["images"] == 30 and reg["num_repeats"] == 3  # 90 ~= 100
+        assert out["samples_per_epoch"] == 190
+
+    async def test_a_pair_splits_regularization_between_the_genders(self, db):
+        await _world(db)
+        out = await _preflight(db, **PAIR)
+        character = sum(g["images"] * g["num_repeats"] for g in out["groups"]
+                        if g["kind"] != "regularization")
+        assert character == (10 + 12 + 9) * 10
+        man, woman = out["groups"][3:]
+        assert man["num_repeats"] == round(character / 2 / 30)
+        assert woman["num_repeats"] == round(character / 2 / 40)
+
+    async def test_passes_and_base_checkpoint(self, db):
+        from app.ltx_stack import LTX_STACK
+        await _world(db)
+        out = await _preflight(db, **SOLO, steps=1900)
+        assert out["passes_per_image"] == 100.0  # 1900 / 190 epochs x 10 repeats
+        assert out["base_checkpoint"] == LTX_STACK["checkpoint"] == "10Eros_v1.5_bf16"
+
+    async def test_the_preflight_writes_nothing(self, db):
+        from sqlalchemy import func, select
+        await _world(db)
+        await _preflight(db, **SOLO)
+        assert (await db.execute(select(func.count(TrainingJob.id)))).scalar_one() == 0
+
+
+class TestGuardEveryImageHasACaption:
+    async def test_a_missing_caption_blocks(self, db):
+        w = await _world(db)
+        caps = dict(w["david"].captions)
+        caps.pop(w["david"].images[3])
+        w["david"].captions = caps
+        await db.flush()
+        out = await _preflight(db, **SOLO)
+        assert "caption_missing" in _codes(out)
+        assert "1 of 10" in next(p["message"] for p in out["problems"]
+                                 if p["code"] == "caption_missing")
+
+    async def test_the_regularization_pool_needs_captions_too(self, db):
+        w = await _world(db)
+        w["reg_man"].captions = {}
+        await db.flush()
+        assert "caption_missing" in _codes(await _preflight(db, **SOLO))
+
+
+class TestGuardTheDatasetBelongsToTheCharacter:
+    async def test_kellys_set_cannot_train_david(self, db):
+        """The plan's own verification case."""
+        w = await _world(db)
+        out = await _preflight(db, **SOLO, datasets={"David": str(w["kelly"].id)})
+        assert "dataset_wrong_owner" in _codes(out)
+
+    async def test_a_regularization_pool_is_not_a_character_set(self, db):
+        w = await _world(db)
+        out = await _preflight(db, **SOLO, datasets={"David": str(w["reg_man"].id)})
+        assert "dataset_wrong_owner" in _codes(out)
+
+    async def test_no_owned_set_blocks(self, db):
+        w = await _world(db)
+        w["david"].character = None
+        w["david"].kind = None
+        await db.flush()
+        assert "dataset_missing" in _codes(await _preflight(db, **SOLO))
+
+    async def test_two_owned_sets_must_be_chosen_between(self, db):
+        from app.models import Dataset
+        w = await _world(db)
+        db.add(Dataset(name="David 2", prefix="x", kind="character", character="David",
+                       images=_set("d2", 9)))
+        await db.flush()
+        assert "dataset_ambiguous" in _codes(await _preflight(db, **SOLO))
+        out = await _preflight(db, **SOLO, datasets={"David": str(w["david"].id)})
+        assert out["ok"], out["problems"]
+
+    async def test_a_choice_for_someone_not_in_the_run_blocks(self, db):
+        w = await _world(db)
+        out = await _preflight(db, **SOLO, datasets={"Kelly-2026": str(w["kelly"].id)})
+        assert "dataset_for_non_member" in _codes(out)
+
+
+class TestGuardTheSetIsProvablyOnePerson:
+    async def test_no_anchor_blocks(self, db):
+        w = await _world(db)
+        w["david"].anchor_uri = None
+        await db.flush()
+        assert "anchor_missing" in _codes(await _preflight(db, **SOLO))
+
+    async def test_unscored_images_block(self, db):
+        w = await _world(db)
+        w["david"].scores = {}
+        await db.flush()
+        assert "scores_missing" in _codes(await _preflight(db, **SOLO))
+
+    async def test_a_face_below_the_floor_blocks(self, db):
+        from app.config import settings
+        w = await _world(db)
+        w["david"].scores = {**w["david"].scores, w["david"].images[5]: settings.face_cos_floor - 0.01}
+        await db.flush()
+        assert "score_below_floor" in _codes(await _preflight(db, **SOLO))
+
+    async def test_no_face_at_all_blocks(self, db):
+        w = await _world(db)
+        w["david"].scores = {**w["david"].scores, w["david"].images[5]: None}
+        await db.flush()
+        assert "score_below_floor" in _codes(await _preflight(db, **SOLO))
+
+
+class TestGuardPairMembers:
+    async def test_one_member_is_not_a_pair(self, db):
+        await _world(db)
+        out = await _preflight(db, mode="pair", character="DavidKelly-2026", members=["David"])
+        assert "pair_members" in _codes(out)
+
+    async def test_the_same_member_twice_is_not_a_pair(self, db):
+        await _world(db)
+        out = await _preflight(db, mode="pair", character="DavidKelly-2026",
+                               members=["David", "David"])
+        assert "pair_members" in _codes(out)
+
+    async def test_an_unregistered_member_blocks(self, db):
+        await _world(db)
+        out = await _preflight(db, mode="pair", character="DavidX",
+                               members=["David", "Nobody"])
+        assert "member_unknown" in _codes(out)
+
+    async def test_a_member_without_a_gender_blocks(self, db):
+        w = await _world(db)
+        w["kelly_c"].gender = None
+        await db.flush()
+        assert "trigger_missing" in _codes(await _preflight(db, **PAIR))
+
+    async def test_a_registered_pair_supplies_its_own_members(self, db):
+        await _world(db)
+        db.add(LtxCharacter(name="DavidKelly-2026", kind="pair", char_lora="none",
+                            members=["David", "Kelly-2026"], trigger="x"))
+        await db.flush()
+        out = await _preflight(db, mode="pair", character="DavidKelly-2026")
+        assert out["ok"], out["problems"]
+        out = await _preflight(db, mode="pair", character="DavidKelly-2026",
+                               members=["Kelly-2026", "David"])
+        assert "members_mismatch" in _codes(out)
+
+    async def test_members_with_one_trigger_cannot_train_together(self, db):
+        w = await _world(db)
+        w["kelly_c"].trigger = "d@vid"
+        await db.flush()
+        assert "duplicate_trigger" in _codes(await _preflight(db, **PAIR))
+
+
+class TestGuardTheCompositionSet:
+    async def test_a_pair_without_one_blocks(self, db):
+        w = await _world(db)
+        await db.delete(w["comp"])
+        await db.flush()
+        assert "composition_missing" in _codes(await _preflight(db, **PAIR))
+
+    async def test_it_can_be_waived_knowingly_with_a_warning(self, db):
+        w = await _world(db)
+        await db.delete(w["comp"])
+        await db.flush()
+        out = await _preflight(db, **PAIR, allow_no_composition=True)
+        assert out["ok"], out["problems"]
+        assert "no_composition" in {x["code"] for x in out["warnings"]}
+        assert "composition" not in [g["kind"] for g in out["groups"]]
+
+    async def test_another_pairs_composition_set_blocks(self, db):
+        w = await _world(db)
+        w["comp"].character = "DavidKelly-2000"
+        await db.flush()
+        out = await _preflight(db, **PAIR, composition_dataset_id=str(w["comp"].id))
+        assert "dataset_wrong_owner" in _codes(out)
+
+    async def test_a_solo_run_has_none(self, db):
+        w = await _world(db)
+        out = await _preflight(db, **SOLO, composition_dataset_id=str(w["comp"].id))
+        assert "composition_in_solo" in _codes(out)
+
+
+class TestGuardSoloAndPairNamesDoNotCollide:
+    async def test_a_pair_cannot_be_named_after_a_person(self, db):
+        """That is the bug: a joint run publishing over David's own row."""
+        await _world(db)
+        out = await _preflight(db, mode="pair", character="David",
+                               members=["David", "Kelly-2026"])
+        assert {"pair_name_is_solo", "pair_is_member"} <= _codes(out)
+
+    async def test_a_pair_row_cannot_be_trained_solo(self, db):
+        await _world(db)
+        db.add(LtxCharacter(name="DavidKelly-2026", kind="pair", char_lora="none",
+                            members=["David", "Kelly-2026"], trigger="x"))
+        await db.flush()
+        out = await _preflight(db, mode="solo", character="DavidKelly-2026")
+        assert "solo_on_pair" in _codes(out)
+
+    async def test_an_unregistered_solo_character_blocks(self, db):
+        await _world(db)
+        assert "unknown_character" in _codes(await _preflight(db, mode="solo", character="Zed"))
+
+
+class TestGuardRegularization:
+    async def test_no_pool_for_the_gender_blocks(self, db):
+        w = await _world(db)
+        await db.delete(w["reg_man"])
+        await db.flush()
+        out = await _preflight(db, **SOLO)
+        assert "regularization_missing" in _codes(out)
+        # Kelly is a woman; her pool is untouched, so a Kelly run is still fine.
+        assert (await _preflight(db, mode="solo", character="Kelly-2026"))["ok"]
+
+    async def test_the_largest_pool_is_used(self, db):
+        from app.models import Dataset
+        await _world(db)
+        db.add(Dataset(name="Reg-man-big", prefix="x", kind="regularization",
+                       reg_class="man", images=_set("big", 60),
+                       captions={u: "a" for u in _set("big", 60)}))
+        await db.flush()
+        out = await _preflight(db, **SOLO)
+        assert out["groups"][1]["dataset_name"] == "Reg-man-big"
+
+
+class TestGuardTheLongStandingChecks:
+    async def test_too_few_images(self, db):
+        w = await _world(db)
+        w["david"].images = w["david"].images[:5]
+        await db.flush()
+        assert "too_few_images" in _codes(await _preflight(db, **SOLO))
+
+    async def test_one_set_in_two_groups(self, db):
+        w = await _world(db)
+        w["kelly"].character = "David"
+        await db.flush()
+        out = await _preflight(db, **PAIR, datasets={"David": str(w["david"].id),
+                                                     "Kelly-2026": str(w["kelly"].id)})
+        # Kelly's set is David's now, so it is refused for her before it can be reused.
+        assert "dataset_wrong_owner" in _codes(out)
+
+    async def test_a_live_run_of_the_same_version(self, db):
+        await _world(db)
+        db.add(_job(character="David", version=1, status=TrainingStatus.RUNNING))
+        await db.flush()
+        assert "version_taken" in _codes(await _preflight(db, **SOLO))
+
+
+class TestTheWarnings:
+    async def test_too_many_passes_warns_but_does_not_block(self, db):
+        await _world(db)
+        out = await _preflight(db, **SOLO, steps=3000)
+        assert out["ok"]
+        assert "passes_high" in {x["code"] for x in out["warnings"]}
+
+    async def test_a_modest_run_does_not_warn(self, db):
+        await _world(db)
+        out = await _preflight(db, **SOLO, steps=150)
+        assert out["warnings"] == []
+
+
+class TestCreateRefusesWhatThePreflightRefuses:
+    async def test_a_problem_is_a_422_with_the_list(self, db):
+        from fastapi import HTTPException
+        from app.routes.training import create_training_job
+        w = await _world(db)
+        w["david"].captions = {}
+        await db.flush()
+        with pytest.raises(HTTPException) as e:
+            await create_training_job(TrainingCreate(**SOLO), user=_U(), db=db)
+        assert e.value.status_code == 422
+        assert "caption_missing" in {p["code"] for p in e.value.detail["problems"]}
+
+    async def test_over_http_too(self, db):
+        """The console reads detail.problems off the wire, so check the wire."""
+        from httpx import ASGITransport, AsyncClient
+        from app.auth import get_current_user
+        from app.database import get_db
+        from app.main import app
+        w = await _world(db)
+        w["reg_man"].captions = {}
+        await db.flush()
+        app.dependency_overrides[get_db] = lambda: db
+        app.dependency_overrides[get_current_user] = lambda: _U()
+        try:
+            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+                pre = await c.post("/training/preflight", json=SOLO)
+                made = await c.post("/training", json=SOLO)
+        finally:
+            app.dependency_overrides.clear()
+        assert pre.status_code == 200 and pre.json()["ok"] is False
+        assert made.status_code == 422
+        assert made.json()["detail"]["problems"] == pre.json()["problems"]
+
+
+class TestTheCaptionsAreSnapshotted:
+    """A run trains on the words that were previewed. Editing a caption, or re-registering
+    the owner, after pressing Train must not change what a queued job does."""
+
+    async def test_group_zero_and_every_group_carry_their_captions(self, db):
+        from app.routes.training import create_training_job
+        w = await _world(db)
+        job = await create_training_job(TrainingCreate(**PAIR), user=_U(), db=db)
+        assert job.trigger == "d@vid"
+        assert job.dataset_images == w["david"].images
+        assert job.config["captions"][0] == "d@vid, man, medium shot, standing, look 0"
+        assert len(job.config["captions"]) == len(job.dataset_images)
+        assert job.config["caption"] == job.config["captions"][0]
+        assert job.config["mode"] == "pair"
+        assert job.config["members"] == ["David", "Kelly-2026"]
+        assert job.config["base_checkpoint"] == "10Eros_v1.5_bf16"
+        assert job.config["num_repeats"] == 10
+        for g in job.identities:
+            assert len(g["captions"]) == len(g["images"])
+            assert g["caption"] == g["captions"][0]
+        assert [g["kind"] for g in job.identities] == [
+            "identity", "composition", "regularization", "regularization"]
+        assert [g["trigger"] for g in job.identities] == ["k3lly2026", None, None, None]
+
+    async def test_editing_a_caption_afterwards_changes_nothing(self, db):
+        from app.routes.training import create_training_job
+        w = await _world(db)
+        job = await create_training_job(TrainingCreate(**SOLO), user=_U(), db=db)
+        before = list(job.config["captions"])
+        w["david"].captions = {u: "EDITED" for u in w["david"].images}
+        w["david_c"].trigger = "somebody-else"
+        await db.commit()
+        await db.refresh(job)
+        assert job.config["captions"] == before
+
+
+class TestTheClaimContract:
+    """What wanly-gpu-docker's trainer consumes (#146 on that side): top-level `captions`
+    for group 0 parallel to download_urls, config.base_checkpoint as a bare name, and per
+    group `kind`, `captions`, `num_repeats`."""
+
+    async def _claim_one(self, db):
+        return await TestTheClaimEndpoint()._claim(db)
+
+    @pytest.fixture(autouse=True)
+    def _no_s3(self, monkeypatch):
+        from app.routes import training as mod
+        monkeypatch.setattr(mod.s3, "generate_presigned_url",
+                            lambda uri, expires=21600: f"https://presigned/{uri.rsplit('/', 1)[-1]}")
+
+    async def test_a_pair_claim(self, db):
+        from app.routes.training import create_training_job
+        await _world(db)
+        await TestTheClaimEndpoint()._trainer(db)
+        await create_training_job(TrainingCreate(**PAIR), user=_U(), db=db)
+        resp = await self._claim_one(db)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert len(body["captions"]) == len(body["download_urls"]) == 10
+        assert body["captions"][0].startswith("d@vid, man, ")
+        assert body["config"]["base_checkpoint"] == "10Eros_v1.5_bf16"
+        assert "/" not in body["config"]["base_checkpoint"]
+        kinds = [g["kind"] for g in body["identities"]]
+        assert kinds == ["identity", "composition", "regularization", "regularization"]
+        for g in body["identities"]:
+            assert len(g["captions"]) == len(g["download_urls"])
+            assert all(c.strip() for c in g["captions"])
+            assert isinstance(g["num_repeats"], int) and g["num_repeats"] >= 1
+            assert g["caption"] == g["captions"][0]
+        reg = body["identities"][2]
+        assert reg["trigger"] is None and reg["gender"] == "man"
+        assert reg["captions"][0].startswith("man, ")
+
+    async def test_a_legacy_job_claims_with_no_captions(self, db):
+        """A pre-#352 row sends null, never [] -- the trainer reads [] as a list to match."""
+        await TestTheClaimEndpoint()._trainer(db)
+        db.add(_job(identities=[{"character": "Me", "trigger": "d@vid", "gender": "man",
+                                 "caption": "d@vid, man", "images": ["s3://b/x.jpg"]}]))
+        await db.flush()
+        body = (await self._claim_one(db)).json()
+        assert body["captions"] is None
+        assert body["identities"][0]["captions"] is None
+        assert body["identities"][0]["kind"] == "identity"
+
+
+class TestAPairPublishesToItsOwnRow:
+    async def _run(self, db, body):
+        from app.routes.training import create_training_job
+        job = await create_training_job(TrainingCreate(**body), user=_U(), db=db)
+        job.output_lora_path = "s3://ltx-loras/character/dk_v1_final.safetensors"
+        await _publish_character(db, job)
+        await db.flush()
+        return job
+
+    async def _row(self, db, name):
+        from sqlalchemy import select
+        return (await db.execute(select(LtxCharacter).where(LtxCharacter.name == name))
+                ).scalar_one_or_none()
+
+    async def test_the_pair_row_is_created_with_the_joined_phrase(self, db):
+        await _world(db)
+        await self._run(db, PAIR)
+        row = await self._row(db, "DavidKelly-2026")
+        assert row.kind == "pair"
+        assert row.members == ["David", "Kelly-2026"]
+        assert row.trigger == "d@vid, man and k3lly2026, woman"
+        assert row.gender is None
+        assert row.char_lora == "dk_v1_final"
+        assert row.base_checkpoint == "10Eros_v1.5_bf16"
+        assert [t["kind"] for t in row.trained_from] == [
+            "identity", "identity", "composition", "regularization", "regularization"]
+
+    async def test_no_member_row_is_touched(self, db):
+        w = await _world(db)
+        w["david_c"].char_lora = "david_v1_final"
+        w["david_c"].strength_stage_2 = 1.3
+        await db.flush()
+        await self._run(db, PAIR)
+        david = await self._row(db, "David")
+        assert david.char_lora == "david_v1_final"
+        assert david.trigger == "d@vid" and david.gender == "man"
+        assert david.strength_stage_2 == 1.3
+        assert (await self._row(db, "Kelly-2026")).char_lora == "none"
+
+    async def test_an_existing_pair_keeps_its_strengths(self, db):
+        await _world(db)
+        db.add(LtxCharacter(name="DavidKelly-2026", kind="pair", char_lora="old",
+                            members=["David", "Kelly-2026"], trigger="old phrase",
+                            strength_stage_1=0.7, strength_stage_2=1.1))
+        await db.flush()
+        await self._run(db, PAIR)
+        row = await self._row(db, "DavidKelly-2026")
+        assert row.char_lora == "dk_v1_final"
+        assert (row.strength_stage_1, row.strength_stage_2) == (0.7, 1.1)
+        assert row.trigger == "d@vid, man and k3lly2026, woman"
+
+    async def test_a_solo_publish_leaves_trigger_and_gender_alone(self, db):
+        w = await _world(db)
+        await self._run(db, SOLO)
+        david = await self._row(db, "David")
+        assert david.char_lora == "dk_v1_final"
+        assert (david.trigger, david.gender, david.kind) == ("d@vid", "man", "solo")
+        assert david.base_checkpoint == "10Eros_v1.5_bf16"
+        assert david.image_uri == w["david"].anchor_uri
+
+
+class TestARegisteredRunRetriesFromItsSnapshot:
+    async def _failed(self, db, body=SOLO):
+        from app.routes.training import create_training_job
+        job = await create_training_job(TrainingCreate(**body), user=_U(), db=db)
+        job.status = TrainingStatus.FAILED
+        job.error_message = "404"
+        await db.commit()
+        return job
+
+    async def test_live_captions_are_never_read(self, db):
+        from app.routes.training import retry_training_job
+        w = await _world(db)
+        job = await self._failed(db)
+        before = list(job.config["captions"])
+        w["david"].captions = {u: "EDITED" for u in w["david"].images}
+        await db.commit()
+        out = await retry_training_job(job.id, _user=None, db=db)
+        assert out.status == TrainingStatus.PENDING
+        assert out.config["captions"] == before
+        assert all("EDITED" not in c for g in out.identities for c in g["captions"])
+
+    async def test_removed_images_leave_with_their_captions(self, db):
+        from app.routes.training import retry_training_job
+        w = await _world(db)
+        job = await self._failed(db)
+        dead = w["david"].images[2]
+        w["david"].images = [u for u in w["david"].images if u != dead]
+        await db.commit()
+        out = await retry_training_job(job.id, _user=None, db=db)
+        assert dead not in out.dataset_images
+        assert len(out.config["captions"]) == len(out.dataset_images) == 9
+        assert out.config["captions"][2] == "d@vid, man, medium shot, standing, look 3"
+        assert out.config["dataset"]["count"] == 9
+
+    async def test_an_image_added_since_is_not_trained_uncaptioned(self, db):
+        from app.routes.training import retry_training_job
+        w = await _world(db)
+        job = await self._failed(db)
+        w["david"].images = w["david"].images + ["s3://wanly-images/datasets/new.jpg"]
+        await db.commit()
+        out = await retry_training_job(job.id, _user=None, db=db)
+        assert "s3://wanly-images/datasets/new.jpg" not in out.dataset_images
+        assert len(out.config["captions"]) == len(out.dataset_images) == 10
+
+    async def test_too_few_snapshotted_images_left_refuses(self, db):
+        from fastapi import HTTPException
+        from app.routes.training import retry_training_job
+        w = await _world(db)
+        job = await self._failed(db)
+        w["david"].images = w["david"].images[:4]
+        await db.commit()
+        with pytest.raises(HTTPException) as e:
+            await retry_training_job(job.id, _user=None, db=db)
+        assert e.value.status_code == 422
+        await db.refresh(job)
+        assert job.status == TrainingStatus.FAILED

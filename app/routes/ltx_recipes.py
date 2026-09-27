@@ -26,6 +26,7 @@ from app.config import settings
 from app.s3 import list_bucket
 from app.auth import get_current_user, verify_api_key_or_bearer
 from app.database import get_db
+from app.character_registry import has_trained, pair_phrase
 from app.checkpoint_sources import CHECKPOINT_SOURCES
 from app.ltx_stack import LTX_STACK
 from app.models import LtxBook, LtxCharacter, LtxRecipe, User, Worker
@@ -212,6 +213,11 @@ async def get_recipe_book(
                 "strength_stage_2": c.strength_stage_2,
                 #: Which datasets trained this LoRA (migration 099), group order.
                 "trained_from": c.trained_from,
+                #: solo | pair, the pair's members, and what the LoRA was trained against
+                #: (migration 103).
+                "kind": c.kind or "solo",
+                "members": c.members,
+                "base_checkpoint": c.base_checkpoint,
             }
             for c in chars
         ],
@@ -411,16 +417,67 @@ async def delete_book(
         )
 
 
+async def _pair_members(db: AsyncSession, names: list[str] | None, pair_name: str
+                        ) -> list[LtxCharacter]:
+    """The two SOLO rows a pair is made of, in the order given, or a 422 saying why not.
+
+    Refused rather than half-accepted: a pair whose phrase names a member with no gender
+    would render "d@vid and k3lly2026, woman" -- a caption pair the LoRA never saw.
+    """
+    names = list(names or [])
+    if len(names) != 2 or len(set(names)) != 2:
+        raise HTTPException(status_code=422,
+                            detail="a pair names exactly two different member characters")
+    if pair_name in names:
+        raise HTTPException(status_code=422,
+                            detail=f"a pair cannot be one of its own members ({pair_name!r})")
+    rows = []
+    for n in names:
+        m = (await db.execute(select(LtxCharacter).where(LtxCharacter.name == n))
+             ).scalar_one_or_none()
+        if m is None:
+            raise HTTPException(status_code=422,
+                                detail=f"member {n!r} is not a registered character — "
+                                       f"register it first, with its trigger and gender")
+        if (m.kind or "solo") != "solo":
+            raise HTTPException(status_code=422,
+                                detail=f"member {n!r} is itself a pair; members are people")
+        if not m.trigger or not m.gender:
+            raise HTTPException(status_code=422,
+                                detail=f"member {n!r} needs both a trigger and a gender")
+        rows.append(m)
+    return rows
+
+
 @router.post("/ltx/characters", response_model=LtxCharacterResponse, status_code=201)
 async def create_character(
     body: LtxCharacterCreate,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    """Register a character -- before it trains, since #352.
+
+    The registry is now where a run's trigger and gender come from, so registering is the
+    first step of training somebody new rather than something the first publish does. The
+    LoRA defaults to "none" (render on the base model) until a run publishes one.
+
+    A PAIR's trigger and gender are DERIVED from its members, whatever the request said:
+    the phrase must be exactly the prefix the composition captions will carry.
+    """
     data = body.model_dump()
-    # A character without a trigger renders a prompt containing a literal "<TRIGGER>", which
-    # is worse than any default. The name is what all three seeded characters use.
-    data["trigger"] = data.get("trigger") or data["name"]
+    data["char_lora"] = data.get("char_lora") or "none"
+    if body.kind == "pair":
+        members = await _pair_members(db, body.members, body.name)
+        data["members"] = [m.name for m in members]
+        data["trigger"] = pair_phrase(members)
+        data["gender"] = None
+    else:
+        if body.members:
+            raise HTTPException(status_code=422, detail="only a pair has members")
+        data["members"] = None
+        # A character without a trigger renders a prompt containing a literal "<TRIGGER>",
+        # which is worse than any default. The name is what all three seeded characters use.
+        data["trigger"] = data.get("trigger") or data["name"]
     c = LtxCharacter(**data)
     db.add(c)
     try:
@@ -441,6 +498,11 @@ async def list_characters(
     return list(rows)
 
 
+#: What a trained character may no longer change. Each is part of the caption its LoRA
+#: learned (or, for a pair, of the phrase its composition captions carried).
+LOCKED_WHEN_TRAINED = ("trigger", "gender", "kind", "members")
+
+
 @router.patch("/ltx/characters/{character_id}", response_model=LtxCharacterResponse)
 async def update_character(
     character_id: uuid.UUID,
@@ -453,9 +515,42 @@ async def update_character(
     Without this the only way to correct a strength or a trigger typo was delete and
     recreate, which is a worse trade than it looks: the character's id changes, and a
     per-stage strength is exactly the field someone tunes repeatedly.
+
+    A TRAINED CHARACTER'S TRIGGER AND GENDER ARE LOCKED (#352). They are the caption its
+    LoRA learned; changing either leaves a row whose <TRIGGER> fill no longer matches its
+    weights, and the render quietly stops being that person. That is how David's face came
+    to have a different trigger in every pair.
+
+    THE ONE WAY THROUGH: detach the LoRA in the same request (`char_lora: "none"`). The row
+    then no longer claims weights trained on the old words, so the new ones are honest; its
+    provenance and base model are cleared with it (they described the detached LoRA, which
+    stays in the bucket and in its training job's record). This is what re-registering an
+    existing character under a new trigger before retraining it looks like.
     """
     c = await _character(db, character_id)
-    for k, v in body.model_dump(exclude_unset=True).items():
+    data = body.model_dump(exclude_unset=True)
+    changing = [k for k in LOCKED_WHEN_TRAINED if k in data and data[k] != getattr(c, k)]
+    detaching = str(data.get("char_lora") or "").strip().lower() == "none"
+    if changing and has_trained(c) and not detaching:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{c.name} has trained a LoRA against its current "
+                   f"{' and '.join(changing)}; changing them would render that LoRA under "
+                   f"words it never learned. Retrain under a new character name, or detach "
+                   f"the LoRA in the same edit (char_lora: \"none\") to re-register it.")
+    kind = data.get("kind", c.kind or "solo")
+    if kind == "pair" and ("members" in data or "kind" in data):
+        members = await _pair_members(db, data.get("members", c.members), data.get("name", c.name))
+        data["members"] = [m.name for m in members]
+        # Derived, never typed: see create_character.
+        data["trigger"] = pair_phrase(members)
+        data["gender"] = None
+    elif kind == "solo" and data.get("members"):
+        raise HTTPException(status_code=422, detail="only a pair has members")
+    if detaching and changing:
+        c.trained_from = None
+        c.base_checkpoint = None
+    for k, v in data.items():
         setattr(c, k, v)
     try:
         await db.commit()
