@@ -88,6 +88,19 @@ class TrainingCreate(BaseModel):
     #: checkpoint takes ~18 minutes to leave the 3090. Every epoch stays on the trainer and
     #: can be published afterwards.
     publish: Literal["final", "all"] = "final"
+    #: HOW IMAGES ARE CAPTIONED. "per_image" trains each image under "<trigger>, <gender>,
+    #: <its stored body>". "trigger_only" is the recipe every LoRA before #352 used -- every
+    #: image under the bare "<trigger>, <gender>" -- and stored bodies are ignored, so a set
+    #: need not be captioned at all.
+    #:
+    #: Kept because it WON: Kelly-2000 v2 (per-image captions + 1:1 regularization) rendered a
+    #: generic woman at every strength where v1, on this recipe, was unmistakably her. The
+    #: long captions spread what the trigger had to carry across every other token.
+    caption_mode: Literal["per_image", "trigger_only"] = "per_image"
+    #: Add a regularization pool per gender. False trains the characters alone, as before
+    #: #352: identity stays strongest, and "woman"/"man" may drift toward them (a warning,
+    #: not a problem -- it is a trade, not a mistake).
+    regularization: bool = True
 
     @model_validator(mode="before")
     @classmethod

@@ -1620,6 +1620,63 @@ class TestTheWarnings:
         assert out["warnings"] == []
 
 
+class TestTheV1Recipe:
+    """caption_mode=trigger_only + regularization=False: the recipe before #352, which beat
+    per-image captions with 1:1 regularization on Kelly-2000 (v1 vs v2, 2026-09-27)."""
+
+    async def test_trigger_only_captions_every_image_with_the_bare_phrase(self, db):
+        await _world(db)
+        out = await _preflight(db, **SOLO, caption_mode="trigger_only")
+        g0 = out["groups"][0]
+        assert g0["kind"] == "identity"
+        assert set(g0["sample_captions"]) == {g0["sample_captions"][0]}
+        assert "," in g0["sample_captions"][0] and g0["sample_captions"][0].count(",") == 1
+
+    async def test_trigger_only_needs_no_stored_captions_on_the_character_set(self, db):
+        w = await _world(db)
+        w["david"].captions = {}
+        await db.flush()
+        assert "caption_missing" in _codes(await _preflight(db, **SOLO))
+        assert "caption_missing" not in _codes(
+            await _preflight(db, **SOLO, caption_mode="trigger_only"))
+
+    async def test_the_regularization_pool_still_needs_its_captions(self, db):
+        w = await _world(db)
+        w["reg_man"].captions = {}
+        await db.flush()
+        assert "caption_missing" in _codes(
+            await _preflight(db, **SOLO, caption_mode="trigger_only"))
+
+    async def test_no_regularization_adds_no_pool_and_warns(self, db):
+        w = await _world(db)
+        await db.delete(w["reg_man"])
+        await db.flush()
+        out = await _preflight(db, **SOLO, regularization=False)
+        assert out["ok"], out["problems"]
+        assert [g["kind"] for g in out["groups"]] == ["identity"]
+        assert "no_regularization" in {x["code"] for x in out["warnings"]}
+
+    async def test_the_v1_recipe_end_to_end_snapshots_its_choices(self, db):
+        from app.routes.training import create_training_job
+        w = await _world(db)
+        w["david"].captions = {}
+        await db.flush()
+        job = await create_training_job(
+            TrainingCreate(**SOLO, caption_mode="trigger_only", regularization=False),
+            user=_U(), db=db)
+        assert job.config["captions"] == ["d@vid, man"] * len(job.dataset_images)
+        assert job.config["caption_mode"] == "trigger_only"
+        assert job.config["reg_ratio"] == 0
+        assert job.identities is None
+
+    async def test_a_v1_length_run_does_not_warn_about_passes(self, db):
+        """~30 passes is the proven recipe, not memorising."""
+        await _world(db)
+        out = await _preflight(db, **SOLO, regularization=False, steps=300)
+        assert out["passes_per_image"] == 30
+        assert "passes_high" not in {x["code"] for x in out["warnings"]}
+
+
 class TestCreateRefusesWhatThePreflightRefuses:
     async def test_a_problem_is_a_422_with_the_list(self, db):
         from fastapi import HTTPException

@@ -45,9 +45,12 @@ CHARACTER_REPEATS = 10
 #: usual prior-preservation balance: as many generic "woman" steps as "<trigger>, woman"
 #: ones, so the class word is pulled back exactly as hard as the trigger pulls it away.
 REG_RATIO = 1.0
-#: Above this many passes over each character image a run is into memorising the set; the
-#: rated runs so far sat at ~5-8. A warning, not a refusal -- it is a judgement call.
-MAX_PASSES_WARNING = 8
+#: Above this many passes over each character image a run is into memorising the set. A
+#: pass is one sight of one image, so it is epochs x repeats: the recipe's 1200 steps over
+#: 50 images x 10 repeats is 24 passes, and Kelly-2000 v1 -- the best identity so far -- ran
+#: ~30. The first value here (8) counted epochs, not passes, and warned on every good run.
+#: A warning, not a refusal -- it is a judgement call.
+MAX_PASSES_WARNING = 40
 #: How many final captions per group the preview shows.
 SAMPLE_CAPTIONS = 5
 
@@ -141,6 +144,13 @@ def _same(a: str | None, b: str | None) -> bool:
 def _final_caption(prefix: str, body: str | None) -> str:
     body = (body or "").strip()
     return f"{prefix}, {body}" if body else prefix
+
+
+def _captions_for(body: TrainingCreate, prefix: str, ds: Dataset) -> list[str]:
+    """Every image's final caption. trigger_only ignores the stored bodies entirely."""
+    if body.caption_mode == "trigger_only":
+        return [prefix for _ in ds.images]
+    return [_final_caption(prefix, (ds.captions or {}).get(u)) for u in ds.images]
 
 
 async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
@@ -256,8 +266,7 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
         prefix = identity_phrase(m.trigger, m.gender)
         g = Group(kind="identity", character=m.name, trigger=m.trigger, gender=m.gender,
                   dataset=ds, images=list(ds.images),
-                  captions=[_final_caption(prefix, (ds.captions or {}).get(u))
-                            for u in ds.images])
+                  captions=_captions_for(body, prefix, ds))
         _check_character_set(plan, ds)
         plan.groups.append(g)
 
@@ -303,12 +312,17 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
             plan.groups.append(Group(
                 kind="composition", character=body.character, trigger=None, gender=None,
                 dataset=comp, images=list(comp.images),
-                captions=[_final_caption(prefix, (comp.captions or {}).get(u))
-                          for u in comp.images]))
+                captions=_captions_for(body, prefix, comp)))
 
     # ---- regularization, one pool per gender present
     genders = list(dict.fromkeys(m.gender for m in plan.members if m.gender))
     reg_groups: list[Group] = []
+    if not body.regularization:
+        plan.warn("no_regularization",
+                  "no regularization pool: identity trains strongest this way, but "
+                  + " and ".join(repr(g) for g in genders)
+                  + " may drift toward this character (other people in frame take the face)")
+        genders = []
     for gender in genders:
         pools = [d for d in datasets if d.kind == "regularization" and d.reg_class == gender]
         if not pools:
@@ -330,7 +344,10 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
 
     # ---- per-group checks that apply to every set
     for g in plan.groups + reg_groups:
-        _check_common(plan, g)
+        # Regularization always trains under its own captions; a trigger_only run only
+        # skips caption checks for the character and composition sets.
+        _check_common(plan, g, captions_required=(
+            g.kind == "regularization" or body.caption_mode == "per_image"))
 
     # ---- regularization repeats, sized against what the character groups contribute
     character_samples = sum(len(g.images) * g.num_repeats for g in plan.groups)
@@ -384,7 +401,7 @@ def _check_character_set(plan: Plan, ds: Dataset) -> None:
                      f"anchor (or show no face) — remove them, or they teach a different face")
 
 
-def _check_common(plan: Plan, g: Group) -> None:
+def _check_common(plan: Plan, g: Group, captions_required: bool = True) -> None:
     ds = g.dataset
     name = ds.name if ds else "?"
     n = len(g.images)
@@ -397,7 +414,7 @@ def _check_common(plan: Plan, g: Group) -> None:
     if len(set(g.images)) != n:
         plan.problem("duplicate_images", f"{name!r} contains duplicates")
     caps = (ds.captions or {}) if ds else {}
-    missing = [u for u in g.images if not (caps.get(u) or "").strip()]
+    missing = [u for u in g.images if not (caps.get(u) or "").strip()] if captions_required else []
     if missing:
         plan.problem("caption_missing",
                      f"{name!r}: {len(missing)} of {n} images have no caption — caption the "
