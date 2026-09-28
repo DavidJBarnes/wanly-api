@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.enums import SegmentStatus
 from app.models import Job, Segment
+from app.render_size import RECIPE_SQL, render_size
 
 # Linear in duration. NOT fitted — this is a neutral prior, and saying so is the point.
 #
@@ -111,6 +112,8 @@ async def get_estimation_rates(db: AsyncSession, user_id: UUID) -> dict:
     Returns a dict with:
       - shape_rates: {(width, height, fps): (rate, samples)} pooled across GPUs
       - gpu_rates: {(width, height, fps, gpu_name): (rate, samples)}
+    where width x height is the size the segment RENDERED at (app/render_size.py), so callers
+    must look a segment up by its render size too.
       - gpu_factors: {gpu_name: multiplier against the pooled rate}
       - pixel_law: PixelLaw | None - rate as a function of the shape's pixel count
     """
@@ -132,40 +135,60 @@ async def get_estimation_rates(db: AsyncSession, user_id: UUID) -> dict:
         )
     )
 
+    # Keyed on the size that RENDERED, not the job's size (#359). A recipe job's width/height
+    # are its start frame's, and the engine caps the render below that: an upscaled 1856x1280
+    # frame renders at 1216x832, in 1216x832's time. Grouping on the stored size would file
+    # those runs as a big shape that runs fast, which prices the next 1856x1280 job at the
+    # wrong key and drags the pixel law's slope down with it. The cap is applied in Python,
+    # from the one copy of the engine's rule, so the rows are fetched ungrouped and the
+    # medians taken here. Recipe runs from before the cap existed (wanly-gpu-docker#148) are
+    # filed at the capped size too, which they did not render at; there were few, and they
+    # leave the window after WINDOW_DAYS.
+    rows = await db.execute(
+        base.add_columns(
+            Job.width,
+            Job.height,
+            Job.fps,
+            Segment.gpu_name,
+            rate,
+            RECIPE_SQL,
+        )
+    )
+    by_shape: dict[tuple, list[float]] = {}
+    by_gpu: dict[tuple, list[float]] = {}
+    for width, height, fps, gpu_name, value, recipe in rows.all():
+        if value is None:
+            continue
+        shape = (*render_size(width, height, recipe), fps)
+        by_shape.setdefault(shape, []).append(float(value))
+        # Keyed on gpu_name, not worker_name. A RunPod worker's row is deleted when the pod
+        # drains and its name is never reused, so every rate learned from a pod used to die
+        # with it; the GPU is what determines speed and is snapshotted onto the segment. Note
+        # this tier can only fire for a segment already claimed - a pending one has no GPU yet
+        # - which is correct: the right price for work nobody has picked up is the pooled rate
+        # across whatever might pick it up.
+        if gpu_name is not None:
+            by_gpu.setdefault((*shape, gpu_name), []).append(float(value))
+
     # Median, not mean, matching the stats endpoint (wanly-console#287) so the two views cannot
     # disagree about the same segments. Honesty about what it buys: on median absolute error the
     # mean is actually the better predictor (12.9% against 14.3%), because the run-time
     # distribution is right skewed and the mean leans into that. The median wins where it was
     # meant to, in the tail - p90 43.1% against 44.5% - and one stalled run cannot move it at
-    # all, which is the property being paid for.
-    median_rate = func.percentile_cont(0.5).within_group(rate)
-
-    shape_result = await db.execute(
-        base.add_columns(Job.width, Job.height, Job.fps, median_rate, func.count()).group_by(
-            Job.width, Job.height, Job.fps
-        )
-    )
+    # all, which is the property being paid for. _median interpolates between the middle two,
+    # as percentile_cont(0.5) did when this was computed in SQL. (The stats endpoint still
+    # groups on the stored size, so a capped recipe job's runs sit under 1856x1280 there and
+    # are pooled into 1216x832 here. Same runs, different label.)
     shape_rates: dict[tuple, tuple[float, int]] = {}
-    for width, height, fps, value, samples in shape_result.all():
-        if value is not None and value > 0:
-            shape_rates[(width, height, fps)] = (float(value), samples)
-
-    # Keyed on gpu_name, not worker_name. A RunPod worker's row is deleted when the pod drains
-    # and its name is never reused, so every rate learned from a pod used to die with it; the GPU
-    # is what determines speed and is snapshotted onto the segment. Note this tier can only fire
-    # for a segment already claimed - a pending one has no GPU yet - which is correct: the right
-    # price for work nobody has picked up is the pooled rate across whatever might pick it up.
-    gpu_result = await db.execute(
-        base.add_columns(
-            Job.width, Job.height, Job.fps, Segment.gpu_name, median_rate, func.count()
-        )
-        .where(Segment.gpu_name.isnot(None))
-        .group_by(Job.width, Job.height, Job.fps, Segment.gpu_name)
-    )
+    for key, values in by_shape.items():
+        median = _median(values)
+        if median > 0:
+            shape_rates[key] = (median, len(values))
     gpu_rates: dict[tuple, tuple[float, int]] = {}
-    for width, height, fps, gpu_name, value, samples in gpu_result.all():
-        if value is not None and value > 0:
-            gpu_rates[(width, height, fps, gpu_name)] = (float(value), samples)
+    for key, values in by_gpu.items():
+        median = _median(values)
+        if median > 0:
+            gpu_rates[key] = (median, len(values))
 
     return {
         "shape_rates": shape_rates,

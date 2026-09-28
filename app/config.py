@@ -186,6 +186,12 @@ class Settings(BaseSettings):
     # in seconds. 0 disables it (hard-cut concat, prior behavior). Superseded later by
     # VACE video-conditioned continuation.
     stitch_crossfade_seconds: float = 0.0
+    # The largest clip a recipe renders, in pixels (#359). Env MAX_RENDER_PIXELS, and it MUST
+    # MATCH the workers' ENGINE_MAX_RENDER_PIXELS (wanly-gpu-docker engine/app.py): the engine
+    # decides the render size and this only predicts it, for run-time estimates and the job
+    # page. A mismatch does not break a render, it makes every capped job's estimate and its
+    # "renders WxH" wrong. 0 disables the cap, as it does in the engine.
+    max_render_pixels: int = 1024 * 1024
 
     model_config = {"env_file": ".env"}
 

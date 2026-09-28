@@ -56,8 +56,16 @@ class JobLoraSummary(BaseModel):
 class JobResponse(BaseModel):
     id: UUID
     name: str
+    # The start frame's size, as the job was created. NOT necessarily what renders: see below.
     width: int
     height: int
+    # The size the clips actually render at (#359). A recipe render is capped by the engine,
+    # so an upscaled 1856x1280 start frame renders at 1216x832; everything else renders at
+    # width x height and these equal them. Filled by the list, detail and reopen endpoints,
+    # which are the ones that know whether a job's segments are recipe renders. None from the
+    # endpoints that return the bare row (create, update, reorder): read it as width x height.
+    render_width: Optional[int] = None
+    render_height: Optional[int] = None
     fps: int
     seed: int
     starting_image: Optional[str]
