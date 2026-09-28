@@ -101,6 +101,16 @@ class TrainingCreate(BaseModel):
     #: #352: identity stays strongest, and "woman"/"man" may drift toward them (a warning,
     #: not a problem -- it is a trade, not a mistake).
     regularization: bool = True
+    #: The base the LoRA trains against, as a bare checkpoint name the trainer resolves under
+    #: ltx-2.3/diffusion_models. Default: the render stack's checkpoint. Asked because a
+    #: comparison needs it: Kelly-2000 v1 trained on ltx-2.3-22b-dev and v2/v3 on 10Eros, and
+    #: whether that swap cost identity cannot be answered without training both. The trainer's
+    #: preflight fails the job if the file is not on the box, so a typo costs no GPU time.
+    base_checkpoint: str | None = Field(default=None, max_length=128,
+                                        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+    #: Training seed. Default 42, as every run so far. Varying it with everything else fixed is
+    #: how run-to-run noise is measured -- the floor any other comparison must clear.
+    seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
 
     @model_validator(mode="before")
     @classmethod

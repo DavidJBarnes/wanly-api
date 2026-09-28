@@ -1677,6 +1677,41 @@ class TestTheV1Recipe:
         assert "passes_high" not in {x["code"] for x in out["warnings"]}
 
 
+class TestTheBaseAndSeedAreTheRequests:
+    """E0/E1 of the identity-drift plan: v1 retrained on dev with another seed, and v1's recipe on
+    10Eros. Neither is expressible if the base and the seed are fixed."""
+
+    async def test_default_base_is_the_render_stack_and_default_seed_is_42(self, db):
+        from app.routes.training import create_training_job
+        await _world(db)
+        job = await create_training_job(TrainingCreate(**SOLO), user=_U(), db=db)
+        assert job.config["base_checkpoint"] == "10Eros_v1.5_bf16"
+        assert job.config["seed"] == 42
+
+    async def test_a_named_base_and_seed_are_snapshotted(self, db):
+        from app.routes.training import create_training_job
+        await _world(db)
+        job = await create_training_job(
+            TrainingCreate(**SOLO, base_checkpoint="ltx-2.3-22b-dev.safetensors", seed=7),
+            user=_U(), db=db)
+        assert job.config["base_checkpoint"] == "ltx-2.3-22b-dev"
+        assert job.config["seed"] == 7
+
+    async def test_a_base_other_than_the_render_stack_warns(self, db):
+        await _world(db)
+        out = await _preflight(db, **SOLO, base_checkpoint="ltx-2.3-22b-dev")
+        assert out["ok"]
+        assert out["base_checkpoint"] == "ltx-2.3-22b-dev"
+        assert "base_differs" in {w["code"] for w in out["warnings"]}
+
+    async def test_a_path_is_not_a_checkpoint_name(self):
+        import pytest
+        from pydantic import ValidationError
+        for bad in ("../etc/passwd", "a/b", ".hidden"):
+            with pytest.raises(ValidationError):
+                TrainingCreate(**SOLO, base_checkpoint=bad)
+
+
 class TestCreateRefusesWhatThePreflightRefuses:
     async def test_a_problem_is_a_422_with_the_list(self, db):
         from fastapi import HTTPException
