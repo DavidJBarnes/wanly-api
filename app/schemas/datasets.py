@@ -30,10 +30,27 @@ class DatasetCreate(BaseModel):
     @field_validator("name")
     @classmethod
     def _safe(cls, v: str) -> str:
-        v = v.strip()
-        if not NAME_RE.match(v):
-            raise ValueError("letters, numbers, spaces, and . _ - @ only")
-        return v
+        return _safe_name(v)
+
+
+def _safe_name(v: str) -> str:
+    v = v.strip()
+    if not NAME_RE.match(v):
+        raise ValueError("letters, numbers, spaces, and . _ - @ only")
+    return v
+
+
+class DatasetClone(BaseModel):
+    """POST /datasets/{id}/clone (#356). Only the name: everything else is the source's.
+
+    Validated exactly as a new set's name is, because that is what a clone is.
+    """
+    name: str = Field(min_length=1, max_length=100)
+
+    @field_validator("name")
+    @classmethod
+    def _safe(cls, v: str) -> str:
+        return _safe_name(v)
 
 
 class DatasetUpdate(BaseModel):
@@ -92,6 +109,14 @@ class DatasetRegularizeStatus(BaseModel):
     images: int = 0
 
 
+class DatasetTrainedBy(BaseModel):
+    """One training run that used a set (#356), read from the run's recorded provenance."""
+    job_id: str
+    character: str
+    version: int
+    status: str
+
+
 class DatasetResponse(BaseModel):
     id: uuid.UUID
     name: str
@@ -109,6 +134,14 @@ class DatasetResponse(BaseModel):
     scores: dict[str, float | None] = Field(default_factory=dict)
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    #: LOCKED ONCE IT HAS TRAINED (#356): some run that is not failed or cancelled used this
+    #: set, so a LoRA came -- or is coming -- of exactly these images and captions. Not
+    #: columns: derived from training_jobs on every read, so a run that fails unlocks the set
+    #: with nothing to keep in step. The ORM row has neither attribute, so a response built
+    #: straight from it reads unlocked; the routes fill both (datasets._respond).
+    locked: bool = False
+    #: Every run that locks it, oldest first -- what the console's lock chip names.
+    trained_by: list[DatasetTrainedBy] = Field(default_factory=list)
 
     @field_validator("captions", "scores", mode="before")
     @classmethod

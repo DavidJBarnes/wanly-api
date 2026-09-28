@@ -106,7 +106,9 @@ class TestUploadSemantics:
         s3.delete_prefix(prefix, bucket), so botocore validated the PREFIX as a bucket name
         and raised ParamValidationError — for a legacy name-keyed prefix like
         "dataset-test-faces" that is not a valid bucket at all. The fake asserts the
-        positional contract the three other call sites already honour."""
+        positional contract the other call sites already honour. (#356 made it
+        delete_prefix_except, keeping what other sets list; tests/test_dataset_lock.py
+        runs that against a bucket.)"""
         from unittest.mock import patch
         from app import s3
         from app.config import settings
@@ -115,22 +117,29 @@ class TestUploadSemantics:
         ds = Dataset(id=uuid.uuid4(), name="Me", prefix="dataset-test-faces", images=[])
         calls = []
 
-        def fake_delete_prefix(prefix, bucket):
-            calls.append((prefix, bucket))
+        def fake_delete_prefix_except(prefix, bucket, except_uris):
+            calls.append((prefix, bucket, except_uris))
             return 0
+
+        class _Rows:
+            def all(self):
+                return []
 
         class FakeDb:
             async def get(self, model, _id):
                 return ds
+            async def execute(self, _q):
+                # No training runs lock it; no other set lists anything.
+                return _Rows()
             async def delete(self, row):
                 pass
             async def commit(self):
                 pass
 
-        with patch.object(s3, "delete_prefix", fake_delete_prefix):
+        with patch.object(s3, "delete_prefix_except", fake_delete_prefix_except):
             await mod.delete_dataset(ds.id, purge=True, _user=None, db=FakeDb())
 
-        assert calls == [(ds.prefix + "/", settings.s3_images_bucket)]
+        assert calls == [(ds.prefix + "/", settings.s3_images_bucket, set())]
 
     def test_renaming_does_not_move_the_prefix(self):
         """A finished training job's dataset_images point at the old keys."""
