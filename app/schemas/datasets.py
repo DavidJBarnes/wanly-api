@@ -53,7 +53,20 @@ class DatasetClone(BaseModel):
         return _safe_name(v)
 
 
+class DatasetLock(BaseModel):
+    """POST /datasets/{id}/lock (#358). The reason is optional and shown on the lock chip."""
+    reason: str | None = Field(default=None, max_length=500)
+
+    @field_validator("reason")
+    @classmethod
+    def _blank_is_none(cls, v: str | None) -> str | None:
+        # "" from an empty confirmation box is no reason, not an empty pair of parentheses.
+        return (v or "").strip() or None
+
+
 class DatasetUpdate(BaseModel):
+    #: Deliberately has no locked_at / locked_reason: a manual lock is one-way (#358), and an
+    #: unknown field in a PATCH is ignored, so a PATCH cannot set or clear one.
     name: str | None = Field(default=None, max_length=100)
     tags: str | None = Field(default=None, max_length=500)
     notes: str | None = None
@@ -142,6 +155,9 @@ class DatasetResponse(BaseModel):
     locked: bool = False
     #: Every run that locks it, oldest first -- what the console's lock chip names.
     trained_by: list[DatasetTrainedBy] = Field(default_factory=list)
+    #: LOCKED BY HAND (#358): columns, unlike the above. `locked` is true when either is set.
+    locked_at: datetime | None = None
+    locked_reason: str | None = None
 
     @field_validator("captions", "scores", mode="before")
     @classmethod
