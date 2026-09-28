@@ -18,14 +18,15 @@ import random
 
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Query, UploadFile
-from sqlalchemy import func, select
+from sqlalchemy import cast, func, or_, select
+from sqlalchemy.dialects.postgresql import JSONB, JSONPATH
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import s3
 from app.auth import get_current_user, verify_api_key_or_bearer
 from app.config import settings
 from app.database import async_session, get_db
-from app.enums import TRAINING_TERMINAL, JobStatus, SegmentStatus
+from app.enums import JobStatus, SegmentStatus, TrainingStatus
 from app.joycaption import TRAINING_CAPTION, CaptionError
 from app.models import Dataset, Job, LtxCharacter, Segment, TrainingJob, User
 from app.ltx_stack import LTX_STACK
@@ -33,9 +34,9 @@ from app.regularization import (
     REG_FRAMES, REG_PRIORITY_BASE, reg_prompt, reg_recipe, reg_size, reg_tag,
 )
 from app.schemas.datasets import (
-    DatasetCaptionEdit, DatasetCaptionStatus, DatasetCaptionsRun, DatasetCreate,
+    DatasetCaptionEdit, DatasetCaptionStatus, DatasetCaptionsRun, DatasetClone, DatasetCreate,
     DatasetRegularize, DatasetRegularizeStatus, DatasetResponse, DatasetScore, DatasetScores,
-    DatasetUpdate,
+    DatasetTrainedBy, DatasetUpdate,
 )
 from app.seeds import new_seed
 from app.tag_filter import tag_clause
@@ -133,22 +134,80 @@ async def _validate_ownership(db: AsyncSession, kind: str | None, character: str
     return kind, character, None
 
 
-async def _live_runs_using(db: AsyncSession, ds_id: uuid.UUID) -> list[str]:
-    """"<character> vN" for every queued or running training job that trains on this set.
+#: A run in any other state -- queued, claimed, running, completed -- means a LoRA came, or
+#: is coming, of the set as it stands. A failed or cancelled run produced nothing, so it
+#: locks nothing (#356).
+_UNLOCKING = (TrainingStatus.FAILED, TrainingStatus.CANCELLED)
 
-    Read from each job's recorded provenance, group by group. A handful of live rows at
-    most, so filtered here rather than in a JSONB query.
+
+async def _trained_by(db: AsyncSession,
+                      ds_id: uuid.UUID | None = None) -> dict[str, list[DatasetTrainedBy]]:
+    """{dataset id: every non-failed, non-cancelled run that trained on it}, oldest first.
+
+    LOCKED ONCE IT HAS TRAINED (#356). A set edited after its LoRA trained leaves the LoRA's
+    record pointing at a dataset that no longer holds what it learned from: the job
+    snapshots its images and captions, but the dataset page, /retry and anyone comparing
+    versions see the edited set. So a set that trained is frozen, and the way to a v2 is a
+    clone.
+
+    Read from each run's RECORDED provenance -- group 0's `config.dataset.id`, and every
+    `identities[].dataset.id` -- the same fields /training's `trained_from` reads, never
+    from matching image URIs: a clone shares its source's URIs and must not inherit its lock.
+
+    ONE QUERY, for one set or for all of them, so the list endpoint is not N+1. Only the ids
+    come back, never the groups' image and caption lists. For one set the match is pushed
+    into the WHERE clause (`->>` for group 0, `@>` for the identity groups); for all of them
+    every locking run is read, which is one row per training run ever.
     """
-    jobs = (await db.execute(select(TrainingJob).where(
-        TrainingJob.status.not_in(list(TRAINING_TERMINAL))))).scalars().all()
-    out = []
-    for j in jobs:
-        ids = {((j.config or {}).get("dataset") or {}).get("id")}
-        ids |= {(g.get("dataset") or {}).get("id") for g in (j.identities or [])
-                if isinstance(g, dict)}
-        if str(ds_id) in ids:
-            out.append(f"{j.character} v{j.version}")
+    group0 = TrainingJob.config["dataset"]["id"].astext
+    others = func.jsonb_path_query_array(
+        TrainingJob.identities, cast("$[*].dataset.id", JSONPATH), type_=JSONB)
+    q = (select(TrainingJob.id, TrainingJob.character, TrainingJob.version, TrainingJob.status,
+                group0, others)
+         .where(TrainingJob.status.not_in(list(_UNLOCKING)))
+         .order_by(TrainingJob.created_at.asc(), TrainingJob.id.asc()))
+    if ds_id is not None:
+        q = q.where(or_(group0 == str(ds_id),
+                        TrainingJob.identities.contains([{"dataset": {"id": str(ds_id)}}])))
+    out: dict[str, list[DatasetTrainedBy]] = {}
+    for job_id, character, version, status, g0, rest in (await db.execute(q)).all():
+        run = DatasetTrainedBy(job_id=str(job_id), character=character, version=version,
+                               status=status)
+        # A set used by two groups of one run (a joint run's member set that is also its
+        # composition set, say) is still one run.
+        for used in {g0, *(rest or [])} - {None}:
+            out.setdefault(str(used), []).append(run)
     return out
+
+
+def _respond(ds: Dataset, trained_by: list[DatasetTrainedBy] | None) -> DatasetResponse:
+    """The wire shape of a set, with its lock filled in (#356)."""
+    out = DatasetResponse.model_validate(ds)
+    out.trained_by = list(trained_by or [])
+    out.locked = bool(out.trained_by)
+    return out
+
+
+async def _respond_one(db: AsyncSession, ds: Dataset) -> DatasetResponse:
+    return _respond(ds, (await _trained_by(db, ds.id)).get(str(ds.id)))
+
+
+def _lock_detail(ds: Dataset, trained_by: list[DatasetTrainedBy]) -> str:
+    runs = ", ".join(f"{r.character} v{r.version}" for r in trained_by)
+    return f"{ds.name!r} trained {runs} and is locked — clone it to make changes"
+
+
+async def _refuse_if_locked(db: AsyncSession, ds: Dataset) -> None:
+    """409, naming the run, if a LoRA came (or is coming) of this set (#356).
+
+    Called BEFORE any work or write: a refused crop must not have uploaded its faces first.
+    Anything that changes what a run would train on -- the images, their captions, whose set
+    it is, or the set's existence -- goes through here. Renaming, notes, tags, the anchor and
+    scoring do not change the training data, and stay open.
+    """
+    trained_by = (await _trained_by(db, ds.id)).get(str(ds.id))
+    if trained_by:
+        raise HTTPException(status_code=409, detail=_lock_detail(ds, trained_by))
 
 
 @router.post("/datasets", response_model=DatasetResponse, status_code=201)
@@ -169,14 +228,17 @@ async def create_dataset(
     db.add(ds)
     await db.commit()
     await db.refresh(ds)
-    return ds
+    # A new id: no run can have recorded it yet.
+    return _respond(ds, None)
 
 
 @router.get("/datasets", response_model=list[DatasetResponse],
             dependencies=[Depends(verify_api_key_or_bearer)])
 async def list_datasets(db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(select(Dataset).order_by(Dataset.updated_at.desc()))).scalars().all()
-    return list(rows)
+    # Two queries for the whole page, not one per set: every locking run is read once.
+    trained_by = await _trained_by(db)
+    return [_respond(ds, trained_by.get(str(ds.id))) for ds in rows]
 
 
 @router.get("/datasets/{dataset_id}", response_model=DatasetResponse,
@@ -185,7 +247,7 @@ async def get_dataset(dataset_id: uuid.UUID, db: AsyncSession = Depends(get_db))
     ds = await db.get(Dataset, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    return ds
+    return await _respond_one(db, ds)
 
 
 @router.patch("/datasets/{dataset_id}", response_model=DatasetResponse)
@@ -198,6 +260,13 @@ async def update_dataset(
     ds = await db.get(Dataset, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    trained_by = (await _trained_by(db, ds.id)).get(str(ds.id))
+    # A LOCKED SET'S IMAGES ARE WHAT ITS LoRA LEARNED FROM (#356). The list is how the console
+    # removes and reorders, so a changed list is refused -- before any field is touched, so a
+    # PATCH that also renames is refused whole rather than half-applied. The SAME list is not
+    # a change: a form that sends everything back with a new name must still work.
+    if trained_by and body.images is not None and list(body.images) != list(ds.images):
+        raise HTTPException(status_code=409, detail=_lock_detail(ds, trained_by))
     if body.name is not None and body.name != ds.name:
         dupe = (await db.execute(
             select(Dataset).where(Dataset.name == body.name, Dataset.id != ds.id)
@@ -236,20 +305,18 @@ async def update_dataset(
         kind, character, reg_class = await _validate_ownership(
             db, new["kind"], new["character"], new["reg_class"])
         if (kind, character, reg_class) != (ds.kind, ds.character, ds.reg_class):
-            # A live run snapshotted its captions and owner's trigger at creation, so this
-            # would not corrupt it -- but the set would then say it is somebody else's while
-            # a LoRA of the old owner is being trained from it, and the publish would stamp
-            # a provenance that no longer matches the set. Finish or cancel the run first.
-            live = await _live_runs_using(db, ds.id)
-            if live:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"{', '.join(live)} is training on this set; its kind and owner "
-                           f"cannot change until that run finishes or is cancelled")
+            # A run snapshotted its captions and owner's trigger at creation, so this would
+            # not corrupt it -- but the set would then say it is somebody else's while a LoRA
+            # of the old owner came from it, and a publish would stamp a provenance that no
+            # longer matches the set. Compared AFTER validation, so re-sending the owner as
+            # the registry spells it (or in another case) is not a change. Nothing has been
+            # committed yet, so the refusal leaves the row as it was.
+            if trained_by:
+                raise HTTPException(status_code=409, detail=_lock_detail(ds, trained_by))
             ds.kind, ds.character, ds.reg_class = kind, character, reg_class
     await db.commit()
     await db.refresh(ds)
-    return ds
+    return _respond(ds, trained_by)
 
 
 @router.post("/datasets/{dataset_id}/images", response_model=DatasetResponse)
@@ -263,6 +330,9 @@ async def add_images(
     ds = await db.get(Dataset, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    # Before the uploads: a re-upload over an existing name overwrites the object in place,
+    # which on a locked set would change a trained image under its LoRA's record.
+    await _refuse_if_locked(db, ds)
 
     added: list[str] = []
     replaced: set[str] = set()
@@ -295,7 +365,7 @@ async def add_images(
         await db.commit()
         await db.refresh(ds)
     logger.info("dataset %s: added %d image(s), now %d", ds.name, len(added), len(ds.images))
-    return ds
+    return _respond(ds, None)
 
 
 @router.delete("/datasets/{dataset_id}", status_code=204)
@@ -309,18 +379,82 @@ async def delete_dataset(
 
     Not by default: a finished training job records the URIs it trained on, and destroying them
     turns a reproducible run into an unreproducible one.
+
+    Refused outright while the set is locked (#356): the row IS the trained LoRA's record of
+    what it learned from, and its id is what the run's provenance points at.
+
+    A PURGE DELETES ONLY THIS SET'S OWN PREFIX, AND NOTHING ANOTHER SET STILL LISTS. A clone
+    shares its source's URIs rather than copying the objects, so its images live under the
+    SOURCE's prefix: purging the clone never reaches them (its own prefix holds only what was
+    uploaded or cropped into the clone), and purging the source skips every object a clone
+    -- or any other set -- still names. Removing an image from a set never deletes anything;
+    it only edits the list.
     """
     ds = await db.get(Dataset, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    await _refuse_if_locked(db, ds)
     if purge and ds.prefix:
-        # Positional order is (prefix, bucket) — the other three call sites pass it that way.
+        shared = {u for (images,) in (await db.execute(
+            select(Dataset.images).where(Dataset.id != ds.id))).all() for u in images or []}
+        # Positional order is (prefix, bucket, ...) — the other call sites pass it that way.
         # Swapping them makes botocore reject the PREFIX as an invalid bucket name, which is
         # how every purge-delete 500'd: a legacy prefix like "dataset-test-faces" is not a
-        # bucket.
-        await asyncio.to_thread(s3.delete_prefix, ds.prefix + "/", settings.s3_images_bucket)
+        # bucket. The trailing "/" keeps "datasets/<id>" from matching a longer sibling.
+        await asyncio.to_thread(s3.delete_prefix_except, ds.prefix + "/",
+                                settings.s3_images_bucket, shared)
     await db.delete(ds)
     await db.commit()
+
+
+@router.post("/datasets/{dataset_id}/clone", response_model=DatasetResponse, status_code=201)
+async def clone_dataset(
+    dataset_id: uuid.UUID,
+    body: DatasetClone,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """An unlocked copy of a set, under a new name -- the way to build the next version (#356).
+
+    A locked set cannot change, so "v6 is v5 minus three bad crops" starts here: clone v5,
+    then edit the clone. Allowed on any set, locked or not; cloning reads the source and
+    writes nothing to it.
+
+    THE SAME URIs, NOT COPIES OF THE OBJECTS. The images are shared: the clone's list names
+    the objects under the source's prefix. That is safe because nothing that edits a set
+    deletes an object -- removal only edits the list, a crop writes a new batch under the
+    set's OWN prefix and leaves the photographs where they were -- and a purge-delete keeps
+    anything another set still lists (see delete_dataset). The clone gets its own prefix,
+    keyed by its own id, for whatever is uploaded or cropped into it from now on.
+
+    Everything that describes the images comes along -- captions and scores are keyed by URI,
+    so they still pair; the anchor is one of the same URIs -- and so do kind, owner and class,
+    so the clone trains as the same person's set without being re-assigned. The notes say
+    where it came from, because the source's notes would otherwise read as the clone's own
+    history.
+    """
+    src = await db.get(Dataset, dataset_id)
+    if not src:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    dupe = (await db.execute(select(Dataset).where(Dataset.name == body.name))).scalar_one_or_none()
+    if dupe:
+        raise HTTPException(status_code=409, detail=f"a dataset called {body.name!r} already exists")
+    ds_id = uuid.uuid4()
+    # Lists and dicts copied, not shared: the ORM would otherwise hold the source's own
+    # objects on the clone, and a later reassign on one must not be the other's too.
+    ds = Dataset(id=ds_id, user_id=user.id, name=body.name, tags=src.tags,
+                 notes=(f"Cloned from {src.name!r}. " + (src.notes or "")).strip(),
+                 images=list(src.images or []), prefix=_prefix(ds_id),
+                 anchor_uri=src.anchor_uri, kind=src.kind, character=src.character,
+                 reg_class=src.reg_class, captions=dict(src.captions or {}),
+                 scores=dict(src.scores or {}))
+    db.add(ds)
+    await db.commit()
+    await db.refresh(ds)
+    logger.info("dataset %s: cloned from %s (%d images, shared)", ds.name, src.name,
+                len(ds.images))
+    # A new id: no run can have recorded it, so a clone is always unlocked.
+    return _respond(ds, None)
 
 
 @router.post("/datasets/{dataset_id}/crop", response_model=DatasetResponse)
@@ -368,6 +502,9 @@ async def crop_faces(
     ds = await db.get(Dataset, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    # Before the downloads and the face-crop call: a refused crop must not have uploaded a
+    # batch of faces nobody will ever see.
+    await _refuse_if_locked(db, ds)
     if not settings.face_crop_url:
         raise HTTPException(
             status_code=503,
@@ -453,7 +590,7 @@ async def crop_faces(
     logger.info("cropped %s (save_as=%s): %d faces from %d of %d photos",
                 ds.name, save_as, len(crop_uris), len(targets),
                 len(ds.images) - (len(crop_uris) if save_as else 0))
-    return ds
+    return _respond(ds, None)
 
 
 @router.post("/datasets/{dataset_id}/score", response_model=DatasetScores)
@@ -624,6 +761,15 @@ async def caption_dataset_images(db: AsyncSession, ds_id: uuid.UUID, overwrite: 
         await db.refresh(ds)
         if uri not in ds.images:
             continue
+        # A run can be queued on this set while the loop is still going -- the Train button
+        # does not wait for captioning. From then on the set is locked (#356), and a caption
+        # written after the run snapshotted its captions is one the LoRA never trained on.
+        trained_by = (await _trained_by(db, ds.id)).get(str(ds.id))
+        if trained_by:
+            logger.warning("dataset %s: captioning stopped at %s: %s",
+                           ds.name, uri, _lock_detail(ds, trained_by))
+            (_CAPTION_RUNS.setdefault(ds_id, {}))["error"] = _lock_detail(ds, trained_by)
+            break
         ds.captions = {**(ds.captions or {}), uri: text}
         await db.commit()
         done += 1
@@ -661,6 +807,7 @@ async def caption_dataset(
     ds = await db.get(Dataset, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    await _refuse_if_locked(db, ds)
     if not ds.images:
         raise HTTPException(status_code=422, detail="this dataset has no images")
     run = _CAPTION_RUNS.get(ds.id)
@@ -695,6 +842,7 @@ async def edit_dataset_caption(
     ds = await db.get(Dataset, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    await _refuse_if_locked(db, ds)
     if body.uri not in ds.images:
         raise HTTPException(status_code=422,
                             detail="that image is not in this dataset — it may have been removed")
@@ -707,7 +855,7 @@ async def edit_dataset_caption(
     ds.captions = caps
     await db.commit()
     await db.refresh(ds)
-    return ds
+    return _respond(ds, None)
 
 
 # ---------------------------------------------------------------------------------------
@@ -737,6 +885,9 @@ async def regularize_dataset(
     ds = await db.get(Dataset, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
+    # A pool that trained a LoRA is part of that LoRA's record like any other set; growing
+    # it is adding images. Clone it and generate into the clone.
+    await _refuse_if_locked(db, ds)
     if ds.kind != "regularization" or not ds.reg_class:
         raise HTTPException(
             status_code=422,
@@ -773,6 +924,14 @@ async def _collect_regularization(db: AsyncSession, ds: Dataset) -> DatasetRegul
     """
     jobs = (await db.execute(select(Job).where(tag_clause(Job.tags, reg_tag(ds.id))))
             ).scalars().all()
+    # A LOCKED POOL IS NOT GROWN (#356). Renders queued before the pool trained a LoRA can
+    # finish after it; collecting them would add images to a set that is part of that LoRA's
+    # record. They are left uncollected and counted as still running -- not failed, because
+    # if the run fails or is cancelled the pool unlocks and the next poll collects them.
+    locked = (await _trained_by(db, ds.id)).get(str(ds.id))
+    if locked:
+        logger.info("dataset %s: not collecting regularization frames: %s",
+                    ds.name, _lock_detail(ds, locked))
     requested = len(jobs)
     pending = rendering = failed = collected = collected_now = 0
     for job in jobs:
@@ -788,7 +947,7 @@ async def _collect_regularization(db: AsyncSession, ds: Dataset) -> DatasetRegul
         if seg.status == SegmentStatus.PENDING:
             pending += 1
             continue
-        if seg.status != SegmentStatus.COMPLETED or not seg.last_frame_path:
+        if seg.status != SegmentStatus.COMPLETED or not seg.last_frame_path or locked:
             rendering += 1
             continue
         ext = seg.last_frame_path.rsplit(".", 1)[-1].lower() if "." in seg.last_frame_path \
