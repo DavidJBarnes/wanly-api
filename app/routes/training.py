@@ -129,6 +129,7 @@ async def create_training_job(
         version=body.version,
         dataset_images=g0.images,
         config={**RECIPE_DEFAULTS,
+                "seed": RECIPE_DEFAULTS["seed"] if body.seed is None else body.seed,
                 "steps": body.steps,
                 "num_repeats": g0.num_repeats,
                 "mode": body.mode,

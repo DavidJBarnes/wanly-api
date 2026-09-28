@@ -160,6 +160,13 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
     somebody fix things one refusal at a time. Everything that can be checked is.
     """
     plan = Plan(steps=body.steps)
+    if body.base_checkpoint:
+        name = body.base_checkpoint.removesuffix(".safetensors")
+        plan.base_checkpoint = name
+        if name != LTX_STACK["checkpoint"]:
+            plan.warn("base_differs",
+                      f"training against {name!r}; renders use {LTX_STACK['checkpoint']!r}. A "
+                      f"LoRA fits the base it was trained on -- compare in the real pipeline.")
     chars = {c.name: c for c in (await db.execute(select(LtxCharacter))).scalars().all()}
     datasets = list((await db.execute(select(Dataset))).scalars().all())
     by_id = {d.id: d for d in datasets}
