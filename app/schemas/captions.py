@@ -2,6 +2,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from app.schemas.app_settings import CaptionInstruction
+
 
 class CaptionRequest(BaseModel):
     # An s3:// URI. Deliberately not a raw upload: the image is already in S3 by the time
@@ -11,7 +13,7 @@ class CaptionRequest(BaseModel):
     # Override the saved setting for this one call, so the console can offer "try it
     # shorter" without changing the global default.
     style: Optional[str] = None
-    instruction: Optional[str] = Field(default=None, max_length=2000)
+    instruction: Optional[CaptionInstruction] = None
 
 
 class CaptionResponse(BaseModel):
