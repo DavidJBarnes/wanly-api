@@ -1,7 +1,7 @@
 """Default pose and default character (wanly-console#543)
 
-Revision ID: 104
-Revises: 103
+Revision ID: 105
+Revises: 104
 Create Date: 2026-09-28
 
 The New Job and Next Segment modals open with nothing picked, and nearly every job is the
@@ -19,8 +19,8 @@ preselected until someone stars one -- the modals behave exactly as before.
 import sqlalchemy as sa
 from alembic import op
 
-revision = "104"
-down_revision = "103"
+revision = "105"
+down_revision = "104"
 branch_labels = None
 depends_on = None
 
