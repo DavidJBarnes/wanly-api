@@ -6,6 +6,11 @@
 
 Phase 1 is `mode: "face"` -- LivePortrait via the face-edit service, see app/face_edit.py.
 
+WHAT TO APPLY is a preset, slider values, a described change (`prompt`, #550), or a mix. A
+prompt is read by the service, not here, so both calls answer with what it resolved to
+(`expression`, all twelve axes) and which terms it understood (`source`, `matched_terms`): the
+editor moves its sliders there, and the save records numbers rather than a sentence.
+
 PREVIEW AND SAVE ARE TWO CALLS, AND THE SAVE RE-RUNS THE EDIT. The dialog previews on every
 slider release, and if each of those wrote to the bucket the repo would fill with the drafts of
 every edit ever tried. The warp is deterministic -- no seed, no sampler; same input and numbers,
@@ -67,19 +72,39 @@ async def _fetch(uri: str) -> bytes:
         raise HTTPException(status_code=404, detail=f"source image not found: {e}") from e
 
 
+def _prompt(body) -> str | None:
+    """The described change, or None. Whitespace-only is nothing, not a prompt of spaces."""
+    return (body.prompt or "").strip() or None
+
+
 def _params(body) -> dict[str, float]:
     expr = body.expression.model_dump() if body.expression else None
     try:
-        return face_edit.resolve(body.preset, expr)
+        return face_edit.resolve(body.preset, expr, _prompt(body))
     except face_edit.FaceEditError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
 
-async def _run(source: bytes, params: dict[str, float], preview: bool) -> dict:
+async def _run(source: bytes, params: dict[str, float], prompt: str | None,
+               preview: bool) -> dict:
     try:
-        return await face_edit.edit(source, params, preview=preview)
+        return await face_edit.edit(source, params, prompt=prompt, preview=preview)
     except face_edit.FaceEditError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+
+
+def _applied(params: dict[str, float], out: dict) -> tuple[dict[str, float], dict[str, float]]:
+    """(params, expression): what was applied, non-zero only and as all twelve axes.
+
+    Taken from the service's answer when it gave one -- for a prompt it is the only place the
+    numbers exist. A service too old to report them edited with exactly `params`.
+    """
+    got = out.get("expression")
+    if isinstance(got, dict):
+        full = {k: float(got.get(k) or 0) for k in face_edit.AXIS_KEYS}
+    else:
+        full = {k: float(params.get(k, 0)) for k in face_edit.AXIS_KEYS}
+    return {k: v for k, v in full.items() if v}, full
 
 
 def result_key(source_key: str, tag: str, dataset: Dataset | None = None) -> str:
@@ -118,11 +143,14 @@ async def preview_edit(body: ImageEditPreviewRequest):
     params = _params(body)
     source = await _fetch(body.source_uri)
     t0 = time.monotonic()
-    out = await _run(source, params, preview=True)
+    out = await _run(source, params, _prompt(body), preview=True)
     fmt = out.get("format") or "jpeg"
+    applied, full = _applied(params, out)
     return ImageEditPreview(
         image=f"data:image/{fmt};base64,{base64.b64encode(out['image']).decode()}",
-        params=params, width=out.get("width") or 0, height=out.get("height") or 0,
+        params=applied, expression=full, source=out.get("source"),
+        matched_terms=face_edit.matched_terms(out.get("source")),
+        width=out.get("width") or 0, height=out.get("height") or 0,
         device=out.get("device"), device_reason=out.get("device_reason"),
         elapsed_ms=round((time.monotonic() - t0) * 1000),
     )
@@ -149,14 +177,18 @@ async def save_edit(
 
     source = await _fetch(body.source_uri)
     t0 = time.monotonic()
-    out = await _run(source, params, preview=False)
+    prompt = _prompt(body)
+    out = await _run(source, params, prompt, preview=False)
     if (out.get("format") or "png") != "png":
         # A saved edit is lossless by contract; a service that answered otherwise is wrong,
         # and saving its JPEG under a .png name would be worse.
         raise HTTPException(status_code=502,
                             detail=f"face-edit returned {out.get('format')} for a save, not png")
 
-    key = result_key(source_key, body.preset or "custom", ds)
+    applied, full = _applied(params, out)
+    src = out.get("source")
+    tag = body.preset or ("prompt" if (src or "").startswith("prompt:") else "custom")
+    key = result_key(source_key, tag, ds)
     uri = await asyncio.to_thread(s3.upload_bytes, out["image"], key, settings.s3_images_bucket)
 
     if ds is not None:
@@ -169,10 +201,13 @@ async def save_edit(
         ds.images = list(ds.images) + [uri]
         await db.commit()
 
-    logger.info("edited %s -> %s (%s%s) on %s", body.source_uri, uri, body.preset or "custom",
+    logger.info("edited %s -> %s (%s%s%s) on %s", body.source_uri, uri, tag,
+                f" {prompt!r} -> {applied}" if prompt else "",
                 f", dataset {ds.name}" if ds is not None else "", out.get("device"))
     return ImageEditResponse(
-        uri=uri, source_uri=body.source_uri, mode=body.mode, preset=body.preset, params=params,
+        uri=uri, source_uri=body.source_uri, mode=body.mode, preset=body.preset, prompt=prompt,
+        params=applied, expression=full, source=src,
+        matched_terms=face_edit.matched_terms(src),
         dataset_id=ds.id if ds is not None else None, device=out.get("device"),
         elapsed_ms=round((time.monotonic() - t0) * 1000),
     )
