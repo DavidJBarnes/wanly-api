@@ -1390,23 +1390,41 @@ class TestThePreflightOutput:
         assert (await db.execute(select(func.count(TrainingJob.id)))).scalar_one() == 0
 
 
-class TestGuardEveryImageHasACaption:
-    async def test_a_missing_caption_blocks(self, db):
+class TestABlankCaptionIsTheBarePhrase:
+    """#365: blank = "<trigger>, <gender>" (the standard); only props are typed."""
+
+    async def test_a_blank_caption_trains_as_the_bare_phrase(self, db):
+        from app.routes.training import create_training_job
         w = await _world(db)
         caps = dict(w["david"].captions)
-        caps.pop(w["david"].images[3])
+        blank = w["david"].images[3]
+        caps.pop(blank)
         w["david"].captions = caps
         await db.flush()
         out = await _preflight(db, **SOLO)
-        assert "caption_missing" in _codes(out)
-        assert "1 of 10" in next(p["message"] for p in out["problems"]
-                                 if p["code"] == "caption_missing")
+        assert out["ok"], out["problems"]
+        job = await create_training_job(TrainingCreate(**SOLO), user=_U(), db=db)
+        i = job.dataset_images.index(blank)
+        assert job.config["captions"][i] == "d@vid, man"
 
-    async def test_the_regularization_pool_needs_captions_too(self, db):
+    async def test_a_typed_caption_is_still_appended(self, db):
+        from app.routes.training import create_training_job
+        w = await _world(db)
+        u = w["david"].images[0]
+        w["david"].captions = {u: "wearing glasses"}
+        await db.flush()
+        job = await create_training_job(TrainingCreate(**SOLO), user=_U(), db=db)
+        assert job.config["captions"][job.dataset_images.index(u)] == "d@vid, man, wearing glasses"
+        assert set(job.config["captions"]) == {"d@vid, man, wearing glasses", "d@vid, man"}
+
+    async def test_a_blank_regularization_caption_is_the_class_word(self, db):
         w = await _world(db)
         w["reg_man"].captions = {}
         await db.flush()
-        assert "caption_missing" in _codes(await _preflight(db, **SOLO))
+        out = await _preflight(db, **SOLO)
+        assert out["ok"], out["problems"]
+        reg = [g for g in out["groups"] if g["kind"] == "regularization"][0]
+        assert set(reg["sample_captions"]) == {"man"}
 
 
 class TestGuardTheDatasetBelongsToTheCharacter:
@@ -1636,16 +1654,15 @@ class TestTheV1Recipe:
         w = await _world(db)
         w["david"].captions = {}
         await db.flush()
-        assert "caption_missing" in _codes(await _preflight(db, **SOLO))
-        assert "caption_missing" not in _codes(
-            await _preflight(db, **SOLO, caption_mode="trigger_only"))
+        assert (await _preflight(db, **SOLO))["ok"]
+        assert (await _preflight(db, **SOLO, caption_mode="trigger_only"))["ok"]
 
-    async def test_the_regularization_pool_still_needs_its_captions(self, db):
+    async def test_a_blank_regularization_pool_trains_under_the_class_word(self, db):
         w = await _world(db)
         w["reg_man"].captions = {}
         await db.flush()
-        assert "caption_missing" in _codes(
-            await _preflight(db, **SOLO, caption_mode="trigger_only"))
+        out = await _preflight(db, **SOLO, caption_mode="trigger_only")
+        assert out["ok"], out["problems"]
 
     async def test_no_regularization_adds_no_pool_and_warns(self, db):
         w = await _world(db)
@@ -1717,12 +1734,12 @@ class TestCreateRefusesWhatThePreflightRefuses:
         from fastapi import HTTPException
         from app.routes.training import create_training_job
         w = await _world(db)
-        w["david"].captions = {}
+        w["david"].images = w["david"].images[:5]
         await db.flush()
         with pytest.raises(HTTPException) as e:
             await create_training_job(TrainingCreate(**SOLO), user=_U(), db=db)
         assert e.value.status_code == 422
-        assert "caption_missing" in {p["code"] for p in e.value.detail["problems"]}
+        assert "too_few_images" in {p["code"] for p in e.value.detail["problems"]}
 
     async def test_over_http_too(self, db):
         """The console reads detail.problems off the wire, so check the wire."""
@@ -1731,7 +1748,7 @@ class TestCreateRefusesWhatThePreflightRefuses:
         from app.database import get_db
         from app.main import app
         w = await _world(db)
-        w["reg_man"].captions = {}
+        w["david"].images = w["david"].images[:5]
         await db.flush()
         app.dependency_overrides[get_db] = lambda: db
         app.dependency_overrides[get_current_user] = lambda: _U()
