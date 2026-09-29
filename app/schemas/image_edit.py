@@ -10,6 +10,8 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.face_edit import MAX_PROMPT
+
 
 class FaceExpression(BaseModel):
     """LivePortrait ExpressionEditor's parameters, all optional: a value laid over a preset.
@@ -40,6 +42,10 @@ class ImageEditRequest(BaseModel):
     #: Named server-side (GET /images/edit/presets). Either or both; explicit values win.
     preset: Optional[str] = Field(None, max_length=50)
     expression: Optional[FaceExpression] = None
+    #: "Describe the change" (console#550): read by the service against its keyword lexicon
+    #: ("big smile, eyes closed, look left"). Instead of numbers, or with them -- in which case
+    #: the numbers win, the service's rule. At least one of the three is required.
+    prompt: Optional[str] = Field(None, max_length=MAX_PROMPT)
     #: Save into this dataset (appended to its image list) instead of the Image Repo.
     #: Refused with 409 when the set is locked (#356/#358), before anything runs.
     dataset_id: Optional[uuid.UUID] = None
@@ -50,12 +56,20 @@ class ImageEditPreviewRequest(BaseModel):
     mode: Literal["face"] = "face"
     preset: Optional[str] = Field(None, max_length=50)
     expression: Optional[FaceExpression] = None
+    prompt: Optional[str] = Field(None, max_length=MAX_PROMPT)
 
 
 class ImageEditPreview(BaseModel):
     #: data: URI -- a capped-size JPEG, for the dialog's "after" pane only. Never stored.
     image: str
     params: dict[str, float]
+    #: All twelve axes as the service applied them, zeros included -- what the editor sets its
+    #: sliders to after a described change, so the user can fine-tune from there (#550).
+    expression: dict[str, float]
+    #: The service's account of where the numbers came from: "explicit", or
+    #: "prompt:<lexicon hit>,…" -- and those hits as words, for the editor's chips.
+    source: Optional[str] = None
+    matched_terms: list[str] = []
     width: int
     height: int
     device: Optional[str] = None
@@ -68,7 +82,11 @@ class ImageEditResponse(BaseModel):
     source_uri: str
     mode: str
     preset: Optional[str] = None
+    prompt: Optional[str] = None
     params: dict[str, float]
+    expression: dict[str, float]
+    source: Optional[str] = None
+    matched_terms: list[str] = []
     dataset_id: Optional[uuid.UUID] = None
     device: Optional[str] = None
     elapsed_ms: Optional[int] = None

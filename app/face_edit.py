@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 
 import httpx
 
@@ -80,6 +81,10 @@ PRESETS: dict[str, tuple[str, dict[str, float]]] = {
 #: the 3090's line): a full-size PNG is ~3 MB, ~5 s per slider drag; this is ~120 KB.
 PREVIEW_MAX_EDGE = 1024
 
+#: Longest "describe the change" text accepted (console#550). The service reads it against a
+#: small keyword lexicon, so anything near this is not a description, it is a paste.
+MAX_PROMPT = 500
+
 
 class FaceEditError(Exception):
     """Carries the HTTP status the route should answer with, and a sentence that says why."""
@@ -90,12 +95,18 @@ class FaceEditError(Exception):
         self.detail = detail
 
 
-def resolve(preset: str | None, expression: dict[str, float | None] | None) -> dict[str, float]:
+def resolve(preset: str | None, expression: dict[str, float | None] | None,
+            prompt: str | None = None) -> dict[str, float]:
     """The numbers to send: the preset's, with any explicit value laid over it.
 
     That is how the editor works: clicking a preset moves the sliders to its values, and a
     drag afterwards changes one axis without losing the others. Only non-zero axes are kept, so
     the record of what was done reads as the edit, not twelve zeros.
+
+    With a `prompt` (console#550) and no numbers this returns {} -- the service reads the text
+    against its lexicon and says what it resolved to. Numbers and a prompt together send both,
+    and the numbers win: that is the service's own rule (resolve_expression), not a choice made
+    here, and the response's `source` ("explicit") shows it.
     """
     params: dict[str, float] = {}
     if preset is not None:
@@ -107,11 +118,74 @@ def resolve(preset: str | None, expression: dict[str, float | None] | None) -> d
         if v is not None:
             params[k] = float(v)
     params = {k: v for k, v in params.items() if v}
-    if not params:
+    if not params and not prompt:
         # Refused rather than sent: the service would answer the same, after an S3 fetch and a
         # round trip -- and "saved" an unchanged copy of the original is the worst outcome.
-        raise FaceEditError(422, "nothing to apply: pick a preset or move a slider")
+        raise FaceEditError(
+            422, "nothing to apply: pick a preset, move a slider, or describe the change")
     return params
+
+
+#: Labels for the lexicon entries whose first spelling is not what anyone types -- "frown"
+#: reports as its first alternative, "furrow"; "big smile" as "grin". Everything else reads
+#: fine through _term_label's generic tidy-up. Keyed by the service's hit text, see
+#: matched_terms.
+_TERM_LABELS = {
+    "furrow(s|ed|ing)?": "frown",
+    "grin(s|ning)?": "big smile",
+    "clos(e|es|ed|ing) (her |his |their )?eyes?": "eyes closed",
+    "wid(e|er) eyes?": "wide eyes",
+    "rais(e|es|ed|ing) (her |his |their )?(eye)?brows?": "raised brows",
+    "mouth open": "mouth open",
+}
+
+
+def _term_label(hit: str) -> str:
+    """"look(s|ing)? (to (her |his |their )?)?left" -> "look left".
+
+    The service reports each matched lexicon entry as the first \\b-delimited piece of its
+    regex (expression.py, resolve_expression), which is regex, not words. Innermost optional
+    groups are dropped until none are left, then each remaining group becomes its first
+    alternative and each "x?" becomes "x".
+    """
+    if hit in _TERM_LABELS:
+        return _TERM_LABELS[hit]
+    s = hit
+    while True:
+        t = re.sub(r"\([^()]*\)\?", "", s)
+        if t == s:
+            break
+        s = t
+    s = re.sub(r"\(([^()|]*)[^()]*\)", r"\1", s)
+    s = s.replace("?", "")
+    return re.sub(r"\s+", " ", s).strip() or hit
+
+
+def matched_terms(source: str | None) -> list[str]:
+    """The service's `source` ("prompt:<hit>,<hit>") as the words the console shows as chips.
+    [] for "explicit" or anything else that did not come from a prompt."""
+    if not source or not source.startswith("prompt:"):
+        return []
+    out: list[str] = []
+    for hit in source[len("prompt:"):].split(","):
+        label = _term_label(hit.strip()) if hit.strip() else ""
+        if label and label not in out:
+            out.append(label)
+    # "big smile" also matches the plain smile entry, whose smaller value then loses (largest
+    # magnitude wins per axis): one chip for what was typed, not two.
+    return [t for t in out
+            if not any(o != t and re.search(rf"\b{re.escape(t)}\b", o) for o in out)]
+
+
+def _nothing_to_apply(detail: str, prompt: str | None) -> str:
+    """The service's "nothing to apply" refusal, reworded for someone who typed a sentence:
+    the service's own wording talks about `expression` objects, which the editor never shows."""
+    known = ""
+    i = detail.find("Recognised terms:")
+    if i >= 0:
+        known = " " + detail[i:].strip()
+    said = f" in {prompt!r}" if prompt else ""
+    return f"nothing to apply: no known terms{said}.{known}"
 
 
 def _service_url() -> str:
@@ -122,15 +196,25 @@ def _service_url() -> str:
     return url
 
 
-async def edit(image_bytes: bytes, params: dict[str, float], *, preview: bool = False) -> dict:
+async def edit(image_bytes: bytes, params: dict[str, float], *, prompt: str | None = None,
+               preview: bool = False) -> dict:
     """Run one edit. Returns the service's JSON with `image` decoded to bytes.
+
+    `params` empty means "read `prompt`": the service then resolves the text itself and returns
+    what it resolved to in `expression` and `source`. An `expression` is only sent when there
+    are numbers, because the service treats any `expression` -- even all zeros -- as explicit
+    and ignores the prompt.
 
     Raises FaceEditError with the status the caller should pass on: 503 for down or busy (the
     two things that fix themselves), 422 for this image or these numbers, 502 for anything the
     service should not have said.
     """
     base = _service_url()
-    body: dict = {"image": base64.b64encode(image_bytes).decode(), "expression": params}
+    body: dict = {"image": base64.b64encode(image_bytes).decode()}
+    if params:
+        body["expression"] = params
+    if prompt:
+        body["prompt"] = prompt
     if preview:
         body.update(format="jpeg", max_edge=PREVIEW_MAX_EDGE)
     try:
@@ -151,6 +235,10 @@ async def edit(image_bytes: bytes, params: dict[str, float], *, preview: bool = 
         detail = detail if isinstance(detail, str) else (r.text[:300] or r.reason_phrase)
         if r.status_code == 503:
             raise FaceEditError(503, f"face-edit is busy or not ready: {detail}")
+        if r.status_code == 422 and detail.startswith("nothing to apply"):
+            # The prompt had no word the lexicon knows (expression.py, NothingToApply). Not the
+            # image's fault, so not "refused this image".
+            raise FaceEditError(422, _nothing_to_apply(detail, prompt))
         if r.status_code in (400, 413, 422):
             raise FaceEditError(422, f"face-edit refused this image: {detail}")
         raise FaceEditError(502, f"face-edit returned {r.status_code}: {detail}")
@@ -161,5 +249,6 @@ async def edit(image_bytes: bytes, params: dict[str, float], *, preview: bool = 
     except Exception as e:
         raise FaceEditError(502, f"face-edit returned an unreadable image: {e}") from e
     logger.info("face edit on %s (%s) in %s ms: %s", out.get("device"),
-                out.get("device_reason"), (out.get("timings_ms") or {}).get("total"), params)
+                out.get("device_reason"), (out.get("timings_ms") or {}).get("total"),
+                params or f"{out.get('source')} from {prompt!r}")
     return out

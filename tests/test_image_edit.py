@@ -7,6 +7,8 @@ What these pin down:
   * the service being down, slow or busy is a 503 that says which, and writes nothing
   * a save is always a NEW object; the source is never overwritten
   * a preview stores nothing
+  * a described change (#550) is forwarded as text, answered with the resolved numbers and the
+    understood terms, and "no known terms" is a 422 that says so rather than "refused this image"
 """
 import base64
 import uuid
@@ -51,6 +53,18 @@ class TestResolve:
                 face_edit.resolve(preset, expr)
             assert e.value.status_code == 422
 
+    def test_a_prompt_alone_is_enough_and_sends_no_numbers(self):
+        """The service reads the text; any `expression` at all would make it ignore the text."""
+        assert face_edit.resolve(None, None, "big smile") == {}
+
+    def test_a_prompt_with_numbers_keeps_the_numbers(self):
+        assert face_edit.resolve("smile", None, "look left") == {"smile": 0.5}
+
+    def test_the_nothing_message_mentions_describing(self):
+        with pytest.raises(face_edit.FaceEditError) as e:
+            face_edit.resolve(None, None, "")
+        assert "describe" in e.value.detail
+
     def test_every_preset_the_issue_asks_for_exists(self):
         wanted = {"smile", "big_laugh", "eyes_closed", "surprised", "serious", "speaking",
                   "look_left", "look_right", "look_up", "look_down",
@@ -68,6 +82,41 @@ class TestResolve:
         main = {a["key"] for a in face_edit.AXES if a["group"] == "main"}
         assert main == {"rotate_yaw", "rotate_pitch", "rotate_roll", "blink", "smile", "aaa",
                         "eyebrow"}
+
+
+# ------------------------------------------------------------------ matched terms
+
+class TestMatchedTerms:
+    # The service's hits are the first \\b-piece of each lexicon regex (expression.py).
+    CLOSE = "clos(e|es|ed|ing) (her |his |their )?eyes?"
+    GRIN = "grin(s|ning)?"
+    SMILE = "smil(e|es|ing)"
+    LEFT = "look(s|ing)? (to (her |his |their )?)?left"
+
+    def test_the_issues_example_reads_as_three_terms(self):
+        """"big smile, eyes closed, look left" also hits the plain smile entry, whose value
+        loses to the grin's -- one chip, not two."""
+        src = f"prompt:{self.CLOSE},{self.GRIN},{self.SMILE},{self.LEFT}"
+        assert face_edit.matched_terms(src) == ["eyes closed", "big smile", "look left"]
+
+    @pytest.mark.parametrize("hit,label", [
+        ("look(s|ing)? up", "look up"),
+        ("turn(s|ed|ing)? (her |his |their )?head (to the )?left", "turn head left"),
+        ("tilt(s|ed|ing)? (her |his |their )?head", "tilt head"),
+        ("squint(s|ed|ing)?", "squint"),
+        ("furrow(s|ed|ing)?", "frown"),
+        ("chin up", "chin up"),
+        ("purs(e|es|ed|ing)", "purse"),
+    ])
+    def test_regex_pieces_become_words(self, hit, label):
+        assert face_edit.matched_terms(f"prompt:{hit}") == [label]
+
+    def test_smile_alone_stays(self):
+        assert face_edit.matched_terms(f"prompt:{self.SMILE}") == ["smile"]
+
+    @pytest.mark.parametrize("src", [None, "", "explicit", "preset:smile"])
+    def test_nothing_that_is_not_a_prompt(self, src):
+        assert face_edit.matched_terms(src) == []
 
 
 # ---------------------------------------------------------------------- the client
@@ -169,6 +218,33 @@ class TestTheClient:
             await self._edit(monkeypatch, resp=_Resp(422, {"detail": "no face detected"}))
         assert e.value.status_code == 422 and "no face" in e.value.detail
 
+    async def test_a_prompt_is_sent_as_text_without_an_expression(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(face_edit, "httpx",
+                            _Httpx(_client(resp=_Resp(200, _ok_body()), seen=seen)))
+        await face_edit.edit(b"src", {}, prompt="big smile", preview=True)
+        body = seen[0][1]
+        assert body["prompt"] == "big smile" and "expression" not in body
+
+    async def test_numbers_and_no_prompt_send_no_prompt(self, monkeypatch):
+        seen = []
+        await self._edit(monkeypatch, resp=_Resp(200, _ok_body()), seen=seen)
+        assert "prompt" not in seen[0][1]
+
+    async def test_no_known_terms_is_422_that_says_so(self, monkeypatch):
+        """The service's NothingToApply (expression.py) is a 422 from app.py; it is about the
+        words, not the image, so it must not read "refused this image"."""
+        monkeypatch.setattr(face_edit, "httpx", _Httpx(_client(resp=_Resp(422, {
+            "detail": "nothing to apply: send an `expression` object, or a prompt using a "
+                      "known term. Recognised terms: smile, grin, laugh."}))))
+        with pytest.raises(face_edit.FaceEditError) as e:
+            await face_edit.edit(b"src", {}, prompt="dance a jig")
+        d = e.value.detail
+        assert e.value.status_code == 422
+        assert d.startswith("nothing to apply: no known terms in 'dance a jig'")
+        assert "Recognised terms: smile, grin, laugh." in d
+        assert "refused this image" not in d and "`expression`" not in d
+
     async def test_anything_else_is_502(self, monkeypatch):
         with pytest.raises(face_edit.FaceEditError) as e:
             await self._edit(monkeypatch, resp=_Resp(500, None, text="Traceback"))
@@ -224,14 +300,18 @@ def wired(monkeypatch):
 
     fake_s3 = _FakeS3()
     calls = []
-    state = {"error": None}
+    state = {"error": None, "resolved": None, "prompts": []}
 
-    async def fake_edit(image_bytes, params, preview=False):
+    async def fake_edit(image_bytes, params, prompt=None, preview=False):
         calls.append((image_bytes, params, preview))
+        state["prompts"].append(prompt)
         if state["error"]:
             raise state["error"]
-        return {"image": b"edited png", "format": "jpeg" if preview else "png",
-                "width": 1248, "height": 1824, "device": "cuda", "device_reason": "free"}
+        out = {"image": b"edited png", "format": "jpeg" if preview else "png",
+               "width": 1248, "height": 1824, "device": "cuda", "device_reason": "free"}
+        if state["resolved"] is not None:
+            out.update(state["resolved"])
+        return out
 
     monkeypatch.setattr(mod, "s3", fake_s3)
     monkeypatch.setattr(mod.face_edit, "edit", fake_edit)
@@ -344,11 +424,61 @@ class TestOverHTTP:
         assert d["params"] == {"rotate_yaw": -12} and (d["width"], d["height"]) == (1248, 1824)
         assert calls[0][2] is True and s3.uploaded == []
 
+    async def test_a_described_change_previews_and_says_what_it_understood(self, db, wired):
+        s3, calls, state = wired
+        exp = dict.fromkeys(face_edit.AXIS_KEYS, 0.0)
+        exp.update(smile=1.3, blink=-20.0, pupil_x=-12.0)
+        state["resolved"] = {"expression": exp, "source": (
+            "prompt:clos(e|es|ed|ing) (her |his |their )?eyes?,grin(s|ning)?,smil(e|es|ing),"
+            "look(s|ing)? (to (her |his |their )?)?left")}
+        r = await _http(db, "post", "/images/edit/preview",
+                        json={"source_uri": SRC, "prompt": "  big smile, eyes closed, look left "})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert state["prompts"] == ["big smile, eyes closed, look left"] and calls[0][1] == {}
+        assert d["matched_terms"] == ["eyes closed", "big smile", "look left"]
+        assert d["source"].startswith("prompt:")
+        assert d["expression"] == exp, "all twelve axes, for the sliders"
+        assert d["params"] == {"smile": 1.3, "blink": -20, "pupil_x": -12}
+        assert s3.uploaded == []
+
+    async def test_a_described_change_saves_its_numbers(self, db, wired):
+        s3, _, state = wired
+        exp = dict.fromkeys(face_edit.AXIS_KEYS, 0.0)
+        exp.update(wink=15.0)
+        state["resolved"] = {"expression": exp, "source": "prompt:wink(s|ed|ing)?"}
+        r = await _http(db, "post", "/images/edit", json={"source_uri": SRC, "prompt": "wink"})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["prompt"] == "wink" and d["params"] == {"wink": 15}
+        assert d["matched_terms"] == ["wink"] and d["expression"]["wink"] == 15
+        assert d["uri"].startswith(f"s3://{BUCKET}/2026-09-01/sel_008_edit-prompt_")
+        assert len(s3.uploaded) == 1
+
+    async def test_numbers_answer_with_all_twelve_axes_too(self, db, wired):
+        """An older service returns no `expression`; the sent numbers are what it applied."""
+        r = await _http(db, "post", "/images/edit/preview",
+                        json={"source_uri": SRC, "preset": "look_left"})
+        d = r.json()
+        assert d["expression"]["pupil_x"] == -8 and d["expression"]["smile"] == 0
+        assert len(d["expression"]) == 12 and d["matched_terms"] == []
+
+    async def test_no_known_terms_is_422_and_writes_nothing(self, db, wired):
+        s3, _, state = wired
+        state["error"] = face_edit.FaceEditError(
+            422, "nothing to apply: no known terms in 'dance'. Recognised terms: smile.")
+        for path in ("/images/edit", "/images/edit/preview"):
+            r = await _http(db, "post", path, json={"source_uri": SRC, "prompt": "dance"})
+            assert r.status_code == 422 and "no known terms" in r.json()["detail"]
+        assert s3.uploaded == []
+
     @pytest.mark.parametrize("body,status", [
         ({"source_uri": SRC, "expression": {"rotate_yaw": 40}}, 422),       # out of range
         ({"source_uri": SRC, "expression": {"grin": 1}}, 422),              # unknown axis
         ({"source_uri": SRC, "preset": "grimace"}, 422),                    # unknown preset
         ({"source_uri": SRC}, 422),                                         # nothing to apply
+        ({"source_uri": SRC, "prompt": "   "}, 422),                        # blank description
+        ({"source_uri": SRC, "prompt": "smile " * 100}, 422),               # too long
         ({"source_uri": SRC, "mode": "full", "preset": "smile"}, 422),      # phase 2
         ({"source_uri": "s3://wanly-jobs/x.png", "preset": "smile"}, 400),  # wrong bucket
         ({"source_uri": "https://example.com/a.png", "preset": "smile"}, 400),
