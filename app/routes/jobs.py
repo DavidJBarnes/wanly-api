@@ -19,6 +19,7 @@ from app.config import settings
 from app.database import get_db
 from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStatus
 from app.regularization import REG_PRIORITY_BASE
+from app.render_size import RECIPE_SQL, render_size, renders_through_recipe
 from app.seeds import new_seed
 from app.estimation import estimate_segment_time, get_estimation_rates, sum_estimated_queue_time
 from app.models import Job, Segment, User, Video, Worker
@@ -254,6 +255,16 @@ def job_filter(
     return clauses
 
 
+def _job_render_size(job: Job, recipe: bool) -> tuple[int, int]:
+    """What a job's clips render at (#359); its width/height stay the start frame's.
+
+    `recipe` is whether any of the job's segments takes the engine's recipe path. A job is one
+    shape, so the first recipe segment's size is every later one's: a continuation starts from
+    the previous clip's last frame, which is already at the render size and derives to itself.
+    """
+    return render_size(job.width, job.height, recipe)
+
+
 @router.get("/jobs", response_model=JobListResponse)
 async def list_jobs(
     limit: int = Query(50, ge=1, le=200),
@@ -292,6 +303,7 @@ async def list_jobs(
     # Aggregate segment counts per job in a single query
     job_ids = [j.id for j in items]
     counts_map: dict[UUID, tuple[int, int]] = {}
+    recipe_jobs: set[UUID] = set()
     if job_ids:
         counts_result = await db.execute(
             # Progress excludes discarded segments from BOTH halves. A job whose only bad
@@ -306,12 +318,15 @@ async def list_jobs(
                     ((Segment.status == SegmentStatus.COMPLETED)
                      & Segment.discarded.is_(False), 1)
                 )).label("completed"),
+                func.bool_or(RECIPE_SQL).label("recipe"),
             )
             .where(Segment.job_id.in_(job_ids))
             .group_by(Segment.job_id)
         )
         for row in counts_result.all():
             counts_map[row[0]] = (row[1], row[2])
+            if row[3]:
+                recipe_jobs.add(row[0])
 
     # Fetch active segment info for estimation
     active_statuses = {SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING}
@@ -324,6 +339,7 @@ async def list_jobs(
                 Segment.job_id,
                 Segment.duration_seconds,
                 Segment.gpu_name,
+                RECIPE_SQL,
             )
             .where(
                 Segment.job_id.in_(active_job_ids),
@@ -334,24 +350,28 @@ async def list_jobs(
         if active_segs:
             rates = await get_estimation_rates(db, user.id)
             for row in active_segs:
-                seg_job_id, seg_dur, seg_gpu = row
+                seg_job_id, seg_dur, seg_gpu, seg_recipe = row
                 job_obj = next((j for j in active_jobs if j.id == seg_job_id), None)
                 if job_obj:
+                    # Priced at the size that renders, which is how the rates are keyed.
                     est = estimate_segment_time(
-                        rates, job_obj.width, job_obj.height, job_obj.fps,
-                        seg_dur, seg_gpu,
+                        rates, *render_size(job_obj.width, job_obj.height, seg_recipe),
+                        job_obj.fps, seg_dur, seg_gpu,
                     )
                     est_map[seg_job_id] = est
 
     response_items = []
     for j in items:
         seg_total, seg_completed = counts_map.get(j.id, (0, 0))
+        render_width, render_height = _job_render_size(j, j.id in recipe_jobs)
         response_items.append(
             JobResponse(
                 id=j.id,
                 name=j.name,
                 width=j.width,
                 height=j.height,
+                render_width=render_width,
+                render_height=render_height,
                 fps=j.fps,
                 seed=j.seed,
                 starting_image=j.starting_image,
@@ -545,8 +565,9 @@ async def get_job(
             sr = SegmentResponse.model_validate(s)
             if s.status in (SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING):
                 est = estimate_segment_time(
-                    rates, job.width, job.height, job.fps,
-                    s.duration_seconds, s.gpu_name,
+                    rates, *render_size(job.width, job.height,
+                                        renders_through_recipe(s.ltx_recipe)),
+                    job.fps, s.duration_seconds, s.gpu_name,
                 )
                 sr.estimated_run_time = est
                 if job_est is None:
@@ -556,12 +577,16 @@ async def get_job(
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
     await _annotate_blocked(db, segments, seg_responses)
+    render_width, render_height = _job_render_size(
+        job, any(renders_through_recipe(s.ltx_recipe) for s in segments))
 
     return JobDetailResponse(
         id=job.id,
         name=job.name,
         width=job.width,
         height=job.height,
+        render_width=render_width,
+        render_height=render_height,
         fps=job.fps,
         seed=job.seed,
         starting_image=job.starting_image,
@@ -689,8 +714,9 @@ async def reopen_job(
             sr = SegmentResponse.model_validate(s)
             if s.status in (SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING):
                 est = estimate_segment_time(
-                    rates, job.width, job.height, job.fps,
-                    s.duration_seconds, s.gpu_name,
+                    rates, *render_size(job.width, job.height,
+                                        renders_through_recipe(s.ltx_recipe)),
+                    job.fps, s.duration_seconds, s.gpu_name,
                 )
                 sr.estimated_run_time = est
                 if job_est is None:
@@ -700,9 +726,12 @@ async def reopen_job(
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
     await _annotate_blocked(db, segments, seg_responses)
+    render_width, render_height = _job_render_size(
+        job, any(renders_through_recipe(s.ltx_recipe) for s in segments))
 
     return JobDetailResponse(
         id=job.id, name=job.name, width=job.width, height=job.height,
+        render_width=render_width, render_height=render_height,
         fps=job.fps, seed=job.seed, starting_image=job.starting_image,
         # Lynx engine fields. These responses are hand-built, so anything not
         # listed here is silently dropped by Pydantic even though it is on the schema.
@@ -854,7 +883,8 @@ async def get_stats(
     queue_rows = (
         await db.execute(
             select(
-                Job.width, Job.height, Job.fps, Segment.duration_seconds, Segment.gpu_name
+                Job.width, Job.height, Job.fps, Segment.duration_seconds, Segment.gpu_name,
+                RECIPE_SQL,
             )
             .join(Job, Segment.job_id == Job.id)
             .where(
@@ -867,7 +897,11 @@ async def get_stats(
     total_queue_time = 0.0
     if queue_rows:  # skip three estimator queries when the queue is empty
         rates = await get_estimation_rates(db, user.id)
-        total_queue_time = sum_estimated_queue_time(rates, queue_rows)
+        # At the size each segment renders, which is how the rates are keyed (#359).
+        total_queue_time = sum_estimated_queue_time(rates, [
+            (*render_size(width, height, recipe), fps, duration, gpu)
+            for width, height, fps, duration, gpu, recipe in queue_rows
+        ])
 
     # Worker stats
     worker_rows = (
