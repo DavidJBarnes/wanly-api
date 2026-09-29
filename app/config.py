@@ -105,6 +105,24 @@ class Settings(BaseSettings):
     # holds the GPU), a request queued behind another edit (the service waits up to 60 s for its
     # turn), and a full-size PNG crossing the home uplink.
     face_edit_timeout_s: int = 120
+    # image-edit (wanly-console#548): Qwen-Image-Edit "full mode", in wanly-gpu-docker
+    # (SERVICES=...,image-edit) on the 3090, running only in its EDIT mode. Jobs, not calls:
+    # app/full_edit.py switches the box through its control API (worker_control_port) and polls.
+    # Empty image_edit_url disables full mode with a 503 that says so.
+    image_edit_url: str = "http://3090.zero:8086"
+    #: The box that runs it: the host its control API answers on, and its Workers-page name.
+    image_edit_worker: str = "3090.zero"
+    # One edit: ~13-16 s warm on the 3090, plus a cold checkpoint load (28 GB) on the first.
+    image_edit_timeout_s: int = 900
+    # How long a job may wait for edit mode. The switch lets the segment in flight finish, and
+    # a segment is up to ~27 minutes -- this is that plus the Qwen boot, with room.
+    image_edit_switch_timeout_s: int = 3600
+    image_edit_poll_s: float = 5.0
+    # After the last queued edit, how long to keep edit mode for the next one before giving
+    # the card back to the render queue. A run of edits pays for one switch, not one each.
+    image_edit_return_grace_s: float = 90.0
+    # An unsaved result is a draft; it is dropped this long after it finished.
+    image_edit_job_ttl_s: int = 3600
     # buffalo_l's same-person floor. Below this against a picked anchor is a different person;
     # it is shown as a line on the scores rather than used to delete anything, because the two
     # people who got into this project's training sets got there past a human eye, not past a

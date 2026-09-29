@@ -7,6 +7,17 @@
 
 Phase 1 is `mode: "face"` -- LivePortrait via the face-edit service, see app/face_edit.py.
 
+Phase 2 (#548) adds `mode: "full"` -- Qwen-Image-Edit on the 3090, see app/full_edit.py -- on the
+same POST /images/edit, answered with a JOB (202) because the 3090 has to finish its render
+segment and switch into edit mode first:
+
+    GET  /images/edit/jobs/{id}        state, queue position, why it is waiting; when done a
+                                       preview and the AuraFace identity score vs the source
+    POST /images/edit/jobs/{id}/save   write the held result as a NEW image (repo or dataset)
+
+A full-mode edit is an `instruction` or a head angle (`head_preset`, or `angle` {yaw, pitch});
+head angles within ±20° belong to face mode, and the console routes them there.
+
 WHAT TO APPLY is a preset, slider values, a described change (`prompt`, #550), or a mix. A
 prompt is read by the service, not here, so both calls answer with what it resolved to
 (`expression`, all twelve axes) and which terms it understood (`source`, `matched_terms`): the
@@ -42,17 +53,19 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import face_edit, s3
+from app import face_edit, full_edit, s3
 from app.auth import get_current_user
 from app.config import settings
 from app.database import get_db
 from app.models import Dataset
 from app.routes.datasets import DATASETS_PREFIX, _prefix, _refuse_if_locked
 from app.schemas.image_edit import (
-    EditAxis, EditPreset, EditPresets, ImageEditFaces, ImageEditFacesRequest, ImageEditPreview,
-    ImageEditPreviewRequest, ImageEditRequest, ImageEditResponse,
+    EditAxis, EditPreset, EditPresets, HeadAngle, HeadAnglePreset, ImageEditFaces, ImageEditFacesRequest,
+    ImageEditJob, ImageEditJobSave, ImageEditPreview, ImageEditPreviewRequest, ImageEditRequest,
+    ImageEditResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,6 +153,11 @@ async def edit_presets():
         presets=[EditPreset(name=n, label=label, expression=exp)
                  for n, (label, exp) in face_edit.PRESETS.items()],
         axes=[EditAxis(**a) for a in face_edit.AXES],
+        head_angles=[HeadAnglePreset(name=n, label=label, yaw=y, pitch=p,
+                                     route=full_edit.route(y, p))
+                     for n, (label, y, p) in full_edit.HEAD_ANGLES.items()],
+        face_limit_deg=full_edit.FACE_LIMIT_DEG, max_yaw=full_edit.MAX_YAW,
+        max_pitch=full_edit.MAX_PITCH,
     )
 
 
@@ -187,7 +205,11 @@ async def save_edit(
     _user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Edit `source_uri` and save the result as a new image -- in the repo, or in a dataset."""
+    """Edit `source_uri` and save the result as a new image -- in the repo, or in a dataset.
+
+    Full mode (#548) returns 202 with a job instead; see the module docstring."""
+    if body.mode == "full":
+        return await _submit_full(body)
     params = _params(body)
     source_key = _source_key(body.source_uri)
 
@@ -238,4 +260,115 @@ async def save_edit(
         dataset_id=ds.id if ds is not None else None, device=out.get("device"),
         elapsed_ms=round((time.monotonic() - t0) * 1000),
         face_index=out.get("face_index"), face_box=out.get("face_box"),
+    )
+
+
+# ------------------------------------------------------------------ full mode (#548)
+
+
+def _full_request(body: ImageEditRequest) -> tuple[dict, str]:
+    """(what the image-edit service is sent, the tag for the file name). 422 on nonsense,
+    before anything is fetched or queued."""
+    instruction = (body.instruction or "").strip() or None
+    angle = body.angle
+    tag = "angle"
+    if body.head_preset is not None:
+        if body.head_preset not in full_edit.HEAD_ANGLES:
+            raise HTTPException(
+                422, f"unknown head preset {body.head_preset!r}; known: "
+                     f"{', '.join(full_edit.HEAD_ANGLES)}")
+        _label, yaw, pitch = full_edit.HEAD_ANGLES[body.head_preset]
+        angle = angle or HeadAngle(yaw=yaw, pitch=pitch)
+        tag = body.head_preset
+    if angle is not None and instruction:
+        raise HTTPException(422, "full mode takes an instruction or a head angle, not both")
+    req: dict = {}
+    if angle is not None:
+        if max(abs(angle.yaw), abs(angle.pitch)) < 5:
+            raise HTTPException(422, "nothing to apply: a head angle under 5° is not a change")
+        req["angle"] = {"yaw": angle.yaw, "pitch": angle.pitch}
+    elif instruction:
+        req["instruction"] = instruction
+        tag = "full"
+    else:
+        raise HTTPException(422, "nothing to apply: full mode needs an instruction or a head "
+                                 "angle")
+    if body.seed is not None:
+        req["seed"] = body.seed
+    if body.denoise is not None:
+        req["denoise"] = body.denoise
+    return req, tag
+
+
+async def _submit_full(body: ImageEditRequest) -> JSONResponse:
+    if not settings.image_edit_url:
+        raise HTTPException(503, "no image-edit service is configured (image_edit_url is empty)")
+    req, tag = _full_request(body)
+    source = await _fetch(body.source_uri)
+    job = full_edit.queue.submit(body.source_uri, source, req, tag)
+    return JSONResponse(status_code=202, content=_job_view(job).model_dump(mode="json"))
+
+
+def _job_view(job: full_edit.Job) -> ImageEditJob:
+    end = job.finished_at or time.time()
+    m = job.meta
+    return ImageEditJob(
+        id=job.id, state=job.state, message=job.message, source_uri=job.source_uri,
+        position=full_edit.queue.position(job), tag=job.tag, request=job.request,
+        error=job.error, elapsed_s=round(end - job.created_at, 1),
+        preview=job.preview if job.state == "done" else None,
+        width=m.get("width"), height=m.get("height"), identity=m.get("identity"),
+        prompt=m.get("prompt"), seed=m.get("seed"), saved=job.saved,
+    )
+
+
+def _job_or_404(job_id: str) -> full_edit.Job:
+    job = full_edit.queue.get(job_id)
+    if job is None:
+        raise HTTPException(404, "no such edit job (unsaved results expire, and do not survive "
+                                 "an API restart)")
+    return job
+
+
+@router.get("/images/edit/jobs/{job_id}", response_model=ImageEditJob,
+            dependencies=[Depends(get_current_user)])
+async def edit_job(job_id: str):
+    return _job_view(_job_or_404(job_id))
+
+
+@router.post("/images/edit/jobs/{job_id}/save", response_model=ImageEditResponse)
+async def save_edit_job(
+    job_id: str,
+    body: ImageEditJobSave,
+    _user=Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Write a finished full-mode result as a NEW image. Saving the same job twice writes two
+    objects (to two places, usually): the held bytes are not consumed."""
+    job = _job_or_404(job_id)
+    if job.state != "done" or job.result is None:
+        raise HTTPException(409, f"the edit is {job.state}, not done"
+                                 + (f": {job.error}" if job.error else ""))
+    source_key = _source_key(job.source_uri)
+    ds = None
+    if body.dataset_id is not None:
+        ds = await db.get(Dataset, body.dataset_id)
+        if not ds:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+        await _refuse_if_locked(db, ds)
+    key = result_key(source_key, job.tag, ds)
+    uri = await asyncio.to_thread(s3.upload_bytes, job.result, key, settings.s3_images_bucket)
+    if ds is not None:
+        ds.images = list(ds.images) + [uri]
+        await db.commit()
+    job.saved.append({"uri": uri, "dataset_id": str(ds.id) if ds is not None else None})
+    ident = (job.meta.get("identity") or {}).get("aura")
+    logger.info("saved full edit %s of %s -> %s (%s, aura %s)%s", job.id, job.source_uri, uri,
+                job.tag, ident, f", dataset {ds.name}" if ds is not None else "")
+    return ImageEditResponse(
+        uri=uri, source_uri=job.source_uri, mode="full",
+        preset=job.tag if job.tag in full_edit.HEAD_ANGLES else None,
+        prompt=job.request.get("instruction"), params={}, expression={},
+        source=job.meta.get("prompt"), dataset_id=ds.id if ds is not None else None,
+        device="cuda", elapsed_ms=round(((job.finished_at or 0) - job.created_at) * 1000),
     )

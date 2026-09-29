@@ -55,10 +55,27 @@ class _FaceChoice(BaseModel):
         return _check_box(v)
 
 
+class HeadAngle(BaseModel):
+    """Degrees, in the IMAGE's directions (app/full_edit.py HEAD_ANGLES): yaw < 0 turns the face
+    toward the left edge of the picture, pitch > 0 raises the chin."""
+    yaw: float = Field(0.0, ge=-90, le=90)
+    pitch: float = Field(0.0, ge=-45, le=45)
+
+
 class ImageEditRequest(_FaceChoice):
     #: The image to edit. Never overwritten: the result is always a new object.
     source_uri: str = Field(..., min_length=1, max_length=1000)
-    mode: Literal["face"] = "face"
+    #: "face": LivePortrait, answered inline with the saved image. "full" (#548): Qwen-Image-Edit
+    #: on the 3090, answered at once with a JOB (202) -- poll GET /images/edit/jobs/{id}, then
+    #: save the result with POST /images/edit/jobs/{id}/save.
+    mode: Literal["face", "full"] = "face"
+    # --- full mode only: an instruction, OR a head angle (a named one or yaw/pitch) ---
+    instruction: Optional[str] = Field(None, max_length=2000)
+    angle: Optional[HeadAngle] = None
+    head_preset: Optional[str] = Field(None, max_length=50)
+    seed: Optional[int] = Field(None, ge=0, le=2**48)
+    #: < 1 starts from the source and only partly redraws it; a head turn needs 1.0.
+    denoise: Optional[float] = Field(None, gt=0, le=1)
     #: Named server-side (GET /images/edit/presets). Either or both; explicit values win.
     preset: Optional[str] = Field(None, max_length=50)
     expression: Optional[FaceExpression] = None
@@ -117,6 +134,44 @@ class ImageEditResponse(BaseModel):
     face_box: Optional[list[float]] = None
 
 
+class ImageEditJob(BaseModel):
+    """A full-mode edit (#548). `state`: queued -> waiting (the 3090 is rendering, training or
+    switching; `message` says which) -> running -> done | failed."""
+    id: str
+    state: str
+    message: str
+    source_uri: str
+    #: Jobs ahead of this one; null once it has started.
+    position: Optional[int] = None
+    tag: str
+    request: dict
+    error: Optional[str] = None
+    elapsed_s: Optional[float] = None
+    #: When done: the result as a capped JPEG data URI, for the "after" pane. Not stored.
+    preview: Optional[str] = None
+    width: Optional[int] = None
+    height: Optional[int] = None
+    #: {"aura": cosine vs the source | null, "reason": why it is null}. AuraFace, as the
+    #: identity harness scores; the console shows it before anything is saved.
+    identity: Optional[dict] = None
+    prompt: Optional[str] = None
+    seed: Optional[int] = None
+    saved: list[dict] = []
+
+
+class ImageEditJobSave(BaseModel):
+    dataset_id: Optional[uuid.UUID] = None
+
+
+class HeadAnglePreset(BaseModel):
+    name: str
+    label: str
+    yaw: float
+    pitch: float
+    #: "face" (LivePortrait, within face_limit_deg) or "full" (Qwen on the 3090).
+    route: str
+
+
 class ImageEditFacesRequest(BaseModel):
     source_uri: str = Field(..., min_length=1, max_length=1000)
 
@@ -157,3 +212,8 @@ class EditPresets(BaseModel):
     mode: str
     presets: list[EditPreset]
     axes: list[EditAxis]
+    #: The head-angle section (#548): presets routed by angle, and where the routing splits.
+    head_angles: list[HeadAnglePreset] = []
+    face_limit_deg: float = 20
+    max_yaw: float = 90
+    max_pitch: float = 45
