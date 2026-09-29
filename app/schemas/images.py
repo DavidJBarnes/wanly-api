@@ -3,6 +3,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from app.schemas.app_settings import CaptionInstruction, CaptionStyle, MotionStyle, MotionTemplate
+
 
 class ImageTagsUpdate(BaseModel):
     tags: Optional[str] = Field(None, max_length=500, description="Comma-separated tags")
@@ -29,9 +31,46 @@ class ImageSceneRequest(BaseModel):
     """
 
     style: Optional[str] = None
-    instruction: Optional[str] = Field(default=None, max_length=2000)
+    instruction: Optional[CaptionInstruction] = None
     motion_style: Optional[str] = None
-    motion_instruction: Optional[str] = Field(default=None, max_length=2000)
+    # A motion TEMPLATE since console#555, validated like the saved setting.
+    motion_instruction: Optional[MotionTemplate] = None
+
+
+class CaptionTryRequest(BaseModel):
+    """Run the caption prompts from the Settings editors on one image, storing nothing.
+
+    console#555. Each field has THREE states, and the console uses all of them:
+
+        omitted / null   use what Settings has SAVED -- the "saved prompt" column
+        ""               use the built-in DEFAULT -- what Reset would give
+        text             use exactly this (unsaved) text -- the "current text" column
+
+    so one request shape answers "what does the saved prompt say" and "what would my edit
+    say" without the console restating any default. Field names match the settings keys the
+    editors write, rather than ImageSceneRequest's, so the page sends the same values it
+    would save.
+    """
+
+    caption_style: Optional[CaptionStyle] = None
+    caption_instruction: Optional[CaptionInstruction] = None
+    motion_style: Optional[MotionStyle] = None
+    motion_template: Optional[MotionTemplate] = None
+
+
+class CaptionTryResponse(BaseModel):
+    caption: str
+    words: int = 0
+    # None when the motion half failed (motion_error says why) or is switched off
+    # (motion_enabled false) -- the same partial-success shape as POST /images/scene.
+    motion: Optional[str] = None
+    motion_words: int = 0
+    motion_error: Optional[str] = None
+    motion_enabled: bool = True
+    # The exact text each half was sent -- the rendered template, not the template -- so the
+    # editor can show what the captioner actually read.
+    caption_instruction_used: str
+    motion_instruction_used: Optional[str] = None
 
 
 class CaptionQueueStatus(BaseModel):

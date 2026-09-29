@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import get_current_user
 from app.database import get_db
 from app.joycaption import (CAPTION_STYLES, DEFAULT_STYLE, MOTION_DEFAULT_STYLE,
-                            MOTION_STYLE_PRESETS)
+                            MOTION_STYLE_PRESETS, MOTION_TEMPLATE)
 from app.models import AppSetting, User
 from app.schemas.app_settings import AppSettingsResponse, AppSettingsUpdate
 
@@ -28,9 +28,33 @@ _DEFAULTS = {
     # The motion half (#326): how the capture should look when the frame is described as a
     # 10-second clip. "handheld" is the house style measured in the prototype.
     "motion_style": MOTION_DEFAULT_STYLE,
-    # Empty means "use the style". Same escape hatch as caption_instruction.
+    # Empty means "use the default template" (joycaption.MOTION_TEMPLATE). A non-empty
+    # value is a whole template of its own (console#555).
     "motion_instruction": "",
 }
+
+
+def _unpin_defaults(updates: dict, current: dict[str, str]) -> dict:
+    """Store "" for an override that is word-for-word the default it would replace.
+
+    The Settings editors are pre-filled with the default text (console#555), so saving the
+    page untouched sends that text back. Stored as-is it would be an override that happens
+    to match today -- and would quietly pin the old wording when a default is next improved,
+    which is the opposite of "defaults unchanged for anyone who doesn't touch them". The
+    console already sends "" in that case; this is the guard for any caller that does not.
+
+    The caption comparison is against the style that will be in force after this update,
+    since that is the preset an empty instruction falls back to.
+    """
+    out = dict(updates)
+    style = out.get("caption_style") or current.get("caption_style") or DEFAULT_STYLE
+    caption = out.get("caption_instruction")
+    if caption and caption.strip() == CAPTION_STYLES.get(style, "").strip():
+        out["caption_instruction"] = ""
+    motion = out.get("motion_instruction")
+    if motion and motion.strip() == MOTION_TEMPLATE.strip():
+        out["motion_instruction"] = ""
+    return out
 
 
 async def _get_all_settings(db: AsyncSession) -> dict[str, str]:
@@ -75,7 +99,7 @@ async def update_settings(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    updates = body.model_dump(exclude_none=True)
+    updates = _unpin_defaults(body.model_dump(exclude_none=True), await _get_all_settings(db))
     now = datetime.now(timezone.utc)
     for key, value in updates.items():
         existing = await db.get(AppSetting, key)

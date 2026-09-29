@@ -17,7 +17,9 @@ from app.joycaption import CaptionError, CaptionerBusy
 from app.enums import TRAINING_TERMINAL
 from app.models import Dataset, Favorite, ImageMeta, Job, Segment, TrainingJob, User
 from app.routes.captions import ScenePair, caption_image_pair
-from app.schemas.images import BulkImageTagsUpdate, CaptionQueueStatus, ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate
+from app.schemas.images import (BulkImageTagsUpdate, CaptionQueueStatus, CaptionTryRequest,
+                                CaptionTryResponse, ImageSceneRequest, ImageSceneResponse,
+                                ImageTagsUpdate)
 from app.tag_filter import like_escape, normalise_tag
 from app.tag_filter import tag_clause as _tag_clause
 from app.s3 import (
@@ -919,6 +921,82 @@ async def describe_image_scene(
 
     return _scene_response(path, meta, motion_error=pair.motion_error)
 
+
+
+@router.post("/images/scene/try", response_model=CaptionTryResponse,
+             dependencies=[Depends(get_current_user)])
+async def try_caption_prompts(
+    path: str = Query(...),
+    body: CaptionTryRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Run the caption and motion prompts from the Settings editors on one image (console#555).
+
+    POST /images/scene WITHOUT THE WRITE. The Settings page calls it twice -- once with the
+    unsaved editor text, once with nothing (the saved prompts) -- and shows the two side by
+    side, so a prompt can be judged before it is saved. Storing either result would put a
+    caption from a prompt nobody has adopted onto the image's record, where the next job
+    would pick it up as the description.
+
+    Not POST /captions/describe, although that is also a no-store preview: it produces the
+    static half only, and the motion prompt -- grounded on the static half -- is half of
+    what is being tried. This is the same two-call pair /images/scene makes, through the
+    same function.
+
+    THROUGH THE CAPTION QUEUE, same as /images/scene. A try is two describes on the one-slot
+    captioner, and a person comparing prompts clicks "Try" repeatedly; outside the queue
+    those calls would race the bulk-tag and dataset captioning that is already waiting, and
+    the back of that line would start timing out (app/caption_queue.py). Same refusal rules
+    too: a box that is rendering answers 503 with its name.
+    """
+    from app.caption_queue import queue as caption_queue
+    from app.joycaption import instruction_for
+    from app.routes.app_settings import _get_all_settings
+
+    _require_known_bucket(path)
+    body = body or CaptionTryRequest()
+
+    # Resolved HERE rather than left to caption_image_pair, because "" means something
+    # different in each place: to this request it is "the default", while caption_image_pair
+    # would send an empty instruction to the captioner.
+    cfg = await _get_all_settings(db)
+    style = body.caption_style or cfg.get("caption_style", "")
+    custom = (body.caption_instruction if body.caption_instruction is not None
+              else cfg.get("caption_instruction", ""))
+    instruction = instruction_for(style, custom)
+
+    async with caption_queue.turn(path):
+        try:
+            image = await asyncio.to_thread(download_bytes, path)
+        except Exception as e:
+            raise HTTPException(status_code=404, detail=f"could not read {path}: {e}") from e
+        try:
+            # motion_template None falls through to the saved one and "" to the default
+            # template -- caption_image_pair already reads it that way.
+            pair = await caption_image_pair(
+                db, image, instruction=instruction,
+                motion_style=body.motion_style, motion_instruction=body.motion_template)
+        except CaptionError as e:
+            logger.warning("prompt try failed for %s: %s", path, e)
+            raise HTTPException(status_code=503, detail=str(e)) from e
+
+    if not pair.scene.strip():
+        raise HTTPException(status_code=503,
+                            detail="the captioner returned nothing for this image")
+    logger.info("prompt try on %s: caption %d words, motion %s", path,
+                len(pair.scene.split()),
+                f"{len(pair.motion.split())} words" if pair.motion else
+                (f"failed ({pair.motion_error})" if pair.motion_error else "off"))
+    return CaptionTryResponse(
+        caption=pair.scene,
+        words=len(pair.scene.split()),
+        motion=pair.motion,
+        motion_words=len(pair.motion.split()) if pair.motion else 0,
+        motion_error=pair.motion_error,
+        motion_enabled=settings.motion_caption_enabled,
+        caption_instruction_used=pair.scene_instruction,
+        motion_instruction_used=pair.motion_instruction,
+    )
 
 def search_pattern(q: str) -> str:
     """The LIKE pattern for a user's query, with their wildcards neutralised.
