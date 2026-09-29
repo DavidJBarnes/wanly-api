@@ -594,6 +594,11 @@ class LtxCharacter(Base):
     seeded characters share 0.8/1.5.
     """
     __tablename__ = "ltx_characters"
+    __table_args__ = (
+        # At most one default (migration 104): a partial unique over the TRUE rows only.
+        Index("uq_ltx_characters_one_default", "is_default",
+              unique=True, postgresql_where=text("is_default")),
+    )
 
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = mapped_column(String(64), nullable=False, unique=True)
@@ -634,6 +639,10 @@ class LtxCharacter(Base):
     # The base model this LoRA was TRAINED against, as the trainer was told it. A LoRA
     # trained on dev and rendered on 10Eros is the mismatch that forced stage-2 to 1.5.
     base_checkpoint = mapped_column(Text, nullable=True)
+    # THE character the New Job and Next Segment modals preselect when nothing else is
+    # picked (wanly-console#543). At most one row is true; set through
+    # POST /ltx/characters/{id}/default, never PATCH, so the old one is cleared with it.
+    is_default = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     # There is NO cascade to recipes: `ltx_recipes` has no character_id and no relationship
@@ -680,6 +689,9 @@ class LtxRecipe(Base):
     __tablename__ = "ltx_recipes"
     __table_args__ = (
         UniqueConstraint("book_id", "name", name="uq_ltx_recipe_book_name"),
+        # At most one default pose (migration 104), as for characters.
+        Index("uq_ltx_recipes_one_default", "is_default",
+              unique=True, postgresql_where=text("is_default")),
     )
 
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -716,6 +728,8 @@ class LtxRecipe(Base):
     book_id = mapped_column(UUID(as_uuid=True), ForeignKey("ltx_books.id", ondelete="RESTRICT"),
                             nullable=False, index=True)
     book = relationship("LtxBook", back_populates="recipes", lazy="selectin")
+    # The pose the modals preselect (wanly-console#543); see LtxCharacter.is_default.
+    is_default = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), nullable=True)
 

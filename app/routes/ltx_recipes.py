@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -86,6 +86,49 @@ async def _character(db: AsyncSession, character_id: uuid.UUID) -> LtxCharacter:
     if c is None:
         raise HTTPException(status_code=404, detail="Character not found")
     return c
+
+
+async def _recipe(db: AsyncSession, recipe_id: uuid.UUID) -> LtxRecipe:
+    r = await db.get(LtxRecipe, recipe_id)
+    if r is None:
+        raise HTTPException(status_code=404, detail="Recipe not found")
+    return r
+
+
+async def _make_default(db: AsyncSession, row: LtxCharacter | LtxRecipe, what: str):
+    """Make `row` THE default of its table, clearing whichever row was, in one transaction.
+
+    Clear first, then set, as two statements in one commit: the partial unique index
+    (migration 104) is checked per statement, so setting first would collide with the old
+    default. Nothing in between is visible to anyone else, so there is never a moment with
+    two defaults and no moment with none that a reader could observe.
+
+    Two of these racing is what the index is for: the loser's set collides with the
+    winner's row and gets a 409 rather than a second default.
+    """
+    model = type(row)
+    await db.execute(
+        update(model).where(model.is_default, model.id != row.id).values(is_default=False)
+    )
+    await db.execute(update(model).where(model.id == row.id).values(is_default=True))
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(status_code=409,
+                            detail=f"The default {what} changed while this was being set; "
+                                   f"try again")
+    await db.refresh(row)
+    return row
+
+
+async def _clear_default(db: AsyncSession, row: LtxCharacter | LtxRecipe):
+    """Un-default `row`. Idempotent: clearing a row that is not the default is a no-op, so
+    the console's toggle never has to know which state the server thinks it is in."""
+    row.is_default = False
+    await db.commit()
+    await db.refresh(row)
+    return row
 
 
 # The placeholder a pose carries and a character's trigger fills.
@@ -199,6 +242,7 @@ async def get_recipe_book(
                 "checkpoint": r.checkpoint or LTX_STACK["checkpoint"],
                 "book_id": str(r.book_id),
                 "book_name": r.book_name,
+                "is_default": bool(r.is_default),
             }
             for r in poses
         ],
@@ -218,6 +262,7 @@ async def get_recipe_book(
                 "kind": c.kind or "solo",
                 "members": c.members,
                 "base_checkpoint": c.base_checkpoint,
+                "is_default": bool(c.is_default),
             }
             for c in chars
         ],
@@ -581,6 +626,32 @@ async def delete_character(
     await db.commit()
 
 
+@router.post("/ltx/characters/{character_id}/default", response_model=LtxCharacterResponse)
+async def set_default_character(
+    character_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Make this THE default character (wanly-console#543), clearing the previous one.
+
+    A route of its own rather than `is_default` on PATCH: setting it is never just this
+    row's business, it also un-sets another, and a PATCH that silently edits a second row
+    is the kind of side effect nobody reading the request would expect.
+    """
+    return await _make_default(db, await _character(db, character_id), "character")
+
+
+@router.delete("/ltx/characters/{character_id}/default", response_model=LtxCharacterResponse)
+async def clear_default_character(
+    character_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Stop this character being the default. No default at all is a valid state: the
+    modals then open with nothing preselected, as they did before #543."""
+    return await _clear_default(db, await _character(db, character_id))
+
+
 @router.post("/ltx/recipes", response_model=LtxRecipeResponse, status_code=201)
 async def create_recipe(
     body: LtxRecipeCreate,
@@ -623,9 +694,7 @@ async def update_recipe(
     Editing the prompt is editing the recipe. There is no separate provenance or quality
     state to keep in sync — a pose is just its prompt and its settings.
     """
-    r = await db.get(LtxRecipe, recipe_id)
-    if r is None:
-        raise HTTPException(status_code=404, detail="Recipe not found")
+    r = await _recipe(db, recipe_id)
     data = body.model_dump(exclude_unset=True)
     if data.get("book_id") is not None:
         await _book(db, data["book_id"])
@@ -649,8 +718,25 @@ async def delete_recipe(
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    r = await db.get(LtxRecipe, recipe_id)
-    if r is None:
-        raise HTTPException(status_code=404, detail="Recipe not found")
-    await db.delete(r)
+    await db.delete(await _recipe(db, recipe_id))
     await db.commit()
+
+
+@router.post("/ltx/recipes/{recipe_id}/default", response_model=LtxRecipeResponse)
+async def set_default_recipe(
+    recipe_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Make this THE default pose (wanly-console#543). See set_default_character."""
+    return await _make_default(db, await _recipe(db, recipe_id), "pose")
+
+
+@router.delete("/ltx/recipes/{recipe_id}/default", response_model=LtxRecipeResponse)
+async def clear_default_recipe(
+    recipe_id: uuid.UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Stop this pose being the default. See clear_default_character."""
+    return await _clear_default(db, await _recipe(db, recipe_id))

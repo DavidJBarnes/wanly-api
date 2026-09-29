@@ -58,6 +58,8 @@ class LtxCharacterResponse(BaseModel):
     members: Optional[List[str]] = None
     base_checkpoint: Optional[str] = None
     trained_from: Optional[list] = None
+    #: Preselected by the console's modals (wanly-console#543). At most one is true.
+    is_default: bool = False
 
 
 class LtxCharacterUpdate(BaseModel):
@@ -183,5 +185,7 @@ class LtxRecipeResponse(BaseModel):
     checkpoint: Optional[str]
     book_id: uuid.UUID
     book_name: Optional[str] = None
+    #: Preselected by the console's modals (wanly-console#543). At most one is true.
+    is_default: bool = False
     created_at: datetime
     updated_at: Optional[datetime]
