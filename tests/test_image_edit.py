@@ -9,6 +9,8 @@ What these pin down:
   * a preview stores nothing
   * a described change (#550) is forwarded as text, answered with the resolved numbers and the
     understood terms, and "no known terms" is a 422 that says so rather than "refused this image"
+  * the face picker (#553): /images/edit/faces lists the service's boxes in the source's own
+    pixels, and a box from it reaches the service unchanged on preview and save
 """
 import base64
 import uuid
@@ -302,9 +304,11 @@ def wired(monkeypatch):
     calls = []
     state = {"error": None, "resolved": None, "prompts": []}
 
-    async def fake_edit(image_bytes, params, prompt=None, preview=False):
+    async def fake_edit(image_bytes, params, prompt=None, preview=False, face_index=None,
+                        face_box=None):
         calls.append((image_bytes, params, preview))
         state["prompts"].append(prompt)
+        state.setdefault("faces_sent", []).append((face_index, face_box))
         if state["error"]:
             raise state["error"]
         out = {"image": b"edited png", "format": "jpeg" if preview else "png",
@@ -507,3 +511,177 @@ class TestOverHTTP:
             r = await c.get("/images/edit/presets")
             p = await c.post("/images/edit", json={"source_uri": SRC, "preset": "smile"})
         assert r.status_code in (401, 403) and p.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------- the face picker (#553)
+
+#: What the service's /faces says about a 1248x1824 two-person frame.
+FACES = {"width": 1248, "height": 1824, "default_index": 1, "faces": [
+    {"index": 0, "box": [101.5, 400.0, 351.5, 700.0], "width": 250.0},
+    {"index": 1, "box": [700.0, 380.0, 940.0, 670.0], "width": 240.0},
+]}
+
+
+@pytest.mark.asyncio
+class TestTheFacesClient:
+    @pytest.fixture(autouse=True)
+    def _url(self, monkeypatch):
+        monkeypatch.setattr(settings, "face_edit_url", "http://edit.test:8085")
+
+    async def test_it_asks_the_services_faces(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(face_edit, "httpx",
+                            _Httpx(_client(resp=_Resp(200, FACES), seen=seen)))
+        out = await face_edit.faces(b"src")
+        assert seen[0][0] == "http://edit.test:8085/faces"
+        assert base64.b64decode(seen[0][1]["image"]) == b"src"
+        assert out == FACES
+
+    async def test_a_service_too_old_for_faces_says_so(self, monkeypatch):
+        """The 2070 not yet re-pinned: FastAPI's 404 for an unknown route."""
+        monkeypatch.setattr(face_edit, "httpx",
+                            _Httpx(_client(resp=_Resp(404, {"detail": "Not Found"}))))
+        with pytest.raises(face_edit.FaceEditError) as e:
+            await face_edit.faces(b"src")
+        assert e.value.status_code == 502 and "too old" in e.value.detail
+
+    async def test_a_nonsense_answer_is_502(self, monkeypatch):
+        monkeypatch.setattr(face_edit, "httpx", _Httpx(_client(resp=_Resp(200, {"x": 1}))))
+        with pytest.raises(face_edit.FaceEditError) as e:
+            await face_edit.faces(b"src")
+        assert e.value.status_code == 502
+
+    async def test_busy_is_503(self, monkeypatch):
+        monkeypatch.setattr(face_edit, "httpx",
+                            _Httpx(_client(resp=_Resp(503, {"detail": "face-edit is busy"}))))
+        with pytest.raises(face_edit.FaceEditError) as e:
+            await face_edit.faces(b"src")
+        assert e.value.status_code == 503
+
+    async def test_an_edit_sends_the_choice_only_when_there_is_one(self, monkeypatch):
+        seen = []
+        monkeypatch.setattr(face_edit, "httpx",
+                            _Httpx(_client(resp=_Resp(200, _ok_body()), seen=seen)))
+        await face_edit.edit(b"src", {"smile": 0.5})
+        monkeypatch.setattr(face_edit, "httpx",     # a fresh body: edit() decodes in place
+                            _Httpx(_client(resp=_Resp(200, _ok_body()), seen=seen)))
+        await face_edit.edit(b"src", {"smile": 0.5}, face_index=0,
+                             face_box=[101.5, 400.0, 351.5, 700.0])
+        assert "face_index" not in seen[0][1] and "face_box" not in seen[0][1]
+        assert seen[1][1]["face_index"] == 0
+        assert seen[1][1]["face_box"] == [101.5, 400.0, 351.5, 700.0]
+
+    @pytest.mark.parametrize("detail", [
+        "face_index 2 is out of range: 2 faces detected (0-1)",
+        "face 0 cannot be edited on its own: it is too close to another face",
+        "face_box [1, 2, 3, 4] matches none of the 2 faces detected in this image",
+    ])
+    async def test_the_services_face_refusals_are_422(self, monkeypatch, detail):
+        monkeypatch.setattr(face_edit, "httpx",
+                            _Httpx(_client(resp=_Resp(422, {"detail": detail}))))
+        with pytest.raises(face_edit.FaceEditError) as e:
+            await face_edit.edit(b"src", {"smile": 0.5}, face_index=2)
+        assert e.value.status_code == 422 and detail in e.value.detail
+
+
+@pytest.fixture
+def faces_wired(wired, monkeypatch):
+    from app.routes import image_edit as mod
+    state = wired[2]
+    state["faces"] = FACES
+    seen = []
+
+    async def fake_faces(image_bytes):
+        seen.append(image_bytes)
+        if isinstance(state["faces"], Exception):
+            raise state["faces"]
+        return state["faces"]
+
+    monkeypatch.setattr(mod.face_edit, "faces", fake_faces)
+    return (*wired, seen)
+
+
+@pytest.mark.asyncio
+class TestTheFacePickerOverHTTP:
+    async def test_faces_are_the_services_boxes_in_source_pixels(self, db, faces_wired):
+        """Nothing is resized on the way to the service, so its boxes ARE source pixels: the
+        mapping is the identity, and must stay one (a downscale here would need its inverse on
+        every box, both ways)."""
+        s3, _, _, seen = faces_wired
+        r = await _http(db, "post", "/images/edit/faces", json={"source_uri": SRC})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert seen == [b"source bytes"], "the source's bytes, unresized"
+        assert (d["width"], d["height"]) == (1248, 1824) and d["default_index"] == 1
+        assert [f["box"] for f in d["faces"]] == [f["box"] for f in FACES["faces"]]
+        assert s3.downloaded == [SRC] and s3.uploaded == []
+
+    async def test_a_box_from_faces_reaches_the_service_unchanged(self, db, faces_wired):
+        """The round trip the console makes: /faces, then preview and save with that box."""
+        s3, calls, state, _ = faces_wired
+        box = (await _http(db, "post", "/images/edit/faces",
+                           json={"source_uri": SRC})).json()["faces"][0]["box"]
+        state["resolved"] = {"face_index": 0, "face_box": box}
+        p = await _http(db, "post", "/images/edit/preview",
+                        json={"source_uri": SRC, "preset": "smile", "face_box": box})
+        s = await _http(db, "post", "/images/edit",
+                        json={"source_uri": SRC, "preset": "smile", "face_box": box})
+        assert p.status_code == 200 and s.status_code == 200, (p.text, s.text)
+        assert state["faces_sent"] == [(None, box), (None, box)]
+        assert p.json()["face_box"] == box and p.json()["face_index"] == 0
+        assert s.json()["face_box"] == box and s.json()["face_index"] == 0
+        assert len(s3.uploaded) == 1
+
+    async def test_an_index_is_forwarded_too(self, db, faces_wired):
+        _, _, state, _ = faces_wired
+        r = await _http(db, "post", "/images/edit/preview",
+                        json={"source_uri": SRC, "preset": "smile", "face_index": 1})
+        assert r.status_code == 200 and state["faces_sent"] == [(1, None)]
+
+    async def test_no_choice_sends_none_and_echoes_none(self, db, faces_wired):
+        _, _, state, _ = faces_wired
+        r = await _http(db, "post", "/images/edit/preview",
+                        json={"source_uri": SRC, "preset": "smile"})
+        assert state["faces_sent"] == [(None, None)]
+        assert r.json()["face_index"] is None and r.json()["face_box"] is None
+
+    async def test_a_face_refusal_is_422_and_writes_nothing(self, db, faces_wired):
+        s3, _, state, _ = faces_wired
+        state["error"] = face_edit.FaceEditError(
+            422, "face-edit refused this image: face_index 5 is out of range: 2 faces detected")
+        r = await _http(db, "post", "/images/edit",
+                        json={"source_uri": SRC, "preset": "smile", "face_index": 5})
+        assert r.status_code == 422 and "out of range" in r.json()["detail"]
+        assert s3.uploaded == []
+
+    async def test_faces_passes_service_errors_on(self, db, faces_wired):
+        _, _, state, _ = faces_wired
+        state["faces"] = face_edit.FaceEditError(502, "the face-edit service is too old")
+        r = await _http(db, "post", "/images/edit/faces", json={"source_uri": SRC})
+        assert r.status_code == 502 and "too old" in r.json()["detail"]
+
+    async def test_faces_only_reads_the_images_bucket(self, db, faces_wired):
+        s3, _, _, seen = faces_wired
+        r = await _http(db, "post", "/images/edit/faces",
+                        json={"source_uri": "s3://wanly-jobs/x.png"})
+        assert r.status_code == 400 and seen == [] and s3.downloaded == []
+
+    @pytest.mark.parametrize("extra", [
+        {"face_index": -1},
+        {"face_box": [10, 10, 5, 50]},          # x2 < x1
+        {"face_box": [10, 10, 50]},             # three numbers
+        {"face_box": [-1, 10, 50, 60]},
+    ])
+    async def test_a_malformed_choice_is_422_before_anything_runs(self, db, faces_wired, extra):
+        s3, calls, _, _ = faces_wired
+        for path in ("/images/edit", "/images/edit/preview"):
+            r = await _http(db, "post", path, json={"source_uri": SRC, "preset": "smile", **extra})
+            assert r.status_code == 422, (path, r.text)
+        assert calls == [] and s3.downloaded == []
+
+    async def test_faces_needs_a_login(self, db, faces_wired):
+        from httpx import ASGITransport, AsyncClient
+        from app.main import app
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
+            r = await c.post("/images/edit/faces", json={"source_uri": SRC})
+        assert r.status_code in (401, 403)

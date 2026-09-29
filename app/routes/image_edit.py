@@ -1,6 +1,7 @@
 """The Image Edit tool: micro-adjustments to an existing image (wanly-console#547).
 
     GET  /images/edit/presets   the preset buttons and slider ranges the editor draws
+    POST /images/edit/faces     the faces an edit can be pointed at, when there is more than one
     POST /images/edit/preview   run an edit, return a small JPEG, store NOTHING
     POST /images/edit           run it again and save the result as a NEW image
 
@@ -10,6 +11,11 @@ WHAT TO APPLY is a preset, slider values, a described change (`prompt`, #550), o
 prompt is read by the service, not here, so both calls answer with what it resolved to
 (`expression`, all twelve axes) and which terms it understood (`source`, `matched_terms`): the
 editor moves its sliders there, and the save records numbers rather than a sentence.
+
+WHICH FACE (#553): the node edits the face nearest the horizontal centre unless the request
+names another with `face_box` (from /images/edit/faces) or `face_index`. Both are passed through
+untouched, in the source's own pixels -- the service gets the source bytes unresized -- and
+the service answers with the face it edited.
 
 PREVIEW AND SAVE ARE TWO CALLS, AND THE SAVE RE-RUNS THE EDIT. The dialog previews on every
 slider release, and if each of those wrote to the bucket the repo would fill with the drafts of
@@ -45,8 +51,8 @@ from app.database import get_db
 from app.models import Dataset
 from app.routes.datasets import DATASETS_PREFIX, _prefix, _refuse_if_locked
 from app.schemas.image_edit import (
-    EditAxis, EditPreset, EditPresets, ImageEditPreview, ImageEditPreviewRequest,
-    ImageEditRequest, ImageEditResponse,
+    EditAxis, EditPreset, EditPresets, ImageEditFaces, ImageEditFacesRequest, ImageEditPreview,
+    ImageEditPreviewRequest, ImageEditRequest, ImageEditResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,9 +92,10 @@ def _params(body) -> dict[str, float]:
 
 
 async def _run(source: bytes, params: dict[str, float], prompt: str | None,
-               preview: bool) -> dict:
+               preview: bool, body) -> dict:
     try:
-        return await face_edit.edit(source, params, prompt=prompt, preview=preview)
+        return await face_edit.edit(source, params, prompt=prompt, preview=preview,
+                                    face_index=body.face_index, face_box=body.face_box)
     except face_edit.FaceEditError as e:
         raise HTTPException(status_code=e.status_code, detail=e.detail) from e
 
@@ -136,6 +143,23 @@ async def edit_presets():
     )
 
 
+@router.post("/images/edit/faces", response_model=ImageEditFaces,
+             dependencies=[Depends(get_current_user)])
+async def edit_faces(body: ImageEditFacesRequest):
+    """The faces the editor can point an edit at, left to right, and the one it edits when
+    told nothing. The console draws these over the "before" image when there are two or more;
+    with one or none it draws nothing, and the editor is unchanged."""
+    source = await _fetch(body.source_uri)
+    try:
+        out = await face_edit.faces(source)
+    except face_edit.FaceEditError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+    return ImageEditFaces(
+        width=out.get("width") or 0, height=out.get("height") or 0,
+        faces=out["faces"], default_index=out.get("default_index"),
+    )
+
+
 @router.post("/images/edit/preview", response_model=ImageEditPreview,
              dependencies=[Depends(get_current_user)])
 async def preview_edit(body: ImageEditPreviewRequest):
@@ -143,7 +167,7 @@ async def preview_edit(body: ImageEditPreviewRequest):
     params = _params(body)
     source = await _fetch(body.source_uri)
     t0 = time.monotonic()
-    out = await _run(source, params, _prompt(body), preview=True)
+    out = await _run(source, params, _prompt(body), preview=True, body=body)
     fmt = out.get("format") or "jpeg"
     applied, full = _applied(params, out)
     return ImageEditPreview(
@@ -153,6 +177,7 @@ async def preview_edit(body: ImageEditPreviewRequest):
         width=out.get("width") or 0, height=out.get("height") or 0,
         device=out.get("device"), device_reason=out.get("device_reason"),
         elapsed_ms=round((time.monotonic() - t0) * 1000),
+        face_index=out.get("face_index"), face_box=out.get("face_box"),
     )
 
 
@@ -178,7 +203,7 @@ async def save_edit(
     source = await _fetch(body.source_uri)
     t0 = time.monotonic()
     prompt = _prompt(body)
-    out = await _run(source, params, prompt, preview=False)
+    out = await _run(source, params, prompt, preview=False, body=body)
     if (out.get("format") or "png") != "png":
         # A saved edit is lossless by contract; a service that answered otherwise is wrong,
         # and saving its JPEG under a .png name would be worse.
@@ -201,8 +226,10 @@ async def save_edit(
         ds.images = list(ds.images) + [uri]
         await db.commit()
 
-    logger.info("edited %s -> %s (%s%s%s) on %s", body.source_uri, uri, tag,
+    face = out.get("face_index")
+    logger.info("edited %s -> %s (%s%s%s%s) on %s", body.source_uri, uri, tag,
                 f" {prompt!r} -> {applied}" if prompt else "",
+                f", face {face}" if face is not None else "",
                 f", dataset {ds.name}" if ds is not None else "", out.get("device"))
     return ImageEditResponse(
         uri=uri, source_uri=body.source_uri, mode=body.mode, preset=body.preset, prompt=prompt,
@@ -210,4 +237,5 @@ async def save_edit(
         matched_terms=face_edit.matched_terms(src),
         dataset_id=ds.id if ds is not None else None, device=out.get("device"),
         elapsed_ms=round((time.monotonic() - t0) * 1000),
+        face_index=out.get("face_index"), face_box=out.get("face_box"),
     )
