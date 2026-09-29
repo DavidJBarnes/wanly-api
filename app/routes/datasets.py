@@ -13,6 +13,7 @@ import asyncio
 import base64
 import logging
 import uuid
+from datetime import datetime, timezone
 
 import random
 
@@ -35,7 +36,7 @@ from app.regularization import (
 )
 from app.schemas.datasets import (
     DatasetCaptionEdit, DatasetCaptionStatus, DatasetCaptionsRun, DatasetClone, DatasetCreate,
-    DatasetRegularize, DatasetRegularizeStatus, DatasetResponse, DatasetScore, DatasetScores,
+    DatasetLock, DatasetRegularize, DatasetRegularizeStatus, DatasetResponse, DatasetScore, DatasetScores,
     DatasetTrainedBy, DatasetUpdate,
 )
 from app.seeds import new_seed
@@ -180,11 +181,16 @@ async def _trained_by(db: AsyncSession,
     return out
 
 
+def _is_locked(ds: Dataset, trained_by: list[DatasetTrainedBy] | None) -> bool:
+    """Trained on (#356), or locked by hand (#358). Either one refuses the same mutations."""
+    return bool(trained_by) or ds.locked_at is not None
+
+
 def _respond(ds: Dataset, trained_by: list[DatasetTrainedBy] | None) -> DatasetResponse:
-    """The wire shape of a set, with its lock filled in (#356)."""
+    """The wire shape of a set, with its lock filled in (#356, #358)."""
     out = DatasetResponse.model_validate(ds)
     out.trained_by = list(trained_by or [])
-    out.locked = bool(out.trained_by)
+    out.locked = _is_locked(ds, out.trained_by)
     return out
 
 
@@ -192,9 +198,16 @@ async def _respond_one(db: AsyncSession, ds: Dataset) -> DatasetResponse:
     return _respond(ds, (await _trained_by(db, ds.id)).get(str(ds.id)))
 
 
-def _lock_detail(ds: Dataset, trained_by: list[DatasetTrainedBy]) -> str:
-    runs = ", ".join(f"{r.character} v{r.version}" for r in trained_by)
-    return f"{ds.name!r} trained {runs} and is locked — clone it to make changes"
+def _lock_detail(ds: Dataset, trained_by: list[DatasetTrainedBy] | None) -> str:
+    """Why the set is locked, naming the run(s), the hand lock and its reason -- or both."""
+    by_hand = "locked by hand" + (f" ({ds.locked_reason})" if ds.locked_reason else "")
+    if not trained_by:
+        why = f"is {by_hand}"
+    else:
+        runs = ", ".join(f"{r.character} v{r.version}" for r in trained_by)
+        why = f"trained {runs} and is locked" + (
+            f", and was also {by_hand}" if ds.locked_at is not None else "")
+    return f"{ds.name!r} {why} — clone it to make changes"
 
 
 async def _refuse_if_locked(db: AsyncSession, ds: Dataset) -> None:
@@ -204,9 +217,11 @@ async def _refuse_if_locked(db: AsyncSession, ds: Dataset) -> None:
     Anything that changes what a run would train on -- the images, their captions, whose set
     it is, or the set's existence -- goes through here. Renaming, notes, tags, the anchor and
     scoring do not change the training data, and stay open.
+
+    A set locked by hand (#358) is refused exactly the same, whether or not it trained.
     """
     trained_by = (await _trained_by(db, ds.id)).get(str(ds.id))
-    if trained_by:
+    if _is_locked(ds, trained_by):
         raise HTTPException(status_code=409, detail=_lock_detail(ds, trained_by))
 
 
@@ -265,7 +280,8 @@ async def update_dataset(
     # removes and reorders, so a changed list is refused -- before any field is touched, so a
     # PATCH that also renames is refused whole rather than half-applied. The SAME list is not
     # a change: a form that sends everything back with a new name must still work.
-    if trained_by and body.images is not None and list(body.images) != list(ds.images):
+    if (_is_locked(ds, trained_by) and body.images is not None
+            and list(body.images) != list(ds.images)):
         raise HTTPException(status_code=409, detail=_lock_detail(ds, trained_by))
     if body.name is not None and body.name != ds.name:
         dupe = (await db.execute(
@@ -311,7 +327,7 @@ async def update_dataset(
             # longer matches the set. Compared AFTER validation, so re-sending the owner as
             # the registry spells it (or in another case) is not a change. Nothing has been
             # committed yet, so the refusal leaves the row as it was.
-            if trained_by:
+            if _is_locked(ds, trained_by):
                 raise HTTPException(status_code=409, detail=_lock_detail(ds, trained_by))
             ds.kind, ds.character, ds.reg_class = kind, character, reg_class
     await db.commit()
@@ -453,8 +469,42 @@ async def clone_dataset(
     await db.refresh(ds)
     logger.info("dataset %s: cloned from %s (%d images, shared)", ds.name, src.name,
                 len(ds.images))
-    # A new id: no run can have recorded it, so a clone is always unlocked.
+    # A new id: no run can have recorded it, so a clone is always unlocked. Nor is a hand
+    # lock copied (#358): the lock is on the source, and the clone exists to be changed.
     return _respond(ds, None)
+
+
+@router.post("/datasets/{dataset_id}/lock", response_model=DatasetResponse)
+async def lock_dataset(
+    dataset_id: uuid.UUID,
+    body: DatasetLock | None = None,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Lock a set by hand, trained or not (#358). One-way: clone it to make changes.
+
+    The training lock (#356) only reaches sets a run used, and some need freezing without
+    one -- every existing set, as of #358. This sets `locked_at` and `locked_reason`, and from
+    then on every #356 refusal applies to it.
+
+    There is NO UNLOCK, on purpose: a lock that one click lifts protects nothing. A set
+    already locked by hand comes back unchanged -- the first lock's time and reason stand,
+    so a double-click cannot overwrite them. A set locked only by training can still be
+    locked by hand; that is what keeps it locked if the run is later failed or cancelled.
+    """
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    if ds.locked_at is not None:
+        logger.info("dataset %s: already locked by hand at %s; unchanged",
+                    ds.name, ds.locked_at.isoformat())
+        return await _respond_one(db, ds)
+    ds.locked_at = datetime.now(timezone.utc)
+    ds.locked_reason = body.reason if body else None
+    await db.commit()
+    await db.refresh(ds)
+    logger.info("dataset %s: locked by hand (%s)", ds.name, ds.locked_reason or "no reason given")
+    return await _respond_one(db, ds)
 
 
 @router.post("/datasets/{dataset_id}/crop", response_model=DatasetResponse)
@@ -764,8 +814,9 @@ async def caption_dataset_images(db: AsyncSession, ds_id: uuid.UUID, overwrite: 
         # A run can be queued on this set while the loop is still going -- the Train button
         # does not wait for captioning. From then on the set is locked (#356), and a caption
         # written after the run snapshotted its captions is one the LoRA never trained on.
+        # The same holds for a lock by hand (#358): the refresh above read locked_at.
         trained_by = (await _trained_by(db, ds.id)).get(str(ds.id))
-        if trained_by:
+        if _is_locked(ds, trained_by):
             logger.warning("dataset %s: captioning stopped at %s: %s",
                            ds.name, uri, _lock_detail(ds, trained_by))
             (_CAPTION_RUNS.setdefault(ds_id, {}))["error"] = _lock_detail(ds, trained_by)
@@ -927,11 +978,14 @@ async def _collect_regularization(db: AsyncSession, ds: Dataset) -> DatasetRegul
     # A LOCKED POOL IS NOT GROWN (#356). Renders queued before the pool trained a LoRA can
     # finish after it; collecting them would add images to a set that is part of that LoRA's
     # record. They are left uncollected and counted as still running -- not failed, because
-    # if the run fails or is cancelled the pool unlocks and the next poll collects them.
-    locked = (await _trained_by(db, ds.id)).get(str(ds.id))
+    # if the run fails or is cancelled the pool unlocks and the next poll collects them. A
+    # pool locked by hand (#358) is not grown either; that lock never lifts, so its late
+    # renders stay uncollected -- clone the pool to keep them.
+    trained_by = (await _trained_by(db, ds.id)).get(str(ds.id))
+    locked = _is_locked(ds, trained_by)
     if locked:
         logger.info("dataset %s: not collecting regularization frames: %s",
-                    ds.name, _lock_detail(ds, locked))
+                    ds.name, _lock_detail(ds, trained_by))
     requested = len(jobs)
     pending = rendering = failed = collected = collected_now = 0
     for job in jobs:
