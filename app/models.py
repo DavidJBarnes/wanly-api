@@ -475,9 +475,13 @@ class Dataset(Base):
     scores = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
     #: LOCKED BY HAND (#358, migration 104). The training lock (#356) is derived from
     #: training_jobs and so only covers sets that trained; these say a person locked it anyway.
-    #: One-way: set by POST /datasets/{id}/lock, cleared by nothing, not copied by a clone.
+    #: Set by POST /datasets/{id}/lock, cleared only by /unlock, not copied by a clone.
     locked_at = mapped_column(DateTime(timezone=True), nullable=True)
     locked_reason = mapped_column(Text, nullable=True)
+    #: ONE-TIME UNLOCK (#363, migration 106). When set, the training lock only counts runs
+    #: created AFTER it, so the runs that already trained stop locking the set and the next
+    #: one locks it again. Set by POST /datasets/{id}/unlock, not copied by a clone.
+    unlocked_at = mapped_column(DateTime(timezone=True), nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
                                onupdate=lambda: datetime.now(timezone.utc))

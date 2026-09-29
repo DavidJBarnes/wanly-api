@@ -145,6 +145,9 @@ async def _trained_by(db: AsyncSession,
                       ds_id: uuid.UUID | None = None) -> dict[str, list[DatasetTrainedBy]]:
     """{dataset id: every non-failed, non-cancelled run that trained on it}, oldest first.
 
+    EVERY run, before any unlock (#363): nothing reads this raw to decide a lock. Go through
+    `_since_unlock` / `_locking_runs`, which drop the runs a set was unlocked from.
+
     LOCKED ONCE IT HAS TRAINED (#356). A set edited after its LoRA trained leaves the LoRA's
     record pointing at a dataset that no longer holds what it learned from: the job
     snapshots its images and captions, but the dataset page, /retry and anyone comparing
@@ -164,16 +167,16 @@ async def _trained_by(db: AsyncSession,
     others = func.jsonb_path_query_array(
         TrainingJob.identities, cast("$[*].dataset.id", JSONPATH), type_=JSONB)
     q = (select(TrainingJob.id, TrainingJob.character, TrainingJob.version, TrainingJob.status,
-                group0, others)
+                TrainingJob.created_at, group0, others)
          .where(TrainingJob.status.not_in(list(_UNLOCKING)))
          .order_by(TrainingJob.created_at.asc(), TrainingJob.id.asc()))
     if ds_id is not None:
         q = q.where(or_(group0 == str(ds_id),
                         TrainingJob.identities.contains([{"dataset": {"id": str(ds_id)}}])))
     out: dict[str, list[DatasetTrainedBy]] = {}
-    for job_id, character, version, status, g0, rest in (await db.execute(q)).all():
+    for job_id, character, version, status, created_at, g0, rest in (await db.execute(q)).all():
         run = DatasetTrainedBy(job_id=str(job_id), character=character, version=version,
-                               status=status)
+                               status=status, created_at=created_at)
         # A set used by two groups of one run (a joint run's member set that is also its
         # composition set, say) is still one run.
         for used in {g0, *(rest or [])} - {None}:
@@ -181,13 +184,36 @@ async def _trained_by(db: AsyncSession,
     return out
 
 
+def _since_unlock(ds: Dataset, runs: list[DatasetTrainedBy] | None) -> list[DatasetTrainedBy]:
+    """The runs that lock `ds`: all of them, or only those created after its unlock (#363).
+
+    THE ONE PLACE the unlock is applied. `_trained_by` reads every run that used a set; this
+    drops the ones a POST /unlock has let go of, and everything that decides "locked" -- the
+    response, the 409s, the caption loop, the regularization collector -- reads its runs
+    through here (or `_locking_runs`, which does). A run with no creation time counts: a
+    lock must not be lifted by a missing timestamp.
+    """
+    runs = list(runs or [])
+    if ds.unlocked_at is None:
+        return runs
+    return [r for r in runs if r.created_at is None or r.created_at > ds.unlocked_at]
+
+
+async def _locking_runs(db: AsyncSession, ds: Dataset) -> list[DatasetTrainedBy]:
+    """Every run that locks this one set, oldest first -- `_trained_by` after the unlock."""
+    return _since_unlock(ds, (await _trained_by(db, ds.id)).get(str(ds.id)))
+
+
 def _is_locked(ds: Dataset, trained_by: list[DatasetTrainedBy] | None) -> bool:
-    """Trained on (#356), or locked by hand (#358). Either one refuses the same mutations."""
+    """Trained on (#356), or locked by hand (#358). Either one refuses the same mutations.
+
+    `trained_by` must already be `_since_unlock`'d (#363) -- every caller gets it that way.
+    """
     return bool(trained_by) or ds.locked_at is not None
 
 
 def _respond(ds: Dataset, trained_by: list[DatasetTrainedBy] | None) -> DatasetResponse:
-    """The wire shape of a set, with its lock filled in (#356, #358)."""
+    """The wire shape of a set, with its lock filled in (#356, #358, #363)."""
     out = DatasetResponse.model_validate(ds)
     out.trained_by = list(trained_by or [])
     out.locked = _is_locked(ds, out.trained_by)
@@ -195,7 +221,7 @@ def _respond(ds: Dataset, trained_by: list[DatasetTrainedBy] | None) -> DatasetR
 
 
 async def _respond_one(db: AsyncSession, ds: Dataset) -> DatasetResponse:
-    return _respond(ds, (await _trained_by(db, ds.id)).get(str(ds.id)))
+    return _respond(ds, await _locking_runs(db, ds))
 
 
 def _lock_detail(ds: Dataset, trained_by: list[DatasetTrainedBy] | None) -> str:
@@ -218,9 +244,10 @@ async def _refuse_if_locked(db: AsyncSession, ds: Dataset) -> None:
     it is, or the set's existence -- goes through here. Renaming, notes, tags, the anchor and
     scoring do not change the training data, and stay open.
 
-    A set locked by hand (#358) is refused exactly the same, whether or not it trained.
+    A set locked by hand (#358) is refused exactly the same, whether or not it trained. A set
+    unlocked (#363) is refused again once a run created after the unlock uses it.
     """
-    trained_by = (await _trained_by(db, ds.id)).get(str(ds.id))
+    trained_by = await _locking_runs(db, ds)
     if _is_locked(ds, trained_by):
         raise HTTPException(status_code=409, detail=_lock_detail(ds, trained_by))
 
@@ -251,9 +278,10 @@ async def create_dataset(
             dependencies=[Depends(verify_api_key_or_bearer)])
 async def list_datasets(db: AsyncSession = Depends(get_db)):
     rows = (await db.execute(select(Dataset).order_by(Dataset.updated_at.desc()))).scalars().all()
-    # Two queries for the whole page, not one per set: every locking run is read once.
+    # Two queries for the whole page, not one per set: every locking run is read once, and
+    # each set's unlock (#363) is applied to its own runs here, in Python.
     trained_by = await _trained_by(db)
-    return [_respond(ds, trained_by.get(str(ds.id))) for ds in rows]
+    return [_respond(ds, _since_unlock(ds, trained_by.get(str(ds.id)))) for ds in rows]
 
 
 @router.get("/datasets/{dataset_id}", response_model=DatasetResponse,
@@ -275,7 +303,7 @@ async def update_dataset(
     ds = await db.get(Dataset, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
-    trained_by = (await _trained_by(db, ds.id)).get(str(ds.id))
+    trained_by = await _locking_runs(db, ds)
     # A LOCKED SET'S IMAGES ARE WHAT ITS LoRA LEARNED FROM (#356). The list is how the console
     # removes and reorders, so a changed list is refused -- before any field is touched, so a
     # PATCH that also renames is refused whole rather than half-applied. The SAME list is not
@@ -481,14 +509,15 @@ async def lock_dataset(
     _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Lock a set by hand, trained or not (#358). One-way: clone it to make changes.
+    """Lock a set by hand, trained or not (#358). Clone it to make changes.
 
     The training lock (#356) only reaches sets a run used, and some need freezing without
     one -- every existing set, as of #358. This sets `locked_at` and `locked_reason`, and from
     then on every #356 refusal applies to it.
 
-    There is NO UNLOCK, on purpose: a lock that one click lifts protects nothing. A set
-    already locked by hand comes back unchanged -- the first lock's time and reason stand,
+    The only way back is the deliberate one-time /unlock (#363), which also lets go of the
+    runs trained so far. A set already locked by hand comes back unchanged -- the first
+    lock's time and reason stand,
     so a double-click cannot overwrite them. A set locked only by training can still be
     locked by hand; that is what keeps it locked if the run is later failed or cancelled.
     """
@@ -504,6 +533,38 @@ async def lock_dataset(
     await db.commit()
     await db.refresh(ds)
     logger.info("dataset %s: locked by hand (%s)", ds.name, ds.locked_reason or "no reason given")
+    return await _respond_one(db, ds)
+
+
+@router.post("/datasets/{dataset_id}/unlock", response_model=DatasetResponse)
+async def unlock_dataset(
+    dataset_id: uuid.UUID,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """One-time unlock (#363): lift both locks, so the set can change once more.
+
+    Reuse is free; changes need this deliberate step. It sets `unlocked_at` to now and clears
+    the hand lock (#358). From then on the training lock (#356) only counts runs created
+    AFTER `unlocked_at`: the runs that already trained stop locking it, and the next run that
+    uses the set locks it again, with no one having to remember. /lock still works after it.
+
+    Nothing is lost by it. Every run snapshotted its images and captions when it was created,
+    and /retry trains from that snapshot; the job rows are untouched and still list on the
+    Training page. Only this set's `trained_by` forgets them. Unlocking again moves the
+    cutoff to now, which is the same thing.
+    """
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    before = await _locking_runs(db, ds)
+    was = _lock_detail(ds, before) if _is_locked(ds, before) else "it was not locked"
+    ds.unlocked_at = datetime.now(timezone.utc)
+    ds.locked_at = None
+    ds.locked_reason = None
+    await db.commit()
+    await db.refresh(ds)
+    logger.info("dataset %s: unlocked; before: %s", ds.name, was)
     return await _respond_one(db, ds)
 
 
@@ -814,8 +875,9 @@ async def caption_dataset_images(db: AsyncSession, ds_id: uuid.UUID, overwrite: 
         # A run can be queued on this set while the loop is still going -- the Train button
         # does not wait for captioning. From then on the set is locked (#356), and a caption
         # written after the run snapshotted its captions is one the LoRA never trained on.
-        # The same holds for a lock by hand (#358): the refresh above read locked_at.
-        trained_by = (await _trained_by(db, ds.id)).get(str(ds.id))
+        # The same holds for a lock by hand (#358): the refresh above read locked_at -- and
+        # unlocked_at (#363), so an unlock mid-loop lets the rest of it through.
+        trained_by = await _locking_runs(db, ds)
         if _is_locked(ds, trained_by):
             logger.warning("dataset %s: captioning stopped at %s: %s",
                            ds.name, uri, _lock_detail(ds, trained_by))
@@ -979,9 +1041,9 @@ async def _collect_regularization(db: AsyncSession, ds: Dataset) -> DatasetRegul
     # finish after it; collecting them would add images to a set that is part of that LoRA's
     # record. They are left uncollected and counted as still running -- not failed, because
     # if the run fails or is cancelled the pool unlocks and the next poll collects them. A
-    # pool locked by hand (#358) is not grown either; that lock never lifts, so its late
-    # renders stay uncollected -- clone the pool to keep them.
-    trained_by = (await _trained_by(db, ds.id)).get(str(ds.id))
+    # pool locked by hand (#358) is not grown either; its late renders stay uncollected until
+    # the pool is unlocked (#363) -- or clone the pool to keep them.
+    trained_by = await _locking_runs(db, ds)
     locked = _is_locked(ds, trained_by)
     if locked:
         logger.info("dataset %s: not collecting regularization frames: %s",

@@ -140,7 +140,7 @@ class TestWhatLocks:
         assert out.locked is True
         assert [t.model_dump() for t in out.trained_by] == [
             {"job_id": str(job.id), "character": "Kelly-2000", "version": 5,
-             "status": str(status)}]
+             "status": str(status), "created_at": job.created_at}]
 
     @pytest.mark.parametrize("status", [TrainingStatus.FAILED, TrainingStatus.CANCELLED])
     async def test_a_failed_or_cancelled_run_leaves_it_editable(self, db, status):
@@ -401,7 +401,8 @@ class TestRefusedWhileLocked:
         body = g.json()
         assert body["locked"] is True
         assert body["trained_by"][0]["character"] == "Kelly-2000"
-        assert set(body["trained_by"][0]) == {"job_id", "character", "version", "status"}
+        assert set(body["trained_by"][0]) == {"job_id", "character", "version", "status",
+                                            "created_at"}
         assert next(d for d in lst.json() if d["id"] == str(ds.id))["locked"] is True
 
 
