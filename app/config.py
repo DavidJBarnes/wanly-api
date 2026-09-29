@@ -97,6 +97,14 @@ class Settings(BaseSettings):
     # Generous. It is per REQUEST, and a request carries a whole dataset — 50 images at a
     # second or two each on CPU.
     face_crop_timeout_s: int = 300
+    # face-edit (wanly-console#547): LivePortrait expression/gaze/head-turn edits, in
+    # wanly-gpu-docker (SERVICES=face-edit) on the 2070 beside Automatic1111. Called inline like
+    # face-crop. Empty disables the Edit tool with a 503 that says so.
+    face_edit_url: str = "http://2070.zero:8085"
+    # Covers the slow path: the CPU fallback (~8-10 s for a 1248x1824 frame when a neighbour
+    # holds the GPU), a request queued behind another edit (the service waits up to 60 s for its
+    # turn), and a full-size PNG crossing the home uplink.
+    face_edit_timeout_s: int = 120
     # buffalo_l's same-person floor. Below this against a picked anchor is a different person;
     # it is shown as a line on the scores rather than used to delete anything, because the two
     # people who got into this project's training sets got there past a human eye, not past a
