@@ -8,7 +8,7 @@ share one dialog and one endpoint without guessing.
 import uuid
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.face_edit import MAX_PROMPT
 
@@ -35,7 +35,27 @@ class FaceExpression(BaseModel):
     smile: Optional[float] = Field(None, ge=-0.3, le=1.3)
 
 
-class ImageEditRequest(BaseModel):
+def _check_box(v: Optional[list[float]]) -> Optional[list[float]]:
+    if v is not None and not (v[2] > v[0] and v[3] > v[1] and min(v) >= 0):
+        raise ValueError("face_box must be [x1, y1, x2, y2] with x2 > x1, y2 > y1, all >= 0")
+    return v
+
+
+class _FaceChoice(BaseModel):
+    """Which face, when the image has more than one (console#553). A box from
+    POST /images/edit/faces, in the source's pixels -- preferred, because it names the face by
+    where it is -- or an index into that call's left-to-right list. Neither: the face the node
+    picks itself (the one nearest the horizontal centre), exactly as before."""
+    face_index: Optional[int] = Field(None, ge=0, le=100)
+    face_box: Optional[list[float]] = Field(None, min_length=4, max_length=4)
+
+    @field_validator("face_box")
+    @classmethod
+    def _a_real_box(cls, v):
+        return _check_box(v)
+
+
+class ImageEditRequest(_FaceChoice):
     #: The image to edit. Never overwritten: the result is always a new object.
     source_uri: str = Field(..., min_length=1, max_length=1000)
     mode: Literal["face"] = "face"
@@ -51,7 +71,7 @@ class ImageEditRequest(BaseModel):
     dataset_id: Optional[uuid.UUID] = None
 
 
-class ImageEditPreviewRequest(BaseModel):
+class ImageEditPreviewRequest(_FaceChoice):
     source_uri: str = Field(..., min_length=1, max_length=1000)
     mode: Literal["face"] = "face"
     preset: Optional[str] = Field(None, max_length=50)
@@ -75,6 +95,9 @@ class ImageEditPreview(BaseModel):
     device: Optional[str] = None
     device_reason: Optional[str] = None
     elapsed_ms: Optional[int] = None
+    #: The face that was edited, as the service boxed it; null when the node chose (#553).
+    face_index: Optional[int] = None
+    face_box: Optional[list[float]] = None
 
 
 class ImageEditResponse(BaseModel):
@@ -90,6 +113,29 @@ class ImageEditResponse(BaseModel):
     dataset_id: Optional[uuid.UUID] = None
     device: Optional[str] = None
     elapsed_ms: Optional[int] = None
+    face_index: Optional[int] = None
+    face_box: Optional[list[float]] = None
+
+
+class ImageEditFacesRequest(BaseModel):
+    source_uri: str = Field(..., min_length=1, max_length=1000)
+
+
+class DetectedFace(BaseModel):
+    index: int
+    #: [x1, y1, x2, y2] in the source image's pixels (upright, EXIF orientation applied).
+    box: list[float]
+    width: float
+
+
+class ImageEditFaces(BaseModel):
+    #: The size the boxes are measured against -- the source's, upright. The console scales
+    #: from this to the size it draws the image at, never from the image file's own header.
+    width: int
+    height: int
+    faces: list[DetectedFace]
+    #: The face an edit that names none will change; null with no faces.
+    default_index: Optional[int] = None
 
 
 class EditAxis(BaseModel):

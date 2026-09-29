@@ -28,7 +28,7 @@ FastAPI backend for the Wanly video generation system.
 | `PATCH /segments/{id}` | Update segment status |
 | `POST /segments/{id}/upload` | Upload segment output |
 | `POST /videos/{id}/stitch` | Stitch all segments |
-| `POST /images/edit` (+ `/preview`, `GET /presets`) | Image Edit tool: face mode via the face-edit service (`face_edit_url`); saves a NEW image, refuses locked datasets (console#547). Takes a preset, slider values and/or a `prompt` ("describe the change", console#550 -- read by the service's lexicon; answers with the resolved `expression` and `matched_terms`, 422 "nothing to apply" when no term is known) |
+| `POST /images/edit` (+ `/preview`, `/faces`, `GET /presets`) | Image Edit tool: face mode via the face-edit service (`face_edit_url`); saves a NEW image, refuses locked datasets (console#547). Takes a preset, slider values and/or a `prompt` ("describe the change", console#550 -- read by the service's lexicon; answers with the resolved `expression` and `matched_terms`, 422 "nothing to apply" when no term is known). `/faces` lists the faces (source pixels, left to right, `default_index`); preview/save take `face_box` or `face_index` to edit one that is not the centre-most (console#553) |
 
 ## Quality Enhancement Features
 

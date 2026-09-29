@@ -14,6 +14,13 @@ keyframe-server's lexicon, which is what was tuned by eye on real faces.
 
 Like face-crop, this is called inline: an edit is ~1 s on a free GPU and several seconds on the
 CPU fallback, far below anything worth a queue row.
+
+WHICH FACE (console#553). The node edits the face nearest the horizontal centre. `faces()` asks
+the service for every face it would accept, and an edit can name one by `face_box` (preferred:
+a box names a face by where it is) or `face_index`. The source's bytes go to the service as they
+are -- nothing here resizes them -- so the boxes are in the source's own pixels, upright: the
+service applies EXIF orientation on decode, as a browser does when it shows the image. The only
+rescaling is the console's, from those pixels to the size it draws the image at.
 """
 from __future__ import annotations
 
@@ -196,30 +203,14 @@ def _service_url() -> str:
     return url
 
 
-async def edit(image_bytes: bytes, params: dict[str, float], *, prompt: str | None = None,
-               preview: bool = False) -> dict:
-    """Run one edit. Returns the service's JSON with `image` decoded to bytes.
-
-    `params` empty means "read `prompt`": the service then resolves the text itself and returns
-    what it resolved to in `expression` and `source`. An `expression` is only sent when there
-    are numbers, because the service treats any `expression` -- even all zeros -- as explicit
-    and ignores the prompt.
-
-    Raises FaceEditError with the status the caller should pass on: 503 for down or busy (the
-    two things that fix themselves), 422 for this image or these numbers, 502 for anything the
-    service should not have said.
-    """
+async def _post(path: str, body: dict, prompt: str | None = None):
+    """POST to the service; the JSON on a 200, else FaceEditError with the status the caller
+    should pass on: 503 for down or busy (the two things that fix themselves), 422 for this
+    image or these numbers, 502 for anything the service should not have said."""
     base = _service_url()
-    body: dict = {"image": base64.b64encode(image_bytes).decode()}
-    if params:
-        body["expression"] = params
-    if prompt:
-        body["prompt"] = prompt
-    if preview:
-        body.update(format="jpeg", max_edge=PREVIEW_MAX_EDGE)
     try:
         async with httpx.AsyncClient(timeout=settings.face_edit_timeout_s) as client:
-            r = await client.post(f"{base}/edit", json=body)
+            r = await client.post(f"{base}{path}", json=body)
     except httpx.TimeoutException as e:
         raise FaceEditError(
             503, f"face-edit did not answer within {settings.face_edit_timeout_s}s at {base} "
@@ -235,20 +226,63 @@ async def edit(image_bytes: bytes, params: dict[str, float], *, prompt: str | No
         detail = detail if isinstance(detail, str) else (r.text[:300] or r.reason_phrase)
         if r.status_code == 503:
             raise FaceEditError(503, f"face-edit is busy or not ready: {detail}")
+        if r.status_code == 404 and path != "/edit":
+            # A face-edit image from before the endpoint existed: the 2070 not yet re-pinned.
+            raise FaceEditError(
+                502, f"the face-edit service is too old for {path} (404); redeploy it")
         if r.status_code == 422 and detail.startswith("nothing to apply"):
             # The prompt had no word the lexicon knows (expression.py, NothingToApply). Not the
             # image's fault, so not "refused this image".
             raise FaceEditError(422, _nothing_to_apply(detail, prompt))
         if r.status_code in (400, 413, 422):
+            # Includes the face choice's refusals (#553): an index out of range, a box that
+            # matches no face, faces too close together to edit one alone.
             raise FaceEditError(422, f"face-edit refused this image: {detail}")
         raise FaceEditError(502, f"face-edit returned {r.status_code}: {detail}")
+    return r.json()
 
-    out = r.json()
+
+async def faces(image_bytes: bytes) -> dict:
+    """Every face the edit could be pointed at: {width, height, faces: [{index, box, width}],
+    default_index}, boxes [x1, y1, x2, y2] in the source's pixels, left to right, and the one
+    the node picks when none is named. Errors as for edit()."""
+    out = await _post("/faces", {"image": base64.b64encode(image_bytes).decode()})
+    if not isinstance(out.get("faces"), list):
+        raise FaceEditError(502, f"face-edit /faces returned no face list: {str(out)[:200]}")
+    return out
+
+
+async def edit(image_bytes: bytes, params: dict[str, float], *, prompt: str | None = None,
+               preview: bool = False, face_index: int | None = None,
+               face_box: list[float] | None = None) -> dict:
+    """Run one edit. Returns the service's JSON with `image` decoded to bytes.
+
+    `params` empty means "read `prompt`": the service then resolves the text itself and returns
+    what it resolved to in `expression` and `source`. An `expression` is only sent when there
+    are numbers, because the service treats any `expression` -- even all zeros -- as explicit
+    and ignores the prompt.
+
+    `face_index` / `face_box` choose the face (#553) and are only sent when set, so an edit
+    that names none is the same request it always was. Errors: see _post.
+    """
+    body: dict = {"image": base64.b64encode(image_bytes).decode()}
+    if params:
+        body["expression"] = params
+    if prompt:
+        body["prompt"] = prompt
+    if preview:
+        body.update(format="jpeg", max_edge=PREVIEW_MAX_EDGE)
+    if face_index is not None:
+        body["face_index"] = face_index
+    if face_box is not None:
+        body["face_box"] = list(face_box)
+    out = await _post("/edit", body, prompt)
     try:
         out["image"] = base64.b64decode(out["image"])
     except Exception as e:
         raise FaceEditError(502, f"face-edit returned an unreadable image: {e}") from e
-    logger.info("face edit on %s (%s) in %s ms: %s", out.get("device"),
+    logger.info("face edit on %s (%s) in %s ms: %s%s", out.get("device"),
                 out.get("device_reason"), (out.get("timings_ms") or {}).get("total"),
-                params or f"{out.get('source')} from {prompt!r}")
+                params or f"{out.get('source')} from {prompt!r}",
+                f" (face {out.get('face_index')})" if out.get("face_index") is not None else "")
     return out
