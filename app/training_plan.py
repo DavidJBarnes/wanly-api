@@ -350,11 +350,13 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
                       for u in pool.images]))
 
     # ---- per-group checks that apply to every set
+    # No caption check (#365): a blank caption IS the standard. _final_caption turns it into
+    # the bare phrase -- "<trigger>, <gender>", the pair phrase, or the class word -- which is
+    # what identity trains best under (Kelly-2000 v1/v5 bare vs v2's descriptive captions,
+    # which lost her). Only props get typed. Requiring a body forced a filler word ("photo")
+    # onto every plain image.
     for g in plan.groups + reg_groups:
-        # Regularization always trains under its own captions; a trigger_only run only
-        # skips caption checks for the character and composition sets.
-        _check_common(plan, g, captions_required=(
-            g.kind == "regularization" or body.caption_mode == "per_image"))
+        _check_common(plan, g)
 
     # ---- regularization repeats, sized against what the character groups contribute
     character_samples = sum(len(g.images) * g.num_repeats for g in plan.groups)
@@ -408,7 +410,7 @@ def _check_character_set(plan: Plan, ds: Dataset) -> None:
                      f"anchor (or show no face) — remove them, or they teach a different face")
 
 
-def _check_common(plan: Plan, g: Group, captions_required: bool = True) -> None:
+def _check_common(plan: Plan, g: Group) -> None:
     ds = g.dataset
     name = ds.name if ds else "?"
     n = len(g.images)
@@ -420,9 +422,4 @@ def _check_common(plan: Plan, g: Group, captions_required: bool = True) -> None:
                      f"{name!r}: {n} images — at most {MAX_DATASET_IMAGES}")
     if len(set(g.images)) != n:
         plan.problem("duplicate_images", f"{name!r} contains duplicates")
-    caps = (ds.captions or {}) if ds else {}
-    missing = [u for u in g.images if not (caps.get(u) or "").strip()] if captions_required else []
-    if missing:
-        plan.problem("caption_missing",
-                     f"{name!r}: {len(missing)} of {n} images have no caption — caption the "
-                     f"set (every image trains under its own caption now)")
+
