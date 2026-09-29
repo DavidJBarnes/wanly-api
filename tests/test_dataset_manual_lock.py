@@ -2,8 +2,8 @@
 
 #356 locks a set once a run has trained on it. Some sets need freezing without one, so
 POST /datasets/{id}/lock sets `locked_at` / `locked_reason`, and from then on every #356
-refusal applies. There is no unlock, a second lock changes nothing, and a clone starts
-unlocked.
+refusal applies. Only the one-time /unlock (#363, tests/test_dataset_unlock.py) lifts it,
+a second lock changes nothing, and a clone starts unlocked.
 """
 import importlib.util
 import uuid
@@ -73,7 +73,8 @@ class TestLock:
             DatasetLock(reason="x" * 501)
 
     async def test_patch_cannot_set_or_clear_it(self, db):
-        """No unlock: the fields are not in DatasetUpdate, and unknown fields are ignored."""
+        """Only /unlock clears it: the fields are not in DatasetUpdate, and unknown fields are
+        ignored."""
         from httpx import ASGITransport, AsyncClient
         from app.auth import get_current_user
         from app.database import get_db

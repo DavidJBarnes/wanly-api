@@ -65,8 +65,9 @@ class DatasetLock(BaseModel):
 
 
 class DatasetUpdate(BaseModel):
-    #: Deliberately has no locked_at / locked_reason: a manual lock is one-way (#358), and an
-    #: unknown field in a PATCH is ignored, so a PATCH cannot set or clear one.
+    #: Deliberately has no locked_at / locked_reason / unlocked_at: only /lock and /unlock
+    #: (#358, #363) move them, and an unknown field in a PATCH is ignored, so a PATCH cannot
+    #: set or clear one.
     name: str | None = Field(default=None, max_length=100)
     tags: str | None = Field(default=None, max_length=500)
     notes: str | None = None
@@ -128,6 +129,9 @@ class DatasetTrainedBy(BaseModel):
     character: str
     version: int
     status: str
+    #: When the run was created. A set's lock only counts runs created after its
+    #: `unlocked_at` (#363), so this is what that is compared against.
+    created_at: datetime | None = None
 
 
 class DatasetResponse(BaseModel):
@@ -158,6 +162,9 @@ class DatasetResponse(BaseModel):
     #: LOCKED BY HAND (#358): columns, unlike the above. `locked` is true when either is set.
     locked_at: datetime | None = None
     locked_reason: str | None = None
+    #: ONE-TIME UNLOCK (#363): when POST /datasets/{id}/unlock was last called. From then on
+    #: only runs created after it lock the set, so `trained_by` lists only those.
+    unlocked_at: datetime | None = None
 
     @field_validator("captions", "scores", mode="before")
     @classmethod
