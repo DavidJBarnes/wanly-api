@@ -274,7 +274,7 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
         g = Group(kind="identity", character=m.name, trigger=m.trigger, gender=m.gender,
                   dataset=ds, images=list(ds.images),
                   captions=_captions_for(body, prefix, ds))
-        _check_character_set(plan, ds)
+        _check_character_set(plan, ds, body.allow_low_scores)
         plan.groups.append(g)
 
     # ---- the composition set (pairs only)
@@ -388,7 +388,7 @@ def _describe_owner(ds: Dataset) -> str:
     return f"a {ds.kind} set owned by {ds.character!r}"
 
 
-def _check_character_set(plan: Plan, ds: Dataset) -> None:
+def _check_character_set(plan: Plan, ds: Dataset, allow_low: bool = False) -> None:
     """A character set must be PROVABLY one person: anchored, scored, every face above the
     floor. The scores are the only evidence the set holds one face -- the 14 stray images
     in the David set would each have scored far below it."""
@@ -404,7 +404,13 @@ def _check_character_set(plan: Plan, ds: Dataset) -> None:
                      f"scored against the anchor — re-score the set")
     floor = settings.face_cos_floor
     low = [u for u in ds.images if u in scores and (scores[u] is None or scores[u] < floor)]
-    if low:
+    if low and allow_low:
+        # Acknowledged (console#575): the person vouched these are real photos of this
+        # character. Still said out loud, so the run record shows what was waved through.
+        plan.warn("score_below_floor_allowed",
+                  f"{ds.name!r}: {len(low)} image(s) score below {floor:g} against the anchor "
+                  f"(or show no face) — training on them anyway, as verified real photos")
+    elif low:
         plan.problem("score_below_floor",
                      f"{ds.name!r}: {len(low)} image(s) score below {floor:g} against the "
                      f"anchor (or show no face) — remove them, or they teach a different face")

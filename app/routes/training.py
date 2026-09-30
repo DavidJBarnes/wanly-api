@@ -145,6 +145,7 @@ async def create_training_job(
                 "reg_ratio": REG_RATIO if body.regularization else 0,
                 "caption_mode": body.caption_mode,
                 "allow_no_composition": body.allow_no_composition,
+                "allow_low_scores": body.allow_low_scores,
                 "dataset": g0.provenance(),
                 "lora_name": body.lora_name or _default_lora_name(body.character),
                 "publish": body.publish},
