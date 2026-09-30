@@ -69,7 +69,11 @@ class TestTheRefusal:
         # the second call cannot slip onto the busy box.
         assert "describe(image, instruction, base_url=base)" in inspect.getsource(
             captions.caption_image_bytes)
-        assert "base_url=base" in inspect.getsource(captions.caption_image_pair)
+        # The pair's captioner half moved into run_caption_pair (console#562); the base
+        # caption_image_pair resolves is handed to it and used for both calls.
+        assert "run_caption_pair(image, base, cfg" in inspect.getsource(
+            captions.caption_image_pair)
+        assert "base_url=base" in inspect.getsource(captions.run_caption_pair)
         # Claim-time <SCENE> resolution opts out: the worker was just handed the segment and
         # has not loaded the render; a failed caption there is non-fatal by design.
         assert "caption_image_bytes(db, image, interactive=False)" in inspect.getsource(segments)

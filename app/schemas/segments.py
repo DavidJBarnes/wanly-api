@@ -107,6 +107,11 @@ class SegmentResponse(BaseModel):
     # reported an inventory yet". Only the job detail route fills this in; every other
     # construction leaves the default, which is why it HAS one.
     blocked_reason: Optional[str] = None
+    # A caption-held segment (console#562): the image its caption comes from, and -- while it
+    # is awaiting_caption -- what the hold is doing right now and where the image sits in the
+    # caption queue. Computed per request by the job detail route, like blocked_reason.
+    caption_image: Optional[str] = None
+    caption_wait: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

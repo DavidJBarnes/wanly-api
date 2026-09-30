@@ -107,6 +107,23 @@ async def caption_image_pair(db: AsyncSession, image: bytes,
     """
     base = await _caption_base(db, interactive)
     cfg = await _get_all_settings(db)
+    return await run_caption_pair(image, base, cfg, style=style, instruction=instruction,
+                                  motion_style=motion_style,
+                                  motion_instruction=motion_instruction)
+
+
+async def run_caption_pair(image: bytes, base: str, cfg: dict,
+                           style: str | None = None,
+                           instruction: str | None = None,
+                           motion_style: str | None = None,
+                           motion_instruction: str | None = None) -> ScenePair:
+    """caption_image_pair's captioner half, with the database half already done.
+
+    Split out for the caption hold (console#562): it captions in the background, and must not
+    keep a database session -- and so a pooled connection -- open across two captioner calls
+    that can take minutes. It resolves `base` and `cfg` on a short session, closes it, then
+    calls this. Same rules as caption_image_pair, because it IS caption_image_pair.
+    """
     if instruction is None:
         instruction = instruction_for(style or cfg.get("caption_style", ""),
                                       cfg.get("caption_instruction", ""))

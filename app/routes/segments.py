@@ -23,7 +23,8 @@ from app.config import settings
 from app.database import get_db
 from app.routes.captions import caption_image_bytes
 from app.seeds import new_seed
-from app.enums import JobStatus, SegmentStatus, VideoStatus, WorkerKind
+from app import caption_hold
+from app.enums import SEGMENT_HELD, JobStatus, SegmentStatus, VideoStatus, WorkerKind
 from app.ltx_stack import LTX_STACK
 from app.model_requirements import CHECKPOINT, canonical
 from app.recipe_blob import (
@@ -506,7 +507,18 @@ async def add_segment(
     # for segment 0, where a person can review the caption first; this catches a prompt that
     # arrives still carrying the placeholder, which is every continuation and any caller
     # that is not the console. Same convention as <TRIGGER>.
-    resolved_prompt = await _resolve_scene(db, resolved_prompt, body.start_image)
+    #
+    # A start image that is KNOWN goes through the caption hold (console#562): filled now if
+    # its words are saved, otherwise the segment is created held and the submit returns
+    # without waiting for a caption. The live caption that used to happen here blocked the
+    # submit and could disagree with the one the modal was making. No start image (the
+    # continuation case) and a frame outside our buckets keep _resolve_scene's behaviour.
+    held = False
+    gated = await caption_hold.gate(db, resolved_prompt, body.start_image)
+    if gated is None:
+        resolved_prompt = await _resolve_scene(db, resolved_prompt, body.start_image)
+    else:
+        resolved_prompt, held = gated
 
     # Inherit negative_prompt from prior segment if not explicitly set.
     # Segments are eagerly loaded and ordered by index via the relationship,
@@ -527,12 +539,17 @@ async def add_segment(
         ltx_recipe=body.ltx_recipe,
         auto_finalize=body.auto_finalize,
     )
+    if held:
+        segment.status = SegmentStatus.AWAITING_CAPTION
     db.add(segment)
 
     job.status = JobStatus.PENDING
 
     await db.commit()
     await db.refresh(segment)
+    if held:
+        # After the commit: the waiter's first act is to look for this row.
+        caption_hold.ensure(body.start_image)
     return segment
 
 
@@ -1274,6 +1291,78 @@ async def retry_segment(
     return segment
 
 
+async def _held_segment(db: AsyncSession, segment_id: UUID, user: User) -> tuple[Segment, Job]:
+    """A caption-held segment of this user's, locked, with its job. 404/400 otherwise."""
+    result = await db.execute(
+        select(Segment, Job)
+        .join(Job, Segment.job_id == Job.id)
+        .where(Segment.id == segment_id, Job.user_id == user.id)
+        .with_for_update(of=Segment)
+    )
+    row = result.one_or_none()
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+    segment, job = row
+    if segment.status not in SEGMENT_HELD:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Segment is not waiting on a caption (current: '{segment.status}')",
+        )
+    return segment, job
+
+
+@router.post("/segments/{segment_id}/caption/retry", response_model=SegmentResponse)
+async def retry_segment_caption(
+    segment_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Caption failed: try again (console#562). Back to held, and a waiter for its image.
+
+    Only the halves still missing are made. A scene that was saved before the motion half
+    failed is kept -- it is the text the person already read.
+    """
+    segment, job = await _held_segment(db, segment_id, user)
+    path = caption_hold.hold_image(segment.start_image, segment.index, job.starting_image)
+    segment.status = SegmentStatus.AWAITING_CAPTION
+    segment.error_message = None
+    await db.commit()
+    await db.refresh(segment)
+    if path:
+        caption_hold.ensure(path)
+    # No image means the sweep fails it again, with the reason, within one sweep.
+    logger.info("Caption hold: retry requested for segment %s on %s", segment.id, path)
+    return segment
+
+
+@router.post("/segments/{segment_id}/caption/skip", response_model=SegmentResponse)
+async def render_without_caption(
+    segment_id: UUID,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Render without the missing caption (console#562) -- a person's decision, never ours.
+
+    Every half that IS saved is filled, exactly as a release would. A half that is not is
+    dropped now, rather than left for the claim: at the claim a leftover <SCENE> would be
+    captioned live, and that is a caption nobody asked for and nobody saw.
+    """
+    segment, job = await _held_segment(db, segment_id, user)
+    path = caption_hold.hold_image(segment.start_image, segment.index, job.starting_image)
+    meta = await db.get(ImageMeta, path) if path else None
+    filled = caption_hold.fill_saved(segment.prompt, meta)
+    dropped = [p for p in (SCENE_PLACEHOLDER, MOTION_PLACEHOLDER) if p in filled]
+    segment.prompt = _drop_motion(_drop_scene(filled))
+    segment.status = SegmentStatus.PENDING
+    segment.error_message = None
+    segment.progress_log = None
+    await db.commit()
+    await db.refresh(segment)
+    logger.info("Caption hold: segment %s released WITHOUT %s by request",
+                segment.id, ", ".join(dropped) or "nothing (all halves were saved)")
+    return segment
+
+
 @router.post("/jobs/{job_id}/hologram", response_model=SegmentResponse)
 async def make_hologram(
     job_id: UUID,
@@ -1571,10 +1660,12 @@ async def cancel_segment(
     segment = result.scalar_one_or_none()
     if segment is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
-    if segment.status not in (SegmentStatus.PENDING, SegmentStatus.CLAIMED, SegmentStatus.PROCESSING):
+    # A held segment (console#562) cancels like a pending one: nothing is rendering it.
+    if segment.status not in (SegmentStatus.PENDING, SegmentStatus.CLAIMED,
+                              SegmentStatus.PROCESSING, *SEGMENT_HELD):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Only pending, claimed, or processing segments can be cancelled (current: '{segment.status}')",
+            detail=f"Only pending, claimed, processing or caption-held segments can be cancelled (current: '{segment.status}')",
         )
 
     segment.status = SegmentStatus.FAILED
@@ -1818,9 +1909,22 @@ async def _reroll(db: AsyncSession, job: Job, old: Segment,
 
     fresh = _roll_new_take(job, old, prompt=resolved, prompt_template=template,
                            negative_prompt=negative_at)
+    # A new prompt may carry a caption placeholder; held on the same terms as a new segment
+    # (console#562). A copied prompt was resolved when its take was, so it never gates.
+    hold_on = None
+    if prompt is not None:
+        image = caption_hold.hold_image(fresh.start_image, fresh.index, job.starting_image)
+        gated = await caption_hold.gate(db, fresh.prompt, image)
+        if gated is not None:
+            fresh.prompt, held = gated
+            if held:
+                fresh.status = SegmentStatus.AWAITING_CAPTION
+                hold_on = image
     db.add(fresh)
     await db.commit()
     await db.refresh(fresh)
+    if hold_on:
+        caption_hold.ensure(hold_on)
     return fresh
 
 

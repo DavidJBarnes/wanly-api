@@ -74,6 +74,10 @@ class JobResponse(BaseModel):
     segment_count: int = 0
     completed_segment_count: int = 0
     estimated_run_time: Optional[float] = None
+    # "awaiting_caption" or "caption_failed" when a live segment is held on its start image's
+    # caption (console#562), else None. The job's status stays "pending" -- it is queued --
+    # so this is what says why it is not starting. Filled by the list and detail endpoints.
+    caption_hold: Optional[str] = None
     tags: Optional[str] = None
     continuation_mode: Optional[str] = None
     # === Lynx identity-preserving engine ===

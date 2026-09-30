@@ -26,6 +26,19 @@ class SegmentStatus(StrEnum):
     PROCESSING = "processing"
     COMPLETED = "completed"
     FAILED = "failed"
+    #: Held until the caption its prompt needs is saved for its start image (console#562).
+    #: Never claimed: the claim endpoint hands out PENDING only. app/caption_hold.py moves it
+    #: to PENDING with the saved words filled in, or to CAPTION_FAILED.
+    AWAITING_CAPTION = "awaiting_caption"
+    #: The caption a held segment was waiting for failed or timed out. error_message says
+    #: why; the person chooses between retrying the caption and rendering without it. Never
+    #: claimed, and never resolved on its own -- dropping the half silently is the bug.
+    CAPTION_FAILED = "caption_failed"
+
+
+#: A segment waiting on a caption rather than on a worker. Not claimable, and not "active" in
+#: the sense the job-status rules use: nothing is rendering it.
+SEGMENT_HELD = frozenset({SegmentStatus.AWAITING_CAPTION, SegmentStatus.CAPTION_FAILED})
 
 
 class VideoStatus(StrEnum):
