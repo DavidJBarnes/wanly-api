@@ -15,8 +15,11 @@ segment and switch into edit mode first:
                                        preview and the AuraFace identity score vs the source
     POST /images/edit/jobs/{id}/save   write the held result as a NEW image (repo or dataset)
 
-A full-mode edit is an `instruction` or a head angle (`head_preset`, or `angle` {yaw, pitch});
-head angles within ±20° belong to face mode, and the console routes them there.
+A full-mode edit is any mix of a head angle (`head_preset`, or `angle` {yaw, pitch}), an
+expression preset (`preset`, one of full_edit.EXPRESSIONS) and free text (`instruction`), with
+an optional `face_box` naming one face of several (#569). Since #569 it is the ONLY thing the
+Edit dialog sends: every head angle, every expression and the free-text box go to Qwen, and
+LivePortrait's routes below stay only because removing them is a separate decision.
 
 WHAT TO APPLY is a preset, slider values, a described change (`prompt`, #550), or a mix. A
 prompt is read by the service, not here, so both calls answer with what it resolved to
@@ -63,7 +66,8 @@ from app.database import get_db
 from app.models import Dataset
 from app.routes.datasets import DATASETS_PREFIX, _prefix, _refuse_if_locked
 from app.schemas.image_edit import (
-    EditAxis, EditPreset, EditPresets, HeadAngle, HeadAnglePreset, ImageEditFaces, ImageEditFacesRequest,
+    EditAxis, EditPreset, EditPresets, ExpressionPreset, HeadAngle, HeadAnglePreset, ImageEditFaces,
+    ImageEditFacesRequest,
     ImageEditJob, ImageEditJobSave, ImageEditPreview, ImageEditPreviewRequest, ImageEditRequest,
     ImageEditResponse,
 )
@@ -148,16 +152,21 @@ def result_key(source_key: str, tag: str, dataset: Dataset | None = None) -> str
 @router.get("/images/edit/presets", response_model=EditPresets,
             dependencies=[Depends(get_current_user)])
 async def edit_presets():
+    """What the Edit dialog draws. Since #569 everything in it runs on Qwen: `expressions` are
+    the expression buttons, `head_angles` the angle buttons (all `route: "full"`), and
+    `face_limit_deg` is 0 -- which also makes a console from before #569, still open in a tab,
+    send every angle to Qwen rather than to LivePortrait. `presets`/`axes` are LivePortrait's,
+    kept for the face-mode endpoints that remain."""
     return EditPresets(
-        mode="face",
+        mode="full",
         presets=[EditPreset(name=n, label=label, expression=exp)
                  for n, (label, exp) in face_edit.PRESETS.items()],
         axes=[EditAxis(**a) for a in face_edit.AXES],
-        head_angles=[HeadAnglePreset(name=n, label=label, yaw=y, pitch=p,
-                                     route=full_edit.route(y, p))
+        head_angles=[HeadAnglePreset(name=n, label=label, yaw=y, pitch=p, route="full")
                      for n, (label, y, p) in full_edit.HEAD_ANGLES.items()],
-        face_limit_deg=full_edit.FACE_LIMIT_DEG, max_yaw=full_edit.MAX_YAW,
-        max_pitch=full_edit.MAX_PITCH,
+        expressions=[ExpressionPreset(name=n, label=label)
+                     for n, label in full_edit.EXPRESSIONS.items()],
+        face_limit_deg=0, max_yaw=full_edit.MAX_YAW, max_pitch=full_edit.MAX_PITCH,
     )
 
 
@@ -166,12 +175,18 @@ async def edit_presets():
 async def edit_faces(body: ImageEditFacesRequest):
     """The faces the editor can point an edit at, left to right, and the one it edits when
     told nothing. The console draws these over the "before" image when there are two or more;
-    with one or none it draws nothing, and the editor is unchanged."""
+    with one or none it draws nothing, and the editor is unchanged.
+
+    Asked of the standing image-edit service first (#569/#570) -- the one that will do the
+    edit -- and of face-edit when there is none. The boxes only have to say where a face is:
+    the Qwen edit crops around whichever box it is sent."""
     source = await _fetch(body.source_uri)
-    try:
-        out = await face_edit.faces(source)
-    except face_edit.FaceEditError as e:
-        raise HTTPException(status_code=e.status_code, detail=e.detail) from e
+    out = await full_edit.faces(source)
+    if out is None:
+        try:
+            out = await face_edit.faces(source)
+        except face_edit.FaceEditError as e:
+            raise HTTPException(status_code=e.status_code, detail=e.detail) from e
     return ImageEditFaces(
         width=out.get("width") or 0, height=out.get("height") or 0,
         faces=out["faces"], default_index=out.get("default_index"),
@@ -268,10 +283,15 @@ async def save_edit(
 
 def _full_request(body: ImageEditRequest) -> tuple[dict, str]:
     """(what the image-edit service is sent, the tag for the file name). 422 on nonsense,
-    before anything is fetched or queued."""
+    before anything is fetched or queued.
+
+    Any mix of a head angle, an expression preset (`preset`) and an instruction (#569): the
+    service writes one prompt from all three. The tag names what was asked for, most specific
+    first -- `profile_left-smile`, `smile`, `angle`, `full` (free text) -- so a folder of
+    edits reads."""
     instruction = (body.instruction or "").strip() or None
     angle = body.angle
-    tag = "angle"
+    tags: list[str] = []
     if body.head_preset is not None:
         if body.head_preset not in full_edit.HEAD_ANGLES:
             raise HTTPException(
@@ -279,25 +299,40 @@ def _full_request(body: ImageEditRequest) -> tuple[dict, str]:
                      f"{', '.join(full_edit.HEAD_ANGLES)}")
         _label, yaw, pitch = full_edit.HEAD_ANGLES[body.head_preset]
         angle = angle or HeadAngle(yaw=yaw, pitch=pitch)
-        tag = body.head_preset
-    if angle is not None and instruction:
-        raise HTTPException(422, "full mode takes an instruction or a head angle, not both")
+        tags.append(body.head_preset)
+    if body.preset is not None and body.preset not in full_edit.EXPRESSIONS:
+        raise HTTPException(
+            422, f"unknown expression {body.preset!r}; known: "
+                 f"{', '.join(full_edit.EXPRESSIONS)}")
     req: dict = {}
     if angle is not None:
         if max(abs(angle.yaw), abs(angle.pitch)) < 5:
-            raise HTTPException(422, "nothing to apply: a head angle under 5° is not a change")
-        req["angle"] = {"yaw": angle.yaw, "pitch": angle.pitch}
-    elif instruction:
+            if not (body.preset or instruction):
+                raise HTTPException(422, "nothing to apply: a head angle under 5° is not a "
+                                         "change")
+        else:
+            req["angle"] = {"yaw": angle.yaw, "pitch": angle.pitch}
+            if not tags:
+                tags.append("angle")
+    if body.preset is not None:
+        req["expression"] = body.preset
+        tags.append(body.preset)
+    if instruction:
         req["instruction"] = instruction
-        tag = "full"
-    else:
-        raise HTTPException(422, "nothing to apply: full mode needs an instruction or a head "
-                                 "angle")
+        if not tags:
+            tags.append("full")
+    if not req:
+        raise HTTPException(422, "nothing to apply: full mode needs a head angle, an "
+                                 "expression or an instruction")
+    if body.face_box is not None:
+        # The chosen face (#553/#569), in the source's pixels: the service crops around it,
+        # edits that alone and pastes it back.
+        req["face_box"] = list(body.face_box)
     if body.seed is not None:
         req["seed"] = body.seed
     if body.denoise is not None:
         req["denoise"] = body.denoise
-    return req, tag
+    return req, "-".join(tags)
 
 
 async def _submit_full(body: ImageEditRequest) -> JSONResponse:
@@ -318,7 +353,8 @@ def _job_view(job: full_edit.Job) -> ImageEditJob:
         error=job.error, elapsed_s=round(end - job.created_at, 1),
         preview=job.preview if job.state == "done" else None,
         width=m.get("width"), height=m.get("height"), identity=m.get("identity"),
-        prompt=m.get("prompt"), seed=m.get("seed"), saved=job.saved,
+        prompt=m.get("prompt"), seed=m.get("seed"), saved=job.saved, worker=job.worker,
+        face_box=job.request.get("face_box"),
     )
 
 
@@ -367,8 +403,10 @@ async def save_edit_job(
                 job.tag, ident, f", dataset {ds.name}" if ds is not None else "")
     return ImageEditResponse(
         uri=uri, source_uri=job.source_uri, mode="full",
-        preset=job.tag if job.tag in full_edit.HEAD_ANGLES else None,
+        preset=job.request.get("expression") or (
+            job.tag if job.tag in full_edit.HEAD_ANGLES else None),
         prompt=job.request.get("instruction"), params={}, expression={},
         source=job.meta.get("prompt"), dataset_id=ds.id if ds is not None else None,
         device="cuda", elapsed_ms=round(((job.finished_at or 0) - job.created_at) * 1000),
+        face_box=job.request.get("face_box"),
     )

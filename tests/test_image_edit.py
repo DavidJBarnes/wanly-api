@@ -343,7 +343,9 @@ class TestOverHTTP:
         r = await _http(db, "get", "/images/edit/presets")
         assert r.status_code == 200
         d = r.json()
-        assert d["mode"] == "face" and len(d["presets"]) == 12
+        # "full" since console#569: the dialog is all Qwen. LivePortrait's presets and axes stay
+        # listed for the face-mode endpoints that remain.
+        assert d["mode"] == "full" and len(d["presets"]) == 12
         assert {a["key"] for a in d["axes"]} >= {"rotate_yaw", "smile", "aaa", "blink"}
 
     async def test_save_to_the_repo_is_a_new_object_beside_the_original(self, db, wired):
@@ -483,7 +485,7 @@ class TestOverHTTP:
         ({"source_uri": SRC}, 422),                                         # nothing to apply
         ({"source_uri": SRC, "prompt": "   "}, 422),                        # blank description
         ({"source_uri": SRC, "prompt": "smile " * 100}, 422),               # too long
-        ({"source_uri": SRC, "mode": "full", "preset": "smile"}, 422),      # phase 2
+        ({"source_uri": SRC, "mode": "full", "preset": "grimace"}, 422),    # not an expression
         ({"source_uri": "s3://wanly-jobs/x.png", "preset": "smile"}, 400),  # wrong bucket
         ({"source_uri": "https://example.com/a.png", "preset": "smile"}, 400),
     ])
