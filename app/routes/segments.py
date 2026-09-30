@@ -28,7 +28,8 @@ from app.enums import SEGMENT_HELD, JobStatus, SegmentStatus, VideoStatus, Worke
 from app.ltx_stack import LTX_STACK
 from app.model_requirements import CHECKPOINT, canonical
 from app.recipe_blob import (
-    character_phrase, placeholders_in, recipe_characters, render_prompt, trigger_phrase,
+    TRIGGER_PLACEHOLDER, character_phrase, placeholders_in, recipe_characters, render_prompt,
+    trigger_phrase,
 )
 from app.models import (
     AppSetting, ImageMeta, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker,
@@ -105,8 +106,9 @@ async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
       * <MOTION> is CACHE-ONLY. It fills from ImageMeta.motion_description and, on a miss,
         defers to the claim and then drops — it NEVER triggers a caption call. Three reasons,
         each sufficient: the daemon's claim poll has a 10s HTTP timeout and a warm motion
-        caption is ~50s (it would cost the claim); production runs MOTION_CAPTION_ENABLED=false
-        because the 2070's captioner cannot answer the directional prompt at all; and the
+        caption is ~50s (it would cost the claim); a captioner that cannot answer the
+        directional prompt is run with MOTION_CAPTION_ENABLED=false (the 2070's JoyCaption
+        could not, #326), so a claim-time call could not be relied on; and the
         paragraph's value is that a person read it in the lightbox — a fresh claim-time
         caption would render words nobody saw, which is what #427's cache test exists to stop.
 
@@ -381,6 +383,102 @@ def _drop_motion(prompt: str) -> str:
     return _drop_placeholder(prompt, MOTION_PLACEHOLDER)
 
 
+# ---------------------------------------------------------------------------------------
+# Is there anything to render? (console#577)
+#
+# A Motion recipe's prompt is little more than "<trigger phrase>, <MOTION>". The console used
+# to delete the unfilled placeholder before it submitted, so the caption hold never saw it,
+# the segment went out PENDING, and the claim handed the GPU "k3lly2026, woman," -- a render
+# with, in effect, an EMPTY prompt, and nothing anywhere said so. The console is fixed, but
+# "the client promised" is not a guarantee: these two checks make the API refuse such a
+# prompt on its own, at submit (422) and at the last moment before a worker gets it.
+# ---------------------------------------------------------------------------------------
+
+# Any <scene>/<motion> tag, either case, opening or closing -- the placeholders included.
+_CAPTION_TAG = re.compile(r"</?(?:scene|motion)>", re.IGNORECASE)
+# A letter or a digit. Punctuation and whitespace are not something to render.
+_WORD_CHAR = re.compile(r"[^\W_]")
+
+
+def _without_caption_placeholders(prompt: str | None) -> str:
+    """The prompt with every caption marker gone: regions unwrapped to their words, bare
+    placeholders and stray tags removed."""
+    return _CAPTION_TAG.sub(" ", _unwrap_caption_regions(prompt or ""))
+
+
+def _is_blank(text: str | None) -> bool:
+    """Nothing but whitespace and punctuation."""
+    return not _WORD_CHAR.search(text or "")
+
+
+def _has_caption_placeholder(prompt: str | None) -> bool:
+    return SCENE_PLACEHOLDER in (prompt or "") or MOTION_PLACEHOLDER in (prompt or "")
+
+
+async def _trigger_words(db: AsyncSession, ltx_recipe: dict | None) -> list[str]:
+    """Every spelling of the recipe's trigger that could make up a trigger-only prompt.
+
+    The phrase from the character's row and from the blob (they can disagree once a
+    character is edited), the bare trigger, the gender word it is captioned with, and the
+    literal <TRIGGER>. Longest first, so the phrase is removed before its parts.
+    """
+    words: set[str] = {TRIGGER_PLACEHOLDER}
+    for person in recipe_characters(ltx_recipe):
+        words.update(filter(None, (character_phrase(person), person.get("trigger"),
+                                   person.get("gender"))))
+        if person.get("name"):
+            row = (await db.execute(
+                select(LtxCharacter).where(LtxCharacter.name == person["name"])
+            )).scalar_one_or_none()
+            if row is not None:
+                words.update(filter(None, (trigger_phrase(row.trigger, row.gender),
+                                           row.trigger, row.gender)))
+    return sorted((w for w in words if w.strip()), key=len, reverse=True)
+
+
+async def _has_content(db: AsyncSession, prompt: str | None, ltx_recipe: dict | None) -> bool:
+    """Is there anything in this prompt besides caption placeholders and the trigger phrase?
+
+    "k3lly2026, woman," is not a prompt -- it names the character and says nothing about the
+    shot. Word-bounded, so a trigger inside a longer word does not eat it.
+    """
+    text = _without_caption_placeholders(prompt)
+    for w in await _trigger_words(db, ltx_recipe):
+        text = re.sub(rf"(?<!\w){re.escape(w)}(?!\w)", " ", text, flags=re.IGNORECASE)
+    return not _is_blank(text)
+
+
+async def _refuse_empty_submit(db: AsyncSession, prompt: str | None,
+                               ltx_recipe: dict | None) -> None:
+    """422 a submit whose prompt could only ever render as nothing (console#577).
+
+    Blank once the placeholders are removed: there is nothing but caption words to come, and
+    no words of its own. Trigger-only with NO placeholder: nothing more is coming at all --
+    what a console that stripped the placeholder used to send. A trigger phrase WITH a
+    placeholder is the normal Motion-recipe shape and is accepted: the caption hold fills it.
+    """
+    if _is_blank(_without_caption_placeholders(prompt)):
+        raise HTTPException(
+            status_code=422,
+            detail="The prompt is empty once the <SCENE>/<MOTION> placeholders are removed.",
+        )
+    if not _has_caption_placeholder(prompt) and not await _has_content(db, prompt, ltx_recipe):
+        raise HTTPException(
+            status_code=422,
+            detail=("The prompt is only the character's trigger phrase -- nothing describes the "
+                    "shot. If it should be filled from the start frame's caption, keep its "
+                    "<SCENE>/<MOTION> placeholder in the prompt."),
+        )
+
+
+def _empty_prompt_reason(unresolved: list[str]) -> str:
+    """Why a claim refused to hand a segment out, for error_message."""
+    why = (f"{' and '.join(unresolved)} had no saved words for the start frame"
+           if unresolved else "nothing else is in it")
+    return (f"Caption failed: the prompt is empty or only the trigger phrase ({why}), so it "
+            f"was not rendered. Retry the caption, or edit the prompt.")
+
+
 async def _resolve_trigger(db: AsyncSession, prompt: str, ltx_recipe: dict | None) -> str:
     """Fill a pose's <TRIGGER> with the character's trigger phrase.
 
@@ -500,6 +598,10 @@ async def add_segment(
         )
 
     next_index = max((s.index for s in job.segments), default=-1) + 1
+
+    # Before anything is resolved or stored: a prompt that can only ever render as nothing is
+    # a 422, not a segment that fails ten minutes into a GPU's time (console#577).
+    await _refuse_empty_submit(db, body.prompt, body.ltx_recipe)
 
     prompt = await _resolve_trigger(db, body.prompt, body.ltx_recipe)
     resolved_prompt, prompt_template = await _resolve_wildcards_outside_scene(db, prompt)
@@ -781,7 +883,8 @@ async def claim_next_segment(
         segment.gpu_name = claiming_worker.gpu_stats.get("gpu_name")
 
     job = await db.get(Job, segment.job_id)
-    if job.status == JobStatus.PENDING:
+    job_was_pending = job.status == JobStatus.PENDING
+    if job_was_pending:
         job.status = JobStatus.PROCESSING
 
     # Resolve start_image
@@ -881,6 +984,7 @@ async def claim_next_segment(
     # come off before the prompt reaches the encoder. <MOTION> (wanly-api#335) joins the gate
     # as a cache-only token — for a continuation its frame's paragraph exists only if the
     # Next Segment dialog described the pair, which is exactly when it must be picked up here.
+    submitted_prompt = segment.prompt
     if (SCENE_PLACEHOLDER in (segment.prompt or "")
             or MOTION_PLACEHOLDER in (segment.prompt or "")
             or _CAPTION_REGION.search(segment.prompt or "")):
@@ -889,6 +993,39 @@ async def claim_next_segment(
             # Persisted, not just returned: the segment must record what it actually ran, so
             # a retry reproduces it and a rated result can be traced to its real prompt.
             segment.prompt = resolved
+
+    # NEVER HAND OUT A PROMPT WITH NOTHING IN IT (console#577). A pose whose words all come
+    # from <SCENE>/<MOTION> resolves to "k3lly2026, woman," when those halves have no saved
+    # words -- the claim drops an unresolved placeholder rather than ship it -- and that went
+    # to the GPU as an effectively empty prompt, silently. Caption-failed instead, with the
+    # reason, where Retry caption and Render without can see it (and Render without refuses
+    # it too, while it is still empty). The prompt goes back to what was submitted, so the
+    # placeholders survive for a retry to fill.
+    #
+    # Real generations only: a reprocess carrier has no prompt of its own to speak of.
+    if (segment.reprocess_type is None
+            and not await _has_content(db, segment.prompt, segment.ltx_recipe)):
+        # Which halves had no saved words for the frame -- what the reason names.
+        unresolved = []
+        for placeholder, saved in ((SCENE_PLACEHOLDER, _cached_scene),
+                                   (MOTION_PLACEHOLDER, _cached_motion)):
+            if placeholder in (submitted_prompt or "") and not (
+                    resolved_start_image and await saved(db, resolved_start_image)):
+                unresolved.append(placeholder)
+        segment.prompt = submitted_prompt
+        segment.status = SegmentStatus.CAPTION_FAILED
+        segment.error_message = _empty_prompt_reason(unresolved)
+        segment.worker_id = None
+        segment.worker_name = None
+        segment.claimed_at = None
+        segment.gpu_name = None
+        if job_was_pending:
+            job.status = JobStatus.PENDING
+        await db.commit()
+        logger.warning("Refused to hand out segment %s (job %s, index %d): empty or "
+                       "trigger-only prompt %r (unresolved: %s)", segment.id, job.id,
+                       segment.index, segment.prompt, ", ".join(unresolved) or "none")
+        return None
 
     # Resolve continuation mode API-side (VACE vs traditional). seg0 is always i2v;
     # VACE requires index>0 + the previous segment's video. The daemon falls back to
@@ -1352,7 +1489,18 @@ async def render_without_caption(
     meta = await db.get(ImageMeta, path) if path else None
     filled = caption_hold.fill_saved(segment.prompt, meta)
     dropped = [p for p in (SCENE_PLACEHOLDER, MOTION_PLACEHOLDER) if p in filled]
-    segment.prompt = _drop_motion(_drop_scene(filled))
+    without = _drop_motion(_drop_scene(filled))
+    # "Without the caption" must still leave something to render (console#577). A Motion
+    # recipe is its trigger phrase plus <MOTION>; dropping the half leaves "k3lly2026, woman"
+    # and the claim would refuse it anyway. Say so now, and leave the segment as it is.
+    if not await _has_content(db, without, segment.ltx_recipe):
+        raise HTTPException(
+            status_code=422,
+            detail=(f"Rendering without {', '.join(dropped) or 'the caption'} would leave "
+                    f"only the trigger phrase ({without!r}) -- nothing describes the shot. "
+                    f"Retry the caption, or edit the prompt."),
+        )
+    segment.prompt = without
     segment.status = SegmentStatus.PENDING
     segment.error_message = None
     segment.progress_log = None
