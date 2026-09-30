@@ -84,6 +84,15 @@ class CaptionQueue:
                     "depth": self.depth()}
         return {"status": None, "position": None, "depth": self.depth()}
 
+    def in_flight(self, path: str) -> bool:
+        """Is a caption of this image queued or running right now, from anywhere?
+
+        The single-flight check the caption hold makes (console#562): a job waiting on this
+        image joins the caption the modal, the New Job dialog or another job already started,
+        rather than queueing a second one that would overwrite the first with different words.
+        """
+        return self._running == path or path in self._waiting
+
     def depth(self) -> int:
         """Everything not yet finished, including the one in progress."""
         return len(self._waiting) + (1 if self._running is not None else 0)

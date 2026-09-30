@@ -22,8 +22,14 @@ class TestJobStatusEnum:
 
 class TestSegmentStatusEnum:
     def test_all_statuses_present(self):
-        expected = {"pending", "claimed", "processing", "completed", "failed"}
+        expected = {"pending", "claimed", "processing", "completed", "failed",
+                    "awaiting_caption", "caption_failed"}
         assert set(SegmentStatus) == expected
+
+    def test_every_status_fits_the_column(self):
+        # segments.status is String(20) with no CHECK constraint, so nothing but this would
+        # notice a status too long for it until the first INSERT failed in production.
+        assert all(len(s) <= 20 for s in SegmentStatus)
 
 
 class TestVideoStatusEnum:

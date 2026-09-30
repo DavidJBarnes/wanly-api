@@ -75,6 +75,14 @@ class Settings(BaseSettings):
     # a model that cannot do it, producing plausible junk persisted as authoritative. Flip
     # this back to true when the captioner model can actually do the motion half.
     motion_caption_enabled: bool = True
+    # The caption hold (console#562): how long a segment waits for its start image's caption
+    # before it goes to caption_failed and asks the person what to do. Generous on purpose:
+    # the wait includes the captioner being refused while the box beside it renders, and a
+    # 720p render is ~30 minutes. Past this, a person deciding beats a job that never moves.
+    caption_hold_timeout_s: int = 3600
+    # How often held segments are swept: released if their words have been saved, re-queued
+    # if nothing is captioning them (an API restart loses the in-memory waiters).
+    caption_hold_sweep_s: int = 30
     # Automatic1111 on the same 2070, so a caption can ask it for the card back.
     #
     # The keep_alive above makes JoyCaption yield to A1111. Nothing made A1111 yield back,

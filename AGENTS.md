@@ -25,6 +25,7 @@ FastAPI backend for the Wanly video generation system.
 | `POST /jobs` | Create new job |
 | `POST /segments` | Add segment to job |
 | `POST /segments/{id}/claim` | Daemon claims segment |
+| `POST /segments/{id}/caption/retry`, `POST /segments/{id}/caption/skip` | Caption hold (console#562): a segment whose `<SCENE>`/`<MOTION>` has no saved words for its known start image is created `awaiting_caption` (never claimed) and released to `pending` with the saved ImageMeta text once both halves exist (only `<SCENE>` gates while `MOTION_CAPTION_ENABLED=false`). One background waiter per image joins a caption already in the queue, else takes a turn; failure/timeout -> `caption_failed`, and these two routes (retry / render without) are the way out. See `app/caption_hold.py` |
 | `PATCH /segments/{id}` | Update segment status |
 | `POST /segments/{id}/upload` | Upload segment output |
 | `POST /videos/{id}/stitch` | Stitch all segments |

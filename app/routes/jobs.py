@@ -17,7 +17,8 @@ from sqlalchemy import or_
 from app.auth import get_current_user
 from app.config import settings
 from app.database import get_db
-from app.enums import JOB_VALID_TRANSITIONS, JobStatus, SegmentStatus, VideoStatus
+from app import caption_hold
+from app.enums import JOB_VALID_TRANSITIONS, SEGMENT_HELD, JobStatus, SegmentStatus, VideoStatus
 from app.regularization import REG_PRIORITY_BASE
 from app.render_size import RECIPE_SQL, render_size, renders_through_recipe
 from app.seeds import new_seed
@@ -196,6 +197,16 @@ async def create_job(
     # the markers come off, and the caption inside them is held back from the wildcard
     # resolver rather than fed to it.
     resolved_prompt, prompt_template = await _resolve_wildcards_outside_scene(db, seg.prompt)
+    # The caption hold (console#562). A <SCENE>/<MOTION> the New Job dialog had no words for
+    # yet -- the modal's caption still running, or a dialog submitted without waiting -- holds
+    # the segment until they are saved, instead of the claim captioning the frame a second
+    # time (<SCENE>) or dropping the half (<MOTION>). When the words are already saved they
+    # are filled now. Not held: None, and the claim resolves as it always has.
+    hold_on = caption_hold.hold_image(seg.start_image, 0, job.starting_image)
+    gated = await caption_hold.gate(db, resolved_prompt, hold_on)
+    held = False
+    if gated is not None:
+        resolved_prompt, held = gated
     segment = Segment(
         job_id=job.id,
         index=0,
@@ -208,9 +219,13 @@ async def create_job(
         ltx_recipe=seg.ltx_recipe,
         auto_finalize=seg.auto_finalize,
     )
+    if held:
+        segment.status = SegmentStatus.AWAITING_CAPTION
     db.add(segment)
     await db.commit()
     await db.refresh(job)
+    if held:
+        caption_hold.ensure(hold_on)
     return job
 
 
@@ -360,6 +375,8 @@ async def list_jobs(
                     )
                     est_map[seg_job_id] = est
 
+    held_map = await _caption_holds(db, job_ids)
+
     response_items = []
     for j in items:
         seg_total, seg_completed = counts_map.get(j.id, (0, 0))
@@ -380,6 +397,7 @@ async def list_jobs(
                 segment_count=seg_total,
                 completed_segment_count=seg_completed,
                 estimated_run_time=est_map.get(j.id),
+                caption_hold=held_map.get(j.id),
                 # Lynx engine fields. These responses are hand-built, so anything not
                 # listed here is silently dropped by Pydantic even though it is on the schema.
                 generation_engine=j.generation_engine,
@@ -488,6 +506,50 @@ async def reorder_jobs(
 
 
 
+async def _caption_holds(db: AsyncSession, job_ids: list) -> dict:
+    """{job_id: "caption_failed" | "awaiting_caption"} for jobs with a caption-held segment.
+
+    console#562. A held job's own status stays PENDING -- it IS queued -- so without this the
+    queue would show a job that never starts and not say why. Failed wins over waiting: it
+    is the one a person has to act on.
+    """
+    if not job_ids:
+        return {}
+    rows = (await db.execute(
+        select(Segment.job_id, Segment.status)
+        .where(Segment.job_id.in_(job_ids), Segment.status.in_(list(SEGMENT_HELD)),
+               Segment.discarded.is_(False))
+    )).all()
+    out: dict = {}
+    for job_id, seg_status in rows:
+        if out.get(job_id) != SegmentStatus.CAPTION_FAILED:
+            out[job_id] = str(seg_status)
+    return out
+
+
+def _annotate_held(job: Job, segments, seg_responses) -> str | None:
+    """Say what a caption-held segment is waiting on (console#562); return the job's state.
+
+    The note and queue place are in-process facts about this moment, so they are computed
+    per request like blocked_reason, never stored.
+    """
+    by_id = {sr.id: sr for sr in seg_responses}
+    state = None
+    for seg in segments:
+        if seg.status not in SEGMENT_HELD or seg.discarded:
+            continue
+        if state != SegmentStatus.CAPTION_FAILED:
+            state = str(seg.status)
+        sr = by_id.get(seg.id)
+        if sr is None:
+            continue
+        path = caption_hold.hold_image(seg.start_image, seg.index, job.starting_image)
+        sr.caption_image = path
+        if seg.status == SegmentStatus.AWAITING_CAPTION and path:
+            sr.caption_wait = caption_hold.wait_note(path)
+    return state
+
+
 async def _annotate_blocked(db: AsyncSession, segments, seg_responses) -> None:
     """Say why a PENDING segment is going nowhere, when the answer is "no worker has it".
 
@@ -577,6 +639,7 @@ async def get_job(
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
     await _annotate_blocked(db, segments, seg_responses)
+    caption_hold_state = _annotate_held(job, segments, seg_responses)
     render_width, render_height = _job_render_size(
         job, any(renders_through_recipe(s.ltx_recipe) for s in segments))
 
@@ -612,6 +675,7 @@ async def get_job(
         status=job.status,
         tags=job.tags,
         estimated_run_time=job_est,
+        caption_hold=caption_hold_state,
         created_at=job.created_at,
         updated_at=job.updated_at,
         segments=seg_responses,
@@ -726,6 +790,7 @@ async def reopen_job(
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
     await _annotate_blocked(db, segments, seg_responses)
+    caption_hold_state = _annotate_held(job, segments, seg_responses)
     render_width, render_height = _job_render_size(
         job, any(renders_through_recipe(s.ltx_recipe) for s in segments))
 
@@ -753,6 +818,7 @@ async def reopen_job(
         priority=job.priority, status=job.status,
         tags=job.tags,
         estimated_run_time=job_est,
+        caption_hold=caption_hold_state,
         created_at=job.created_at, updated_at=job.updated_at,
         segments=seg_responses, videos=job.videos,
         segment_count=len(segments), completed_segment_count=len(completed),
