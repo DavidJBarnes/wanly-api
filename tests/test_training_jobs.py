@@ -1488,6 +1488,26 @@ class TestGuardTheSetIsProvablyOnePerson:
         await db.flush()
         assert "score_below_floor" in _codes(await _preflight(db, **SOLO))
 
+    async def test_verified_real_photos_can_train_below_the_floor(self, db):
+        # console#575: profiles and face-filling selfies of the REAL person score low or read as
+        # "no face". The acknowledgement turns the block into a warning -- never silently.
+        from app.config import settings
+        w = await _world(db)
+        imgs = w["david"].images
+        w["david"].scores = {**w["david"].scores, imgs[5]: settings.face_cos_floor - 0.1,
+                             imgs[6]: None}
+        await db.flush()
+        out = await _preflight(db, **SOLO, allow_low_scores=True)
+        assert "score_below_floor" not in _codes(out)
+        assert "score_below_floor_allowed" in {w["code"] for w in out["warnings"]}
+
+    async def test_the_acknowledgement_does_not_excuse_missing_scores(self, db):
+        # Only a LOW score is waivable; an unscored set has no evidence at all.
+        w = await _world(db)
+        w["david"].scores = {}
+        await db.flush()
+        assert "scores_missing" in _codes(await _preflight(db, **SOLO, allow_low_scores=True))
+
 
 class TestGuardPairMembers:
     async def test_one_member_is_not_a_pair(self, db):

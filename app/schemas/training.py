@@ -75,6 +75,10 @@ class TrainingCreate(BaseModel):
     composition_dataset_id: uuid.UUID | None = None
     #: Pair only: train without a composition set, knowingly. A warning, not a default.
     allow_no_composition: bool = False
+    #: Train on images that score below the anchor floor (or read as "no face"), knowingly.
+    #: The floor exists to catch bad faceswaps; on VERIFIED REAL photos it rejects exactly the
+    #: profiles and face-filling close-ups a set needs (console#575). A warning, not a default.
+    allow_low_scores: bool = False
     version: int = Field(default=1, ge=1, le=99)
     #: Total training steps across every group, regularization included. The ceiling is a
     #: guard against a typo, not a quality opinion: a pair at the proven passes-per-image
