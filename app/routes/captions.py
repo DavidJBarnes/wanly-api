@@ -136,12 +136,17 @@ async def run_caption_pair(image: bytes, base: str, cfg: dict,
     if not settings.motion_caption_enabled:
         return ScenePair(scene=scene, scene_instruction=instruction)
 
-    custom = (motion_instruction if motion_instruction is not None
-              else cfg.get("motion_instruction", ""))
+    # An explicit motion_instruction ("" = the default) replaces the saved override, a
+    # legacy whole prompt included; only None means "what Settings has saved".
+    if motion_instruction is not None:
+        custom, legacy = motion_instruction, ""
+    else:
+        custom = cfg.get("motion_instruction", "")
+        legacy = cfg.get("motion_legacy_prompt", "")
     try:
         motion, motion_instr = await describe_motion(
             image, scene, style=motion_style or cfg.get("motion_style", ""),
-            custom=custom, base_url=base)
+            custom=custom, base_url=base, legacy=legacy)
     except CaptionError as e:
         logger.warning("motion caption failed (static half kept): %s", e)
         return ScenePair(scene=scene, scene_instruction=instruction, motion_error=str(e))

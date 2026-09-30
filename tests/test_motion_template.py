@@ -1,22 +1,26 @@
-"""The caption and motion prompts are editable from Settings (console#555).
+"""The caption and motion prompts are editable from Settings (console#555, console#573).
 
-Three promises carry the change, and each is pinned here:
+The promises, each pinned here:
 
-1. NOBODY WHO DOES NOT TOUCH THE EDITORS SEES A DIFFERENT PROMPT. The motion prompt became a
-   template; rendering the default template must give byte-for-byte what the hand-assembled
-   prompt gave, with a scene and without one, for every capture style. The findings in
-   app/joycaption.py above MOTION_BASE are why the exact words matter.
-2. AN OVERRIDE WRITTEN BEFORE #555 KEEPS ITS MEANING: the whole prompt, no grounding.
-3. A BAD TEMPLATE IS REFUSED ON THE WAY IN (422), and "try" stores nothing.
+1. NOBODY WHO DOES NOT TOUCH THE EDITORS SEES A DIFFERENT PROMPT. The motion prompt was a
+   hand-assembled string, then a template (#555), and is now plain instructions the API wraps
+   in the style sentence and grounding (#573). Each step must give byte-for-byte what the
+   hand-assembled prompt gave, with a scene and without one, for every capture style. The
+   findings in app/joycaption.py above MOTION_BASE are why the exact words matter.
+2. A SAVED #555 TEMPLATE BECOMES ITS INSTRUCTIONS: tags and grounding sections stripped,
+   since the API now adds exactly those.
+3. AN OVERRIDE WRITTEN BEFORE #555 KEEPS ITS MEANING: the whole prompt, no style, no grounding.
+4. "Try" stores nothing, and shows the full text sent.
 """
 from unittest.mock import patch
 
 import pytest
 
 from app.joycaption import (CAPTION_STYLES, MOTION_BASE, MOTION_DEFAULT_STYLE,
-                            MOTION_GROUNDING, MOTION_STYLE_PRESETS, MOTION_TAIL,
-                            MOTION_TEMPLATE, PROMPT_MAX_CHARS, motion_instruction_for,
-                            render_motion_template, validate_motion_template)
+                            MOTION_GROUNDING, MOTION_INSTRUCTIONS, MOTION_STYLE_PRESETS,
+                            MOTION_TAIL, PROMPT_MAX_CHARS, compose_motion_prompt,
+                            has_motion_tags, motion_instruction_for, resolve_motion_override,
+                            strip_motion_tags)
 from app.models import AppSetting, ImageMeta
 
 BUCKET = "wanly-images"
@@ -40,6 +44,15 @@ def _pre_555(style: str, custom: str = "", scene: str = "") -> str:
     return prompt
 
 
+#: The #555 default template, copied verbatim -- the value a console that saved its
+#: pre-filled editor before the API normalised it would have stored.
+TEMPLATE_555 = (
+    "{#scene}Scene: {scene}\n\n{/scene}"
+    + MOTION_BASE + "{style}" + MOTION_TAIL
+    + "{#scene}\n\n" + MOTION_GROUNDING
+    + " Do not restate the scene description.{/scene}"
+)
+
 ALL_STYLES = [*MOTION_STYLE_PRESETS, "not-a-style"]
 
 
@@ -54,7 +67,7 @@ class TestTheDefaultIsUnchanged:
 
     @pytest.mark.parametrize("scene", ["", "   ", "\n\t"])
     def test_a_blank_scene_is_no_scene(self, scene):
-        """Today a whitespace scene dropped the grounding; so must the template."""
+        """Today a whitespace scene dropped the grounding; so must the instructions."""
         assert motion_instruction_for("handheld", "", scene) == _pre_555("handheld", "", scene)
         assert "Scene:" not in motion_instruction_for("handheld", "", scene)
 
@@ -62,82 +75,112 @@ class TestTheDefaultIsUnchanged:
         assert (motion_instruction_for("amateur", "", f"  {SCENE}\n")
                 == _pre_555("amateur", "", f"  {SCENE}\n"))
 
-    def test_the_default_template_rendered_directly(self):
-        """The template itself, not just motion_instruction_for, is the thing the console
-        pre-fills and a user saves -- so saving it untouched must also be a no-op."""
-        style = MOTION_STYLE_PRESETS["handheld"]
-        assert render_motion_template(MOTION_TEMPLATE, style, SCENE) == _pre_555("handheld", "", SCENE)
-        assert render_motion_template(MOTION_TEMPLATE, style) == _pre_555("handheld")
+    @pytest.mark.parametrize("style", ALL_STYLES)
+    def test_the_default_instructions_composed_directly(self, style):
+        """The instructions themselves, not just motion_instruction_for, are what the console
+        pre-fills and a user saves -- so saving them untouched must also be a no-op."""
+        sentence = MOTION_STYLE_PRESETS.get(style, MOTION_STYLE_PRESETS["handheld"])
+        assert compose_motion_prompt(MOTION_INSTRUCTIONS, sentence, SCENE) == \
+            _pre_555(style, "", SCENE)
+        assert compose_motion_prompt(MOTION_INSTRUCTIONS, sentence) == _pre_555(style)
         # And a saved copy of the default goes down the custom path with the same result.
-        assert motion_instruction_for("cinematic", MOTION_TEMPLATE, SCENE) == \
-            _pre_555("cinematic", "", SCENE)
+        assert motion_instruction_for(style, MOTION_INSTRUCTIONS, SCENE) == \
+            _pre_555(style, "", SCENE)
 
-    def test_the_default_template_is_valid(self):
-        assert validate_motion_template(MOTION_TEMPLATE) == MOTION_TEMPLATE
+    def test_the_editor_text_has_no_tags(self):
+        assert not has_motion_tags(MOTION_INSTRUCTIONS)
+        assert "{" not in MOTION_INSTRUCTIONS and "Scene:" not in MOTION_INSTRUCTIONS
+        assert MOTION_GROUNDING not in MOTION_INSTRUCTIONS
 
     def test_it_fits_under_the_cap(self):
-        assert len(MOTION_TEMPLATE) < PROMPT_MAX_CHARS
+        assert len(MOTION_INSTRUCTIONS) < PROMPT_MAX_CHARS
         assert all(len(v) < PROMPT_MAX_CHARS for v in CAPTION_STYLES.values())
 
 
-class TestLegacyOverrides:
-    """A custom motion instruction saved before #555 has no placeholders."""
+class TestComposition:
+    def test_the_style_goes_before_the_anchor_sentence(self):
+        out = compose_motion_prompt("Move. Single continuous shot, no cuts.", "Handheld. ")
+        assert out == "Move. Handheld.  Single continuous shot, no cuts."
+
+    def test_without_the_anchor_the_style_goes_at_the_end(self):
+        assert compose_motion_prompt("She leans back.", "Handheld. ") == \
+            "She leans back. Handheld."
+        assert compose_motion_prompt("She leans back.", MOTION_STYLE_PRESETS["none"]) == \
+            "She leans back."
+
+    def test_the_grounding_is_added_around_edited_instructions(self):
+        out = motion_instruction_for("static", "She leans back slowly.", SCENE)
+        assert out == (f"Scene: {SCENE}\n\nShe leans back slowly. "
+                       f"{MOTION_STYLE_PRESETS['static'].strip()}\n\n{MOTION_GROUNDING} "
+                       "Do not restate the scene description.")
+
+    def test_no_scene_no_grounding(self):
+        out = motion_instruction_for("none", "She leans back slowly.")
+        assert out == "She leans back slowly."
+
+    def test_braces_are_just_text(self):
+        """Plain instructions have no syntax: a brace that is not a #555 tag is prose."""
+        text = "Use JSON-ish {a b} notes, a {sceen} typo and a lone { brace."
+        assert strip_motion_tags(text) == text
+        assert motion_instruction_for("none", text) == text
+
+    def test_a_scene_containing_tag_text_is_inserted_as_text(self):
+        out = motion_instruction_for("none", "Move.", "she says {style}")
+        assert out.startswith("Scene: she says {style}\n\nMove.")
+
+
+class TestMigratingA555Template:
+    def test_the_555_default_becomes_the_default_instructions(self):
+        assert strip_motion_tags(TEMPLATE_555) == MOTION_INSTRUCTIONS
+        assert resolve_motion_override("", TEMPLATE_555) == ("", "")
+
+    @pytest.mark.parametrize("style", ALL_STYLES)
+    def test_an_edited_555_template_keeps_its_words_and_its_grounding(self, style):
+        """An edit of the #555 default renders exactly as it did under the template."""
+        edited = TEMPLATE_555.replace("under 110 words", "under 80 words")
+        instructions, legacy = resolve_motion_override("", edited)
+        assert legacy == "" and "under 80 words" in instructions
+        assert not has_motion_tags(instructions)
+        expected = _pre_555(style, "", SCENE).replace("under 110 words", "under 80 words")
+        assert motion_instruction_for(style, instructions, SCENE) == expected
+
+    def test_text_before_and_after_the_sections_is_kept_and_sections_go(self):
+        t = "{#scene}Given: {scene}. {/scene}Draft motion. {style}{#scene} Keep faces.{/scene}"
+        assert strip_motion_tags(t) == "Draft motion."
+
+    def test_a_bare_scene_tag_is_dropped(self):
+        assert strip_motion_tags("Describe {scene} in motion. {style}") == \
+            "Describe in motion."
+
+    def test_stripping_is_idempotent(self):
+        once = strip_motion_tags(TEMPLATE_555)
+        assert strip_motion_tags(once) == once
+
+    def test_a_template_passed_as_instructions_is_read_the_same_way(self):
+        """A console tab opened before #573 still sends templates."""
+        assert motion_instruction_for("handheld", TEMPLATE_555, SCENE) == \
+            _pre_555("handheld", "", SCENE)
+
+
+class TestLegacyWholePromptOverrides:
+    """A custom motion instruction saved before #555 has no tags, in the old key."""
 
     def test_it_is_still_the_whole_prompt(self):
         legacy = "Describe the motion in this frame as a ten second clip."
-        assert motion_instruction_for("handheld", legacy, SCENE) == legacy
-        assert motion_instruction_for("handheld", legacy, SCENE) == _pre_555("handheld", legacy, SCENE)
+        assert resolve_motion_override("", legacy) == ("", legacy)
+        assert motion_instruction_for("handheld", "", SCENE, legacy) == legacy
+        assert motion_instruction_for("handheld", "", SCENE, legacy) == \
+            _pre_555("handheld", legacy, SCENE)
 
-    def test_no_grounding_is_added(self):
-        out = motion_instruction_for("handheld", "  my own words  ", SCENE)
+    def test_no_style_or_grounding_is_added(self):
+        out = motion_instruction_for("handheld", "", SCENE, "  my own words  ")
         assert out == "my own words"
         assert SCENE not in out and MOTION_GROUNDING not in out
 
-    def test_literal_braces_that_are_not_placeholders_survive(self):
-        text = "Use JSON-ish {a b} notes and a lone { brace."
-        assert motion_instruction_for("handheld", text, SCENE) == text
-        assert validate_motion_template(text) == text
-
-
-class TestTemplateRendering:
-    def test_an_edit_keeps_grounding_while_it_keeps_the_section(self):
-        t = "{#scene}Scene: {scene}\n\n{/scene}Move. {style}"
-        assert render_motion_template(t, "Handheld. ", SCENE) == f"Scene: {SCENE}\n\nMove. Handheld."
-        assert render_motion_template(t, "Handheld. ") == "Move. Handheld."
-
-    def test_scene_outside_a_section_is_empty_without_a_scene(self):
-        assert render_motion_template("A {scene} B", "") == "A  B"
-
-    def test_a_scene_containing_placeholder_text_is_not_expanded(self):
-        """One substitution pass: the caption is inserted as text."""
-        out = render_motion_template("{scene} / {style}", "S", "she says {style}")
-        assert out == "she says {style} / S"
-
-    def test_the_none_style_is_empty(self):
-        assert render_motion_template("a{style}b", MOTION_STYLE_PRESETS["none"]) == "ab"
-
-    def test_rendering_tolerates_what_validation_would_refuse(self):
-        """A stored value must never 500 a caption; unknowns are left as written."""
-        assert render_motion_template("x {sceen} {#scene}y", "") == "x {sceen} {#scene}y"
-
-
-class TestValidation:
-    @pytest.mark.parametrize("bad, fragment", [
-        ("Describe {sceen}.", "{sceen}"),
-        ("{Scene} and {style}", "{Scene}"),
-        ("{#scene}unclosed", "never closed"),
-        ("stray {/scene}", "without a matching"),
-        ("{#scene}a{#scene}b{/scene}{/scene}", "nested"),
-        ("{#style}x{/style}", "{#style}"),
-    ])
-    def test_refused(self, bad, fragment):
-        with pytest.raises(ValueError) as e:
-            validate_motion_template(bad)
-        assert fragment in str(e.value)
-
-    def test_two_sections_are_fine(self):
-        t = "{#scene}a {scene}{/scene} middle {#scene}b{/scene}"
-        assert validate_motion_template(t) == t
+    def test_instructions_saved_since_win_over_it(self):
+        assert resolve_motion_override("New words.", "old whole prompt") == ("New words.", "")
+        assert motion_instruction_for("none", "New words.", "", "old whole prompt") == \
+            "New words."
 
 
 # ---------------------------------------------------------------------------------------
@@ -181,17 +224,11 @@ class TestSettingsEndpoint:
         body = (await _get(db)).json()
         assert body["caption_style_prompts"] == CAPTION_STYLES
         assert body["motion_style_prompts"] == MOTION_STYLE_PRESETS
-        assert body["motion_template_default"] == MOTION_TEMPLATE
-        assert set(body["motion_placeholders"]) >= {"{scene}", "{style}"}
+        assert body["motion_instruction_default"] == MOTION_INSTRUCTIONS
+        assert "motion_placeholders" not in body and "motion_template_default" not in body
         assert body["prompt_max_length"] == PROMPT_MAX_CHARS
         assert body["motion_instruction"] == "" and body["caption_instruction"] == ""
-
-    @pytest.mark.asyncio
-    async def test_an_unknown_placeholder_is_422(self, db):
-        resp = await _put(db, {"motion_instruction": "Describe {sceen} {style}"})
-        assert resp.status_code == 422
-        assert "{sceen}" in resp.text
-        assert await db.get(AppSetting, "motion_instruction") is None
+        assert body["motion_legacy_prompt"] == ""
 
     @pytest.mark.asyncio
     async def test_an_overlong_prompt_is_422(self, db):
@@ -200,27 +237,32 @@ class TestSettingsEndpoint:
         assert (await _put(db, {"caption_instruction": too_long})).status_code == 422
 
     @pytest.mark.asyncio
-    async def test_a_valid_template_is_saved_as_written(self, db):
+    async def test_plain_instructions_are_saved_as_written(self, db):
+        resp = await _put(db, {"motion_instruction": "Slow motion, {a b} and all."})
+        assert resp.status_code == 200
+        assert resp.json()["motion_instruction"] == "Slow motion, {a b} and all."
+        assert (await db.get(AppSetting, "motion_prompt_instructions")).value == \
+            "Slow motion, {a b} and all."
+
+    @pytest.mark.asyncio
+    async def test_a_template_sent_by_a_stale_console_is_stored_stripped(self, db):
         t = "{#scene}Scene: {scene}\n\n{/scene}Slow motion. {style}"
         resp = await _put(db, {"motion_instruction": t})
         assert resp.status_code == 200
-        assert resp.json()["motion_instruction"] == t
-
-    @pytest.mark.asyncio
-    async def test_a_legacy_override_is_still_accepted(self, db):
-        resp = await _put(db, {"motion_instruction": "my own words"})
-        assert resp.status_code == 200
-        assert resp.json()["motion_instruction"] == "my own words"
+        assert resp.json()["motion_instruction"] == "Slow motion."
 
     @pytest.mark.asyncio
     async def test_saving_the_default_text_stores_empty(self, db):
         """Saving the pre-filled editor untouched must not pin today's wording."""
-        resp = await _put(db, {"motion_instruction": MOTION_TEMPLATE,
+        resp = await _put(db, {"motion_instruction": MOTION_INSTRUCTIONS,
                                "caption_style": "rich",
                                "caption_instruction": CAPTION_STYLES["rich"]})
         assert resp.status_code == 200
         assert resp.json()["motion_instruction"] == ""
         assert resp.json()["caption_instruction"] == ""
+        # And so does the #555 default template, from a tab opened before #573.
+        resp = await _put(db, {"motion_instruction": TEMPLATE_555})
+        assert resp.json()["motion_instruction"] == ""
 
     @pytest.mark.asyncio
     async def test_another_styles_text_is_a_real_override(self, db):
@@ -230,15 +272,47 @@ class TestSettingsEndpoint:
         assert resp.json()["caption_instruction"] == CAPTION_STYLES["rich"]
 
     @pytest.mark.asyncio
-    async def test_the_scene_endpoint_validates_the_same_way(self, db):
-        client, app = await _client(db)
-        try:
-            async with client as c:
-                resp = await c.post("/images/scene", params={"path": PATH},
-                                    json={"motion_instruction": "{bogus}"})
-        finally:
-            app.dependency_overrides.clear()
-        assert resp.status_code == 422
+    async def test_a_saved_555_template_is_read_as_its_instructions(self, db):
+        db.add(AppSetting(key="motion_instruction",
+                          value="{#scene}Scene: {scene}\n\n{/scene}Slow. {style}"))
+        await db.flush()
+        body = (await _get(db)).json()
+        assert body["motion_instruction"] == "Slow."
+        assert body["motion_legacy_prompt"] == ""
+
+    @pytest.mark.asyncio
+    async def test_a_saved_555_default_is_read_as_the_default(self, db):
+        db.add(AppSetting(key="motion_instruction", value=TEMPLATE_555))
+        await db.flush()
+        body = (await _get(db)).json()
+        assert body["motion_instruction"] == "" and body["motion_legacy_prompt"] == ""
+
+    @pytest.mark.asyncio
+    async def test_a_legacy_whole_prompt_is_reported_and_kept(self, db):
+        db.add(AppSetting(key="motion_instruction", value="my own words"))
+        await db.flush()
+        body = (await _get(db)).json()
+        assert body["motion_instruction"] == ""
+        assert body["motion_legacy_prompt"] == "my own words"
+        # A save that does not touch the motion prompt leaves it in force.
+        body = (await _put(db, {"motion_style": "static"})).json()
+        assert body["motion_legacy_prompt"] == "my own words"
+
+    @pytest.mark.asyncio
+    async def test_saving_instructions_replaces_a_legacy_override(self, db):
+        db.add(AppSetting(key="motion_instruction", value="my own words"))
+        await db.flush()
+        body = (await _put(db, {"motion_instruction": "New words."})).json()
+        assert body["motion_instruction"] == "New words."
+        assert body["motion_legacy_prompt"] == ""
+        assert (await db.get(AppSetting, "motion_instruction")).value == ""
+
+    @pytest.mark.asyncio
+    async def test_resetting_to_default_replaces_a_legacy_override(self, db):
+        db.add(AppSetting(key="motion_instruction", value="my own words"))
+        await db.flush()
+        body = (await _put(db, {"motion_instruction": ""})).json()
+        assert body["motion_instruction"] == "" and body["motion_legacy_prompt"] == ""
 
 
 class TestTryEndpoint:
@@ -286,13 +360,32 @@ class TestTryEndpoint:
     @pytest.mark.asyncio
     async def test_saved_overrides_are_used_when_nothing_is_sent(self, db):
         db.add(AppSetting(key="caption_instruction", value="Say what you see."))
-        db.add(AppSetting(key="motion_instruction", value="Motion only. {style}"))
+        db.add(AppSetting(key="motion_prompt_instructions", value="Motion only."))
         db.add(AppSetting(key="motion_style", value="static"))
         await db.flush()
         body = (await self._try(db))[0].json()
         assert body["caption_instruction_used"] == "Say what you see."
-        assert body["motion_instruction_used"] == ("Motion only. "
-                                                   + MOTION_STYLE_PRESETS["static"]).strip()
+        # The full text sent: the instructions with the style and grounding the API adds.
+        assert body["motion_instruction_used"] == motion_instruction_for(
+            "static", "Motion only.", "a woman on a sofa")
+        assert body["motion_instruction_used"].startswith("Scene: a woman on a sofa\n\n")
+        assert MOTION_GROUNDING in body["motion_instruction_used"]
+
+    @pytest.mark.asyncio
+    async def test_a_saved_legacy_whole_prompt_is_sent_verbatim(self, db):
+        db.add(AppSetting(key="motion_instruction", value="Whole prompt of my own."))
+        await db.flush()
+        body = (await self._try(db))[0].json()
+        assert body["motion_instruction_used"] == "Whole prompt of my own."
+
+    @pytest.mark.asyncio
+    async def test_the_old_field_name_still_works(self, db):
+        """A Settings tab opened before #573 sends motion_template, and a template in it."""
+        body = (await self._try(db, {
+            "motion_template": "{#scene}Scene: {scene}\n\n{/scene}Old tab. {style}",
+            "motion_style": "none"}))[0].json()
+        assert body["motion_instruction_used"] == motion_instruction_for(
+            "none", "Old tab.", "a woman on a sofa")
 
     @pytest.mark.asyncio
     async def test_unsaved_text_is_used_and_nothing_is_stored(self, db):
@@ -300,30 +393,33 @@ class TestTryEndpoint:
         await db.flush()
         resp, sent = await self._try(db, {
             "caption_instruction": "Draft caption prompt.",
-            "motion_template": "{#scene}Given: {scene}. {/scene}Draft motion. {style}",
+            "motion_instruction": "Draft motion.",
             "motion_style": "none",
         })
         body = resp.json()
         assert body["caption_instruction_used"] == "Draft caption prompt."
-        assert body["motion_instruction_used"] == "Given: a woman on a sofa. Draft motion."
+        assert body["motion_instruction_used"] == (
+            f"Scene: a woman on a sofa\n\nDraft motion.\n\n{MOTION_GROUNDING} "
+            "Do not restate the scene description.")
         # Nothing stored: no image row, and the saved setting is untouched.
         assert await db.get(ImageMeta, PATH) is None
         assert (await db.get(AppSetting, "caption_instruction")).value == "saved caption prompt"
-        assert await db.get(AppSetting, "motion_instruction") is None
+        assert await db.get(AppSetting, "motion_prompt_instructions") is None
 
     @pytest.mark.asyncio
     async def test_empty_means_the_default(self, db):
         db.add(AppSetting(key="caption_instruction", value="saved caption prompt"))
+        # A legacy whole prompt too: "" is the default, not "whatever is saved".
         db.add(AppSetting(key="motion_instruction", value="saved motion prompt"))
         await db.flush()
         body = (await self._try(db, {"caption_instruction": "", "caption_style": "terse",
-                                     "motion_template": ""}))[0].json()
+                                     "motion_instruction": ""}))[0].json()
         assert body["caption_instruction_used"] == CAPTION_STYLES["terse"]
         assert body["motion_instruction_used"] == _pre_555("handheld", "", "a woman on a sofa")
 
     @pytest.mark.asyncio
-    async def test_a_bad_template_is_422_before_the_captioner_is_called(self, db):
-        resp, sent = await self._try(db, {"motion_template": "{nope}"})
+    async def test_an_overlong_prompt_is_422_before_the_captioner_is_called(self, db):
+        resp, sent = await self._try(db, {"motion_instruction": "x" * (PROMPT_MAX_CHARS + 1)})
         assert resp.status_code == 422
         assert sent == []
 

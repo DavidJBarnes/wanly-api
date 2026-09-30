@@ -421,7 +421,8 @@ async def _caption(path: str, outstanding: set[str]) -> None:
 
     motion, instruction = await describe_motion(
         image, saved_scene, style=cfg.get("motion_style", ""),
-        custom=cfg.get("motion_instruction", ""), base_url=base)
+        custom=cfg.get("motion_instruction", ""), base_url=base,
+        legacy=cfg.get("motion_legacy_prompt", ""))
     motion = (motion or "").strip()
     if not motion:
         raise CaptionError("the captioner returned no motion paragraph")
