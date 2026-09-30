@@ -4,11 +4,13 @@ EVERY EDIT IN THE EDIT DIALOG IS ONE OF THESE NOW (#569). LivePortrait (app/face
 every detail"; head angles at any size, the expression presets and the free-text box all come
 here. The face-mode endpoints stay for now, but nothing in the console calls them.
 
-TWO PLACES AN EDIT CAN RUN (#570). A STANDING image-edit service -- the second 3090, Qwen
-resident full-time beside Automatic1111, no mode switch -- is preferred whenever its /health is
-ok. Otherwise the job falls back to the main 3090's EDIT MODE, below. A standing box that is
-merely busy (A1111 generating) is waited for, not fallen back from: the fallback pauses renders,
-and the point of the second card is that edits never do.
+WHERE AN EDIT RUNS is "a worker equipped with image-edit", in two shapes. An ALWAYS-ON one
+(`image_edit_standing_url`: image-edit running without a mode switch) is preferred whenever its
+/health is ok; otherwise the job goes to `image_edit_worker`'s EDIT MODE, below, which pauses its
+renders. No box is named in code: which boxes carry image-edit is being re-planned as symmetric
+3090 workers, and choosing among them extends `_on_standing` / `_box_ready`. An always-on worker
+that is merely busy (its service says it is waiting, e.g. for an A1111 on its card) is waited
+for, not fallen back from: the fallback is the one path that pauses renders.
 
 WHY A JOB AND NOT A CALL. Face mode (app/face_edit.py) is ~1 s on the 2070 and answers inline.
 Full mode needs the 3090's card to itself: ~20 GB of Qwen cannot sit beside a render that holds
@@ -132,7 +134,7 @@ class Job:
     preview: str | None = None
     meta: dict = field(default_factory=dict)
     saved: list[dict] = field(default_factory=list)
-    #: Which box ran it: the standing service's name, or the main 3090's (#570).
+    #: Which worker ran it: the always-on one's name, or image_edit_worker.
     worker: str | None = None
 
 
@@ -234,7 +236,7 @@ class FullEditQueue:
                         f", aura {(job.meta.get('identity') or {}).get('aura')}")
 
     async def _on_standing(self, job: Job) -> dict | None:
-        """Run the job on the standing service (#570), or None to fall back to edit mode.
+        """Run the job on the always-on image-edit worker, or None to fall back to edit mode.
 
         None when no standing service is configured, when its /health is not ok, or when it
         stops answering before the edit is sent. A standing box that is only BUSY -- A1111
@@ -246,7 +248,7 @@ class FullEditQueue:
         url = _standing_url()
         if not url:
             return None
-        name = settings.image_edit_standing_name
+        name = _standing_name(url)
         deadline = time.time() + settings.image_edit_switch_timeout_s
         while True:
             h = await _standing_health(url)
@@ -385,6 +387,12 @@ def _standing_url() -> str:
     return (settings.image_edit_standing_url or "").strip().rstrip("/")
 
 
+def _standing_name(url: str) -> str:
+    """What a job's status calls the always-on worker: its configured name, else its host."""
+    from urllib.parse import urlparse
+    return (settings.image_edit_standing_name or "").strip() or urlparse(url).hostname or url
+
+
 async def _standing_health(url: str) -> dict | None:
     """The standing service's /health when it is up and ready for an edit, else None.
 
@@ -458,9 +466,9 @@ async def _edit(source: bytes, request: dict, url: str | None = None) -> dict:
 
 
 async def faces(source: bytes) -> dict | None:
-    """The face list from the standing service (#569/#570), or None when there is none to ask.
+    """The face list from the always-on image-edit worker, or None when there is none to ask.
 
-    Only the standing box: the main 3090 runs image-edit in edit mode only, and a face list
+    Only an always-on one: image_edit_worker runs image-edit in edit mode only, and a face list
     is not worth stopping a render for. The route falls back to face-edit's list, whose boxes
     are as good for a crop -- a box is a box, whichever detector drew it."""
     url = _standing_url()
