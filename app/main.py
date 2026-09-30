@@ -2,10 +2,12 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
+from sqlalchemy.exc import TimeoutError as PoolTimeout
 
 from app.config import settings
 from app.heartbeat_monitor import heartbeat_monitor
@@ -37,6 +39,24 @@ app = FastAPI(title="wanly-api", lifespan=lifespan)
 # --- Rate limiting -----------------------------------------------------------
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+# --- An empty connection pool is a 503 with a reason, not a bare 500 (console#559) ----------
+@app.exception_handler(PoolTimeout)
+async def _pool_exhausted(request: Request, exc: PoolTimeout):
+    """Every pooled connection stayed checked out for POOL_TIMEOUT_S.
+
+    Temporary and on our side, so 503 -- and a message the console can show, instead of the
+    unhandled-exception 500 that reads as "the delete is broken" when it is "the API is
+    saturated, try again".
+    """
+    logger.error("connection pool exhausted on %s %s: %s",
+                 request.method, request.url.path, exc)
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "The API is out of database connections right now "
+                           "(too much in flight at once). Try again in a moment."},
+    )
 
 # --- CORS --------------------------------------------------------------------
 _origins = [o.strip() for o in settings.cors_origins.split(",") if o.strip()]

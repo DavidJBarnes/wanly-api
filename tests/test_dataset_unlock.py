@@ -165,6 +165,9 @@ class TestTheBackgroundPathsUseTheSameRule:
         class _S3:
             def download_bytes(self, uri):
                 return b"x"
+
+            def head_object(self, uri):
+                return {"Key": uri}
         monkeypatch.setattr(cap_mod, "caption_image_bytes", _caption)
         monkeypatch.setattr(mod, "s3", _S3())
         n = await mod.caption_dataset_images(db, ds.id, overwrite=False)
@@ -190,6 +193,9 @@ class TestTheBackgroundPathsUseTheSameRule:
         class _S3:
             def download_bytes(self, uri):
                 return b"x"
+
+            def head_object(self, uri):
+                return {"Key": uri}
         monkeypatch.setattr(cap_mod, "caption_image_bytes", _caption)
         monkeypatch.setattr(mod, "s3", _S3())
         n = await mod.caption_dataset_images(db, ds.id, overwrite=False)

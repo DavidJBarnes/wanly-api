@@ -9,6 +9,7 @@ here; dataset removal is the Datasets page's job (wanly-console#464's split).
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy import Select
 
 from app.enums import JobStatus
 from app.models import Job
@@ -44,7 +45,19 @@ class _FakeSession:
         self._rows = {"jobs": list(jobs), "segments": list(segments),
                       "datasets": list(datasets)}
 
+    async def commit(self):
+        pass
+
+    async def rollback(self):
+        pass
+
     async def execute(self, query):
+        # Only find_image_references' reads are modelled. The delete's own writes -- the
+        # lock_timeout, dropping image_meta, the FOR UPDATE read of datasets holding
+        # captions (console#559) -- are pinned against a real database in
+        # test_image_delete_forgets.py, so here they simply match nothing.
+        if not isinstance(query, Select) or query._for_update_arg is not None:
+            return _FakeResult([])
         table = query.get_final_froms()[0].name
         columns = list(query.selected_columns.keys())
         wanted: set[str] = set()
@@ -68,6 +81,9 @@ class _FakeResult:
 
     def all(self):
         return self._rows
+
+    def scalars(self):
+        return self
 
 
 def _override(session):

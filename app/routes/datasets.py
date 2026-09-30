@@ -26,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app import s3
 from app.auth import get_current_user, verify_api_key_or_bearer
 from app.config import settings
-from app.database import async_session, get_db
+from app.database import async_session, get_db, release_connection
 from app.enums import JobStatus, SegmentStatus, TrainingStatus
 from app.joycaption import TRAINING_CAPTION, CaptionError
 from app.models import Dataset, Job, LtxCharacter, Segment, TrainingJob, User
@@ -851,6 +851,10 @@ async def caption_dataset_images(db: AsyncSession, ds_id: uuid.UUID, overwrite: 
     todo = [u for u in ds.images if overwrite or not (have.get(u) or "").strip()]
     done = 0
     for uri in todo:
+        # No connection held while in line or while the captioner works (console#559): a
+        # turn can be minutes away, and the transaction left open by the last read would sit
+        # "idle in transaction" on a pooled connection the whole time.
+        await release_connection(db)
         try:
             async with caption_queue.turn(uri):
                 image = await asyncio.to_thread(s3.download_bytes, uri)
@@ -869,8 +873,21 @@ async def caption_dataset_images(db: AsyncSession, ds_id: uuid.UUID, overwrite: 
         if not text:
             logger.warning("dataset %s: empty caption for %s; skipping", ds.name, uri)
             continue
-        await db.refresh(ds)
+        # FOR UPDATE, held only from here to the commit below -- milliseconds, never across the
+        # captioner. It orders this write against DELETE /images dropping the same URI's
+        # entries (console#559): without it, a delete landing between this read and the
+        # commit is undone by writing back the dict read before it.
+        await db.refresh(ds, with_for_update=True)
         if uri not in ds.images:
+            continue
+        # DELETED WHILE IT WAS BEING CAPTIONED. The delete keeps the set's membership (the
+        # 409 dialog's "dead entry"), so the membership check above cannot see it -- and the
+        # caption written here would be exactly the orphan the delete just dropped. One HEAD
+        # per ~25 s caption; a HEAD that fails for any other reason skips the image too,
+        # which the next run fills in.
+        if await asyncio.to_thread(s3.head_object, uri) is None:
+            logger.info("dataset %s: %s was deleted while captioning; not storing its caption",
+                        ds.name, uri)
             continue
         # A run can be queued on this set while the loop is still going -- the Train button
         # does not wait for captioning. From then on the set is locked (#356), and a caption

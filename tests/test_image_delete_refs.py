@@ -16,6 +16,7 @@ import uuid
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy import Select
 
 from app.auth import get_current_user
 from app.database import get_db
@@ -38,6 +39,9 @@ class _FakeResult:
     def all(self):
         return self._rows
 
+    def scalars(self):
+        return self
+
 
 class _FakeSession:
     """Stands in for AsyncSession, answering find_image_references' SELECTs from ORM objects.
@@ -56,7 +60,19 @@ class _FakeSession:
         self._rows = {"jobs": list(jobs), "segments": list(segments),
                       "datasets": list(datasets)}
 
+    async def commit(self):
+        pass
+
+    async def rollback(self):
+        pass
+
     async def execute(self, query):
+        # Only find_image_references' reads are modelled. The delete's own writes -- the
+        # lock_timeout, dropping image_meta, the FOR UPDATE read of datasets holding
+        # captions (console#559) -- are pinned against a real database in
+        # test_image_delete_forgets.py, so here they simply match nothing.
+        if not isinstance(query, Select) or query._for_update_arg is not None:
+            return _FakeResult([])
         table = query.get_final_froms()[0].name
         columns = list(query.selected_columns.keys())
         wanted: set[str] = set()

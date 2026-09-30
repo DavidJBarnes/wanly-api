@@ -285,12 +285,16 @@ class TestCropping:
 class _FakeS3:
     """Records what the endpoint downloaded, which is what `targets` resolved to."""
 
-    def __init__(self):
+    def __init__(self, gone: set[str] | None = None):
         self.downloaded: list[str] = []
+        self.gone = gone or set()
 
     def download_bytes(self, uri):
         self.downloaded.append(uri)
         return b"jpeg"
+
+    def head_object(self, uri):
+        return None if uri in self.gone else {"Key": uri}
 
     def upload_bytes(self, data, key, bucket):
         return f"s3://{bucket}/{key}"
@@ -775,6 +779,21 @@ class TestTrainingCaptions:
         assert ds.captions[imgs[1]] == "hand written"
         assert set(ds.captions) == set(imgs)
         assert seen == [TRAINING_CAPTION, TRAINING_CAPTION]
+
+    async def test_an_image_deleted_while_captioned_gets_no_caption(self, db, monkeypatch):
+        """console#559: DELETE /images keeps the set's membership (the 409's dead entry), so
+        the loop's membership check cannot see a delete that landed while the captioner was
+        working on that image. Storing the caption would recreate the orphan the delete just
+        dropped."""
+        from app.routes import datasets as mod
+        imgs = _imgs(3)
+        ds = await _ds(db, images=imgs)
+        await self._fake_captioner(monkeypatch)
+        monkeypatch.setattr(mod, "s3", _FakeS3(gone={imgs[1]}))
+        n = await mod.caption_dataset_images(db, ds.id, overwrite=False)
+        await db.refresh(ds)
+        assert n == 2
+        assert set(ds.captions) == {imgs[0], imgs[2]}
 
     async def test_overwrite_redoes_every_one(self, db, monkeypatch):
         from app.routes.datasets import caption_dataset_images
