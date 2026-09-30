@@ -6,8 +6,8 @@ embed <SCENE>, and resolution fills it.
 
 The invariant the whole file protects is the one that separates this from <SCENE>:
 **<MOTION> is cache-only.** It never triggers a caption call, at submit or at the claim — the
-daemon's claim poll has a 10s HTTP timeout, a warm motion caption is ~50s, production's
-captioner (MOTION_CAPTION_ENABLED=false) cannot answer the directional prompt at all, and the
+daemon's claim poll has a 10s HTTP timeout, a warm motion caption is ~50s, a captioner run
+with MOTION_CAPTION_ENABLED=false cannot answer the directional prompt at all, and the
 paragraph's value is that a person read it in the lightbox. Every test that matters asserts
 either "filled from the row" or "not called, dropped" — a live call in either direction fails
 loudly here because the captioner is a mock that records.

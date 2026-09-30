@@ -50,10 +50,19 @@ WHAT IT DOES NOT CHANGE
     * Continuations whose start image is not known yet (start_image NULL, index > 0) keep the
       deferral: the frame does not exist until the previous segment renders, so there is
       nothing to wait on. The claim resolves them exactly as before.
-    * With MOTION_CAPTION_ENABLED=false (production today) only <SCENE> gates. <MOTION> is
-      then filled if a paragraph happens to be saved and otherwise behaves as it always has
-      -- deferred to the claim and dropped there -- because waiting for a half that is
-      switched off would be waiting forever.
+    * <MOTION> gates whenever the prompt carries it and motion captioning can run
+      (motion_captioning_can_run: MOTION_CAPTION_ENABLED, true by default). Only with the
+      kill-switch off does <SCENE> gate alone -- then <MOTION> is filled if a paragraph
+      happens to be saved and is otherwise deferred to the claim and dropped there, because
+      waiting for a half that is switched off would be waiting forever. The claim refuses a
+      prompt that the drop leaves empty or trigger-only (console#577), so that case is loud.
+
+THE PLACEHOLDER HAS TO ARRIVE
+
+    Everything here keys on a literal <SCENE>/<MOTION> in the submitted prompt. The console
+    used to delete an unfilled one before submitting, so this never fired and a Motion recipe
+    queued mid-caption rendered with an empty prompt (console#577). It now sends the bare
+    placeholder; the API refuses a blank one at submit and at the claim either way.
 
 NEVER BLOCKS THE LOOP, NEVER HOLDS A CONNECTION ACROSS A CAPTION
 
@@ -111,19 +120,33 @@ def _seg():
 # Pure rules
 # ---------------------------------------------------------------------------------------
 
+def motion_captioning_can_run() -> bool:
+    """Can a caption of an image produce the motion paragraph at all?
+
+    MOTION_CAPTION_ENABLED, the env kill-switch from #326 -- true by default, and set false
+    only for a captioner whose model cannot answer the directional prompt. While it is on,
+    every caption this module makes (run_caption_pair / describe_motion) produces the
+    paragraph, so waiting for one is waiting for something that will come.
+    """
+    return bool(settings.motion_caption_enabled)
+
+
 def needed_halves(prompt: str | None) -> set[str]:
     """The caption halves this prompt must wait for.
 
-    <MOTION> counts only while motion captioning is on. With it off no caption will ever
-    produce the paragraph, so waiting for one would be waiting forever; the placeholder keeps
-    its pre-#562 behaviour instead (filled if saved, otherwise deferred to the claim).
+    <SCENE> whenever the prompt carries it. <MOTION> whenever the prompt carries it and
+    motion captioning can run -- a Motion recipe's prompt is little more than its trigger
+    phrase and <MOTION>, so rendering it without the paragraph renders nothing (console#577).
+    With the kill-switch off no caption will ever produce the paragraph, so waiting for one
+    would be waiting forever; the placeholder keeps its pre-#562 behaviour instead (filled if
+    saved, otherwise deferred to the claim, which refuses the prompt if that leaves it empty).
     """
     seg = _seg()
     prompt = prompt or ""
     out: set[str] = set()
     if seg.SCENE_PLACEHOLDER in prompt:
         out.add(SCENE)
-    if seg.MOTION_PLACEHOLDER in prompt and settings.motion_caption_enabled:
+    if seg.MOTION_PLACEHOLDER in prompt and motion_captioning_can_run():
         out.add(MOTION)
     return out
 

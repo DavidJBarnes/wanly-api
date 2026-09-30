@@ -30,7 +30,7 @@ from app.model_requirements import (
     required_artifacts,
     unsatisfied,
 )
-from app.routes.segments import _resolve_wildcards_outside_scene
+from app.routes.segments import _refuse_empty_submit, _resolve_wildcards_outside_scene
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
 from app.tag_filter import like_escape, tag_clause
 
@@ -92,6 +92,10 @@ async def create_job(
         body = JobCreate.model_validate_json(data)
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Invalid JSON in data field: {e}")
+
+    # Before the job row or the start frame's upload: a prompt that can only ever render as
+    # nothing is refused outright (console#577).
+    await _refuse_empty_submit(db, body.first_segment.prompt, body.first_segment.ltx_recipe)
 
     # Drawn below 2**53, the largest integer JavaScript represents exactly.
     #

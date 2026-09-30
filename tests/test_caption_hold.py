@@ -142,8 +142,9 @@ class TestWhatGates:
         assert caption_hold.needed_halves(BOTH) == {"scene", "motion"}
 
     def test_motion_off_leaves_only_the_scene_gating(self, monkeypatch):
-        # Production runs MOTION_CAPTION_ENABLED=false. Waiting for a paragraph no caption
-        # will ever produce would be waiting forever.
+        # The kill-switch (MOTION_CAPTION_ENABLED=false, for a captioner that cannot do the
+        # motion half). Waiting for a paragraph no caption will ever produce would be waiting
+        # forever.
         monkeypatch.setattr(settings, "motion_caption_enabled", False)
         assert caption_hold.needed_halves(BOTH) == {"scene"}
         assert caption_hold.needed_halves("k3lly, <MOTION>") == set()
