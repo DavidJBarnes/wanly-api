@@ -193,138 +193,148 @@ MOTION_GROUNDING = "Keep both people's faces, bodies and wardrobe exactly as in 
 
 
 #: The longest instruction either editor will store or send (console#555). Generous next to
-#: the defaults (~430 characters for "rich", ~1100 for the motion template) so an edit has
+#: the defaults (~430 characters for "rich", ~900 for the motion instructions) so an edit has
 #: room, but bounded: the instruction shares the captioner's context with the image, and a
 #: prompt the size of an essay is a mistake, not a style.
 PROMPT_MAX_CHARS = 4000
 
 # ---------------------------------------------------------------------------------------
-# The motion prompt as an editable template (console#555)
+# The motion prompt as plain instructions (console#573)
 #
-# Settings used to offer a "custom motion instruction" that REPLACED the prompt outright,
-# and silently took the scene grounding with it (finding 5 above). The prompt is now a
-# template, and the default is simply the pieces above laid out in it, so an override is an
-# edit of the real text rather than a blank box.
+# Settings edits only the INSTRUCTIONS -- plain sentences, no placeholders. The API adds the
+# rest every time it sends the prompt:
 #
-#   {style}                  the capture-style sentence for the chosen motion style
-#                            (MOTION_STYLE_PRESETS; "" for "none")
-#   {scene}                  the static caption, stripped
-#   {#scene}...{/scene}      a section kept only when there IS a scene; removed, markers
-#                            and all, when there is not
+#   * the capture-style sentence (MOTION_STYLE_PRESETS), just before the sentence that
+#     starts MOTION_STYLE_ANCHOR ("Single continuous shot") -- where it has always sat, after
+#     the action has claimed the word budget (finding 4) -- or at the end if the
+#     instructions no longer contain that sentence;
+#   * with a scene caption, the grounding: "Scene: <caption>" above, and the identity lock,
+#     soundscape request and "do not restate" below (finding 5). Without one, nothing.
 #
-# THE SECTION IS WHY THIS IS NOT str.format. With no scene, today's prompt is not the
-# grounded one with an empty "Scene: " line -- the whole grounding (the "Scene:" header AND
-# the identity lock after the prompt) is absent. A template that cannot say "only when" can
-# only reproduce one of the two cases, and both are load-bearing. One flat, non-nesting
-# section is the least syntax that expresses it.
+# WHY NOT THE #555 TEMPLATE. #555 made the prompt a template with {style}, {scene} and a
+# {#scene}...{/scene} section, which kept the grounding editable but made changing a word
+# mean reading around plumbing. The grounding is not a matter of taste -- dropping it is the
+# failure #555 was fixing -- so it moved back into code and the editor holds prose only.
 #
-# Placeholders are {name} with an identifier inside; anything else in braces ("{a b}", a
-# lone "{") is literal text. An unknown identifier is a typo that would otherwise reach the
-# captioner verbatim, so saving one is refused (validate_motion_template). Rendering, by
-# contrast, never raises: a stored value predating validation still renders, unknowns left
-# as they are.
+# THE DEFAULT IS UNCHANGED, BYTE FOR BYTE, with and without a scene, for every style: the
+# default instructions are MOTION_BASE + MOTION_TAIL, and splicing the style in before the
+# anchor reproduces MOTION_BASE + style + MOTION_TAIL exactly, down to the double space the
+# tail has always carried. Pinned by tests/test_motion_template.py against a verbatim copy
+# of the pre-#555 function.
 #
-# A template with NO placeholders renders to itself -- which is exactly what a pre-#555
-# custom motion instruction meant (the whole prompt, no grounding). Existing overrides keep
-# their meaning without a migration or a special case.
+# SAVED OVERRIDES FROM BEFORE THIS CHANGE (strip_motion_tags, resolve_motion_override):
+#   * a #555 template (has tags) -> its instruction text, tags and grounding sections
+#     stripped, since the API now adds exactly those;
+#   * a pre-#555 whole-prompt override (no tags, in the old settings key) -> still the
+#     whole prompt, sent verbatim, no style and no grounding, as it always meant.
 # ---------------------------------------------------------------------------------------
 
-MOTION_SCENE_OPEN = "{#scene}"
-MOTION_SCENE_CLOSE = "{/scene}"
+#: What the motion editor shows and "" in the setting stands for.
+MOTION_INSTRUCTIONS = MOTION_BASE + MOTION_TAIL.lstrip()
 
-#: Renders to exactly what motion_instruction_for produced before #555, with and without a
-#: scene -- pinned by tests/test_motion_template.py. Built from the pieces rather than
-#: restated, so the text has one home and the findings above stay attached to it.
-MOTION_TEMPLATE = (
-    MOTION_SCENE_OPEN + "Scene: {scene}\n\n" + MOTION_SCENE_CLOSE
-    + MOTION_BASE + "{style}" + MOTION_TAIL
-    + MOTION_SCENE_OPEN + "\n\n" + MOTION_GROUNDING
-    + " Do not restate the scene description." + MOTION_SCENE_CLOSE
-)
+#: The capture-style sentence goes just before this, when the instructions contain it.
+MOTION_STYLE_ANCHOR = "Single continuous shot"
 
-#: What each placeholder means, for the Settings legend. The API owns the list so the
-#: legend cannot drift from what the renderer accepts.
-MOTION_PLACEHOLDERS: dict[str, str] = {
-    "{scene}": "The image caption (the static half) this motion prompt is grounded on.",
-    "{style}": "The capture-style sentence for the chosen capture style; empty for None.",
-    "{#scene}...{/scene}": "Kept only when there is a scene caption; dropped entirely "
-                           "otherwise. Put the grounding inside it.",
-}
-
-_PLACEHOLDER = re.compile(r"\{([#/]?[A-Za-z_][A-Za-z0-9_]*)\}")
-_SCENE_SECTION = re.compile(re.escape(MOTION_SCENE_OPEN) + r"(.*?)"
-                            + re.escape(MOTION_SCENE_CLOSE), re.DOTALL)
-_KNOWN = {"scene", "style", "#scene", "/scene"}
+#: The #555 template syntax, recognised only to migrate a saved template away from it.
+_TAG = re.compile(r"\{[#/]?(?:scene|style)\}")
+_SCENE_SECTION = re.compile(r"\{#scene\}.*?\{/scene\}", re.DOTALL)
 
 
-def validate_motion_template(template: str) -> str:
-    """Refuse a template the renderer would mangle. Returns it unchanged; raises ValueError.
+def has_motion_tags(text: str) -> bool:
+    """Whether text is a #555 motion template rather than plain instructions."""
+    return bool(_TAG.search(text or ""))
 
-    Unknown placeholders ("{sceen}") and unbalanced or nested sections. The message names
-    the offending text, because it surfaces verbatim as the 422 the editor shows.
+
+def strip_motion_tags(text: str) -> str:
+    """A #555 motion template as plain instructions. Plain text is returned unchanged.
+
+    The {#scene}...{/scene} sections go whole: in every template the console offered they
+    held the grounding, which the API now adds itself, so keeping their text would ground
+    the prompt twice. {style} and {scene} go too -- the API appends the style sentence, and
+    the scene caption arrives inside the grounding. A tag's surrounding spaces collapse to
+    one, so "stretching. {style} Single" becomes "stretching. Single" and the migrated
+    default is exactly MOTION_INSTRUCTIONS.
+
+    Idempotent, so it can run on every read and every write without a migration step.
     """
-    unknown = sorted({m.group(0) for m in _PLACEHOLDER.finditer(template)
-                      if m.group(1) not in _KNOWN})
-    if unknown:
-        raise ValueError(
-            f"unknown placeholder{'s' if len(unknown) > 1 else ''} {', '.join(unknown)}; "
-            "the motion template understands {scene}, {style} and {#scene}...{/scene}")
-    depth = 0
-    for m in _PLACEHOLDER.finditer(template):
-        if m.group(1) == "#scene":
-            if depth:
-                raise ValueError("{#scene} sections cannot be nested; close the first "
-                                 "with {/scene} before opening another")
-            depth = 1
-        elif m.group(1) == "/scene":
-            if not depth:
-                raise ValueError("{/scene} without a matching {#scene} before it")
-            depth = 0
-    if depth:
-        raise ValueError("{#scene} is never closed; add {/scene} where the section ends")
-    return template
+    if not has_motion_tags(text):
+        return text
+    out = _SCENE_SECTION.sub("", text)
+    out = re.sub(r"[ \t]*" + _TAG.pattern + r"[ \t]*", " ", out)
+    return out.strip()
 
 
-def render_motion_template(template: str, style_sentence: str, scene: str = "") -> str:
-    """Fill a motion template. Never raises; see the block comment above for the syntax.
+def resolve_motion_override(instructions: str, legacy: str) -> tuple[str, str]:
+    """The saved motion override as (plain instructions, legacy whole prompt); one is "".
 
-    One substitution pass, so a scene caption that happens to contain "{style}" is inserted
-    as text rather than expanded.
+    `instructions` is the setting written since #573 (plain text; tags are stripped anyway,
+    in case a stale console wrote a template). `legacy` is the older setting, which is
+    either a #555 template -- migrated to its instructions -- or a pre-#555 whole prompt,
+    which is returned as the whole prompt so it keeps its meaning. The newer setting wins;
+    saving from the editor clears the older one.
     """
+    if instructions and instructions.strip():
+        return strip_motion_tags(instructions).strip(), ""
+    if not (legacy and legacy.strip()):
+        return "", ""
+    if has_motion_tags(legacy):
+        migrated = strip_motion_tags(legacy).strip()
+        # A saved copy of the #555 default migrates to the default, which is "".
+        return ("" if migrated == MOTION_INSTRUCTIONS else migrated), ""
+    return "", legacy.strip()
+
+
+def compose_motion_prompt(instructions: str, style_sentence: str, scene: str = "") -> str:
+    """The full motion prompt: the instructions with the style sentence and grounding added.
+
+    See the block comment above for where each piece goes and why the default is unchanged.
+    """
+    body = instructions.strip()
+    at = body.find(MOTION_STYLE_ANCHOR)
+    if at >= 0:
+        body = body[:at].rstrip() + " " + style_sentence + " " + body[at:]
+    else:
+        body = body + " " + style_sentence
+    body = body.strip()
     scene = (scene or "").strip()
-    text = _SCENE_SECTION.sub(lambda m: m.group(1) if scene else "", template)
-    values = {"scene": scene, "style": style_sentence}
-    text = _PLACEHOLDER.sub(lambda m: values.get(m.group(1), m.group(0)), text)
-    return text.strip()
+    if not scene:
+        return body
+    return (f"Scene: {scene}\n\n{body}\n\n{MOTION_GROUNDING} "
+            "Do not restate the scene description.")
 
 
-def motion_instruction_for(style: str, custom: str = "", scene: str = "") -> str:
+def motion_instruction_for(style: str, custom: str = "", scene: str = "",
+                           legacy: str = "") -> str:
     """The motion instruction, grounded on the static caption when one is given.
 
-    `custom` is the saved motion template (console#555); empty means MOTION_TEMPLATE. It is
-    rendered like the default, so an override keeps its grounding for as long as it keeps
-    the {#scene} section. One with no placeholders at all -- every override written before
-    #555 -- renders to itself: the whole prompt, grounding and all, as it always meant.
+    `custom` is the saved motion INSTRUCTIONS (console#573); empty means
+    MOTION_INSTRUCTIONS. A #555 template is accepted and read as its instructions.
+
+    `legacy` is a pre-#555 whole-prompt override (resolve_motion_override): when set and no
+    instructions are, it is sent exactly as written, with no style and no grounding.
 
     `scene` is the static caption from the first call of the same session; it anchors
     identity and wardrobe so the motion paragraph cannot contradict what the person just
     read and accepted.
     """
-    template = custom.strip() if custom and custom.strip() else MOTION_TEMPLATE
+    instructions = strip_motion_tags(custom).strip() if custom and custom.strip() else ""
+    if not instructions and legacy and legacy.strip():
+        return legacy.strip()
     style_sentence = MOTION_STYLE_PRESETS.get(style,
                                               MOTION_STYLE_PRESETS[MOTION_DEFAULT_STYLE])
-    return render_motion_template(template, style_sentence, scene)
+    return compose_motion_prompt(instructions or MOTION_INSTRUCTIONS, style_sentence, scene)
 
 
 async def describe_motion(image_bytes: bytes, scene_description: str, style: str,
-                          custom: str = "", base_url: str | None = None) -> tuple[str, str]:
+                          custom: str = "", base_url: str | None = None,
+                          legacy: str = "") -> tuple[str, str]:
     """The motion paragraph for an image, grounded on its static caption.
 
     Returns (motion, instruction_used) — same provenance rule as the static caption: the
     row must say how each half was made. Raises CaptionError; callers treat that as
     non-fatal to the static half.
     """
-    instruction = motion_instruction_for(style, custom, scene_description)
+    instruction = motion_instruction_for(style, custom, scene_description, legacy)
     return await describe(image_bytes, instruction, base_url), instruction
 
 

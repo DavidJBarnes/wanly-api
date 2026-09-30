@@ -1054,11 +1054,12 @@ async def try_caption_prompts(
         except Exception as e:
             raise HTTPException(status_code=404, detail=f"could not read {path}: {e}") from e
         try:
-            # motion_template None falls through to the saved one and "" to the default
-            # template -- caption_image_pair already reads it that way.
+            # motion_instruction None falls through to the saved one (a legacy whole prompt
+            # included) and "" to the default instructions -- caption_image_pair already
+            # reads it that way.
             pair = await caption_image_pair(
                 db, image, instruction=instruction,
-                motion_style=body.motion_style, motion_instruction=body.motion_template)
+                motion_style=body.motion_style, motion_instruction=body.motion_instruction)
         except CaptionError as e:
             logger.warning("prompt try failed for %s: %s", path, e)
             raise HTTPException(status_code=503, detail=str(e)) from e

@@ -212,11 +212,19 @@ class TestMotionHalf:
         assert "handheld" in p
         assert "remains still" in p  # the anti-hedge clause, measured necessary
 
-    def test_a_custom_motion_instruction_wins_entirely(self):
+    def test_a_legacy_whole_prompt_wins_entirely(self):
         from app.joycaption import motion_instruction_for
 
-        p = motion_instruction_for("handheld", "my own words", "A woman on a sofa.")
+        p = motion_instruction_for("handheld", "", "A woman on a sofa.", legacy="my own words")
         assert p == "my own words"
+
+    def test_custom_instructions_keep_the_grounding(self):
+        """Since console#573 an override is the instructions only; the grounding stays."""
+        from app.joycaption import MOTION_GROUNDING, motion_instruction_for
+
+        p = motion_instruction_for("handheld", "my own words", "A woman on a sofa.")
+        assert p.startswith("Scene: A woman on a sofa.\n\nmy own words")
+        assert MOTION_GROUNDING in p and "handheld" in p
 
     def test_unknown_style_falls_back_to_the_default_preset(self):
         from app.joycaption import motion_instruction_for
@@ -244,7 +252,7 @@ class TestMotionKillSwitch:
             calls.append("static")
             return "a woman on a sofa"
 
-        async def fake_motion(image, scene, style, custom="", base_url=None):
+        async def fake_motion(image, scene, style, custom="", base_url=None, legacy=""):
             calls.append("motion")
             return "she leans back", "the motion instruction"
 

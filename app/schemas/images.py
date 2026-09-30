@@ -1,9 +1,10 @@
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
-from app.schemas.app_settings import CaptionInstruction, CaptionStyle, MotionStyle, MotionTemplate
+from app.schemas.app_settings import (CaptionInstruction, CaptionStyle, MotionInstructions,
+                                      MotionStyle)
 
 
 class ImageTagsUpdate(BaseModel):
@@ -33,8 +34,8 @@ class ImageSceneRequest(BaseModel):
     style: Optional[str] = None
     instruction: Optional[CaptionInstruction] = None
     motion_style: Optional[str] = None
-    # A motion TEMPLATE since console#555, validated like the saved setting.
-    motion_instruction: Optional[MotionTemplate] = None
+    # Plain motion instructions since console#573, read like the saved setting.
+    motion_instruction: Optional[MotionInstructions] = None
 
 
 class CaptionTryRequest(BaseModel):
@@ -50,12 +51,17 @@ class CaptionTryRequest(BaseModel):
     say" without the console restating any default. Field names match the settings keys the
     editors write, rather than ImageSceneRequest's, so the page sends the same values it
     would save.
+
+    motion_instruction was "motion_template" while the motion prompt was a template
+    (console#555). The old name is still accepted, so a Settings tab opened before #573
+    deployed keeps working; its template is read as its instructions.
     """
 
     caption_style: Optional[CaptionStyle] = None
     caption_instruction: Optional[CaptionInstruction] = None
     motion_style: Optional[MotionStyle] = None
-    motion_template: Optional[MotionTemplate] = None
+    motion_instruction: Optional[MotionInstructions] = Field(
+        None, validation_alias=AliasChoices("motion_instruction", "motion_template"))
 
 
 class CaptionTryResponse(BaseModel):
@@ -67,8 +73,8 @@ class CaptionTryResponse(BaseModel):
     motion_words: int = 0
     motion_error: Optional[str] = None
     motion_enabled: bool = True
-    # The exact text each half was sent -- the rendered template, not the template -- so the
-    # editor can show what the captioner actually read.
+    # The exact text each half was sent -- the instructions WITH the style sentence and
+    # grounding the API adds -- so the editor can show what the captioner actually read.
     caption_instruction_used: str
     motion_instruction_used: Optional[str] = None
 
