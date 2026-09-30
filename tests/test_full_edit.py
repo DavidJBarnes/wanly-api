@@ -1,8 +1,10 @@
 """Image Edit phase 2: full mode (Qwen-Image-Edit on the 3090) as async jobs (wanly-console#548).
 
 What these pin down:
-  * head-angle routing: within ±20° is LivePortrait's (face mode), beyond is Qwen's, and a
-    face-routed angle's pitch is NEGATED for the node (rotate_pitch > 0 lowers the chin)
+  * every head angle and expression is Qwen's (#569): no LivePortrait route, and the service is
+    checked for the fields it would otherwise silently ignore
+  * a healthy standing box (#570) is preferred, waited for while A1111 generates, and fallen
+    back from to the main 3090's edit mode only when it is down
   * validation happens before anything is fetched or queued
   * a job's states: it WAITS while the 3090 renders (asking for edit mode once), trains, or
     switches, and says which; then runs; then is done with a preview and an identity score
@@ -25,16 +27,10 @@ def _png():
     return b"\x89PNG fake result"
 
 
-# ------------------------------------------------------------------------ routing
+# ------------------------------------------------------------------- the presets
 
-class TestRouting:
-    @pytest.mark.parametrize("yaw,pitch,want", [
-        (-20, 0, "face"), (20, 0, "face"), (0, 20, "face"), (-12, 8, "face"),
-        (-45, 0, "full"), (90, 0, "full"), (0, 30, "full"), (15, -21, "full")])
-    def test_the_split(self, yaw, pitch, want):
-        assert full_edit.route(yaw, pitch) == want
-
-    def test_every_preset_the_issue_asks_for(self):
+class TestPresets:
+    def test_every_head_preset_the_issue_asks_for(self):
         assert set(full_edit.HEAD_ANGLES) == {
             "look_left", "look_right", "three_quarter_left", "three_quarter_right",
             "profile_left", "profile_right", "look_up", "look_down"}
@@ -44,19 +40,18 @@ class TestRouting:
         assert full_edit.HEAD_ANGLES["three_quarter_right"][1] == 45
         assert full_edit.HEAD_ANGLES["look_up"][2] > 0 > full_edit.HEAD_ANGLES["look_down"][2]
 
-    def test_look_left_right_stay_on_liveportrait(self):
-        """Within its range the warp is instant and identity-safe; only past it do we pay for
-        a regeneration."""
-        for name in ("look_left", "look_right"):
-            _, y, p = full_edit.HEAD_ANGLES[name]
-            assert full_edit.route(y, p) == "face"
-        for name in ("three_quarter_left", "profile_right", "look_up", "look_down"):
-            _, y, p = full_edit.HEAD_ANGLES[name]
-            assert full_edit.route(y, p) == "full"
+    def test_nothing_routes_to_liveportrait_any_more(self):
+        """#569: LivePortrait "drops every detail". No split, no face route."""
+        assert not hasattr(full_edit, "route") and not hasattr(full_edit, "FACE_LIMIT_DEG")
 
-    def test_face_params_negate_pitch_for_the_node(self):
-        assert full_edit.face_params(-15, 10) == {"rotate_yaw": -15.0, "rotate_pitch": -10.0}
-        assert full_edit.face_params(0, 0) == {}
+    def test_the_expressions_the_issue_names(self):
+        """smile, big laugh, surprised, eyes closed, sad, angry -- and the old face presets'
+        names, so a saved file's tag reads the same across the switch."""
+        assert {"smile", "big_laugh", "surprised", "eyes_closed", "sad", "angry"} \
+            <= set(full_edit.EXPRESSIONS)
+        from app import face_edit
+        kept = set(face_edit.PRESETS) - {"turn_head_left", "turn_head_right"}
+        assert kept <= set(full_edit.EXPRESSIONS), "head turns moved to the angle section"
 
 
 # ---------------------------------------------------------------------- the box
@@ -72,6 +67,9 @@ class _Box:
         self.equipped, self.switch_after = equipped, switch_after
         self.mode_error, self.edit_error = mode_error, edit_error
         self.modes_asked, self.edits, self._polls = [], [], 0
+        self.urls = []
+        #: What the main 3090's image-edit /health says it can do; None = a pre-#569 image.
+        self.features = ["angle", "instruction", "expression", "face_box", "faces"]
 
     async def health(self):
         self._polls += 1
@@ -100,12 +98,13 @@ class _Box:
         else:
             self.mode = mode
 
-    async def edit(self, source, request):
+    async def edit(self, source, request, url=None):
         self.edits.append(request)
+        self.urls.append(url)
         if self.edit_error:
             raise self.edit_error
         return {"image": base64.b64encode(_png()).decode(), "preview": "anBn",
-                "width": 64, "height": 48,
+                "width": 64, "height": 48, "face_box": request.get("face_box"),
                 "prompt": "Turn the person's head ...", "seed": 548,
                 "identity": {"aura": 0.52, "reason": None}, "vram_peak_mib": 23400,
                 "timings_ms": {"edit": 13000}}
@@ -119,6 +118,15 @@ def box(monkeypatch):
         monkeypatch.setattr(full_edit, "_set_mode", b.set_mode)
         monkeypatch.setattr(full_edit, "_edit", b.edit)
         monkeypatch.setattr(full_edit, "queue", full_edit.FullEditQueue())
+        # No standing box unless a test adds one (#570).
+        monkeypatch.setattr(settings, "image_edit_standing_url", "")
+        real_require = full_edit._require_features
+
+        async def require(url, request, who, health=None):
+            if health is None:
+                health = {"features": b.features} if b.features else {}
+            return await real_require(url, request, who, health=health)
+        monkeypatch.setattr(full_edit, "_require_features", require)
         monkeypatch.setattr(settings, "image_edit_poll_s", 0.001)
         monkeypatch.setattr(settings, "image_edit_return_grace_s", 0.01)
         monkeypatch.setattr(settings, "image_edit_url", "http://3090.zero:8086")
@@ -209,11 +217,136 @@ class TestJobStates:
         assert job.state == "failed" and job.error == "image-edit: bad image"
         assert ok.state == "done", "one bad edit does not stop the queue"
 
+    async def test_an_expression_on_a_pre_569_image_fails_instead_of_misapplying(self, box):
+        """It would ignore `expression` and return the angle alone -- plausible and wrong."""
+        b = box(mode="edit")
+        b.features = None
+        job = full_edit.queue.submit(SRC, b"src", {"angle": {"yaw": 45}, "expression": "smile"},
+                                     "angle-smile")
+        await _drain()
+        assert job.state == "failed" and "too old for expression" in job.error
+        assert b.edits == []
+
+    async def test_a_face_box_the_service_ignored_is_not_kept(self, box):
+        b = box(mode="edit")
+        real = b.edit
+
+        async def forgetful(source, request, url=None):
+            out = await real(source, request, url)
+            out.pop("face_box")
+            return out
+        full_edit._edit = forgetful
+        job = full_edit.queue.submit(SRC, b"src", {"expression": "smile",
+                                                   "face_box": [1, 2, 30, 40]}, "smile")
+        await _drain()
+        assert job.state == "failed" and "ignored the chosen face" in job.error
+        assert job.result is None
+
     async def test_the_source_bytes_are_not_kept_after_the_run(self, box):
         box(mode="edit")
         job = full_edit.queue.submit(SRC, b"src", {"angle": {"yaw": 45}}, "angle")
         await _drain()
         assert "_source" not in job.meta
+
+
+# ------------------------------------------------------------ the standing box (#570)
+
+
+class _Standing:
+    """A fake second 3090: image-edit /health (A1111 on its card) and /edit."""
+
+    def __init__(self, generating=(), healthy=True, unreachable=False):
+        self.generating = list(generating)
+        self.healthy, self.unreachable = healthy, unreachable
+        self.edits = []
+
+    async def health(self, url):
+        if not self.healthy:
+            return None
+        gen = self.generating.pop(0) if self.generating else False
+        return {"status": "ok", "a1111_generating": gen, "waiting": None,
+                "features": ["angle", "instruction", "expression", "face_box", "faces"]}
+
+
+@pytest.fixture
+def standing(monkeypatch, box):
+    def make(**kw):
+        b = box(**{k: kw.pop(k) for k in list(kw) if k in ("mode", "rendering")})
+        s = _Standing(**kw)
+        monkeypatch.setattr(settings, "image_edit_standing_url", "http://2070.zero:8086")
+        monkeypatch.setattr(full_edit, "_standing_health", s.health)
+        main_edit = b.edit
+
+        async def edit(source, request, url=None):
+            if url == "http://2070.zero:8086":
+                if s.unreachable:
+                    raise full_edit.FullEditError(503, "image-edit unreachable", unreachable=True)
+                s.edits.append(request)
+                return {"image": base64.b64encode(_png()).decode(), "preview": "anBn",
+                        "face_box": request.get("face_box"),
+                        "identity": {"aura": 0.8, "reason": None}}
+            return await main_edit(source, request, url)
+        monkeypatch.setattr(full_edit, "_edit", edit)
+        return b, s
+    return make
+
+
+@pytest.mark.asyncio
+class TestTheStandingBox:
+    async def test_a_healthy_standing_box_is_preferred_and_renders_never_pause(self, standing):
+        b, s = standing(mode="ltx-engine", rendering=1)
+        job = full_edit.queue.submit(SRC, b"src", {"expression": "smile"}, "smile")
+        await _drain()
+        assert job.state == "done", job.error
+        assert s.edits == [{"expression": "smile"}] and b.edits == []
+        assert b.modes_asked == [], "the main 3090 was never switched"
+        assert job.worker == "second 3090"
+
+    async def test_a1111_generating_is_waited_for_and_named(self, standing):
+        b, s = standing(generating=[True, True, True, False])
+        seen = []
+        job = full_edit.queue.submit(SRC, b"src", {"angle": {"yaw": -90, "pitch": 0}},
+                                     "profile_left")
+        for _ in range(200):
+            seen.append(job.message)
+            if job.state in ("done", "failed"):
+                break
+            await asyncio.sleep(0.001)
+        await _drain()
+        assert "second 3090 busy (A1111 generating); edit queued" in seen
+        assert job.state == "done" and s.edits and b.modes_asked == [], \
+            "busy is waited for, never fallen back from"
+
+    async def test_an_unhealthy_standing_box_falls_back_to_edit_mode(self, standing):
+        b, s = standing(healthy=False, mode="ltx-engine")
+        job = full_edit.queue.submit(SRC, b"src", {"expression": "smile"}, "smile")
+        await _drain()
+        assert job.state == "done", job.error
+        assert s.edits == [] and b.edits == [{"expression": "smile"}]
+        assert b.modes_asked == ["edit", "ltx-engine"]
+        assert job.worker == "3090.zero"
+
+    async def test_unreachable_at_the_edit_falls_back_too(self, standing):
+        b, s = standing(unreachable=True, mode="edit")
+        job = full_edit.queue.submit(SRC, b"src", {"expression": "sad"}, "sad")
+        await _drain()
+        assert job.state == "done" and b.edits == [{"expression": "sad"}]
+
+    async def test_a_standing_failure_after_the_edit_was_sent_is_not_rerun(self, standing,
+                                                                          monkeypatch):
+        b, s = standing(mode="edit")
+
+        async def boom(source, request, url=None):
+            raise full_edit.FullEditError(504, "image-edit did not answer within 900s")
+        monkeypatch.setattr(full_edit, "_edit", boom)
+        job = full_edit.queue.submit(SRC, b"src", {"expression": "sad"}, "sad")
+        await _drain()
+        assert job.state == "failed" and "900s" in job.error
+        assert b.modes_asked == [], "no second run on the main 3090"
+
+    async def test_faces_come_from_the_standing_box_when_it_is_up(self, monkeypatch):
+        monkeypatch.setattr(settings, "image_edit_standing_url", "")
+        assert await full_edit.faces(b"src") is None
 
 
 # -------------------------------------------------------------------- over HTTP
@@ -238,13 +371,70 @@ async def _done_job(db, body):
 
 @pytest.mark.asyncio
 class TestOverHTTP:
-    async def test_presets_carry_the_head_angles_and_the_split(self, db, wired_full):
+    async def test_presets_are_all_qwen(self, db, wired_full):
         d = (await _http(db, "get", "/images/edit/presets")).json()
-        assert d["face_limit_deg"] == 20 and d["max_yaw"] == 90 and d["max_pitch"] == 45
+        assert d["mode"] == "full"
+        # 0, so a console from before #569 still open in a tab sends every angle to Qwen too.
+        assert d["face_limit_deg"] == 0 and d["max_yaw"] == 90 and d["max_pitch"] == 45
         angles = {a["name"]: a for a in d["head_angles"]}
         assert angles["profile_left"] == {"name": "profile_left", "label": "Profile left",
                                           "yaw": -90, "pitch": 0, "route": "full"}
-        assert angles["look_left"]["route"] == "face"
+        assert {a["route"] for a in d["head_angles"]} == {"full"}
+        exprs = {e["name"]: e["label"] for e in d["expressions"]}
+        assert exprs["big_laugh"] == "Big laugh" and "angry" in exprs
+
+    async def test_an_expression_with_an_angle_on_a_chosen_face(self, db, wired_full):
+        s3, b = wired_full
+        r = await _http(db, "post", "/images/edit",
+                        json={"source_uri": SRC, "mode": "full", "head_preset": "profile_left",
+                              "preset": "smile", "face_box": [10, 20, 110, 140]})
+        assert r.status_code == 202, r.text
+        j = r.json()
+        assert j["request"] == {"angle": {"yaw": -90.0, "pitch": 0.0}, "expression": "smile",
+                                "face_box": [10.0, 20.0, 110.0, 140.0]}
+        assert j["tag"] == "profile_left-smile" and j["face_box"] == [10.0, 20.0, 110.0, 140.0]
+        await _drain()
+        d = (await _http(db, "get", f"/images/edit/jobs/{j['id']}")).json()
+        assert d["state"] == "done" and d["worker"] == "3090.zero"
+        r = await _http(db, "post", f"/images/edit/jobs/{j['id']}/save", json={})
+        assert r.status_code == 200 and r.json()["preset"] == "smile"
+        assert "_edit-profile_left-smile_" in r.json()["uri"]
+
+    async def test_free_text_is_an_instruction(self, db, wired_full):
+        s3, b = wired_full
+        jid = await _done_job(db, {"source_uri": SRC, "mode": "full",
+                                   "instruction": "  big grin, eyes half closed  "})
+        assert b.edits[-1] == {"instruction": "big grin, eyes half closed"}
+        d = (await _http(db, "get", f"/images/edit/jobs/{jid}")).json()
+        assert d["tag"] == "full"
+
+    async def test_faces_prefer_the_standing_box(self, db, wired_full, monkeypatch):
+        from app.routes import image_edit as mod
+        got = {"width": 10, "height": 10, "default_index": 0,
+               "faces": [{"index": 0, "box": [1, 1, 5, 5], "width": 4}]}
+
+        async def standing_faces(src):
+            return got
+
+        async def face_edit_faces(src):
+            raise AssertionError("face-edit asked although the standing box answered")
+        monkeypatch.setattr(mod.full_edit, "faces", standing_faces)
+        monkeypatch.setattr(mod.face_edit, "faces", face_edit_faces)
+        r = await _http(db, "post", "/images/edit/faces", json={"source_uri": SRC})
+        assert r.status_code == 200 and r.json()["faces"][0]["box"] == [1, 1, 5, 5]
+
+    async def test_faces_fall_back_to_face_edit(self, db, wired_full, monkeypatch):
+        from app.routes import image_edit as mod
+
+        async def none(src):
+            return None
+
+        async def face_edit_faces(src):
+            return {"width": 10, "height": 10, "default_index": None, "faces": []}
+        monkeypatch.setattr(mod.full_edit, "faces", none)
+        monkeypatch.setattr(mod.face_edit, "faces", face_edit_faces)
+        r = await _http(db, "post", "/images/edit/faces", json={"source_uri": SRC})
+        assert r.status_code == 200 and r.json()["faces"] == []
 
     async def test_a_head_preset_is_a_202_job_then_done_with_identity(self, db, wired_full):
         s3, b = wired_full
@@ -316,8 +506,8 @@ class TestOverHTTP:
     @pytest.mark.parametrize("body,needle", [
         ({}, "nothing to apply"),
         ({"instruction": "   "}, "nothing to apply"),
-        ({"instruction": "x", "angle": {"yaw": 45}}, "not both"),
         ({"head_preset": "cartwheel"}, "unknown head preset"),
+        ({"preset": "wink"}, "unknown expression"),
         ({"angle": {"yaw": 3, "pitch": -2}}, "under 5"),
     ])
     async def test_nonsense_is_422_before_anything_runs(self, db, wired_full, body, needle):

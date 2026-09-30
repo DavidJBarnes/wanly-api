@@ -131,6 +131,15 @@ class Settings(BaseSettings):
     image_edit_return_grace_s: float = 90.0
     # An unsaved result is a draft; it is dropped this long after it finished.
     image_edit_job_ttl_s: int = 3600
+    # A STANDING image-edit service (wanly-console#570): the second 3090 (ex-2070), Qwen
+    # full-time beside Automatic1111, no mode switch. Preferred while its /health is ok; when it
+    # is not, full-mode jobs fall back to image_edit_url's edit mode above. Until the card swap
+    # nothing answers here, which costs one refused connection per job. Empty disables it.
+    image_edit_standing_url: str = "http://2070.zero:8086"
+    # How the console names it in a job's status ("second 3090 busy (A1111 generating); edit queued").
+    image_edit_standing_name: str = "second 3090"
+    # Its /health is asked before every job; a box that is down must cost seconds, not the job.
+    image_edit_standing_timeout_s: float = 5.0
     # buffalo_l's same-person floor. Below this against a picked anchor is a different person;
     # it is shown as a line on the scores rather than used to delete anything, because the two
     # people who got into this project's training sets got there past a human eye, not past a

@@ -69,7 +69,8 @@ class ImageEditRequest(_FaceChoice):
     #: on the 3090, answered at once with a JOB (202) -- poll GET /images/edit/jobs/{id}, then
     #: save the result with POST /images/edit/jobs/{id}/save.
     mode: Literal["face", "full"] = "face"
-    # --- full mode only: an instruction, OR a head angle (a named one or yaw/pitch) ---
+    # --- full mode: any mix of an instruction, a head angle (a named one or yaw/pitch) and an
+    # expression preset (`preset`, one of app/full_edit.py EXPRESSIONS) -- #569 ---
     instruction: Optional[str] = Field(None, max_length=2000)
     angle: Optional[HeadAngle] = None
     head_preset: Optional[str] = Field(None, max_length=50)
@@ -157,6 +158,10 @@ class ImageEditJob(BaseModel):
     prompt: Optional[str] = None
     seed: Optional[int] = None
     saved: list[dict] = []
+    #: The box that ran (or is running) it: the standing service or the main 3090 (#570).
+    worker: Optional[str] = None
+    #: The face it was scoped to, in the source's pixels; null for the whole frame (#569).
+    face_box: Optional[list[float]] = None
 
 
 class ImageEditJobSave(BaseModel):
@@ -168,8 +173,15 @@ class HeadAnglePreset(BaseModel):
     label: str
     yaw: float
     pitch: float
-    #: "face" (LivePortrait, within face_limit_deg) or "full" (Qwen on the 3090).
-    route: str
+    #: Always "full" since #569 (Qwen); was "face" within face_limit_deg (LivePortrait).
+    route: str = "full"
+
+
+class ExpressionPreset(BaseModel):
+    """An expression button (#569). The words are the image-edit service's; this is the name
+    to send as `preset` with mode "full", and the label to show."""
+    name: str
+    label: str
 
 
 class ImageEditFacesRequest(BaseModel):
@@ -214,6 +226,9 @@ class EditPresets(BaseModel):
     axes: list[EditAxis]
     #: The head-angle section (#548): presets routed by angle, and where the routing splits.
     head_angles: list[HeadAnglePreset] = []
+    #: The expression buttons, as Qwen instructions (#569).
+    expressions: list[ExpressionPreset] = []
+    #: 0 since #569: nothing routes to LivePortrait.
     face_limit_deg: float = 20
     max_yaw: float = 90
     max_pitch: float = 45

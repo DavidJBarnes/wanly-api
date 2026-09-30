@@ -1,4 +1,14 @@
-"""Full-mode image edits: Qwen-Image-Edit on the 3090, as asynchronous jobs (wanly-console#548).
+"""Full-mode image edits: Qwen-Image-Edit, as asynchronous jobs (wanly-console#548, #569, #570).
+
+EVERY EDIT IN THE EDIT DIALOG IS ONE OF THESE NOW (#569). LivePortrait (app/face_edit.py) "drops
+every detail"; head angles at any size, the expression presets and the free-text box all come
+here. The face-mode endpoints stay for now, but nothing in the console calls them.
+
+TWO PLACES AN EDIT CAN RUN (#570). A STANDING image-edit service -- the second 3090, Qwen
+resident full-time beside Automatic1111, no mode switch -- is preferred whenever its /health is
+ok. Otherwise the job falls back to the main 3090's EDIT MODE, below. A standing box that is
+merely busy (A1111 generating) is waited for, not fallen back from: the fallback pauses renders,
+and the point of the second card is that edits never do.
 
 WHY A JOB AND NOT A CALL. Face mode (app/face_edit.py) is ~1 s on the 2070 and answers inline.
 Full mode needs the 3090's card to itself: ~20 GB of Qwen cannot sit beside a render that holds
@@ -41,18 +51,13 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-#: Past this, a head turn is out of LivePortrait's reach and goes to full mode (#547/#548).
-#: LivePortrait's own range is ±20 on yaw and pitch; within it, face mode is instant and warps
-#: pixels rather than regenerating them, which is the identity-safe choice.
-FACE_LIMIT_DEG = 20.0
 MAX_YAW = 90.0
 MAX_PITCH = 45.0
 
 #: Head-angle presets: name -> (label, yaw, pitch). DEGREES, IN THE IMAGE'S DIRECTIONS: negative
 #: yaw turns the face toward the LEFT EDGE OF THE PICTURE (the viewer's left, the subject's
-#: right) -- what phase 1's "Turn head left" (rotate_yaw -12) already does, checked on
-#: Kelly-2000 sel_008 -- and positive pitch raises the chin. The console routes each by angle:
-#: within FACE_LIMIT_DEG to face mode, beyond it to full mode.
+#: right) -- what phase 1's "Turn head left" (rotate_yaw -12) already did, checked on
+#: Kelly-2000 sel_008 -- and positive pitch raises the chin. All of them run on Qwen (#569).
 HEAD_ANGLES: dict[str, tuple[str, float, float]] = {
     "look_left": ("Look left", -20.0, 0.0),
     "look_right": ("Look right", 20.0, 0.0),
@@ -65,28 +70,42 @@ HEAD_ANGLES: dict[str, tuple[str, float, float]] = {
 }
 
 
-def route(yaw: float, pitch: float) -> str:
-    """"face" when LivePortrait can do it, "full" when it needs Qwen."""
-    return "face" if max(abs(yaw), abs(pitch)) <= FACE_LIMIT_DEG else "full"
+#: The expression presets (#569), name -> label. THE WORDS LIVE IN THE SERVICE
+#: (wanly-gpu-docker image_edit/graph.py EXPRESSIONS), beside the head-angle words and the model
+#: they are written for, so retuning one never needs an API deploy; this only lists what the
+#: console offers and what a request may name. The names are the old LivePortrait preset names
+#: where one existed, so a saved file's `_edit-smile_` tag reads the same across the switch.
+EXPRESSIONS: dict[str, str] = {
+    "smile": "Smile",
+    "big_laugh": "Big laugh",
+    "surprised": "Surprised",
+    "eyes_closed": "Eyes closed",
+    "sad": "Sad",
+    "angry": "Angry",
+    "serious": "Serious",
+    "speaking": "Speaking",
+    "look_left": "Eyes left",
+    "look_right": "Eyes right",
+    "look_up": "Eyes up",
+    "look_down": "Eyes down",
+}
 
-
-def face_params(yaw: float, pitch: float) -> dict[str, float]:
-    """A face-routed head angle as LivePortrait's numbers. Yaw carries over as is; PITCH IS
-    NEGATED, because the node's rotate_pitch > 0 lowers the chin (checked on sel_008: +15 looks
-    down) while a head angle's pitch > 0 raises it."""
-    out = {}
-    if yaw:
-        out["rotate_yaw"] = float(yaw)
-    if pitch:
-        out["rotate_pitch"] = float(-pitch)
-    return out
+#: What a request needs from the service beyond #548's angle/instruction. An image-edit image
+#: from before #569 IGNORES these fields (pydantic drops unknown keys): an expression beside an
+#: angle would come back as the angle alone, a face_box as the whole frame regenerated -- a
+#: plausible, wrong result. So the service's /health `features` is checked first, and a box
+#: that lacks one fails the job saying "re-pin it" instead.
+_FEATURE_FIELDS = ("expression", "face_box")
 
 
 class FullEditError(Exception):
-    def __init__(self, status_code: int, detail: str):
+    def __init__(self, status_code: int, detail: str, unreachable: bool = False):
         super().__init__(detail)
         self.status_code = status_code
         self.detail = detail
+        #: The request never reached the service (connection refused, DNS): safe to send the
+        #: edit elsewhere, because it cannot be running.
+        self.unreachable = unreachable
 
 
 #: Job states, in order. `waiting` is the box's turn not having come yet: rendering (the
@@ -113,6 +132,8 @@ class Job:
     preview: str | None = None
     meta: dict = field(default_factory=dict)
     saved: list[dict] = field(default_factory=list)
+    #: Which box ran it: the standing service's name, or the main 3090's (#570).
+    worker: str | None = None
 
 
 class FullEditQueue:
@@ -179,9 +200,16 @@ class FullEditQueue:
 
     async def _one(self, job: Job) -> None:
         try:
-            await self._box_ready(job)
-            job.state, job.message, job.started_at = "running", "editing on the 3090", time.time()
-            out = await _edit(job.meta["_source"], job.request)
+            out = await self._on_standing(job)
+            if out is None:
+                await self._box_ready(job)
+                await _require_features(settings.image_edit_url, job.request,
+                                        settings.image_edit_worker)
+                job.worker = settings.image_edit_worker
+                job.state, job.message, job.started_at = (
+                    "running", f"editing on {job.worker}", time.time())
+                out = await _edit(job.meta["_source"], job.request)
+            _check_echo(out, job.request, job.worker or "image-edit")
             png = base64.b64decode(out["image"])
             job.result = png
             # The service sends a capped JPEG beside the PNG (this API has no image library);
@@ -204,6 +232,58 @@ class FullEditQueue:
                         job.finished_at - job.created_at,
                         f": {job.error}" if job.error else
                         f", aura {(job.meta.get('identity') or {}).get('aura')}")
+
+    async def _on_standing(self, job: Job) -> dict | None:
+        """Run the job on the standing service (#570), or None to fall back to edit mode.
+
+        None when no standing service is configured, when its /health is not ok, or when it
+        stops answering before the edit is sent. A standing box that is only BUSY -- A1111
+        generating, or its own edit in flight -- is waited for with the reason on the job,
+        within the same budget as a mode switch. Once the edit has been SENT there is no
+        fallback: a timeout then may be an edit still running, and running it twice is worse
+        than failing it.
+        """
+        url = _standing_url()
+        if not url:
+            return None
+        name = settings.image_edit_standing_name
+        deadline = time.time() + settings.image_edit_switch_timeout_s
+        while True:
+            h = await _standing_health(url)
+            if h is None:
+                logger.info("full edit %s: %s is not healthy; falling back to %s edit mode",
+                            job.id, name, settings.image_edit_worker)
+                return None
+            if h.get("a1111_generating"):
+                job.state, job.message = "waiting", (
+                    f"{name} busy (A1111 generating); edit queued")
+            elif h.get("waiting"):
+                job.state, job.message = "waiting", f"{name} busy ({h['waiting']}); edit queued"
+            else:
+                await _require_features(url, job.request, name, health=h)
+                job.worker = name
+                job.state, job.message, job.started_at = (
+                    "running", f"editing on {name}", time.time())
+                try:
+                    return await _edit(job.meta["_source"], job.request, url=url)
+                except FullEditError as e:
+                    if e.unreachable:
+                        logger.warning("full edit %s: %s unreachable (%s); falling back",
+                                       job.id, name, e.detail)
+                        job.worker, job.started_at = None, None
+                        return None
+                    if e.status_code == 503 and "generating" in e.detail:
+                        # A1111 started between our look and the edit, and outlasted the
+                        # service's own wait. Back to waiting, not failed and not fallen back.
+                        job.state, job.message = "waiting", (
+                            f"{name} busy (A1111 generating); edit queued")
+                    else:
+                        raise
+            if time.time() > deadline:
+                raise FullEditError(
+                    504, f"{name} stayed busy for {settings.image_edit_switch_timeout_s // 60} "
+                         f"minutes (A1111 generating); pause generate-forever to let edits in")
+            await asyncio.sleep(settings.image_edit_poll_s)
 
     async def _box_ready(self, job: Job) -> None:
         """Wait until the 3090 is in edit mode with image-edit answering, asking for the switch
@@ -301,14 +381,66 @@ async def _set_mode(mode: str) -> None:
     logger.info("asked %s for %s mode", settings.image_edit_worker, mode)
 
 
-async def _edit(source: bytes, request: dict) -> dict:
-    url = (settings.image_edit_url or "").strip().rstrip("/")
+def _standing_url() -> str:
+    return (settings.image_edit_standing_url or "").strip().rstrip("/")
+
+
+async def _standing_health(url: str) -> dict | None:
+    """The standing service's /health when it is up and ready for an edit, else None.
+
+    "Ready" is its own `status: ok` (ComfyUI answering). Quick timeout: this is asked before
+    every job, and a box that is down must cost a moment, not the job."""
+    try:
+        async with httpx.AsyncClient(timeout=settings.image_edit_standing_timeout_s) as client:
+            r = await client.get(f"{url}/health")
+        h = r.json() if r.status_code == 200 else None
+    except Exception:                               # noqa: BLE001 -- down is an answer
+        return None
+    return h if isinstance(h, dict) and h.get("status") == "ok" else None
+
+
+async def _require_features(url: str, request: dict, who: str,
+                            health: dict | None = None) -> None:
+    """Refuse a request the service would silently mis-apply (see _FEATURE_FIELDS)."""
+    wanted = [f for f in _FEATURE_FIELDS if request.get(f) is not None]
+    if not wanted:
+        return
+    if health is None:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                health = (await client.get(f"{url.rstrip('/')}/health")).json()
+        except Exception as e:                      # noqa: BLE001
+            raise FullEditError(503, f"image-edit on {who} did not answer /health ({e!r})") \
+                from e
+    have = set((health or {}).get("features") or ("angle", "instruction"))
+    missing = [f for f in wanted if f not in have]
+    if missing:
+        raise FullEditError(
+            503, f"image-edit on {who} is too old for {' and '.join(missing)} "
+                 f"(console#569); re-pin it to a current wanly-gpu-docker image")
+
+
+def _check_echo(out: dict, request: dict, who: str) -> None:
+    """Belt and braces for _require_features: a face-scoped edit must come back saying so."""
+    if request.get("face_box") is not None and out.get("face_box") is None:
+        raise FullEditError(
+            502, f"image-edit on {who} ignored the chosen face (an image from before "
+                 f"console#569); nothing was kept -- re-pin it")
+
+
+async def _edit(source: bytes, request: dict, url: str | None = None) -> dict:
+    url = (url or settings.image_edit_url or "").strip().rstrip("/")
     if not url:
         raise FullEditError(503, "no image-edit service is configured (image_edit_url is empty)")
     body = {"image": base64.b64encode(source).decode(), **request}
     try:
         async with httpx.AsyncClient(timeout=settings.image_edit_timeout_s) as client:
             r = await client.post(f"{url}/edit", json=body)
+    except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+        # Before TimeoutException, which ConnectTimeout subclasses: never connected means the
+        # edit cannot be running, so the caller may send it elsewhere.
+        raise FullEditError(503, f"image-edit unreachable at {url}: {e!r}",
+                            unreachable=True) from e
     except httpx.TimeoutException as e:
         raise FullEditError(504, f"image-edit did not answer within "
                                  f"{settings.image_edit_timeout_s}s") from e
@@ -323,6 +455,26 @@ async def _edit(source: bytes, request: dict) -> dict:
         code = 422 if r.status_code in (400, 413, 422) else 502
         raise FullEditError(code, f"image-edit: {detail}")
     return r.json()
+
+
+async def faces(source: bytes) -> dict | None:
+    """The face list from the standing service (#569/#570), or None when there is none to ask.
+
+    Only the standing box: the main 3090 runs image-edit in edit mode only, and a face list
+    is not worth stopping a render for. The route falls back to face-edit's list, whose boxes
+    are as good for a crop -- a box is a box, whichever detector drew it."""
+    url = _standing_url()
+    if not url or await _standing_health(url) is None:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(f"{url}/faces",
+                                  json={"image": base64.b64encode(source).decode()})
+        out = r.json() if r.status_code == 200 else None
+    except Exception as e:                          # noqa: BLE001
+        logger.info("standing image-edit /faces failed (%s); falling back", e)
+        return None
+    return out if isinstance(out, dict) and isinstance(out.get("faces"), list) else None
 
 
 queue = FullEditQueue()
