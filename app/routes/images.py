@@ -6,13 +6,16 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy import and_, func, not_, or_, select, true
+from sqlalchemy import and_, func, not_, or_, select, text, true
+from sqlalchemy import delete as sa_delete
+from sqlalchemy.dialects.postgresql import array as pg_array
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
 from app.config import settings
 from app.routes.datasets import DATASETS_PREFIX
-from app.database import async_session, get_db
+from app.database import async_session, get_db, release_connection
 from app.joycaption import CaptionError, CaptionerBusy
 from app.enums import TRAINING_TERMINAL
 from app.models import Dataset, Favorite, ImageMeta, Job, Segment, TrainingJob, User
@@ -449,6 +452,68 @@ async def move_images(body: dict, db: AsyncSession = Depends(get_db)):
     return {"moved": len(moved)}
 
 
+#: How long a delete waits for a row another writer holds before it gives up (console#559).
+#: Every writer of these rows holds them for milliseconds -- none across a captioner call --
+#: so a wait this long means something is wrong, and the person should hear so rather than
+#: watch a spinner.
+DELETE_LOCK_TIMEOUT = "5s"
+
+
+def _is_lock_timeout(e: DBAPIError) -> bool:
+    """Postgres's lock_not_available (55P03), which is what lock_timeout raises."""
+    orig = getattr(e, "orig", None)
+    return "55P03" in (getattr(orig, "sqlstate", None), getattr(orig, "pgcode", None))
+
+
+async def _forget_images(db: AsyncSession, paths: list[str]) -> None:
+    """Drop what the database says about images that are being deleted. Does not commit.
+
+    An image's own caption and tags live on its image_meta row; a dataset holding it keeps a
+    training caption and a likeness score keyed by its URI. Deleting the file used to leave
+    all of them behind: a row describing nothing, and dataset entries nobody can see or edit
+    -- which a later upload reusing the filename would silently inherit. Removing an image
+    FROM a dataset, and cropping, already prune the dataset half (_prune_annotations); this
+    is the same rule for deleting it outright (console#559).
+
+    Membership is NOT touched. A force delete of a dataset image is a decision the 409 dialog
+    has already spelled out, dead entry and all, and rewriting a locked set's image list from
+    here would be a lock bypass by another name.
+
+    FAILS FAST. lock_timeout bounds any wait for a dataset row, and a timeout is a 503 that
+    says what happened. The caption loop holds its row only between re-reading it and
+    committing a caption -- never across the captioner call -- so this should not wait at all;
+    if it ever does, a clear refusal is the contract, not a hang.
+    """
+    if not paths:
+        return
+    try:
+        await db.execute(text(f"SET LOCAL lock_timeout = '{DELETE_LOCK_TIMEOUT}'"))
+        await db.execute(sa_delete(ImageMeta).where(ImageMeta.path.in_(paths)))
+        keys = pg_array(paths)
+        holders = (await db.execute(
+            select(Dataset)
+            .where(or_(Dataset.captions.has_any(keys), Dataset.scores.has_any(keys)))
+            .with_for_update()
+        )).scalars().all()
+    except DBAPIError as e:
+        if _is_lock_timeout(e):
+            await db.rollback()
+            raise HTTPException(
+                status_code=503,
+                detail="A dataset holding this image is being written to right now; "
+                       "nothing was deleted. Try again in a moment.",
+            ) from e
+        raise
+    gone = set(paths)
+    for ds in holders:
+        # Reassigned, never mutated: JSONB does not see an in-place change.
+        ds.captions = {u: c for u, c in (ds.captions or {}).items() if u not in gone}
+        ds.scores = {u: v for u, v in (ds.scores or {}).items() if u not in gone}
+    if holders:
+        logger.info("delete: dropped caption/score entries for %d image(s) from dataset(s) %s",
+                    len(gone), ", ".join(ds.name for ds in holders))
+
+
 @router.delete("/images", dependencies=[Depends(get_current_user)])
 async def delete_image(
     path: str = Query(...),
@@ -459,6 +524,10 @@ async def delete_image(
 
     force=true skips the check for when the deletion is genuinely intended and the resulting
     dangling reference is accepted.
+
+    The image's caption, tags and dataset caption/score entries go with it (_forget_images).
+    Nothing here waits on captioning: no caption-queue turn, no captioner call, and no row
+    the caption loop holds across one (console#559).
     """
     bucket = settings.s3_images_bucket
     if not path.startswith(f"s3://{bucket}/"):
@@ -476,7 +545,11 @@ async def delete_image(
                     "dataset_ids": refs[path]["dataset_ids"],
                 },
             )
+    await _forget_images(db, [path])
+    # The object last, the commit after it: a failed S3 delete rolls the forgetting back
+    # (the session closes uncommitted), so an image that is still there keeps its captions.
     await asyncio.to_thread(delete_object, path)
+    await db.commit()
     return {"ok": True}
 
 
@@ -538,7 +611,9 @@ async def delete_folder(
             },
         )
 
+    await _forget_images(db, paths)
     deleted = await asyncio.to_thread(delete_prefix, prefix, bucket)
+    await db.commit()
     return {"ok": True, "deleted": deleted, "folder": name.strip()}
 
 
@@ -888,6 +963,12 @@ async def describe_image_scene(
     # just did their waiting at the captioner, inside an HTTP request that could time out,
     # with the two halves of one image landing on opposite sides of the cliff. Waiting here
     # instead makes the order known and the position reportable.
+    #
+    # WITHOUT A DATABASE CONNECTION (console#559). The auth lookup already opened this
+    # session's transaction, and a turn can be minutes away behind a dataset's captioning;
+    # holding the connection that long, once per waiting describe, emptied the pool and
+    # left every other request -- a delete -- waiting on it.
+    await release_connection(db)
     async with caption_queue.turn(path):
         try:
             # boto3 is synchronous; off the event loop so one slow fetch cannot stall the API.
@@ -965,6 +1046,8 @@ async def try_caption_prompts(
               else cfg.get("caption_instruction", ""))
     instruction = instruction_for(style, custom)
 
+    # Not holding a pooled connection while in line -- see describe_image_scene (console#559).
+    await release_connection(db)
     async with caption_queue.turn(path):
         try:
             image = await asyncio.to_thread(download_bytes, path)
