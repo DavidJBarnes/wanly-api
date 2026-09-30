@@ -253,7 +253,8 @@ class TestJobStates:
 
 
 class _Standing:
-    """A fake second 3090: image-edit /health (A1111 on its card) and /edit."""
+    """A fake always-on image-edit worker: its /health (busy while an A1111 on its card
+    generates) and /edit."""
 
     def __init__(self, generating=(), healthy=True, unreachable=False):
         self.generating = list(generating)
@@ -273,12 +274,12 @@ def standing(monkeypatch, box):
     def make(**kw):
         b = box(**{k: kw.pop(k) for k in list(kw) if k in ("mode", "rendering")})
         s = _Standing(**kw)
-        monkeypatch.setattr(settings, "image_edit_standing_url", "http://2070.zero:8086")
+        monkeypatch.setattr(settings, "image_edit_standing_url", "http://edit-box.zero:8086")
         monkeypatch.setattr(full_edit, "_standing_health", s.health)
         main_edit = b.edit
 
         async def edit(source, request, url=None):
-            if url == "http://2070.zero:8086":
+            if url == "http://edit-box.zero:8086":
                 if s.unreachable:
                     raise full_edit.FullEditError(503, "image-edit unreachable", unreachable=True)
                 s.edits.append(request)
@@ -300,7 +301,7 @@ class TestTheStandingBox:
         assert job.state == "done", job.error
         assert s.edits == [{"expression": "smile"}] and b.edits == []
         assert b.modes_asked == [], "the main 3090 was never switched"
-        assert job.worker == "second 3090"
+        assert job.worker == "edit-box.zero", "named by its host: no box is hardcoded"
 
     async def test_a1111_generating_is_waited_for_and_named(self, standing):
         b, s = standing(generating=[True, True, True, False])
@@ -313,7 +314,7 @@ class TestTheStandingBox:
                 break
             await asyncio.sleep(0.001)
         await _drain()
-        assert "second 3090 busy (A1111 generating); edit queued" in seen
+        assert "edit-box.zero busy (A1111 generating); edit queued" in seen
         assert job.state == "done" and s.edits and b.modes_asked == [], \
             "busy is waited for, never fallen back from"
 
@@ -343,6 +344,18 @@ class TestTheStandingBox:
         await _drain()
         assert job.state == "failed" and "900s" in job.error
         assert b.modes_asked == [], "no second run on the main 3090"
+
+    async def test_a_configured_name_wins_over_the_host(self, standing, monkeypatch):
+        b, s = standing()
+        monkeypatch.setattr(settings, "image_edit_standing_name", "3090b")
+        job = full_edit.queue.submit(SRC, b"src", {"expression": "smile"}, "smile")
+        await _drain()
+        assert job.worker == "3090b"
+
+    def test_there_is_no_always_on_worker_by_default(self):
+        """Which boxes carry image-edit is being re-planned; nothing is assumed meanwhile."""
+        from app.config import Settings
+        assert Settings.model_fields["image_edit_standing_url"].default == ""
 
     async def test_faces_come_from_the_standing_box_when_it_is_up(self, monkeypatch):
         monkeypatch.setattr(settings, "image_edit_standing_url", "")

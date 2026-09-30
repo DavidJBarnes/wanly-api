@@ -177,7 +177,7 @@ async def edit_faces(body: ImageEditFacesRequest):
     told nothing. The console draws these over the "before" image when there are two or more;
     with one or none it draws nothing, and the editor is unchanged.
 
-    Asked of the standing image-edit service first (#569/#570) -- the one that will do the
+    Asked of the always-on image-edit worker first, when there is one -- the one that will do the
     edit -- and of face-edit when there is none. The boxes only have to say where a face is:
     the Qwen edit crops around whichever box it is sent."""
     source = await _fetch(body.source_uri)
