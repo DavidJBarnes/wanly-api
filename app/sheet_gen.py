@@ -1,15 +1,22 @@
-"""Build a character's sheet from a real face photo, as an asynchronous job (wanly-console#582).
+"""Build a character's sheet from ONE photo of her, as an asynchronous job (wanly-console#582,
+#585).
 
-    POST /ltx/characters/{id}/sheet/generate   {face_uri, outfit, hair?, body?, count|seeds}
+    POST /ltx/characters/{id}/sheet/generate   {photo_uri, outfit, hair?, crop_padding?,
+                                                count|seeds}
     GET  /ltx/characters/sheet/jobs/{job_id}   state, why it waits, the candidates so far
     POST /ltx/characters/{id}/sheet/compose    {job_id, seed} -> the sheet, saved and set
 
-THE RECIPE is phase 0's (loras/reftest-2026-09-30/sheets.py) and lives in the image-edit
-service (wanly-gpu-docker#157, `POST /turnaround`): the official Qwen-Image-Edit-2511 draws a
-front / side / back full-body turnaround from the face photo, 40 steps at CFG 4, and the service
-composes the 1536x1024 sheet -- the face-detected real face on the left, the turnaround on the
-right. This module sends the words and the seeds and keeps what comes back; like the Edit
-dialog's words, the prompt wording is the service's.
+THE RECIPE lives in the image-edit service (wanly-gpu-docker, `POST /turnaround`), in its
+one-photo form (console#585, loras/phase0-2026-10-01/character_sheet_one_input.json): ONE photo
+of her -- full body or most of it, in the outfit -- is image 1 of the official
+Qwen-Image-Edit-2511's front / side / back full-body turnaround (40 steps at CFG 4), so her build
+carries into all three views; and the service composes the 1536x1024 sheet with a face panel
+AUTO-CROPPED FROM THAT SAME PHOTO on the left. This module sends the photo, the words, the crop
+padding and the seeds and keeps what comes back; the prompt wording is the service's.
+
+NO BODY WORDS. #582 shipped a BODY field ("She has an athletic build."); Qwen ignored it, and a
+body photo as image 2 too -- it keeps image 1 and little else. The build is controllable only
+by the photo, so the field is gone. Sheets saved before #585 keep their `body` in the table.
 
 ON THE IMAGE-EDIT QUEUE (app/full_edit.py). A candidate is minutes of the same ~20 GB model the
 Edit dialog uses, so a sheet job joins that queue: the always-on image-edit worker when there is
@@ -25,8 +32,9 @@ queue -- loses no picture: the status is read back from the manifest, marked int
 NOTHING IS THE CHARACTER'S UNTIL COMPOSE. The candidates are drafts in the jobs bucket, not
 the Image Repo. Approving one copies its composed sheet into the repo (character-sheets/), sets
 the character's sheet_uri and identity_mode='sheet', and writes the provenance row
-(models.CharacterSheet: face, words, prompt, seed, model). The previous sheet image, if any,
-stays in the repo untouched.
+(models.CharacterSheet: the photo, words, prompt, seed, model, and photo_mode "one_photo" with
+how the face panel was cropped from the photo). The previous sheet image, if any, stays in the
+repo untouched.
 """
 from __future__ import annotations
 
@@ -44,30 +52,20 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-#: The body-build presets the console offers (the user asked for build control). Each is the
-#: words that complete "She has ...", the service's own sentence for it. Free text works too.
-BODY_PRESETS: list[tuple[str, str, str]] = [
-    ("petite", "Petite", "a petite, slender frame"),
-    ("slim", "Slim", "a slim build"),
-    ("athletic", "Athletic", "a slim, athletic build with toned arms and legs"),
-    ("average", "Average", "an average build"),
-    ("curvy", "Curvy", "a curvy figure with full hips and bust"),
-    ("full", "Full-figured", "a full-figured, plus-size build"),
-    ("tall", "Tall and slender", "a tall, slender build with long legs"),
-    ("muscular", "Muscular", "a muscular build with broad shoulders"),
-]
-
-#: Pre-filled outfit and hair, in the recipe's shape: keep what the photo shows and finish the
-#: body with plain clothes the photo cannot show. Per pronoun, because the words are the
-#: prompt's.
+#: Pre-filled outfit and hair, in the recipe's shape: describe what the photo shows, so the
+#: turnaround keeps it. Per pronoun, because the words are the prompt's.
 DEFAULTS: dict[str, dict[str, str]] = {
-    "female": {"outfit": "the same top that she wears in image 1, light blue jeans and white "
-                         "sneakers",
+    "female": {"outfit": "the same clothes and shoes that she wears in image 1",
                "hair": "her hair exactly as in image 1"},
-    "male": {"outfit": "the same top that he wears in image 1, dark blue jeans and white "
-                       "sneakers",
+    "male": {"outfit": "the same clothes and shoes that he wears in image 1",
              "hair": "his hair exactly as in image 1"},
 }
+
+#: The face panel's padding around the detected face, in photo pixels: the tested workflow's
+#: CropByBBoxes value (the service's default too; sent explicitly so the job records it).
+CROP_PADDING = 140
+#: What a job and its saved sheets record as the way the sheet was built (console#585).
+PHOTO_MODE = "one_photo"
 
 DEFAULT_COUNT = 3
 MAX_COUNT = 6
@@ -112,14 +110,15 @@ def pick_seeds(count: int | None = None, seeds: list[int] | None = None) -> list
     return out
 
 
-def service_request(outfit: str, hair: str | None, body: str | None, gender: str,
-                    subject: str | None) -> dict:
-    """What /turnaround is sent besides the image and the seed. 422 without an outfit."""
+def service_request(outfit: str, hair: str | None, gender: str, subject: str | None,
+                    crop_padding: int | None = None) -> dict:
+    """What /turnaround is sent besides the photo and the seed. 422 without an outfit."""
     outfit = (outfit or "").strip()
     if not outfit:
-        raise SheetError(422, "an outfit is required: it is the one thing the photo cannot show")
-    req: dict = {"outfit": outfit, "gender": gender, "score": True}
-    for k, v in (("hair", hair), ("body", body), ("subject", subject)):
+        raise SheetError(422, "an outfit is required: describe what she wears in the photo")
+    req: dict = {"outfit": outfit, "gender": gender, "score": True,
+                 "crop_padding": CROP_PADDING if crop_padding is None else int(crop_padding)}
+    for k, v in (("hair", hair), ("subject", subject)):
         v = (v or "").strip()
         if v:
             req[k] = v
@@ -137,19 +136,22 @@ def _uri(job_id: str, name: str) -> str:
 # ------------------------------------------------------------------------------ the job
 
 
-async def submit(character, face_uri: str, face: bytes, request: dict,
+async def submit(character, photo_uri: str, photo: bytes, request: dict,
                  seeds: list[int]) -> full_edit.Job:
     """Queue a sheet job for `character` on the image-edit queue (manifest first, so a status
     can always be read back)."""
-    job = full_edit.Job(id=uuid.uuid4().hex, source_uri=face_uri, request=request, tag="sheet",
-                        kind="sheet", work=_work, needs={"turnaround": True},
+    # `one_photo`: an image from before #585 would take the photo as a FACE photo -- the old
+    # prompt and a full-height strip for a panel -- and say nothing. Refused instead: re-pin.
+    job = full_edit.Job(id=uuid.uuid4().hex, source_uri=photo_uri, request=request, tag="sheet",
+                        kind="sheet", work=_work, needs={"turnaround": True, "one_photo": True},
                         on_finish=_finished)
     job.meta.update(character_id=str(character.id), character_name=character.name,
                     seeds=list(seeds), candidates=[])
     await asyncio.to_thread(_write_manifest, job)
-    full_edit.queue.submit(face_uri, face, request, "sheet", job=job)
-    logger.info("sheet job %s for %s: %d seed(s) %s from %s", job.id, character.name,
-                len(seeds), seeds, face_uri)
+    full_edit.queue.submit(photo_uri, photo, request, "sheet", job=job)
+    logger.info("sheet job %s for %s: %d seed(s) %s from %s (one photo, crop padding %s)",
+                job.id, character.name, len(seeds), seeds, photo_uri,
+                request.get("crop_padding"))
     return job
 
 
@@ -174,7 +176,8 @@ async def _work(job: full_edit.Job, url: str) -> dict:
 
 
 def _store(job_id: str, seed: int, out: dict) -> dict:
-    """The candidate's three images into the jobs bucket; its record."""
+    """The candidate's images (turnaround, sheet, their previews, the face panel's) into the
+    jobs bucket; its record."""
     for k in ("candidate", "sheet"):
         if not out.get(k):
             raise full_edit.FullEditError(502, f"image-edit returned no {k} for seed {seed}")
@@ -186,12 +189,21 @@ def _store(job_id: str, seed: int, out: dict) -> dict:
     if out.get("sheet_preview"):
         preview = s3.upload_bytes(base64.b64decode(out["sheet_preview"]),
                                   _key(job_id, f"s{seed}_sheet.jpg"), settings.s3_jobs_bucket)
+    panel = None
+    if out.get("face_panel_preview"):
+        panel = s3.upload_bytes(base64.b64decode(out["face_panel_preview"]),
+                                _key(job_id, f"s{seed}_face_panel.jpg"), settings.s3_jobs_bucket)
+    fp = out.get("face_panel") or {}
     return {
         "seed": seed, "candidate_uri": turn, "sheet_uri": sheet, "preview_uri": preview or sheet,
+        "face_panel_preview_uri": panel,
+        "face_panel_crop": {k: fp.get(k) for k in ("source", "box", "crop", "padding", "scale",
+                                                   "detector", "det_size", "photo_size")}
+        if fp else None,
         "prompt": out.get("prompt"), "model": out.get("model"), "files": out.get("files"),
         "settings": out.get("settings"), "steps": out.get("steps"), "cfg": out.get("cfg"),
-        "face_panel": (out.get("face_panel") or {}).get("mode"),
-        "face_panel_note": (out.get("face_panel") or {}).get("note"),
+        "face_panel": fp.get("mode"),
+        "face_panel_note": fp.get("note"),
         "identity": out.get("identity"), "width": out.get("sheet_width"),
         "height": out.get("sheet_height"), "timings_ms": out.get("timings_ms"),
         "vram_peak_mib": out.get("vram_peak_mib"),
@@ -205,8 +217,9 @@ async def _finished(job: full_edit.Job) -> None:
 def _manifest(job: full_edit.Job) -> dict:
     m = job.meta
     return {
-        "id": job.id, "kind": "sheet", "character_id": m.get("character_id"),
-        "character_name": m.get("character_name"), "face_uri": job.source_uri,
+        "id": job.id, "kind": "sheet", "photo_mode": PHOTO_MODE,
+        "character_id": m.get("character_id"), "character_name": m.get("character_name"),
+        "photo_uri": job.source_uri,
         "request": job.request, "seeds": m.get("seeds", []),
         "candidates": m.get("candidates", []), "state": job.state, "message": job.message,
         "error": job.error, "worker": job.worker, "created_at": job.created_at,
@@ -248,13 +261,18 @@ async def load(job_id: str) -> tuple[dict, full_edit.Job | None]:
     return rec, None
 
 
+def photo_uri(rec: dict) -> str | None:
+    """The photo a job was built from. Manifests from before #585 named it face_uri."""
+    return rec.get("photo_uri") or rec.get("face_uri")
+
+
 def view(rec: dict, job: full_edit.Job | None) -> dict:
     """The status the console polls."""
     end = rec.get("finished_at") or time.time()
     return {
         "id": rec["id"], "state": rec["state"], "message": rec.get("message") or rec["state"],
         "character_id": rec.get("character_id"), "character_name": rec.get("character_name"),
-        "face_uri": rec.get("face_uri"), "request": rec.get("request") or {},
+        "photo_uri": photo_uri(rec), "request": rec.get("request") or {},
         "seeds": rec.get("seeds") or [], "candidates": rec.get("candidates") or [],
         "position": full_edit.queue.position(job) if job is not None else None,
         "error": rec.get("error"), "worker": rec.get("worker"),

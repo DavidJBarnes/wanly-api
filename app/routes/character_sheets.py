@@ -1,6 +1,6 @@
 """Build a character's sheet in the console (wanly-console#582). See app/sheet_gen.py.
 
-    GET  /ltx/characters/sheet/presets          body-build presets, pre-filled outfit/hair
+    GET  /ltx/characters/sheet/presets          pre-filled outfit/hair, counts, crop padding
     POST /ltx/characters/{id}/sheet/generate    202 + a job on the image-edit queue
     GET  /ltx/characters/sheet/jobs/{job_id}    state, why it waits, candidates so far
     POST /ltx/characters/{id}/sheet/compose     {job_id, seed}: save that candidate's sheet to
@@ -24,7 +24,7 @@ from app.models import CharacterSheet, LtxCharacter
 from app.routes.image_edit import _fetch
 from app.routes.ltx_recipes import _character, _settle_identity
 from app.schemas.character_sheets import (
-    BodyPreset, CharacterSheetResponse, SheetComposeRequest, SheetComposeResponse,
+    CharacterSheetResponse, SheetComposeRequest, SheetComposeResponse,
     SheetGenerateRequest, SheetJob, SheetPresets,
 )
 
@@ -46,10 +46,8 @@ def _no_pair(c: LtxCharacter) -> None:
             dependencies=[Depends(get_current_user)])
 async def sheet_presets():
     return SheetPresets(
-        body=[BodyPreset(name=n, label=label, text=text)
-              for n, label, text in sheet_gen.BODY_PRESETS],
         defaults=sheet_gen.DEFAULTS, default_count=sheet_gen.DEFAULT_COUNT,
-        max_count=sheet_gen.MAX_COUNT,
+        max_count=sheet_gen.MAX_COUNT, crop_padding=sheet_gen.CROP_PADDING,
     )
 
 
@@ -57,21 +55,21 @@ async def sheet_presets():
              status_code=202, dependencies=[Depends(get_current_user)])
 async def generate_sheet(character_id: uuid.UUID, body: SheetGenerateRequest,
                          db: AsyncSession = Depends(get_db)):
-    """Queue N turnaround candidates (default 3) from a real face photo. Everything that can
-    be refused is refused before the photo is fetched or anything is queued."""
+    """Queue N turnaround candidates (default 3) from one photo of her (console#585).
+    Everything that can be refused is refused before the photo is fetched or queued."""
     c = await _character(db, character_id)
     _no_pair(c)
     if not settings.image_edit_url and not settings.image_edit_standing_url:
         raise HTTPException(503, "no image-edit service is configured (image_edit_url is empty)")
     try:
         request = sheet_gen.service_request(
-            body.outfit, body.hair, body.body, sheet_gen.gender_for(c.gender, body.gender),
-            body.subject)
+            body.outfit, body.hair, sheet_gen.gender_for(c.gender, body.gender), body.subject,
+            body.crop_padding)
         seeds = sheet_gen.pick_seeds(body.count, body.seeds)
     except sheet_gen.SheetError as e:
         raise _http(e) from e
-    face = await _fetch(body.face_uri)
-    job = await sheet_gen.submit(c, body.face_uri, face, request, seeds)
+    photo = await _fetch(body.photo_uri)
+    job = await sheet_gen.submit(c, body.photo_uri, photo, request, seeds)
     rec, live = await sheet_gen.load(job.id)
     return JSONResponse(status_code=202,
                         content=SheetJob(**sheet_gen.view(rec, live)).model_dump(mode="json"))
@@ -115,13 +113,19 @@ async def compose_sheet(character_id: uuid.UUID, body: SheetComposeRequest,
     c.sheet_uri = uri
     c.identity_mode = "sheet"
     _settle_identity(c)
+    one_photo = rec.get("photo_mode") == sheet_gen.PHOTO_MODE
     row = CharacterSheet(
         character_id=c.id, character_name=c.name, sheet_uri=uri,
-        candidate_uri=cand.get("candidate_uri"), face_uri=rec.get("face_uri") or "",
+        candidate_uri=cand.get("candidate_uri"),
+        face_uri=sheet_gen.photo_uri(rec) or "",
         outfit=req.get("outfit") or "", hair=req.get("hair"), body=req.get("body"),
         gender=req.get("gender"), prompt=cand.get("prompt") or "", seed=int(body.seed),
         model=cand.get("model"), settings=cand.get("settings"), files=cand.get("files"),
         face_panel=cand.get("face_panel"), identity=cand.get("identity"), job_id=rec["id"],
+        # The face panel was auto-cropped from the same photo (console#585). A job from
+        # before it (no photo_mode in its manifest) is recorded as it was made.
+        photo_mode=sheet_gen.PHOTO_MODE if one_photo else None,
+        face_panel_crop=cand.get("face_panel_crop") if one_photo else None,
     )
     db.add(row)
     await db.commit()

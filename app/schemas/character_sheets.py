@@ -9,15 +9,15 @@ from app.schemas.ltx import LtxCharacterResponse, S3Uri
 
 
 class SheetGenerateRequest(BaseModel):
-    #: The REAL face photo, from the Image Repo. It is the model's reference and the sheet's
-    #: face panel.
-    face_uri: S3Uri
-    #: What she wears in all three views. Required: the one thing a face photo cannot show.
+    #: ONE photo of her from the Image Repo, full body or most of it, in the outfit
+    #: (console#585). It is the turnaround's image 1 -- her build comes from it -- and the
+    #: sheet's face panel is auto-cropped from it. There is no body field: the model ignored it.
+    photo_uri: S3Uri
+    #: What she wears IN THE PHOTO, described: the turnaround keeps it in all three views.
     outfit: str = Field(min_length=1, max_length=600)
     hair: Optional[str] = Field(None, max_length=300)
-    #: Body build -- its own sentence in the prompt ("She has an athletic build."), never part
-    #: of the outfit. A preset's words (GET .../sheet/presets) or free text.
-    body: Optional[str] = Field(None, max_length=300)
+    #: Pixels around the detected face for the face panel. Default sheet_gen.CROP_PADDING.
+    crop_padding: Optional[int] = Field(None, ge=0, le=1024)
     #: The prompt's pronoun. Default: from the character's gender ("man" -> male, else female).
     gender: Optional[Literal["female", "male"]] = None
     #: Who image 1 shows ("young woman"). Default "woman" / "man".
@@ -40,10 +40,15 @@ class SheetCandidate(BaseModel):
     settings: Optional[str] = None
     steps: Optional[int] = None
     cfg: Optional[float] = None
-    #: How the real-face panel was cut: "crop" (face-detected strip), "letterbox" (a tight
-    #: close-up, on white) or "centre" (no detector).
+    #: How the face panel was cut: "auto_crop" (from the same photo, console#585) or "centre"
+    #: (no detector). Jobs from before #585 say "crop" or "letterbox".
     face_panel: Optional[str] = None
     face_panel_note: Optional[str] = None
+    #: The panel's provenance from the service: {source: "same_photo", box, crop, padding,
+    #: scale (> 1 = upscaled, soft), detector, det_size, photo_size}.
+    face_panel_crop: Optional[dict] = None
+    #: A JPEG of the 448x1024 face panel, so the console can show what was cropped.
+    face_panel_preview_uri: Optional[str] = None
     #: {"aura": AuraFace cosine of the turnaround vs the photo | null, "reason"}.
     identity: Optional[dict] = None
     width: Optional[int] = None
@@ -61,7 +66,8 @@ class SheetJob(BaseModel):
     message: str
     character_id: Optional[str] = None
     character_name: Optional[str] = None
-    face_uri: Optional[str] = None
+    #: The one photo the sheet is built from (a pre-#585 job's face photo).
+    photo_uri: Optional[str] = None
     request: dict = {}
     seeds: list[int] = []
     candidates: list[SheetCandidate] = []
@@ -99,6 +105,8 @@ class CharacterSheetResponse(BaseModel):
     face_panel: Optional[str] = None
     identity: Optional[dict] = None
     job_id: Optional[str] = None
+    photo_mode: Optional[str] = None
+    face_panel_crop: Optional[dict] = None
     created_at: Optional[datetime] = None
 
 
@@ -107,16 +115,10 @@ class SheetComposeResponse(BaseModel):
     sheet: CharacterSheetResponse
 
 
-class BodyPreset(BaseModel):
-    name: str
-    label: str
-    #: The words that complete "She has ...".
-    text: str
-
-
 class SheetPresets(BaseModel):
-    body: list[BodyPreset]
     #: Pre-filled outfit and hair, per pronoun: {"female": {"outfit", "hair"}, "male": ...}.
     defaults: dict[str, dict[str, str]]
     default_count: int
     max_count: int
+    #: The face panel's default padding around the detected face, in photo pixels.
+    crop_padding: int

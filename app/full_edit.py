@@ -103,7 +103,7 @@ EXPRESSIONS: dict[str, str] = {
 #: angle would come back as the angle alone, a face_box as the whole frame regenerated -- a
 #: plausible, wrong result. So the service's /health `features` is checked first, and a box
 #: that lacks one fails the job saying "re-pin it" instead.
-_FEATURE_FIELDS = ("expression", "face_box", "turnaround")
+_FEATURE_FIELDS = ("expression", "face_box", "turnaround", "one_photo")
 
 
 class FullEditError(Exception):
@@ -472,8 +472,8 @@ async def _require_features(url: str, request: dict, who: str,
     missing = [f for f in wanted if f not in have]
     if missing:
         raise FullEditError(
-            503, f"image-edit on {who} is too old for {' and '.join(missing)} "
-                 f"(console#569); re-pin it to a current wanly-gpu-docker image")
+            503, f"image-edit on {who} is too old for {' and '.join(missing)}; "
+                 f"re-pin it to a current wanly-gpu-docker image")
 
 
 def _check_echo(out: dict, request: dict, who: str) -> None:
