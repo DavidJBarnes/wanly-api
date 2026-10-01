@@ -19,6 +19,9 @@ class JobCreate(BaseModel):
     fps: int
     seed: Optional[int] = None
     continuation_mode: Optional[str] = None  # "traditional" | "vace" (NULL -> global default)
+    # Render with the character's identity reference -- its character sheet or face ref
+    # (wanly-console#581)? None: yes when the character has one. False: not on this job.
+    use_identity_ref: Optional[bool] = None
     # === Lynx identity-preserving engine ===
     # generation_engine="lynx" routes the job to the Lynx graph builder. Every lynx_*
     # tunable is optional: None -> the daemon's settings default (the same
@@ -80,6 +83,7 @@ class JobResponse(BaseModel):
     caption_hold: Optional[str] = None
     tags: Optional[str] = None
     continuation_mode: Optional[str] = None
+    use_identity_ref: Optional[bool] = None
     # === Lynx identity-preserving engine ===
     # generation_engine="lynx" routes the job to the Lynx graph builder. Every lynx_*
     # tunable is optional: None -> the daemon's settings default (the same
@@ -125,6 +129,8 @@ class JobUpdate(BaseModel):
     name: Optional[str] = None
     status: Optional[str] = None
     tags: Optional[str] = Field(None, max_length=500, description="Comma-separated tags")
+    # The "Use character sheet" toggle (wanly-console#581). null restores the default.
+    use_identity_ref: Optional[bool] = None
 
 
 class WorkerStatsItem(BaseModel):

@@ -263,6 +263,11 @@ async def get_recipe_book(
                 "members": c.members,
                 "base_checkpoint": c.base_checkpoint,
                 "is_default": bool(c.is_default),
+                #: The identity reference (migration 107): LoRA / sheet / both.
+                "sheet_uri": c.sheet_uri,
+                "face_ref_uri": c.face_ref_uri,
+                "identity_mode": c.identity_mode,
+                "description": c.description,
             }
             for c in chars
         ],
@@ -494,6 +499,43 @@ async def _pair_members(db: AsyncSession, names: list[str] | None, pair_name: st
     return rows
 
 
+def _has_lora(char_lora: str | None) -> bool:
+    """NULL and the legacy "none" both mean no LoRA (migration 107)."""
+    n = (char_lora or "").strip().lower()
+    return bool(n) and n != "none"
+
+
+def _settle_identity(row: LtxCharacter) -> None:
+    """Make the row's identity fields consistent, or 422 saying why they cannot be.
+
+    Run on the row as it WILL be saved, after create's defaults or update's changes, so the
+    rules hold however a request got there:
+
+      * a pair carries no reference of its own -- one reference per render, and a pair
+        renders with its FIRST MEMBER's (see segments._identity_ref_for);
+      * `identity_mode` defaults to the sheet when there is one, else the face, and follows a
+        reference that was removed rather than pointing at nothing;
+      * an explicit mode must name a reference the row actually has;
+      * a character is a LoRA or a reference: char_lora NULL with no reference is refused.
+        The database CHECKs (ck_ltx_characters_*) back this up; the 422 just says it first.
+    """
+    has_ref = bool(row.sheet_uri or row.face_ref_uri)
+    if (row.kind or "solo") == "pair" and has_ref:
+        raise HTTPException(status_code=422,
+                            detail="a pair has no reference of its own — it renders with its "
+                                   "first member's character sheet")
+    if row.identity_mode == "sheet" and not row.sheet_uri:
+        raise HTTPException(status_code=422, detail="identity_mode 'sheet' needs a sheet_uri")
+    if row.identity_mode == "face" and not row.face_ref_uri:
+        raise HTTPException(status_code=422, detail="identity_mode 'face' needs a face_ref_uri")
+    if row.identity_mode is None and has_ref:
+        row.identity_mode = "sheet" if row.sheet_uri else "face"
+    if row.char_lora is None and not has_ref:
+        raise HTTPException(status_code=422,
+                            detail="a character needs a LoRA or a character sheet / face "
+                                   "reference")
+
+
 @router.post("/ltx/characters", response_model=LtxCharacterResponse, status_code=201)
 async def create_character(
     body: LtxCharacterCreate,
@@ -510,7 +552,11 @@ async def create_character(
     the phrase must be exactly the prefix the composition captions will carry.
     """
     data = body.model_dump()
-    data["char_lora"] = data.get("char_lora") or "none"
+    has_ref = bool(body.sheet_uri or body.face_ref_uri)
+    # SHEET-ONLY (wanly-console#581): a reference and no LoRA stores NULL, which says what it
+    # is. With neither, the row is a registration ahead of training (#352) and keeps "none",
+    # exactly as before.
+    data["char_lora"] = data.get("char_lora") or (None if has_ref else "none")
     if body.kind == "pair":
         members = await _pair_members(db, body.members, body.name)
         data["members"] = [m.name for m in members]
@@ -522,8 +568,13 @@ async def create_character(
         data["members"] = None
         # A character without a trigger renders a prompt containing a literal "<TRIGGER>",
         # which is worse than any default. The name is what all three seeded characters use.
-        data["trigger"] = data.get("trigger") or data["name"]
+        # NOT for a sheet-only character: it has no caption to match, and its <TRIGGER> fills
+        # from `description` (or is dropped) -- the name would put a word in every prompt
+        # that means nothing to the model.
+        if data["char_lora"] is not None or not has_ref:
+            data["trigger"] = data.get("trigger") or data["name"]
     c = LtxCharacter(**data)
+    _settle_identity(c)
     db.add(c)
     try:
         await db.commit()
@@ -597,6 +648,18 @@ async def update_character(
         c.base_checkpoint = None
     for k, v in data.items():
         setattr(c, k, v)
+    # A reference removed without naming a new mode: let _settle_identity pick what is left,
+    # rather than refuse a mode that only pointed at the reference just cleared.
+    if "identity_mode" not in data and (
+            (c.identity_mode == "sheet" and not c.sheet_uri)
+            or (c.identity_mode == "face" and not c.face_ref_uri)):
+        c.identity_mode = None
+    try:
+        _settle_identity(c)
+    except HTTPException:
+        # Nothing has been flushed: put the row back as stored rather than leave it dirty.
+        await db.refresh(c)
+        raise
     try:
         await db.commit()
     except IntegrityError:

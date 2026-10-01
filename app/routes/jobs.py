@@ -30,7 +30,9 @@ from app.model_requirements import (
     required_artifacts,
     unsatisfied,
 )
-from app.routes.segments import _refuse_empty_submit, _resolve_wildcards_outside_scene
+from app.routes.segments import (
+    _refuse_empty_submit, _resolve_trigger, _resolve_wildcards_outside_scene,
+)
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
 from app.tag_filter import like_escape, tag_clause
 
@@ -124,6 +126,9 @@ async def create_job(
         fps=body.fps,
         seed=seed,
         continuation_mode=body.continuation_mode,
+        # Condition renders on the character's sheet/face reference (wanly-console#581).
+        # None is the default: on when the character has one.
+        use_identity_ref=body.use_identity_ref,
         # Lynx engine selection + tunables. All optional: None -> daemon settings default.
         generation_engine=body.generation_engine,
         lynx_subject_image=body.lynx_subject_image,
@@ -200,7 +205,11 @@ async def create_job(
     # again here because this path stores the prompt without going through _resolve_scene:
     # the markers come off, and the caption inside them is held back from the wildcard
     # resolver rather than fed to it.
-    resolved_prompt, prompt_template = await _resolve_wildcards_outside_scene(db, seg.prompt)
+    # <TRIGGER> first, exactly as add_segment does. The console normally fills it before it
+    # submits; this catches a prompt that still carries it -- and fills a SHEET-ONLY
+    # character's from its description (wanly-console#581) by the same rule as continuations.
+    prompt = await _resolve_trigger(db, seg.prompt, seg.ltx_recipe)
+    resolved_prompt, prompt_template = await _resolve_wildcards_outside_scene(db, prompt)
     # The caption hold (console#562). A <SCENE>/<MOTION> the New Job dialog had no words for
     # yet -- the modal's caption still running, or a dialog submitted without waiting -- holds
     # the segment until they are saved, instead of the claim captioning the frame a second
@@ -711,6 +720,11 @@ async def update_job(
 
     if body.tags is not None:
         job.tags = body.tags
+
+    # Sent explicitly (null included -- back to the default), it applies to every segment
+    # claimed from now on; segments already rendered recorded what they used in their log.
+    if "use_identity_ref" in body.model_fields_set:
+        job.use_identity_ref = body.use_identity_ref
 
     if body.status is not None:
         allowed = JOB_VALID_TRANSITIONS.get(job.status, set())

@@ -70,9 +70,29 @@ def trigger_phrase(trigger: str | None, gender: str | None) -> str | None:
     return f"{trigger}, {gender}"
 
 
+def fill_phrase(trigger: str | None, gender: str | None,
+                description: str | None = None) -> str | None:
+    """What <TRIGGER> becomes: the trigger phrase, else the character's description.
+
+    A SHEET-ONLY character (wanly-console#581) has no trigger -- there is no LoRA caption to
+    match -- so the placeholder takes its short description instead ("a woman with auburn
+    hair"). A trigger always wins when there is one: it is the caption the LoRA learned.
+    None when there is neither; the caller decides between leaving the placeholder (a LoRA
+    character, where a silently missing trigger is the worse failure) and dropping it (no LoRA,
+    nothing to anchor).
+    """
+    return trigger_phrase(trigger, gender) or ((description or "").strip() or None)
+
+
+def has_lora(char_lora: str | None) -> bool:
+    """NULL and the legacy "none" both mean no LoRA (migration 107)."""
+    n = (char_lora or "").strip().lower()
+    return bool(n) and n != "none"
+
+
 def character_phrase(person: dict[str, Any]) -> str | None:
-    """`trigger_phrase` for one entry of `recipe_characters`."""
-    return trigger_phrase(person.get("trigger"), person.get("gender"))
+    """`fill_phrase` for one entry of `recipe_characters`."""
+    return fill_phrase(person.get("trigger"), person.get("gender"), person.get("description"))
 
 
 def render_prompt(template: str, triggers: str | Any) -> str:

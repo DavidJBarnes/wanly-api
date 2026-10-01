@@ -2,13 +2,18 @@
 
 import uuid
 from datetime import datetime
-from typing import Literal, Optional, List
+from typing import Annotated, Literal, Optional, List
 
 from pydantic import BaseModel, ConfigDict, Field
 
 #: The word a LoRA's caption bound its trigger to (wanly-console#487). The same three the
 #: training request takes, because this is what that request's caption recorded.
 Gender = Literal["woman", "man", "person"]
+#: Which identity reference renders (migration 107): the 1536x1024 character sheet, or the
+#: face close-up. Must name one the character actually has.
+IdentityMode = Literal["sheet", "face"]
+#: An Image Repo reference is an S3 URI. A presigned https URL would expire inside the row.
+S3Uri = Annotated[str, Field(min_length=6, max_length=1024, pattern=r"^s3://[^/]+/.+")]
 
 
 class LtxCharacterCreate(BaseModel):
@@ -24,6 +29,12 @@ class LtxCharacterCreate(BaseModel):
     as the joined phrase and its gender is None (the phrase carries both). Anything sent
     for either is ignored rather than trusted: the phrase must be exactly what the captions
     will teach.
+
+    A LoRA, A SHEET, OR BOTH (wanly-console#581). `sheet_uri` / `face_ref_uri` are Image Repo
+    images the engine conditions on (wanly-gpu-docker#156). A character sent with a reference
+    and no LoRA is SHEET-ONLY: its char_lora is stored NULL rather than "none", it needs no
+    trigger or strengths, and <TRIGGER> fills from `description`. `identity_mode` defaults to
+    the sheet when there is one, else the face.
     """
     name: str = Field(min_length=1, max_length=64)
     #: Omitted or null: "none". Stored as "none" rather than NULL because every reader of
@@ -40,6 +51,10 @@ class LtxCharacterCreate(BaseModel):
     image_uri: Optional[str] = None
     kind: Literal["solo", "pair"] = "solo"
     members: Optional[List[str]] = Field(default=None, max_length=2)
+    sheet_uri: Optional[S3Uri] = None
+    face_ref_uri: Optional[S3Uri] = None
+    identity_mode: Optional[IdentityMode] = None
+    description: Optional[str] = Field(default=None, max_length=255)
 
 
 class LtxCharacterResponse(BaseModel):
@@ -48,7 +63,8 @@ class LtxCharacterResponse(BaseModel):
     id: uuid.UUID
     name: str
     char_lora: Optional[str] = None
-    trigger: str
+    #: None for a sheet-only character (migration 107).
+    trigger: Optional[str] = None
     gender: Optional[Gender] = None
     strength_stage_1: float
     strength_stage_2: float
@@ -60,6 +76,12 @@ class LtxCharacterResponse(BaseModel):
     trained_from: Optional[list] = None
     #: Preselected by the console's modals (wanly-console#543). At most one is true.
     is_default: bool = False
+    #: The identity reference (migration 107): Image Repo URIs, which one renders, and the
+    #: words <TRIGGER> fills with when there is no trigger.
+    sheet_uri: Optional[str] = None
+    face_ref_uri: Optional[str] = None
+    identity_mode: Optional[str] = None
+    description: Optional[str] = None
 
 
 class LtxCharacterUpdate(BaseModel):
@@ -85,6 +107,13 @@ class LtxCharacterUpdate(BaseModel):
     image_uri: Optional[str] = None
     kind: Optional[Literal["solo", "pair"]] = None
     members: Optional[List[str]] = Field(default=None, max_length=2)
+    # The identity reference (migration 107). Sent as null, each clears. `char_lora: null`
+    # removes the LoRA outright -- allowed only while a reference remains (a character must
+    # be one or the other); "none" is still the way to detach and re-register (#352).
+    sheet_uri: Optional[S3Uri] = None
+    face_ref_uri: Optional[S3Uri] = None
+    identity_mode: Optional[IdentityMode] = None
+    description: Optional[str] = Field(default=None, max_length=255)
 
 
 class LtxBookCreate(BaseModel):
