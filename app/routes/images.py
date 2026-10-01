@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy import and_, func, not_, or_, select, text, true
+from sqlalchemy import and_, func, not_, or_, select, text, true, update
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.dialects.postgresql import array as pg_array
 from sqlalchemy.exc import DBAPIError
@@ -18,7 +18,7 @@ from app.routes.datasets import DATASETS_PREFIX
 from app.database import async_session, get_db, release_connection
 from app.joycaption import CaptionError, CaptionerBusy
 from app.enums import TRAINING_TERMINAL
-from app.models import Dataset, Favorite, ImageMeta, Job, Segment, TrainingJob, User
+from app.models import Dataset, Favorite, ImageMeta, Job, LtxCharacter, Segment, TrainingJob, User
 from app.routes.captions import ScenePair, caption_image_pair
 from app.schemas.images import (BulkImageTagsUpdate, CaptionQueueStatus, CaptionTryRequest,
                                 CaptionTryResponse, ImageSceneRequest, ImageSceneResponse,
@@ -447,6 +447,16 @@ async def move_images(body: dict, db: AsyncSession = Depends(get_db)):
             motion_described_at=meta.motion_described_at,
         ))
         await db.delete(meta)
+    # A CHARACTER'S SHEET OR FACE REF MOVES WITH THE IMAGE (wanly-console#581). The row names
+    # the image by URI, and a claim presigns that URI -- left behind, every render of the
+    # character would fail its reference download (or, with no LoRA, have no identity at all).
+    for src_key, dst_key in moved:
+        src = f"s3://{bucket}/{src_key}"
+        dst = f"s3://{bucket}/{dst_key}"
+        if src == dst:
+            continue
+        for col in (LtxCharacter.sheet_uri, LtxCharacter.face_ref_uri):
+            await db.execute(update(LtxCharacter).where(col == src).values({col.key: dst}))
     await db.commit()
 
     return {"moved": len(moved)}

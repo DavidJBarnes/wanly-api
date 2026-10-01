@@ -28,15 +28,18 @@ from app.enums import SEGMENT_HELD, JobStatus, SegmentStatus, VideoStatus, Worke
 from app.ltx_stack import LTX_STACK
 from app.model_requirements import CHECKPOINT, canonical
 from app.recipe_blob import (
-    TRIGGER_PLACEHOLDER, character_phrase, placeholders_in, recipe_characters, render_prompt,
-    trigger_phrase,
+    TRIGGER_PLACEHOLDER, character_phrase, fill_phrase, has_lora, placeholders_in,
+    recipe_characters, render_prompt, trigger_phrase,
 )
 from app.models import (
     AppSetting, ImageMeta, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker,
 )
 from app.negative_prompt import default_negative_prompt
-from app.s3 import delete_object, download_file, move_object, parse_s3_uri
+from app.s3 import (
+    delete_object, download_file, generate_presigned_url, move_object, parse_s3_uri,
+)
 from app.schemas.segments import (
+    ClaimIdentityRef,
     SegmentPromptUpdate,
     FramePreview,
     FramePreviewResponse,
@@ -425,14 +428,16 @@ async def _trigger_words(db: AsyncSession, ltx_recipe: dict | None) -> list[str]
     words: set[str] = {TRIGGER_PLACEHOLDER}
     for person in recipe_characters(ltx_recipe):
         words.update(filter(None, (character_phrase(person), person.get("trigger"),
-                                   person.get("gender"))))
+                                   person.get("gender"), person.get("description"))))
         if person.get("name"):
             row = (await db.execute(
                 select(LtxCharacter).where(LtxCharacter.name == person["name"])
             )).scalar_one_or_none()
             if row is not None:
+                # The description counts too: for a sheet-only character it IS what fills
+                # <TRIGGER>, so "a woman with auburn hair," alone says nothing about the shot.
                 words.update(filter(None, (trigger_phrase(row.trigger, row.gender),
-                                           row.trigger, row.gender)))
+                                           row.trigger, row.gender, row.description)))
     return sorted((w for w in words if w.strip()), key=len, reverse=True)
 
 
@@ -511,7 +516,16 @@ async def _resolve_trigger(db: AsyncSession, prompt: str, ltx_recipe: dict | Non
         row = (await db.execute(
             select(LtxCharacter).where(LtxCharacter.name == person["name"])
         )).scalar_one_or_none()
-    phrase = trigger_phrase(row.trigger, row.gender) if row else character_phrase(person)
+    phrase = (fill_phrase(row.trigger, row.gender, row.description) if row is not None
+              else character_phrase(person))
+    if phrase is None and row is not None and not has_lora(row.char_lora):
+        # A character with NO LoRA and no words for it (a sheet-only character without a
+        # description, wanly-console#581). Leaving the literal "<TRIGGER>" is right for a LoRA
+        # character -- a silently missing trigger is the worse failure there -- but here there
+        # is no caption token to anchor, and the reference carries the identity. So the
+        # placeholder goes, with the comma beside it. If nothing else is left, the #577 guards
+        # refuse the prompt rather than render it empty.
+        return _drop_placeholder(prompt, TRIGGER_PLACEHOLDER)
     return render_prompt(prompt, phrase)
 
 
@@ -726,6 +740,51 @@ def _model_gate(worker: Worker | None) -> tuple:
         func.jsonb_typeof(Segment.ltx_recipe) != "object",
     )
     return (or_(declares_nothing, checkpoint.in_(names)),)
+
+
+async def _identity_ref_for(db: AsyncSession, job: Job,
+                            ltx_recipe: dict | None) -> ClaimIdentityRef | None:
+    """The identity reference this segment renders with, or None.
+
+    None when the job turned it off (`use_identity_ref` False; NULL is the default, on), when
+    the segment is not a recipe render of a known character, or when that character has no
+    reference.
+
+    PAIRS (one reference per render, wanly-console#581): a pair is a joint LoRA over two
+    people and carries no reference of its own. It renders with its FIRST MEMBER's reference
+    -- the member listed first, as the pair was registered -- or with none when that member
+    has none. The second member never contributes one: the conditioning node takes a single
+    identity, and conditioning both people on one face is the wrong answer for one of them.
+
+    Never raises. This is the claim path, where a 500 stops the queue; a reference that cannot
+    be presigned is logged and the segment renders without it.
+    """
+    if job.use_identity_ref is False:
+        return None
+    people = recipe_characters(ltx_recipe)
+    name = (people[0].get("name") if people else None)
+    if not name:
+        return None
+    row = (await db.execute(select(LtxCharacter).where(LtxCharacter.name == name))
+           ).scalar_one_or_none()
+    if row is not None and (row.kind or "solo") == "pair":
+        first = (row.members or [None])[0]
+        row = (await db.execute(select(LtxCharacter).where(LtxCharacter.name == first))
+               ).scalar_one_or_none() if first else None
+    if row is None:
+        return None
+    mode = row.identity_mode or ("sheet" if row.sheet_uri else "face" if row.face_ref_uri
+                                 else None)
+    uri = row.sheet_uri if mode == "sheet" else row.face_ref_uri if mode == "face" else None
+    if not uri:
+        return None
+    try:
+        url = await asyncio.to_thread(generate_presigned_url, uri)
+    except Exception:  # noqa: BLE001 -- see the docstring: the claim must not 500
+        logger.exception("Could not presign %s's identity reference %s; rendering without it",
+                         row.name, uri)
+        return None
+    return ClaimIdentityRef(url=url, mode=mode, uri=uri, character=row.name)
 
 
 @router.get("/segments/next", dependencies=[Depends(verify_api_key)])
@@ -1067,6 +1126,12 @@ async def claim_next_segment(
         ).scalars().first()
         hologram_source_path = holo_video.output_path if holo_video else None
 
+    # The character's sheet / face reference (wanly-console#581). Read at CLAIM time, from
+    # the character row, like the trigger: a sheet added or changed after the job was queued
+    # is the one that renders. Generations only -- a reprocess carrier renders nothing.
+    identity_ref = (await _identity_ref_for(db, job, segment.ltx_recipe)
+                    if segment.reprocess_type is None else None)
+
     await db.commit()
     await db.refresh(segment)
 
@@ -1088,6 +1153,7 @@ async def claim_next_segment(
         # engine that cannot look one up cannot look up a STALE one, which is the failure
         # this shape exists to make impossible (see wanly-api#207).
         ltx_recipe=segment.ltx_recipe,
+        identity_ref=identity_ref,
         reprocess_type=segment.reprocess_type,
         output_path=segment.output_path,
         width=job.width,

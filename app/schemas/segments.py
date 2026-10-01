@@ -129,6 +129,19 @@ class WorkerSegmentResponse(BaseModel):
     completed_at: Optional[datetime]
 
 
+class ClaimIdentityRef(BaseModel):
+    """The segment character's identity reference, for the daemon (wanly-console#581).
+
+    `url` is presigned (6 h) -- the daemon fetches it and caches by content hash
+    (wanly-gpu-daemon#187). `uri` is the S3 object it points at: the cache's index key, and
+    what the record names. `character` is whose it is -- for a pair, the first member.
+    """
+    url: str
+    mode: str
+    uri: str
+    character: str
+
+
 class SegmentClaimResponse(BaseModel):
     id: UUID
     job_id: UUID
@@ -143,6 +156,9 @@ class SegmentClaimResponse(BaseModel):
     # plus any of its defaults the user overrode and the resolved graph hash. NULL means
     # "not a recipe render". See Segment.ltx_recipe for why this is one field and not a dozen.
     ltx_recipe: Optional[dict[str, Any]] = None
+    # The character's sheet / face reference, when it has one and the job did not turn it off.
+    # None for every other segment -- the daemon then renders exactly as before.
+    identity_ref: Optional[ClaimIdentityRef] = None
     reprocess_type: Optional[str] = None
     output_path: Optional[str] = None
     width: int

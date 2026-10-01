@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -46,6 +46,9 @@ class Job(Base):
     priority = mapped_column(Integer, nullable=False, default=0)
     # Per-job continuation-mode override ("traditional"|"vace"); NULL -> global app setting.
     continuation_mode = mapped_column(String(20), nullable=True)
+    # Condition renders on the character's identity reference (migration 107)? NULL is the
+    # default, "yes when the character has one"; False turns it off for this job.
+    use_identity_ref = mapped_column(Boolean, nullable=True)
     # === Lynx identity-preserving engine (ByteDance Lynx on Wan2.1 T2V-14B) ===
     # generation_engine selects the daemon's graph builder: NULL/"wan22" -> the default
     # 2.2 i2v path, "lynx" -> build_lynx_workflow. Lynx is a different base model family,
@@ -591,29 +594,44 @@ class TrainingJob(Base):
 
 
 class LtxCharacter(Base):
-    """A character: a LoRA and the strengths it runs at.
+    """A character: a LoRA, an identity reference (character sheet / face), or both.
 
-    "Adding a character costs a LoRA and a trigger swap" — that is the whole model. The
-    strengths sit here rather than globally so a future character can differ, but all three
-    seeded characters share 0.8/1.5.
+    It used to be "a LoRA and a trigger swap", and every existing row still is. Since
+    migration 107 (wanly-console#581) a character may instead -- or as well -- carry a
+    1536x1024 character sheet or a face close-up, which the engine conditions both render
+    stages on (wanly-gpu-docker#156). Phase 0 (wanly-gpu-docker#155) showed LoRA + sheet
+    holding identity best in wanly's own graph.
     """
     __tablename__ = "ltx_characters"
     __table_args__ = (
         # At most one default (migration 104): a partial unique over the TRUE rows only.
         Index("uq_ltx_characters_one_default", "is_default",
               unique=True, postgresql_where=text("is_default")),
+        # Migration 107. A LoRA or a reference. char_lora IS NOT NULL counts the legacy
+        # "none" rows -- a character registered before it trains -- so no existing row fails.
+        CheckConstraint("char_lora IS NOT NULL OR sheet_uri IS NOT NULL "
+                        "OR face_ref_uri IS NOT NULL", name="ck_ltx_characters_lora_or_ref"),
+        CheckConstraint("identity_mode IS NULL"
+                        " OR (identity_mode = 'sheet' AND sheet_uri IS NOT NULL)"
+                        " OR (identity_mode = 'face' AND face_ref_uri IS NOT NULL)",
+                        name="ck_ltx_characters_identity_mode"),
     )
 
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = mapped_column(String(64), nullable=False, unique=True)
-    char_lora = mapped_column(Text, nullable=False)
+    # NULL (migration 107) or the legacy "none": no LoRA. A sheet-only character renders on
+    # the base model with its reference carrying the identity.
+    char_lora = mapped_column(Text, nullable=True)
     # The token that fills a pose's <TRIGGER> placeholder. "Adding a character costs a LoRA
     # and a trigger swap" — this is the trigger half, and it is why a new LoRA is never
     # locked out: every pose works for it the moment the row exists.
     #
     # 255 since migration 103: a PAIR's trigger is the joined phrase its captions taught,
     # "d@vid, man and k3lly2026, woman", and 64 does not hold two real names.
-    trigger = mapped_column(String(255), nullable=False)
+    #
+    # NULL since migration 107, for a character with no LoRA: there is no caption to match,
+    # and <TRIGGER> fills from `description` (or is dropped) instead.
+    trigger = mapped_column(String(255), nullable=True)
     # The other half of the caption this LoRA trained on. Every run captions its images
     # "<trigger>, <gender>", so the identity is bound to the PAIR; filling <TRIGGER> with
     # the trigger alone left the binding word out of every render prompt, which is what
@@ -647,6 +665,16 @@ class LtxCharacter(Base):
     # picked (wanly-console#543). At most one row is true; set through
     # POST /ltx/characters/{id}/default, never PATCH, so the old one is cleared with it.
     is_default = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
+    # IDENTITY REFERENCE (migration 107). Image Repo s3:// URIs. The sheet is a 1536x1024
+    # turnaround -- the layout the CharacterSheet LoRA was trained on; the face ref is a
+    # close-up. `identity_mode` says which one renders ('sheet' | 'face'); the claim hands the
+    # daemon a presigned URL for it when the job has not turned it off (jobs.use_identity_ref).
+    sheet_uri = mapped_column(Text, nullable=True)
+    face_ref_uri = mapped_column(Text, nullable=True)
+    identity_mode = mapped_column(String(8), nullable=True)
+    # A few words that fill <TRIGGER> when there is no trigger ("a woman with auburn hair").
+    # A LoRA character's trigger always wins: it is the caption the weights learned.
+    description = mapped_column(String(255), nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     # There is NO cascade to recipes: `ltx_recipes` has no character_id and no relationship
