@@ -32,6 +32,12 @@ process restarting mid-queue.
 A TRAINING RUN IS NEVER INTERRUPTED. Edit mode stops the trainer the way caption mode does, and
 a stopped trainer is a run destroyed. While the box reports one, jobs wait and say so.
 
+CHARACTER-SHEET JOBS SHARE THIS QUEUE (wanly-console#582, app/sheet_gen.py). A sheet job is
+N turnaround candidates on the same service, so it needs the same card, the same edit mode and
+the same "never interrupt training" rule -- one queue, FIFO with the edits, one hand-back. A
+job's `kind` says which; `work` is the sheet's own runner, called with the URL of whichever
+worker the job landed on.
+
 NOTHING IS SAVED UNTIL SAVE. A finished job holds its PNG here, in memory, with the AuraFace
 score against the source; the console shows both, and POST .../save writes it as a NEW image --
 the same "never overwrite, the user decides" rule as face mode. In memory on purpose: a result
@@ -97,7 +103,7 @@ EXPRESSIONS: dict[str, str] = {
 #: angle would come back as the angle alone, a face_box as the whole frame regenerated -- a
 #: plausible, wrong result. So the service's /health `features` is checked first, and a box
 #: that lacks one fails the job saying "re-pin it" instead.
-_FEATURE_FIELDS = ("expression", "face_box")
+_FEATURE_FIELDS = ("expression", "face_box", "turnaround")
 
 
 class FullEditError(Exception):
@@ -136,6 +142,14 @@ class Job:
     saved: list[dict] = field(default_factory=list)
     #: Which worker ran it: the always-on one's name, or image_edit_worker.
     worker: str | None = None
+    #: "edit" (the Edit dialog) or "sheet" (a character sheet's candidates, app/sheet_gen.py).
+    kind: str = "edit"
+    #: A sheet job's runner: work(job, url) -> dict. None for an edit.
+    work: object | None = None
+    #: What the service must advertise on /health for this job (see _FEATURE_FIELDS).
+    needs: dict = field(default_factory=dict)
+    #: A sheet job's hook once it is over, done or failed: on_finish(job) (persists its state).
+    on_finish: object | None = None
 
 
 class FullEditQueue:
@@ -149,17 +163,20 @@ class FullEditQueue:
 
     # ------------------------------------------------------------------ public
 
-    def submit(self, source_uri: str, source: bytes, request: dict, tag: str) -> Job:
+    def submit(self, source_uri: str, source: bytes, request: dict, tag: str,
+               job: Job | None = None) -> Job:
+        """Queue an edit -- or `job`, already built (a sheet job, app/sheet_gen.py)."""
         self._expire()
-        job = Job(id=uuid.uuid4().hex, source_uri=source_uri, request=request, tag=tag)
+        if job is None:
+            job = Job(id=uuid.uuid4().hex, source_uri=source_uri, request=request, tag=tag)
         job.meta["_source"] = source
         self.jobs[job.id] = job
         self._order.append(job.id)
         self._wake.set()
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self._run())
-        logger.info("full edit %s queued (%s) for %s, %d ahead", job.id, tag, source_uri,
-                    self.position(job) or 0)
+        logger.info("full edit %s queued (%s %s) for %s, %d ahead", job.id, job.kind, job.tag,
+                    job.source_uri, self.position(job) or 0)
         return job
 
     def get(self, job_id: str) -> Job | None:
@@ -202,15 +219,11 @@ class FullEditQueue:
 
     async def _one(self, job: Job) -> None:
         try:
-            out = await self._on_standing(job)
-            if out is None:
-                await self._box_ready(job)
-                await _require_features(settings.image_edit_url, job.request,
-                                        settings.image_edit_worker)
-                job.worker = settings.image_edit_worker
-                job.state, job.message, job.started_at = (
-                    "running", f"editing on {job.worker}", time.time())
-                out = await _edit(job.meta["_source"], job.request)
+            if job.kind != "edit":
+                await self._place(job)
+                job.state, job.message = "done", "done"
+                return
+            out = await self._place(job)
             _check_echo(out, job.request, job.worker or "image-edit")
             png = base64.b64decode(out["image"])
             job.result = png
@@ -230,10 +243,40 @@ class FullEditQueue:
         finally:
             job.meta.pop("_source", None)
             job.finished_at = time.time()
-            logger.info("full edit %s %s in %.0fs%s", job.id, job.state,
+            logger.info("full edit %s (%s) %s in %.0fs%s", job.id, job.kind, job.state,
                         job.finished_at - job.created_at,
                         f": {job.error}" if job.error else
                         f", aura {(job.meta.get('identity') or {}).get('aura')}")
+            if callable(job.on_finish):
+                try:
+                    await job.on_finish(job)
+                except Exception:                   # noqa: BLE001 -- the job is already over
+                    logger.exception("full edit %s: on_finish failed", job.id)
+
+    async def _call(self, job: Job, url: str | None) -> dict:
+        """Run the job's work against one worker's image-edit service."""
+        if job.kind == "edit":
+            if url is None:
+                return await _edit(job.meta["_source"], job.request)
+            return await _edit(job.meta["_source"], job.request, url=url)
+        return await job.work(job, (url or settings.image_edit_url or "").strip().rstrip("/"))
+
+    def _running(self, job: Job) -> str:
+        return (f"editing on {job.worker}" if job.kind == "edit"
+                else f"generating on {job.worker}")
+
+    async def _place(self, job: Job) -> dict:
+        """The always-on worker when it is up, else the main 3090's edit mode; then the work."""
+        out = await self._on_standing(job)
+        if out is None:
+            await self._box_ready(job)
+            await _require_features(settings.image_edit_url, _needs(job),
+                                    settings.image_edit_worker)
+            job.worker = settings.image_edit_worker
+            job.state, job.message, job.started_at = (
+                "running", self._running(job), time.time())
+            out = await self._call(job, None)
+        return out
 
     async def _on_standing(self, job: Job) -> dict | None:
         """Run the job on the always-on image-edit worker, or None to fall back to edit mode.
@@ -262,12 +305,12 @@ class FullEditQueue:
             elif h.get("waiting"):
                 job.state, job.message = "waiting", f"{name} busy ({h['waiting']}); edit queued"
             else:
-                await _require_features(url, job.request, name, health=h)
+                await _require_features(url, _needs(job), name, health=h)
                 job.worker = name
                 job.state, job.message, job.started_at = (
-                    "running", f"editing on {name}", time.time())
+                    "running", self._running(job), time.time())
                 try:
-                    return await _edit(job.meta["_source"], job.request, url=url)
+                    return await self._call(job, url)
                 except FullEditError as e:
                     if e.unreachable:
                         logger.warning("full edit %s: %s unreachable (%s); falling back",
@@ -337,6 +380,11 @@ class FullEditQueue:
             # The box hands itself back after its own idle timeout; this is not the only path.
             logger.warning("could not put %s back in %s mode: %s (it will return by itself "
                            "after its idle timeout)", settings.image_edit_worker, mode, e)
+
+
+def _needs(job: Job) -> dict:
+    """What the feature check reads: an edit's own request, or a sheet job's `needs`."""
+    return job.request if job.kind == "edit" else job.needs
 
 
 def _switch_message(h: dict) -> str:
@@ -437,13 +485,18 @@ def _check_echo(out: dict, request: dict, who: str) -> None:
 
 
 async def _edit(source: bytes, request: dict, url: str | None = None) -> dict:
+    body = {"image": base64.b64encode(source).decode(), **request}
+    return await post_service(url, "/edit", body)
+
+
+async def post_service(url: str | None, path: str, body: dict) -> dict:
+    """POST to an image-edit service, every failure a FullEditError that says which kind."""
     url = (url or settings.image_edit_url or "").strip().rstrip("/")
     if not url:
         raise FullEditError(503, "no image-edit service is configured (image_edit_url is empty)")
-    body = {"image": base64.b64encode(source).decode(), **request}
     try:
         async with httpx.AsyncClient(timeout=settings.image_edit_timeout_s) as client:
-            r = await client.post(f"{url}/edit", json=body)
+            r = await client.post(f"{url}{path}", json=body)
     except (httpx.ConnectError, httpx.ConnectTimeout) as e:
         # Before TimeoutException, which ConnectTimeout subclasses: never connected means the
         # edit cannot be running, so the caller may send it elsewhere.
