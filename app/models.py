@@ -703,7 +703,9 @@ class CharacterSheet(Base):
     sheet_uri = mapped_column(Text, nullable=False)
     #: The raw turnaround it was composed from (a job draft; may since have been cleaned up).
     candidate_uri = mapped_column(Text, nullable=True)
-    #: The real face photo: the sheet's face panel and the model's reference.
+    #: The photo the sheet was built from. Since console#585 (photo_mode "one_photo") it is
+    #: ONE photo of the person, face + body: the turnaround's image 1 AND the source the face
+    #: panel was auto-cropped from. Before that (photo_mode NULL) it was a face photo.
     face_uri = mapped_column(Text, nullable=False)
     outfit = mapped_column(Text, nullable=False)
     hair = mapped_column(Text, nullable=True)
@@ -719,6 +721,11 @@ class CharacterSheet(Base):
     #: AuraFace of the turnaround against the face photo, when the service could score it.
     identity = mapped_column(JSONB, nullable=True)
     job_id = mapped_column(String(64), nullable=True)
+    #: "one_photo" (console#585, migration 109); NULL = built from a face photo + body words.
+    photo_mode = mapped_column(String(16), nullable=True)
+    #: How the face panel was cut from face_uri: {"source": "same_photo", box, crop, padding,
+    #: scale, detector, det_size, photo_size}. NULL before #585.
+    face_panel_crop = mapped_column(JSONB, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
