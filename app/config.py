@@ -120,7 +120,9 @@ class Settings(BaseSettings):
     image_edit_url: str = "http://3090.zero:8086"
     #: The box that runs it: the host its control API answers on, and its Workers-page name.
     image_edit_worker: str = "3090.zero"
-    # One edit: ~13-16 s warm on the 3090, plus a cold checkpoint load (28 GB) on the first.
+    # One call: an edit, or one character-sheet candidate (wanly-console#582). Since the
+    # official Qwen-Image-Edit-2511 (40 steps at CFG 4, wanly-console#574) that is minutes, not
+    # v23's ~15 s, plus a cold load of ~30 GB of weights on the first.
     image_edit_timeout_s: int = 900
     # How long a job may wait for edit mode. The switch lets the segment in flight finish, and
     # a segment is up to ~27 minutes -- this is that plus the Qwen boot, with room.

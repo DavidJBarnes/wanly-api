@@ -682,6 +682,46 @@ class LtxCharacter(Base):
     # here used to claim an FK with ON DELETE CASCADE; that constraint died in migration 072.
 
 
+class CharacterSheet(Base):
+    """Where a generated character sheet came from (migration 108, wanly-console#582).
+
+    One row per sheet the console built and saved: the REAL face photo it was built around, the
+    words, the seed, the model and its settings. A sheet is the identity every render of the
+    character is conditioned on, so "which photo, which prompt, which model" must outlive the
+    job that made it -- the job is in memory and its drafts are disposable. The row is written
+    when a candidate is approved, never changed afterwards, and survives the character (SET
+    NULL, name kept): the image is still in the repo, and so is its history.
+    """
+    __tablename__ = "character_sheets"
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    character_id = mapped_column(UUID(as_uuid=True),
+                                 ForeignKey("ltx_characters.id", ondelete="SET NULL"),
+                                 nullable=True, index=True)
+    character_name = mapped_column(String(64), nullable=False)
+    #: The saved sheet, an Image Repo URI -- what the character's sheet_uri was set to.
+    sheet_uri = mapped_column(Text, nullable=False)
+    #: The raw turnaround it was composed from (a job draft; may since have been cleaned up).
+    candidate_uri = mapped_column(Text, nullable=True)
+    #: The real face photo: the sheet's face panel and the model's reference.
+    face_uri = mapped_column(Text, nullable=False)
+    outfit = mapped_column(Text, nullable=False)
+    hair = mapped_column(Text, nullable=True)
+    body = mapped_column(Text, nullable=True)
+    gender = mapped_column(String(16), nullable=True)
+    prompt = mapped_column(Text, nullable=False)
+    seed = mapped_column(BigInteger, nullable=False)
+    model = mapped_column(Text, nullable=True)
+    settings = mapped_column(Text, nullable=True)
+    #: {folder: file} the service loaded, and how the face panel was cut ("crop", ...).
+    files = mapped_column(JSONB, nullable=True)
+    face_panel = mapped_column(String(16), nullable=True)
+    #: AuraFace of the turnaround against the face photo, when the service could score it.
+    identity = mapped_column(JSONB, nullable=True)
+    job_id = mapped_column(String(64), nullable=True)
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+
+
 class LtxBook(Base):
     """A BOOK: a named collection of poses.
 
