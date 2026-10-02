@@ -10,6 +10,7 @@ is why re-describing is an explicit action, and why nothing may throw the row aw
 effect of an unrelated edit.
 """
 
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from unittest.mock import patch
 
@@ -356,12 +357,41 @@ async def _get_scene(db, path):
         app.dependency_overrides.clear()
 
 
+@contextmanager
+def _captioner(db, pair=None, error=None):
+    """The ticket a describe now is (console#564), with S3 and the captioner patched out.
+
+    The ticket runs in its own task with short sessions of its own; here those are the
+    test's session, so everything still rolls back.
+    """
+    from app import caption_tickets
+
+    @asynccontextmanager
+    async def _session():
+        yield db
+
+    async def _no_settings(db):
+        return {}
+
+    run = (patch("app.routes.captions.run_caption_pair", side_effect=error) if error
+           else patch("app.routes.captions.run_caption_pair", return_value=pair))
+    caption_tickets.reset()
+    try:
+        with patch("app.s3.download_bytes", return_value=b"png"), \
+             patch("app.routes.captions._caption_base", return_value="http://c"), \
+             patch("app.routes.captions._get_all_settings", side_effect=_no_settings), \
+             patch.object(caption_tickets, "async_session", _session), run as mock:
+            yield mock
+    finally:
+        caption_tickets.reset()
+
+
 async def _post_scene(db, path, caption=None, error=None, motion=None, motion_error=None):
     """POST /images/scene with S3 and the captioner patched out.
 
-    #326: the route calls caption_image_pair, which returns the static half and the motion
-    half. A test that names only a static caption gets motion=None — the shape the real
-    endpoint produces when the motion call failed.
+    #326: the caption is a pair, the static half and the motion half. A test that names only
+    a static caption gets motion=None — the shape the real endpoint produces when the motion
+    call failed.
     """
     client, app = await _client(db)
     from app.routes.captions import ScenePair
@@ -370,12 +400,8 @@ async def _post_scene(db, path, caption=None, error=None, motion=None, motion_er
                      motion=motion,
                      motion_instruction="a motion instruction" if motion else None,
                      motion_error=motion_error)
-    describe = (
-        patch("app.routes.images.caption_image_pair", side_effect=error) if error
-        else patch("app.routes.images.caption_image_pair", return_value=pair)
-    )
     try:
-        with patch("app.routes.images.download_bytes", return_value=b"png"), describe:
+        with _captioner(db, pair=pair, error=error):
             async with client as c:
                 return await c.post("/images/scene", params={"path": path}, json={})
     finally:

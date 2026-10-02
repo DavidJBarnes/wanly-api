@@ -347,14 +347,16 @@ class TestTryEndpoint:
         seen = []
         real_turn = caption_queue.turn
 
-        def spy(path):
-            seen.append(path)
-            return real_turn(path)
+        def spy(path, **kw):
+            seen.append((path, kw.get("kind")))
+            return real_turn(path, **kw)
 
         with patch.object(caption_queue, "turn", side_effect=spy):
             resp, _ = await self._try(db)
         assert resp.status_code == 200
-        assert seen == [PATH]
+        # Labelled a try: it stores nothing, so the console must not show it as a caption of
+        # the image on its way (console#564).
+        assert seen == [(PATH, "try")]
 
     @pytest.mark.asyncio
     async def test_a_foreign_bucket_is_refused(self, db):

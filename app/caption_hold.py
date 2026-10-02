@@ -28,15 +28,16 @@ WHAT THIS DOES
          New Job dialog's, another job's -- it waits for that one to finish instead of
          starting its own. A second caption would overwrite the first with different words,
          and the whole point is to render the words that were shown.
-      2. Otherwise it takes a turn in the ordinary caption queue (app/caption_queue.py), the
-         same line the modal stands in, and re-checks once it is at the front: whatever was
-         ahead of it may have been this image.
+      2. Otherwise it asks for one. Since console#564 both are the same call: a caption
+         TICKET (app/caption_tickets.py), single-flight per image, which takes a turn in the
+         ordinary caption queue -- the same line the modal stands in. A describe clicked
+         while the job's ticket is queued joins that ticket rather than queueing a second.
       3. RELEASE. When every half a held segment needs is saved on the image's ImageMeta row,
          the placeholders are filled from THAT row -- exactly the words the lightbox shows --
          and the segment goes to PENDING.
 
-    Failure is loud. A caption error, an unreadable image, or waiting past
-    caption_hold_timeout_s moves the segment to CAPTION_FAILED with the reason in
+    Failure is loud. A caption error, an unreadable image, or the captioner refusing for
+    longer than caption_hold_timeout_s moves the segment to CAPTION_FAILED with the reason in
     error_message, and it stays there until a person picks Retry caption or Render without
     (routes in app/routes/segments.py). Nothing here ever drops a half on its own.
 
@@ -76,16 +77,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import datetime, timezone
 
 from sqlalchemy import and_, or_, select
 
-from app import s3
+from app import caption_tickets as tickets
+from app import s3  # noqa: F401 - tests patch s3.download_bytes through this name
 from app.caption_queue import queue as caption_queue
 from app.config import settings
 from app.database import async_session
 from app.enums import SegmentStatus
-from app.joycaption import CaptionError, CaptionerBusy, describe_motion
 from app.models import ImageMeta, Job, Segment
 
 logger = logging.getLogger(__name__)
@@ -93,8 +93,8 @@ logger = logging.getLogger(__name__)
 SCENE = "scene"
 MOTION = "motion"
 
-#: How often a waiter looks at the queue while joining someone else's caption. The queue is
-#: in this process, so a look costs nothing; the wait it is watching is ~25 s a call.
+#: How often a waiter looks at the queue while joining a describe-kind turn that is not a
+#: caption ticket. Tickets are awaited directly; this is only the fallback.
 JOIN_POLL_S = 1.0
 #: How long to wait before asking again when the captioner refused because the box beside
 #: it is rendering. A render is minutes; asking every second would only fill the log.
@@ -228,13 +228,29 @@ async def gate(db, prompt: str, image_uri: str | None) -> tuple[str, bool] | Non
         return None
     meta = await db.get(ImageMeta, image_uri)
     missing = needs - saved_halves(meta).keys()
-    if not missing and not caption_queue.in_flight(image_uri):
+    running = caption_in_flight(image_uri)
+    if not missing and not running:
         return fill_saved(prompt, meta), False
     logger.info("Caption hold: holding a segment on %s until its %s %s saved%s",
                 image_uri, " and ".join(sorted(missing or needs)),
                 "are" if len(missing or needs) > 1 else "is",
-                " (a caption of it is running)" if caption_queue.in_flight(image_uri) else "")
+                " (a caption of it is running)" if running else "")
     return prompt, True
+
+
+def caption_in_flight(path: str) -> bool:
+    """Is a caption that will SAVE words on this image queued or running?
+
+    A caption ticket (app/caption_tickets.py), or -- for anything that takes a queue turn
+    without one -- a describe-kind turn. Dataset captions and Settings tries take turns too,
+    but write nothing on the image's row, so they are not worth waiting for.
+    """
+    return tickets.active(path) is not None or caption_queue.in_flight(
+        path, kinds=WRITES_WORDS)
+
+
+#: Queue kinds whose caption lands on the image's ImageMeta row.
+WRITES_WORDS = frozenset({"describe", "hold"})
 
 
 # ---------------------------------------------------------------------------------------
@@ -316,71 +332,136 @@ def ensure(path: str) -> asyncio.Task:
     return task
 
 
+def hold_place(path: str) -> dict:
+    """Where the caption a held image is waiting on has got to, right now.
+
+    {"queue_status": "queued" | "running" | "waiting" | None, "queue_position", "queue_depth",
+    "note"}. "waiting" is a hold with nothing in the queue: between a refusal and asking
+    again (the box beside the captioner is rendering), or about to ask. None: no waiter at
+    all -- the sweep gives it one within caption_hold_sweep_s.
+    """
+    t = tickets.active(path)
+    depth = caption_queue.depth()
+    note = _notes.get(path)
+    if t is not None:
+        v = tickets.view(t)
+        return {"queue_status": v["status"], "queue_position": v["position"],
+                "queue_depth": depth, "note": note}
+    st = caption_queue.status(path)
+    if st["status"] is not None and caption_queue.in_flight(path, kinds=WRITES_WORDS):
+        return {"queue_status": st["status"], "queue_position": st["position"],
+                "queue_depth": depth, "note": note}
+    task = _waiters.get(path)
+    alive = task is not None and not task.done()
+    return {"queue_status": "waiting" if alive else None, "queue_position": None,
+            "queue_depth": depth, "note": note}
+
+
 def wait_note(path: str) -> str | None:
     """What the hold on this image is waiting for, in words, with its place in the queue."""
-    from app.routes.images import _queue_fields  # deferred: images imports a great deal
-    note = _notes.get(path)
-    q = _queue_fields(path)
-    if q["queue_status"] == "running":
+    place = hold_place(path)
+    note = place["note"]
+    if place["queue_status"] == "running":
         where = "captioning now"
-    elif q["queue_status"] == "queued":
-        where = f"{q['queue_position']} of {q['queue_depth']} in the caption queue"
+    elif place["queue_status"] == "queued" and place["queue_position"]:
+        where = f"#{place['queue_position']} of {place['queue_depth']} in the caption queue"
     else:
         where = None
     parts = [p for p in (note, where) if p]
     return "; ".join(parts) if parts else None
 
 
+def missing_halves(prompt: str | None, meta: ImageMeta | None) -> list[str]:
+    """What a held prompt is still waiting for, in a fixed order: ["scene", "motion"]."""
+    missing = needed_halves(prompt) - saved_halves(meta).keys()
+    return [h for h in (SCENE, MOTION) if h in missing]
+
+
 async def _hold(path: str) -> None:
-    deadline = time.monotonic() + settings.caption_hold_timeout_s
+    """Get `path` its words and release what is held on it.
+
+    Everything goes through caption tickets (app/caption_tickets.py), the same single-flight
+    table describe uses, so "join the caption already running" and "make one" are the same
+    call: request() hands back the image's ticket if there is one.
+
+    TIME LIMIT. caption_hold_timeout_s bounds how long the captioner may keep REFUSING (the
+    box beside it rendering), counted from the first refusal in a row. It does not bound time
+    spent in line: a caption that is queued is a caption that is coming, and a held job that
+    failed because twenty images were ahead of it would be failing for nothing (console#562's
+    first version did exactly that when joining a describe deep in the queue).
+    """
+    busy_since: float | None = None
     try:
         while True:
-            # 1. Join a caption of this image that is already happening, wherever it came
-            #    from. Not a turn of our own behind it: it would describe the image AGAIN and
-            #    overwrite the words the modal is about to show.
-            if caption_queue.in_flight(path):
+            t = tickets.active(path)
+            if t is None and caption_queue.in_flight(path, kinds=WRITES_WORDS):
+                # A describe-kind turn that is not a ticket. Nothing in the API takes one any
+                # more, but joining is cheap and a second caption is what this exists to stop.
                 _notes[path] = "waiting for the caption already running for this image"
-                while caption_queue.in_flight(path):
-                    if time.monotonic() > deadline:
-                        await fail(path, _timed_out())
-                        return
+                while caption_queue.in_flight(path, kinds=WRITES_WORDS):
                     await asyncio.sleep(JOIN_POLL_S)
-
-            outstanding = await settle(path)
-            if not outstanding:
-                return
-
-            # 2. Nothing is making the words; make them, through the same line the modal
-            #    uses. Re-checked at the front: what was ahead of us may have been this image.
-            _notes[path] = "waiting for its turn at the captioner"
-            try:
-                async with caption_queue.turn(path):
-                    outstanding = await settle(path)
-                    if not outstanding:
-                        return
-                    _notes[path] = f"captioning the {' and '.join(sorted(outstanding))}"
-                    await _caption(path, outstanding)
-            except CaptionerBusy as e:
-                # The box beside the captioner is rendering. Not a failure -- the modal would
-                # be refused the same way -- so wait it out, up to the deadline.
-                if time.monotonic() > deadline:
-                    await fail(path, f"{_timed_out()} ({e})")
-                    return
-                _notes[path] = f"the captioner is unavailable: {e}"
-                logger.info("Caption hold: %s refused (%s); asking again in %ds",
-                            path, e, BUSY_RETRY_S)
-                await asyncio.sleep(BUSY_RETRY_S)
                 continue
 
+            own = False
+            if t is None:
+                outstanding = await settle(path)
+                if not outstanding:
+                    return
+                mode = tickets.PAIR if SCENE in outstanding else tickets.MOTION
+                t, joined = tickets.request(path, mode=mode, origin="hold",
+                                            precheck=lambda: _settled(path))
+                own = not joined
+                _notes[path] = f"waiting for the {' and '.join(sorted(outstanding))}"
+            else:
+                _notes[path] = "waiting for the caption already running for this image"
+
+            await t.wait()
+
+            if t.status == tickets.FAILED and t.withdrawn:
+                continue  # the sweep found the words already saved; settle and return
+            if t.status == tickets.FAILED:
+                if t.busy:
+                    # The box beside the captioner is rendering. Not a failure -- the modal
+                    # is refused the same way -- so wait it out, up to the limit.
+                    now = time.monotonic()
+                    busy_since = busy_since if busy_since is not None else now
+                    if now - busy_since >= settings.caption_hold_timeout_s:
+                        await fail(path, f"{_timed_out()} ({t.error})")
+                        return
+                    _notes[path] = f"the captioner is unavailable: {t.error}"
+                    logger.info("Caption hold: %s refused (%s); asking again in %ds",
+                                path, t.error, BUSY_RETRY_S)
+                    await asyncio.sleep(BUSY_RETRY_S)
+                    continue
+                if own:
+                    await fail(path, t.error or "the caption failed")
+                    return
+                # Somebody else's caption of this image failed. Make our own.
+                logger.info("Caption hold: the caption %s was waiting on failed (%s); "
+                            "asking for its own", path, t.error)
+                continue
+            busy_since = None
+
+            if tickets.active(path) is not None:
+                # Another caption of the image was queued behind that one -- a re-roll. Its
+                # words are the ones about to be on the person's screen.
+                continue
             left = await settle(path)
-            if left:
-                await fail(path, f"the caption was made but its {' and '.join(sorted(left))} "
-                                 "half is still missing")
-            return
+            if not left:
+                return
+            if own:
+                if MOTION in left and t.motion_error:
+                    reason = (f"the scene was described but the motion caption failed: "
+                              f"{t.motion_error}")
+                else:
+                    reason = (f"the caption was made but its {' and '.join(sorted(left))} "
+                              "half is still missing")
+                await fail(path, reason)
+                return
+            # Somebody else's caption landed without the half we need (a motion failure on a
+            # modal describe): make that half ourselves.
     except asyncio.CancelledError:
         raise
-    except CaptionError as e:
-        await fail(path, str(e))
     except Exception as e:  # noqa: BLE001 - whatever it was, a person must hear about it
         logger.exception("Caption hold on %s failed", path)
         await fail(path, f"{type(e).__name__}: {e}")
@@ -388,76 +469,15 @@ async def _hold(path: str) -> None:
         _notes.pop(path, None)
 
 
+async def _settled(path: str) -> bool:
+    """A hold ticket's precheck, at the front of the line: release what can be, and say
+    whether anything is still missing. Whatever was ahead of it may have been this image."""
+    return not await settle(path)
+
+
 def _timed_out() -> str:
-    return (f"no caption after {settings.caption_hold_timeout_s // 60} minutes of waiting")
-
-
-async def _caption(path: str, outstanding: set[str]) -> None:
-    """Caption `path` and save what it needs. Raises CaptionError / CaptionerBusy.
-
-    A MISSING SCENE is made the way the modal makes it -- the scene and motion pair, from one
-    call, written with the modal's own writer -- so a held job's caption is indistinguishable
-    from one a person asked for.
-
-    A MISSING MOTION BESIDE A SAVED SCENE makes only the motion paragraph, grounded on the
-    saved scene. Regenerating the pair would replace the scene words the person already read,
-    which is the opposite of the point.
-    """
-    from app.routes.app_settings import _get_all_settings
-    from app.routes.captions import _caption_base, run_caption_pair
-    from app.routes.images import _apply_scene_pair
-
-    try:
-        image = await asyncio.to_thread(s3.download_bytes, path)
-    except Exception as e:
-        raise CaptionError(f"could not read {path}: {e}") from e
-
-    # A short session for everything the captioner call needs from the database, closed
-    # before the call. interactive=True: route it exactly as the modal's would be routed --
-    # the primary when the box beside it is idle, the fallback or a refusal while it renders.
-    async with async_session() as db:
-        base = await _caption_base(db, interactive=True)
-        cfg = await _get_all_settings(db)
-        meta = await db.get(ImageMeta, path)
-        saved_scene = (meta.scene_description or "").strip() if meta else ""
-
-    if SCENE in outstanding or not saved_scene:
-        pair = await run_caption_pair(image, base, cfg)
-        if not pair.scene.strip():
-            raise CaptionError("the captioner returned nothing for this image")
-        async with async_session() as db:
-            meta = await db.get(ImageMeta, path)
-            if meta is None:
-                meta = ImageMeta(path=path)
-                db.add(meta)
-            _apply_scene_pair(meta, pair)
-            await db.commit()
-        logger.info("Caption hold: described %s (scene %d words, motion %s)", path,
-                    len(pair.scene.split()),
-                    f"{len(pair.motion.split())} words" if pair.motion
-                    else (f"failed: {pair.motion_error}" if pair.motion_error else "off"))
-        if MOTION in outstanding and not pair.motion:
-            raise CaptionError(
-                f"the scene was described but the motion caption failed: "
-                f"{pair.motion_error or 'the captioner returned no motion paragraph'}")
-        return
-
-    motion, instruction = await describe_motion(
-        image, saved_scene, style=cfg.get("motion_style", ""),
-        custom=cfg.get("motion_instruction", ""), base_url=base)
-    motion = (motion or "").strip()
-    if not motion:
-        raise CaptionError("the captioner returned no motion paragraph")
-    async with async_session() as db:
-        meta = await db.get(ImageMeta, path)
-        if meta is None:  # deleted in the meantime; the scene it was grounded on went too
-            raise CaptionError(f"{path} lost its saved description while captioning")
-        meta.motion_description = motion
-        meta.motion_instruction = instruction
-        meta.motion_described_at = datetime.now(timezone.utc)
-        await db.commit()
-    logger.info("Caption hold: added the motion paragraph to %s (%d words)",
-                path, len(motion.split()))
+    return (f"no caption after {settings.caption_hold_timeout_s // 60} minutes of the "
+            f"captioner refusing")
 
 
 # ---------------------------------------------------------------------------------------
@@ -498,9 +518,47 @@ async def sweep() -> int:
             await db.commit()
         logger.warning("Caption hold: %d held segment(s) have no captionable start image",
                        len(orphans))
+    released = 0
     for path in paths:
+        if _waits_on_a_reroll(path):
+            ensure(path)
+            continue
+        # SETTLE, not just ensure (the console#562 follow-up). A waiter only looks at the row
+        # when its own caption finishes or reaches the front of the line, and the line can be
+        # hours long. Words saved some other way meanwhile -- the bulk-tag auto-describe, a
+        # caption that finished for a different reason, a restart -- left the segment held
+        # behind captions that had nothing to do with it. Seen live on 2026-10-02: a deploy's
+        # startup sweep released two such segments at once, words long since saved.
+        try:
+            outstanding = await settle(path)
+        except Exception:  # noqa: BLE001 - one image's bad row must not stop the sweep
+            logger.exception("Caption hold: sweep could not settle %s", path)
+            ensure(path)
+            continue
+        if not outstanding:
+            released += 1
+            t = tickets.active(path)
+            if t is not None and t.origin == "hold" and t.status == tickets.QUEUED:
+                tickets.withdraw(t, "nothing on this image needs a caption any more")
+            continue
         ensure(path)
+    if released:
+        logger.info("Caption hold: the sweep released everything held on %d image(s) whose "
+                    "words were already saved", released)
     return len(paths)
+
+
+def _waits_on_a_reroll(path: str) -> bool:
+    """Is a caption of this image in flight that the hold must NOT release ahead of?
+
+    A describe (a person's re-roll) -- its words, not the saved ones, are about to be on the
+    screen, which is gate()'s rule. The hold's OWN ticket does not count, unless a describe
+    has joined it (which drops its precheck): then it is a re-roll too.
+    """
+    t = tickets.active(path)
+    if t is not None:
+        return t.origin != "hold" or t.precheck is None
+    return caption_queue.in_flight(path, kinds=WRITES_WORDS)
 
 
 async def caption_hold_monitor() -> None:

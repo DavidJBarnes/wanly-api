@@ -23,7 +23,7 @@ from unittest.mock import AsyncMock
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app import caption_hold
+from app import caption_hold, caption_tickets
 from app import caption_queue as caption_queue_module
 from app.auth import get_current_user, verify_api_key
 from app.config import settings
@@ -58,8 +58,10 @@ def fresh_hold_state(monkeypatch):
     monkeypatch.setattr(settings, "motion_caption_enabled", True)
     caption_hold._waiters.clear()
     caption_hold._notes.clear()
+    caption_tickets.reset()
     yield
     caption_hold._waiters.clear()
+    caption_tickets.reset()
 
 
 @pytest.fixture
@@ -69,6 +71,7 @@ def shared_session(db, monkeypatch):
     async def _session():
         yield db
     monkeypatch.setattr(caption_hold, "async_session", _session)
+    monkeypatch.setattr(caption_tickets, "async_session", _session)
     return db
 
 
@@ -85,7 +88,7 @@ def motion_captioner(monkeypatch):
     """The captioner, for the motion-only path: the scene is saved, the paragraph is not."""
     motion = AsyncMock(return_value=(MOTION_WORDS, "i-motion"))
     pair = AsyncMock(side_effect=AssertionError("the saved scene must not be re-described"))
-    monkeypatch.setattr(caption_hold, "describe_motion", motion)
+    monkeypatch.setattr(caption_tickets, "describe_motion", motion)
     monkeypatch.setattr("app.routes.captions.run_caption_pair", pair)
     monkeypatch.setattr("app.routes.captions._caption_base", AsyncMock(return_value="http://c"))
     monkeypatch.setattr(caption_hold.s3, "download_bytes", lambda uri: b"png-bytes")

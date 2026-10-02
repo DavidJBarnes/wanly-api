@@ -856,7 +856,7 @@ async def caption_dataset_images(db: AsyncSession, ds_id: uuid.UUID, overwrite: 
         # "idle in transaction" on a pooled connection the whole time.
         await release_connection(db)
         try:
-            async with caption_queue.turn(uri):
+            async with caption_queue.turn(uri, kind="dataset"):
                 image = await asyncio.to_thread(s3.download_bytes, uri)
                 text, _ = await caption_image_bytes(db, image, instruction=TRAINING_CAPTION)
         except CaptionError as e:

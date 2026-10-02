@@ -67,9 +67,9 @@ async def user(small_pool):
 
 
 @pytest.fixture
-def captioner(monkeypatch):
+def captioner(monkeypatch, small_pool):
     """A captioner that answers only when `release` is set, and no S3."""
-    from app import caption_queue, config
+    from app import caption_queue, caption_tickets, config, s3
     from app.routes import captions, images
 
     release = asyncio.Event()
@@ -92,8 +92,14 @@ def captioner(monkeypatch):
     monkeypatch.setattr(captions, "_get_all_settings", no_settings)
     monkeypatch.setattr(config.settings, "motion_caption_enabled", False)
     monkeypatch.setattr(images, "download_bytes", lambda path: b"img")
+    monkeypatch.setattr(s3, "download_bytes", lambda path: b"img")
     monkeypatch.setattr(images, "delete_object", lambda path: None)
-    return release
+    # A describe is a caption ticket since console#564: its short sessions come from the same
+    # tiny pool, which is the point -- they must not pile up on it either.
+    monkeypatch.setattr(caption_tickets, "async_session", small_pool)
+    caption_tickets.reset()
+    yield release
+    caption_tickets.reset()
 
 
 def _path(tag: str) -> str:

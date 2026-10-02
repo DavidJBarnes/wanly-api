@@ -13,6 +13,7 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
+from app import caption_tickets
 from app.config import settings
 from app.routes.datasets import DATASETS_PREFIX
 from app.database import async_session, get_db, release_connection
@@ -20,9 +21,9 @@ from app.joycaption import CaptionError, CaptionerBusy
 from app.enums import TRAINING_TERMINAL
 from app.models import Dataset, Favorite, ImageMeta, Job, LtxCharacter, Segment, TrainingJob, User
 from app.routes.captions import ScenePair, caption_image_pair
-from app.schemas.images import (BulkImageTagsUpdate, CaptionQueueStatus, CaptionTryRequest,
-                                CaptionTryResponse, ImageSceneRequest, ImageSceneResponse,
-                                ImageTagsUpdate)
+from app.schemas.images import (BulkImageTagsUpdate, CaptionQueueEntry, CaptionQueueStatus,
+                                CaptionTicket, CaptionTryRequest, CaptionTryResponse,
+                                ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate)
 from app.tag_filter import like_escape, normalise_tag
 from app.tag_filter import tag_clause as _tag_clause
 from app.s3 import (
@@ -689,6 +690,8 @@ async def describe_untagged(db: AsyncSession, paths: list[str]) -> int:
         meta = await db.get(ImageMeta, path)
         if meta is None or (meta.scene_description or "").strip():
             continue  # row gone, or someone described it in the meantime
+        if caption_tickets.active(path) is not None:
+            continue  # a caption of it is already coming (console#564); a second would race it
         try:
             image = await asyncio.to_thread(download_bytes, path)
             pair = await caption_image_pair(db, image)
@@ -863,6 +866,7 @@ def _scene_response(path: str, meta: ImageMeta | None,
         motion_described_at=meta.motion_described_at if meta else None,
         motion_words=len(motion.split()) if motion else 0,
         motion_error=motion_error,
+        caption=_ticket_response(path, caption_tickets.latest(path)),
         **_queue_fields(path),
     )
 
@@ -871,13 +875,26 @@ def _queue_fields(path: str) -> dict:
     """Where this image sits in the caption queue, for any response that mentions it.
 
     Read at response time rather than stored: a position recorded a moment ago is wrong as
-    soon as anything ahead of it finishes.
+    soon as anything ahead of it finishes. The image's own caption ticket when it has one
+    (console#564) -- the same image can be in line twice (a dataset caption and a describe),
+    and the ticket is the one that will land on this row.
     """
     from app.caption_queue import queue as caption_queue
 
+    t = caption_tickets.active(path)
+    if t is not None:
+        v = caption_tickets.view(t)
+        return {"queue_status": v["status"], "queue_position": v["position"],
+                "queue_depth": v["depth"]}
     st = caption_queue.status(path)
     return {"queue_status": st["status"], "queue_position": st["position"],
             "queue_depth": st["depth"]}
+
+
+def _ticket_response(path: str, t, joined: bool = False) -> CaptionTicket | None:
+    if t is None:
+        return None
+    return CaptionTicket(path=path, joined=joined, **caption_tickets.view(t))
 
 
 def _apply_scene_pair(meta: ImageMeta, pair: ScenePair) -> None:
@@ -935,6 +952,10 @@ async def caption_queue_status():
         depth=caption_queue.depth(),
         waiting=len(caption_queue.waiting_paths()),
         running=caption_queue.running_path(),
+        entries=[CaptionQueueEntry(path=e["path"], kind=e["kind"], status=e["status"],
+                                   position=e["position"], ticket_id=e["token"])
+                 for e in caption_queue.entries()],
+        recent=[_ticket_response(t.path, t) for t in caption_tickets.recent()],
     )
 
 
@@ -950,6 +971,65 @@ async def get_image_scene(path: str = Query(...), db: AsyncSession = Depends(get
     return _scene_response(path, await db.get(ImageMeta, path))
 
 
+def _describe_params(body: ImageSceneRequest | None) -> dict:
+    body = body or ImageSceneRequest()
+    return {k: v for k, v in body.model_dump().items() if v is not None}
+
+
+@router.post("/images/scene/describe", response_model=CaptionTicket, status_code=202,
+             dependencies=[Depends(get_current_user)])
+async def request_image_scene(
+    path: str = Query(...),
+    body: ImageSceneRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Describe this image in the background; answer at once with its caption ticket.
+
+    console#564. The describe the console uses: the caption takes its turn in the queue in a
+    task of its own, and the console polls GET /images/scene/status (or the whole queue,
+    GET /images/caption-queue) and fills the words in when the ticket is done. Navigating
+    away, closing the tab or a phone going to sleep loses nothing.
+
+    ALWAYS regenerates, like POST /images/scene -- unless a caption of this image is already
+    queued or running, in which case this IS that caption (joined=true). Two captions of one
+    image would write two different descriptions, and a held job might already be using the
+    first (console#562).
+    """
+    _require_known_bucket(path)
+    # Nothing here waits, but the auth lookup opened a transaction; give the connection back.
+    await release_connection(db)
+    t, joined = caption_tickets.request(path, mode=caption_tickets.PAIR, origin="describe",
+                                        params=_describe_params(body))
+    return _ticket_response(path, t, joined=joined)
+
+
+@router.get("/images/scene/status", response_model=CaptionTicket,
+            dependencies=[Depends(verify_api_key_or_bearer)])
+async def image_scene_status(path: str = Query(...)):
+    """This image's caption ticket: queued (with position), running, done or failed.
+
+    status null: nothing in flight and nothing remembered -- either never asked for, or
+    finished long enough ago (or before a restart) that the saved words are the answer.
+    No database: tickets live in this process.
+    """
+    _require_known_bucket(path)
+    t = caption_tickets.latest(path)
+    if t is None:
+        return CaptionTicket(path=path, **caption_tickets.view(None))
+    return _ticket_response(path, t)
+
+
+@router.get("/images/scene/tickets/{ticket_id}", response_model=CaptionTicket,
+            dependencies=[Depends(verify_api_key_or_bearer)])
+async def image_scene_ticket(ticket_id: str):
+    """One caption ticket by id. 404 once it is forgotten (RESULT_TTL_S, or a restart)."""
+    t = caption_tickets.get(ticket_id)
+    if t is None:
+        raise HTTPException(status_code=404, detail="no such caption ticket (finished long "
+                                                    "ago, or the API restarted)")
+    return _ticket_response(t.path, t)
+
+
 @router.post("/images/scene", response_model=ImageSceneResponse,
              dependencies=[Depends(get_current_user)])
 async def describe_image_scene(
@@ -959,59 +1039,28 @@ async def describe_image_scene(
 ):
     """Describe this image now and store the result, replacing any previous description.
 
+    KEPT FOR OLD CLIENTS (a console tab loaded before console#564). It waits for the caption,
+    as it always did, but the caption itself is a ticket now -- the same one
+    POST /images/scene/describe would hand out -- so it is single-flight with every other
+    caption of the image, and a dropped connection no longer loses the work.
+
     ALWAYS regenerates. This one call is both the first description and the re-roll, because
-    they are the same act — the caller decides which it is by deciding whether to call. Any
-    "only if missing" rule here would be a second opinion about a decision the UI has
-    already made, and would make re-roll impossible to express.
+    they are the same act — the caller decides which it is by deciding whether to call.
     """
-    from app.caption_queue import queue as caption_queue
-
     _require_known_bucket(path)
-    body = body or ImageSceneRequest()
-
-    # TAKE A TURN. ollama is one slot, so concurrent callers were always serialised -- they
-    # just did their waiting at the captioner, inside an HTTP request that could time out,
-    # with the two halves of one image landing on opposite sides of the cliff. Waiting here
-    # instead makes the order known and the position reportable.
-    #
-    # WITHOUT A DATABASE CONNECTION (console#559). The auth lookup already opened this
-    # session's transaction, and a turn can be minutes away behind a dataset's captioning;
-    # holding the connection that long, once per waiting describe, emptied the pool and
-    # left every other request -- a delete -- waiting on it.
+    # WITHOUT A DATABASE CONNECTION while waiting (console#559): the auth lookup opened this
+    # session's transaction, and the wait can be minutes behind other captions.
     await release_connection(db)
-    async with caption_queue.turn(path):
-        try:
-            # boto3 is synchronous; off the event loop so one slow fetch cannot stall the API.
-            image = await asyncio.to_thread(download_bytes, path)
-        except Exception as e:
-            raise HTTPException(status_code=404, detail=f"could not read {path}: {e}") from e
-
-        try:
-            pair = await caption_image_pair(
-                db, image, style=body.style, instruction=body.instruction,
-                motion_style=body.motion_style, motion_instruction=body.motion_instruction)
-        except CaptionError as e:
-            # 503, as /captions/describe does: the captioner being down is a temporary
-            # condition on another host, not a bug in this request.
-            logger.warning("scene description failed for %s: %s", path, e)
-            raise HTTPException(status_code=503, detail=str(e)) from e
-
-        if not pair.scene.strip():
-            # A blank caption is a failure wearing a success's clothes. Storing it would
-            # mark the image described and stop anything ever asking again.
-            raise HTTPException(status_code=503,
-                                detail="the captioner returned nothing for this image")
-
-        meta = await db.get(ImageMeta, path)
-        if meta is None:
-            meta = ImageMeta(path=path)
-            db.add(meta)
-        _apply_scene_pair(meta, pair)
-        await db.commit()
-        await db.refresh(meta)
-
-    return _scene_response(path, meta, motion_error=pair.motion_error)
-
+    t, _ = caption_tickets.request(path, mode=caption_tickets.PAIR, origin="describe",
+                                   params=_describe_params(body))
+    await t.wait()
+    if t.status == caption_tickets.FAILED:
+        # 404 for an image that cannot be read; 503 for the captioner, as /captions/describe
+        # does -- it being down is a temporary condition on another host.
+        raise HTTPException(status_code=404 if t.unreadable else 503,
+                            detail=t.error or "the caption failed")
+    meta = await db.get(ImageMeta, path, populate_existing=True)
+    return _scene_response(path, meta, motion_error=t.motion_error)
 
 
 @router.post("/images/scene/try", response_model=CaptionTryResponse,
@@ -1058,7 +1107,7 @@ async def try_caption_prompts(
 
     # Not holding a pooled connection while in line -- see describe_image_scene (console#559).
     await release_connection(db)
-    async with caption_queue.turn(path):
+    async with caption_queue.turn(path, kind="try"):
         try:
             image = await asyncio.to_thread(download_bytes, path)
         except Exception as e:
