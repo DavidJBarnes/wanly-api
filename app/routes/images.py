@@ -187,6 +187,19 @@ async def find_image_references(db: AsyncSession, paths: list[str]) -> dict[str,
     return refs
 
 
+def _job_referenced_paths(refs: dict[str, dict[str, list[str]]]) -> set[str]:
+    """Paths a job or segment points at — the only ones that earn the Image Repo's green dot.
+
+    The dot means "Used in a job" (wanly-console#168): a video exists or is coming. But the
+    delete gate needs *every* way an image can be live, so `find_image_references` was widened
+    to training runs (#274) and dataset membership (#305). The listing endpoints fed `in_use`
+    off that whole return value, so every member of any dataset lit up with a dot and no video
+    behind it (issue #389). The gate keeps the wide answer; the dot takes only the half that
+    means output exists.
+    """
+    return {p for p, r in refs.items() if r["job_ids"] or r["segment_ids"]}
+
+
 @router.post("/images/upload", dependencies=[Depends(verify_api_key_or_bearer)])
 async def upload_image(
     file: UploadFile,
@@ -265,9 +278,9 @@ async def list_folder_images(
     in_use_set: set[str] = set()
     meta_map: dict[str, dict] = {}
     if paths:
-        # Same helper the delete endpoint gates on. When these two disagree the UI is the one
-        # that gets believed, which is how referenced images got deleted in the first place.
-        in_use_set = set(await find_image_references(db, paths))
+        # Same helper the delete endpoint gates on, narrowed to job/segment refs: the dot
+        # means "Used in a job", and dataset membership must not light it (issue #389).
+        in_use_set = _job_referenced_paths(await find_image_references(db, paths))
         meta_map = await _meta_by_path(db, paths)
 
     return [
@@ -374,7 +387,7 @@ async def list_untagged_images(
         meta_map = await _meta_by_path(db, paths)
         tagged = {p for p, m in meta_map.items() if (m["tags"] or "").strip()}
 
-        in_use_set = set(await find_image_references(db, paths))
+        in_use_set = _job_referenced_paths(await find_image_references(db, paths))
 
     # An untagged image can still carry a description — describing one is offered in the
     # modal whether or not it has tags — so the row is read here rather than assumed empty.
