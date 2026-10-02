@@ -134,8 +134,10 @@ class CaptionQueueEntry(BaseModel):
     #: Within its lane.
     position: int
     ticket_id: Optional[str] = None
-    #: "scene" or "motion" (wanly-console#572).
+    #: "scene" or "motion" (wanly-console#572). For a caption ticket, the half it makes.
     lane: str = "scene"
+    #: The held jobs a ticket is for (console#590); empty when a person asked.
+    requested_by: list[CaptionRequester] = []
 
 
 class CaptionLane(BaseModel):

@@ -167,7 +167,9 @@ class TestHeldJobsAskForTheHalfTheyNeed:
             st = await _status(c, half="motion")
             assert st["requested_by"] == [{"job_id": str(job.id), "name": job.name}]
             q = (await c.get("/images/caption-queue")).json()
-            assert [e["kind"] for e in q["entries"] if e["path"] == IMG] == ["hold"]
+            mine = [e for e in q["entries"] if e["path"] == IMG]
+            assert [(e["kind"], e["lane"]) for e in mine] == [("hold", "motion")]
+            assert mine[0]["requested_by"] == [{"job_id": str(job.id), "name": job.name}]
             await line.open()
             await asyncio.wait_for(waiter, 5)
         captioner.pair.assert_not_called()

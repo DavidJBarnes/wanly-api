@@ -938,6 +938,13 @@ def _require_known_bucket(path: str) -> None:
         )
 
 
+def _requesters(ticket_id: str | None) -> list[dict]:
+    """The held jobs a queued ticket is for, so the queue poll alone can say "Motion requested
+    by job ..." (console#590)."""
+    t = caption_tickets.get(ticket_id) if ticket_id else None
+    return [dict(r) for r in t.requested_by] if t is not None else []
+
+
 @router.get("/images/caption-queue", response_model=CaptionQueueStatus,
             dependencies=[Depends(verify_api_key_or_bearer)])
 async def caption_queue_status():
@@ -959,7 +966,8 @@ async def caption_queue_status():
         waiting=sum(len(q.waiting_paths()) for _, q in lanes),
         running=cq.queue.running_path(),
         entries=[CaptionQueueEntry(path=e["path"], kind=e["kind"], status=e["status"],
-                                   position=e["position"], ticket_id=e["token"], lane=name)
+                                   position=e["position"], ticket_id=e["token"], lane=name,
+                                   requested_by=_requesters(e["token"]))
                  for name, q in lanes for e in q.entries()],
         lanes=[CaptionLane(name=name, depth=q.depth(), waiting=len(q.waiting_paths()),
                            running=q.running_path()) for name, q in lanes],
