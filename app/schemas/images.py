@@ -99,6 +99,9 @@ class CaptionTicket(BaseModel):
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+    #: While unfinished, which caption lane it is in: "scene" then "motion" (console#572).
+    #: `position` and `depth` are that lane's.
+    lane: Optional[str] = None
 
 
 class CaptionQueueEntry(BaseModel):
@@ -107,8 +110,19 @@ class CaptionQueueEntry(BaseModel):
     #: "describe", "hold" (both save words on the image), "dataset" or "try" (they do not).
     kind: str
     status: str  # "running" | "queued"
+    #: Within its lane.
     position: int
     ticket_id: Optional[str] = None
+    #: "scene" or "motion" (wanly-console#572).
+    lane: str = "scene"
+
+
+class CaptionLane(BaseModel):
+    """One caption lane: its own captioner, its own line."""
+    name: str
+    depth: int = 0
+    waiting: int = 0
+    running: Optional[str] = None
 
 
 class CaptionQueueStatus(BaseModel):
@@ -133,6 +147,12 @@ class CaptionQueueStatus(BaseModel):
     #: The last finished ticket of each image that has one remembered (done or failed),
     #: newest first.
     recent: list[CaptionTicket] = []
+    #: Each lane on its own (wanly-console#572). depth/waiting above count both; `running`
+    #: above is the scene lane's, as it always was.
+    lanes: list[CaptionLane] = []
+    #: The scene captioner: {url, model, up, why, fallback}. up=False means scene captions
+    #: are going to the fallback (the motion captioner) because the scene service is down.
+    scene_captioner: Optional[dict] = None
 
 
 class ImageSceneResponse(BaseModel):

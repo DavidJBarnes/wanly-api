@@ -130,38 +130,53 @@ def captioner(monkeypatch):
 
     async def no_settings(db):
         return {}
-    monkeypatch.setattr("app.routes.captions.run_caption_pair", C.pair)
+    from tests.caption_fakes import drive_halves_from
+    drive_halves_from(monkeypatch, C.pair, C.motion)
     monkeypatch.setattr("app.routes.captions._caption_base", C.base)
     monkeypatch.setattr("app.routes.captions._get_all_settings", no_settings)
-    monkeypatch.setattr(caption_tickets, "describe_motion", C.motion)
     monkeypatch.setattr(caption_tickets.s3, "download_bytes", lambda uri: b"png-bytes")
     return C
 
 
 class Line:
-    """The caption queue held shut by a dataset caption at the front, until released."""
+    """Both caption lanes held shut by a turn at the front of each, until released.
+
+    The scene lane by a dataset caption, as it always was; the motion lane (wanly-console#572)
+    by a turn of its own, so a motion-only ticket waits where a test can see it.
+    """
     def __init__(self, q):
         self.q = q
         self.entered = asyncio.Event()
+        self.motion_entered = asyncio.Event()
         self.release = asyncio.Event()
         self.task = None
+        self.motion_task = None
 
     async def __aenter__(self):
         async def hold():
             async with self.q.turn(BLOCKER, kind="dataset"):
                 self.entered.set()
                 await self.release.wait()
+
+        async def hold_motion():
+            async with caption_queue_module.motion_queue.turn(BLOCKER, kind="dataset"):
+                self.motion_entered.set()
+                await self.release.wait()
         self.task = asyncio.create_task(hold())
+        self.motion_task = asyncio.create_task(hold_motion())
         await self.entered.wait()
+        await self.motion_entered.wait()
         return self
 
     async def open(self):
         self.release.set()
         await self.task
+        await self.motion_task
 
     async def __aexit__(self, *exc):
         self.release.set()
         await self.task
+        await self.motion_task
 
 
 async def _until(cond, timeout=2.0):
@@ -410,7 +425,11 @@ class TestTheWholeQueueInOnePoll:
             a = await _describe(c, IMG)
             b = await _describe(c, OTHER)
             q = (await c.get("/images/caption-queue")).json()
-            assert [(e["path"], e["kind"], e["status"], e["position"]) for e in q["entries"]] == [
+            # The scene lane; the motion lane holds only the test's blocker (console#572).
+            assert [(e["path"], e["lane"]) for e in q["entries"] if e["lane"] == "motion"] == [
+                (BLOCKER, "motion")]
+            assert [(e["path"], e["kind"], e["status"], e["position"]) for e in q["entries"]
+                    if e["lane"] == "scene"] == [
                 (BLOCKER, "dataset", "running", 0),
                 (IMG, "describe", "queued", 1),
                 (OTHER, "describe", "queued", 2),
@@ -486,10 +505,15 @@ class TestAHeldJobIsReleasedByTheModalsDescribe:
         assert row.status == SegmentStatus.PENDING
         assert row.prompt == f"k3lly2026, woman, {SCENE_WORDS}, {MOTION_WORDS}"
 
-    async def test_a_describe_upgrades_a_queued_motion_only_hold_to_a_reroll(
+    async def test_a_describe_replaces_a_queued_motion_only_hold_with_a_reroll(
             self, db, shared_session, captioner, fresh):
         """The hold only needed the paragraph, but a person asked for a fresh description
-        before it ran: one caption, the pair, and the job renders the re-rolled words."""
+        before it ran: one caption, the pair, and the job renders the re-rolled words.
+
+        Since wanly-console#572 the motion-only ticket waits in the motion lane, where it
+        cannot become a scene caption, so the re-roll is a NEW pair and the queued motion
+        ticket is withdrawn (its paragraph would have been grounded on the old scene). The
+        hold follows the image's ticket to the pair."""
         await _meta(db, scene="the old scene", motion=None)
         captioner.pair.return_value = ScenePair(scene="the re-rolled scene",
                                                 scene_instruction="i", motion=MOTION_WORDS)
@@ -498,8 +522,10 @@ class TestAHeldJobIsReleasedByTheModalsDescribe:
             waiter = caption_hold.ensure(IMG)
             await _ticket_queued()
             assert caption_tickets.active(IMG).mode == "motion"
+            motion_only = caption_tickets.active(IMG)
             body = await _describe(c)
-            assert body["joined"] is True and body["mode"] == "pair"
+            assert body["joined"] is False and body["mode"] == "pair"
+            assert motion_only.withdrawn
             await line.open()
             await asyncio.wait_for(waiter, 5)
         captioner.motion.assert_not_called()
@@ -585,12 +611,15 @@ class TestWhatAHeldJobShows:
             detail = (await c.get(f"/jobs/{job.id}")).json()
         seg = detail["segments"][0]
         assert seg["caption_needs"] == ["motion"]
+        # Only the motion is missing, so it waits in the MOTION lane (wanly-console#572):
+        # behind that lane's blocker, not behind the other image's scene.
         assert seg["caption_queue_status"] == "queued"
-        assert seg["caption_queue_position"] == 2
-        assert seg["caption_queue_depth"] == 3
-        assert "#2 of 3" in seg["caption_wait"]
+        assert seg["caption_queue_position"] == 1
+        assert seg["caption_queue_depth"] == 2
+        assert "#1 of 2 in the motion caption queue" in seg["caption_wait"]
         assert detail["caption_hold_detail"]["needs"] == ["motion"]
-        assert detail["caption_hold_detail"]["queue_position"] == 2
+        assert detail["caption_hold_detail"]["queue_position"] == 1
+        assert detail["caption_hold_detail"]["lane"] == "motion"
 
     async def test_a_hold_between_refusals_says_waiting_and_why(
             self, db, shared_session, captioner, monkeypatch):
@@ -625,7 +654,9 @@ class TestWhatAHeldJobShows:
             s = (await c.get("/caption-holds")).json()
         assert s["jobs_waiting"] >= 2 and s["segments_waiting"] >= 2
         assert s["jobs_failed"] >= 1
-        assert s["queue_depth"] == 2 and s["running"] == BLOCKER
+        # Both lanes count: the scene lane's blocker and ticket, and the motion lane's blocker.
+        assert s["queue_depth"] == 3 and s["running"] == BLOCKER
+        assert s["motion_queue_depth"] == 1
         mine = [i for i in s["images"] if i["image"] == IMG][0]
         assert mine["needs"] == ["scene", "motion"]
         assert mine["jobs"] == 2 and mine["segments"] == 2
@@ -682,3 +713,115 @@ class TestTheSweepReleasesWhatIsAlreadySaved:
             await asyncio.wait_for(waiter, 5)
         row = await _segment_row(db, seg.id)
         assert row.prompt == "k3lly2026, woman, the new scene, the new motion"
+
+
+# --- two lanes (wanly-console#572) ------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestTwoLanes:
+    """The scene and the motion paragraph are made by different captioners now, in lines of
+    their own: a scene never waits behind a motion, and a held <SCENE> is released the moment
+    its scene is saved while its <MOTION> waits."""
+
+    async def _motion_gate(self, captioner):
+        """Make the motion step wait for `gate` before answering, and say when it starts."""
+        gate, started = asyncio.Event(), asyncio.Event()
+
+        async def slow_motion(*a, **kw):
+            started.set()
+            await gate.wait()
+            return MOTION_WORDS, "i-motion"
+        return gate, started, slow_motion
+
+    async def test_a_scene_only_hold_is_released_while_the_motion_is_still_coming(
+            self, db, shared_session, captioner, monkeypatch):
+        gate, started, slow = await self._motion_gate(captioner)
+        captioner.pair.return_value = ScenePair(scene=SCENE_WORDS, scene_instruction="i",
+                                                motion=None)
+        monkeypatch.setattr(caption_tickets, "describe_motion", slow)
+        user = await _user(db)
+        scene_only = (await _held(db, await _job(db, user),
+                                  prompt="k3lly2026, woman, <SCENE>")).id
+        both = (await _held(db, await _job(db, user))).id
+        async with _client(db, user) as c:
+            t = await _describe(c)
+            await asyncio.wait_for(started.wait(), 2)
+            # The motion is being made; the scene is saved and what needed only it is free.
+            assert (await _segment_row(db, scene_only)).status == SegmentStatus.PENDING
+            assert (await _segment_row(db, both)).status == SegmentStatus.AWAITING_CAPTION
+            st = await _status(c)
+            assert st["status"] == "running" and st["lane"] == "motion"
+            gate.set()
+            await caption_tickets.get(t["ticket_id"]).wait()
+        await caption_hold.settle(IMG)
+        assert (await _segment_row(db, both)).status == SegmentStatus.PENDING
+        assert (await db.get(ImageMeta, IMG)).motion_description == MOTION_WORDS
+
+    async def test_the_next_scene_does_not_wait_for_this_motion(
+            self, db, shared_session, captioner, monkeypatch):
+        gate, started, slow = await self._motion_gate(captioner)
+        captioner.pair.side_effect = [
+            ScenePair(scene=SCENE_WORDS, scene_instruction="i"),
+            ScenePair(scene="another scene", scene_instruction="i"),
+        ]
+        monkeypatch.setattr(caption_tickets, "describe_motion", slow)
+        async with _client(db) as c:
+            a = await _describe(c, IMG)
+            await asyncio.wait_for(started.wait(), 2)
+            b = await _describe(c, OTHER)
+            # OTHER's scene is made while IMG's motion is still held up.
+            await _until(lambda: (caption_tickets.get(b["ticket_id"]).lane == "motion"))
+            assert (await db.get(ImageMeta, OTHER)).scene_description == "another scene"
+            assert not caption_tickets.get(a["ticket_id"]).finished
+            gate.set()
+            await caption_tickets.get(a["ticket_id"]).wait()
+            await caption_tickets.get(b["ticket_id"]).wait()
+        assert captioner.pair.await_count == 2
+
+    async def test_a_refused_motion_keeps_the_scene_and_the_hold_waits_it_out(
+            self, db, shared_session, captioner, monkeypatch):
+        """The motion box is rendering: the scene is saved anyway (the scene service is never
+        refused), and the job waits for the motion rather than failing."""
+        calls = {"n": 0}
+
+        async def motion_base(db, interactive):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise CaptionerBusy("3090a.zero is in render mode")
+            return "http://c"
+        monkeypatch.setattr("app.routes.captions._caption_base", motion_base)
+        monkeypatch.setattr(settings, "scene_caption_url", "http://scene:11436")
+        seg = await _held(db, await _job(db, await _user(db)))
+        await asyncio.wait_for(caption_hold.ensure(IMG), 5)
+        row = await _segment_row(db, seg.id)
+        assert row.status == SegmentStatus.PENDING
+        assert row.prompt == f"k3lly2026, woman, {SCENE_WORDS}, {MOTION_WORDS}"
+        assert captioner.pair.await_count == 1      # the scene was made once, not re-made
+        assert calls["n"] == 2
+
+    async def test_a_motion_made_against_a_replaced_scene_is_dropped(
+            self, db, shared_session, captioner, monkeypatch):
+        gate, started, slow = await self._motion_gate(captioner)
+        captioner.pair.return_value = ScenePair(scene=SCENE_WORDS, scene_instruction="i")
+        monkeypatch.setattr(caption_tickets, "describe_motion", slow)
+        async with _client(db) as c:
+            t = await _describe(c)
+            await asyncio.wait_for(started.wait(), 2)
+            await _meta(db, scene="a re-rolled scene", motion=None)
+            gate.set()
+            await caption_tickets.get(t["ticket_id"]).wait()
+        meta = await db.get(ImageMeta, IMG)
+        assert meta.motion_description is None
+        assert "replaced" in caption_tickets.get(t["ticket_id"]).motion_error
+
+    async def test_the_queue_status_names_each_lane_and_the_scene_captioner(
+            self, db, shared_session, captioner, fresh, monkeypatch):
+        monkeypatch.setattr(settings, "scene_caption_url", "http://scene:11436")
+        async with Line(fresh), _client(db) as c:
+            await _describe(c)
+            q = (await c.get("/images/caption-queue")).json()
+        assert [lane["name"] for lane in q["lanes"]] == ["scene", "motion"]
+        assert q["lanes"][0]["depth"] == 2 and q["lanes"][1]["depth"] == 1
+        assert q["depth"] == 3
+        assert q["scene_captioner"]["url"] == "http://scene:11436"
+        assert q["scene_captioner"]["up"] is True

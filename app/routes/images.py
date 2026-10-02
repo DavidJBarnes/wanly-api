@@ -21,7 +21,8 @@ from app.joycaption import CaptionError, CaptionerBusy
 from app.enums import TRAINING_TERMINAL
 from app.models import Dataset, Favorite, ImageMeta, Job, LtxCharacter, Segment, TrainingJob, User
 from app.routes.captions import ScenePair, caption_image_pair
-from app.schemas.images import (BulkImageTagsUpdate, CaptionQueueEntry, CaptionQueueStatus,
+from app.schemas.images import (BulkImageTagsUpdate, CaptionLane, CaptionQueueEntry,
+                                CaptionQueueStatus,
                                 CaptionTicket, CaptionTryRequest, CaptionTryResponse,
                                 ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate)
 from app.tag_filter import like_escape, normalise_tag
@@ -959,15 +960,20 @@ async def caption_queue_status():
 
     No database and no captioner call -- the queue is in this process.
     """
-    from app.caption_queue import queue as caption_queue
+    from app import caption_queue as cq
+    from app.joycaption import scene_status
 
+    lanes = cq.lanes()
     return CaptionQueueStatus(
-        depth=caption_queue.depth(),
-        waiting=len(caption_queue.waiting_paths()),
-        running=caption_queue.running_path(),
+        depth=sum(q.depth() for _, q in lanes),
+        waiting=sum(len(q.waiting_paths()) for _, q in lanes),
+        running=cq.queue.running_path(),
         entries=[CaptionQueueEntry(path=e["path"], kind=e["kind"], status=e["status"],
-                                   position=e["position"], ticket_id=e["token"])
-                 for e in caption_queue.entries()],
+                                   position=e["position"], ticket_id=e["token"], lane=name)
+                 for name, q in lanes for e in q.entries()],
+        lanes=[CaptionLane(name=name, depth=q.depth(), waiting=len(q.waiting_paths()),
+                           running=q.running_path()) for name, q in lanes],
+        scene_captioner=scene_status(),
         recent=[_ticket_response(t.path, t) for t in caption_tickets.recent()],
     )
 

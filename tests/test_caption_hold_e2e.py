@@ -88,8 +88,8 @@ def motion_captioner(monkeypatch):
     """The captioner, for the motion-only path: the scene is saved, the paragraph is not."""
     motion = AsyncMock(return_value=(MOTION_WORDS, "i-motion"))
     pair = AsyncMock(side_effect=AssertionError("the saved scene must not be re-described"))
-    monkeypatch.setattr(caption_tickets, "describe_motion", motion)
-    monkeypatch.setattr("app.routes.captions.run_caption_pair", pair)
+    from tests.caption_fakes import drive_halves_from
+    drive_halves_from(monkeypatch, pair, motion)
     monkeypatch.setattr("app.routes.captions._caption_base", AsyncMock(return_value="http://c"))
     monkeypatch.setattr(caption_hold.s3, "download_bytes", lambda uri: b"png-bytes")
     return motion

@@ -373,8 +373,8 @@ def _captioner(db, pair=None, error=None):
     async def _no_settings(db):
         return {}
 
-    run = (patch("app.routes.captions.run_caption_pair", side_effect=error) if error
-           else patch("app.routes.captions.run_caption_pair", return_value=pair))
+    from tests.caption_fakes import ticket_captioner
+    run = ticket_captioner(pair=pair, error=error)
     caption_tickets.reset()
     try:
         with patch("app.s3.download_bytes", return_value=b"png"), \

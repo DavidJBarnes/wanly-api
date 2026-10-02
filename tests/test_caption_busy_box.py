@@ -65,15 +65,18 @@ class TestTheRefusal:
         assert "busy_render_beside_the_captioner(db) if interactive else None" in src
         assert "base = captioner_for(busy, interactive)" in src
         assert "raise CaptionerBusy" in src
-        # Every caption goes through the chosen base — both halves of a pair share it, so
-        # the second call cannot slip onto the busy box.
+        # Since wanly-console#572 the scene half goes to the scene service, which shares no
+        # render card and is never refused; only its FALLBACK -- the shared captioner -- goes
+        # through the busy-checked base, and so does every motion caption.
         assert "describe(image, instruction, base_url=base)" in inspect.getsource(
+            captions.describe_scene)
+        assert "base = await fallback_base()" in inspect.getsource(captions.describe_scene)
+        assert "_caption_base(db, interactive)" in inspect.getsource(
             captions.caption_image_bytes)
-        # The pair's captioner half moved into run_caption_pair (console#562); the base
-        # caption_image_pair resolves is handed to it and used for both calls.
-        assert "run_caption_pair(image, base, cfg" in inspect.getsource(
+        assert "_caption_base(db, interactive)" in inspect.getsource(
             captions.caption_image_pair)
-        assert "base_url=base" in inspect.getsource(captions.run_caption_pair)
+        src = inspect.getsource(captions.run_caption_pair)
+        assert "base = await base_for()" in src and "base_url=base" in src
         # Claim-time <SCENE> resolution opts out: the worker was just handed the segment and
         # has not loaded the render; a failed caption there is non-fatal by design.
         assert "caption_image_bytes(db, image, interactive=False)" in inspect.getsource(segments)
@@ -146,7 +149,7 @@ class TestWhichCaptionerIsUsed:
         import inspect
         from app import joycaption
         src = inspect.getsource(joycaption.describe)
-        assert 'base = (base_url or settings.image_description_url).rstrip("/")' in src
+        assert 'base = (base_url or cap.url).rstrip("/")' in src
         assert 'url = f"{base}/api/generate"' in src
 
 
