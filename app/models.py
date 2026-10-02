@@ -607,10 +607,9 @@ class LtxCharacter(Base):
         # At most one default (migration 104): a partial unique over the TRUE rows only.
         Index("uq_ltx_characters_one_default", "is_default",
               unique=True, postgresql_where=text("is_default")),
-        # Migration 107. A LoRA or a reference. char_lora IS NOT NULL counts the legacy
-        # "none" rows -- a character registered before it trains -- so no existing row fails.
-        CheckConstraint("char_lora IS NOT NULL OR sheet_uri IS NOT NULL "
-                        "OR face_ref_uri IS NOT NULL", name="ck_ltx_characters_lora_or_ref"),
+        # Migration 107 required a LoRA or a reference (ck_ltx_characters_lora_or_ref);
+        # migration 110 dropped it so a DRAFT -- neither yet -- can exist for Build sheet to
+        # make its first sheet (wanly-console#592). Drafts are refused at render instead.
         CheckConstraint("identity_mode IS NULL"
                         " OR (identity_mode = 'sheet' AND sheet_uri IS NOT NULL)"
                         " OR (identity_mode = 'face' AND face_ref_uri IS NOT NULL)",

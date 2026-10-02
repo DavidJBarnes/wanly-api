@@ -50,3 +50,32 @@ def pair_phrase(members: list[LtxCharacter]) -> str | None:
     if not parts or any(p is None for p in parts):
         return None
     return " and ".join(parts)
+
+
+def _no_lora(char_lora: str | None) -> bool:
+    lora = (char_lora or "").strip().lower()
+    return not lora or lora == "none"
+
+
+def is_draft(c: LtxCharacter, first_member: LtxCharacter | None = None) -> bool:
+    """A DRAFT character has neither a LoRA nor an identity reference (wanly-console#592).
+
+    Allowed since migration 110 so a brand-new, LoRA-less character can exist long enough for
+    Build sheet to make its first sheet -- the sheet flow lives on an existing character. A
+    draft cannot render: nothing in it carries the person, so the submit and the claim refuse
+    it (see segments._draft_refusal) rather than render a stranger on the base model.
+
+    A PAIR has no reference of its own; it renders with its FIRST member's. So a pair with no
+    joint LoRA is a draft exactly when that member (passed in by the caller, which has the
+    session) has no reference either.
+    """
+    if not _no_lora(c.char_lora):
+        return False
+    if (c.kind or "solo") == "pair":
+        return first_member is None or not (first_member.sheet_uri or first_member.face_ref_uri)
+    return not (c.sheet_uri or c.face_ref_uri)
+
+
+def draft_message(name: str) -> str:
+    """What a refused draft says, everywhere it is refused: one sentence, with the way out."""
+    return f"{name} has no LoRA or sheet yet: build a sheet or attach a LoRA."

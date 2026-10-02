@@ -96,13 +96,31 @@ class TestCreate:
         assert r.json()["identity_mode"] == "face"
 
     async def test_registration_ahead_of_training_is_unchanged(self, db):
-        """No LoRA and no reference: the #352 registration, stored "none" with the name as
-        its trigger, exactly as before."""
-        name = _name()
-        r = await _call(db, "post", "/ltx/characters", json={"name": name})
+        """No LoRA and no reference, but a trigger: the #352 registration, stored "none",
+        exactly as before."""
+        r = await _call(db, "post", "/ltx/characters",
+                        json={"name": _name(), "trigger": "k3lly", "gender": "woman"})
         assert r.status_code == 201, r.text
-        assert r.json()["char_lora"] == "none" and r.json()["trigger"] == name
+        assert r.json()["char_lora"] == "none" and r.json()["trigger"] == "k3lly"
         assert r.json()["identity_mode"] is None
+
+    async def test_a_name_alone_is_a_draft(self, db):
+        """console#592: New character -> a name (and a gender for the sheet's captions) ->
+        Build sheet. Neither a LoRA nor a trigger: the name must not become a <TRIGGER> word
+        the model never learned once the sheet arrives."""
+        r = await _call(db, "post", "/ltx/characters", json={"name": _name(), "gender": "woman"})
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["char_lora"] is None and body["trigger"] is None
+        assert body["sheet_uri"] is None and body["face_ref_uri"] is None
+        assert body["identity_mode"] is None and body["gender"] == "woman"
+
+    async def test_a_draft_takes_a_sheet_and_becomes_sheet_only(self, db):
+        r = await _call(db, "post", "/ltx/characters", json={"name": _name()})
+        cid = r.json()["id"]
+        r = await _call(db, "patch", f"/ltx/characters/{cid}", json={"sheet_uri": SHEET})
+        assert r.status_code == 200, r.text
+        assert r.json()["identity_mode"] == "sheet" and r.json()["char_lora"] is None
 
     @pytest.mark.parametrize("body,why", [
         ({"identity_mode": "sheet"}, "needs a sheet_uri"),
@@ -172,16 +190,15 @@ class TestUpdate:
         assert r.status_code == 200, r.text
         assert r.json()["char_lora"] is None
 
-    async def test_a_character_cannot_end_up_with_neither(self, db):
+    async def test_removing_the_last_reference_leaves_a_draft(self, db):
+        """console#592: neither is allowed now -- a draft, refused at render instead."""
         r = await _call(db, "post", "/ltx/characters", json={"name": _name(),
                                                             "sheet_uri": SHEET})
         cid = r.json()["id"]
         r = await _call(db, "patch", f"/ltx/characters/{cid}", json={"sheet_uri": None})
-        assert r.status_code == 422 and "LoRA or a character sheet" in r.text
-        # And the row is as it was.
-        r = await _call(db, "get", "/ltx/characters")
-        row = next(c for c in r.json() if c["id"] == cid)
-        assert row["sheet_uri"] == SHEET
+        assert r.status_code == 200, r.text
+        assert r.json()["sheet_uri"] is None and r.json()["identity_mode"] is None
+        assert r.json()["char_lora"] is None
 
     async def test_an_inconsistent_mode_is_refused(self, db):
         c = await self._lora_character(db)
@@ -201,11 +218,10 @@ class TestUpdate:
 
 @pytest.mark.asyncio
 class TestTheDatabaseHoldsIt:
-    async def test_neither_lora_nor_reference_is_refused(self, db):
+    async def test_a_draft_with_neither_is_stored(self, db):
+        """Migration 110 dropped ck_ltx_characters_lora_or_ref (console#592)."""
         db.add(LtxCharacter(name=_name(), char_lora=None, trigger=None))
-        with pytest.raises(IntegrityError, match="ck_ltx_characters_lora_or_ref"):
-            await db.flush()
-        await db.rollback()
+        await db.flush()
 
     async def test_a_mode_without_its_reference_is_refused(self, db):
         db.add(LtxCharacter(name=_name(), char_lora=None, sheet_uri=SHEET, identity_mode="face"))
@@ -454,3 +470,114 @@ async def test_a_moved_sheet_is_followed_by_its_character(db, monkeypatch):
     assert r.status_code == 200, r.text
     row = await _row(db, c.name)
     assert row.sheet_uri == f"s3://{bucket}/characters/{src.rsplit('/', 1)[1]}"
+
+
+# ---------------------------------------------------------------------- drafts (console#592)
+
+DRAFT_WORDS = "has no LoRA or sheet yet: build a sheet or attach a LoRA"
+
+
+@pytest.mark.asyncio
+class TestDraftsNeverRender:
+    """A draft -- no LoRA, no reference -- is refused everywhere it could render, with the
+    one message that says how out. Never rendered empty, never rendered as a stranger."""
+
+    async def _submit(self, db, blob):
+        user = await _user(db)
+        app.dependency_overrides[get_current_user] = lambda: user
+        app.dependency_overrides[get_db] = lambda: db
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                data = {"name": "j", "width": 832, "height": 1216, "fps": 24,
+                        "first_segment": {"prompt": "she turns to the camera",
+                                          "duration_seconds": 5, "ltx_recipe": blob}}
+                return await client.post("/jobs", data={"data": json.dumps(data)})
+        finally:
+            app.dependency_overrides.clear()
+
+    async def test_a_job_for_a_draft_is_refused(self, db):
+        c = await _character(db, char_lora=None, trigger=None)
+        r = await self._submit(db, _blob(c.name))
+        assert r.status_code == 422, r.text
+        assert r.json()["detail"] == f"{c.name} {DRAFT_WORDS}."
+
+    async def test_a_legacy_none_registration_is_a_draft_too(self, db):
+        c = await _character(db, char_lora="none", trigger="t")
+        r = await self._submit(db, _blob(c.name, char_lora="none", trigger="t"))
+        assert r.status_code == 422 and DRAFT_WORDS in r.text
+
+    async def test_a_continuation_for_a_draft_is_refused(self, db):
+        c = await _character(db, char_lora=None)
+        seg = await _queued(db, _blob(c.name))
+        job = await db.get(Job, seg.job_id)
+        job.status = JobStatus.AWAITING
+        await db.flush()
+        user = await db.get(User, job.user_id)
+        app.dependency_overrides[get_current_user] = lambda: user
+        app.dependency_overrides[get_db] = lambda: db
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                r = await client.post(f"/jobs/{job.id}/segments", json={
+                    "prompt": "she walks on", "duration_seconds": 5,
+                    "ltx_recipe": _blob(c.name)})
+        finally:
+            app.dependency_overrides.clear()
+        assert r.status_code == 422 and DRAFT_WORDS in r.text
+
+    async def test_a_sheet_or_a_lora_is_enough(self, db):
+        sheet = await _character(db, sheet_uri=SHEET)
+        assert await seg_routes._draft_refusal(db, _blob(sheet.name)) is None
+        lora = await _character(db, char_lora="k_v1", trigger="k")
+        assert await seg_routes._draft_refusal(db, _blob(lora.name, char_lora="k_v1")) is None
+
+    async def test_no_character_is_not_a_draft(self, db):
+        assert await seg_routes._draft_refusal(db, None) is None
+        assert await seg_routes._draft_refusal(db, _blob(_name("gone"))) is None
+
+    async def test_a_pair_is_a_draft_only_when_its_first_member_has_no_sheet(self, db):
+        first = await _character(db, char_lora=None, trigger="a", gender="woman")
+        second = await _character(db, char_lora=None, trigger="b", gender="man",
+                                  sheet_uri=SHEET)
+        pair = await _character(db, char_lora="none", trigger="a and b", kind="pair",
+                                members=[first.name, second.name])
+        assert DRAFT_WORDS in (await seg_routes._draft_refusal(db, _blob(pair.name)))
+        first.sheet_uri = SHEET
+        await db.flush()
+        assert await seg_routes._draft_refusal(db, _blob(pair.name)) is None
+
+    async def test_the_claim_fails_a_draft_with_the_reason(self, db, presign):
+        """A character can become a draft after its job queued (its sheet removed): the
+        claim refuses it, says why, and hands out nothing."""
+        c = await _character(db, sheet_uri=SHEET)
+        seg = await _queued(db, _blob(c.name))
+        name, seg_id = c.name, seg.id
+        c.sheet_uri = None
+        c.identity_mode = None
+        await db.flush()
+        assert await _claim(db) is None
+        db.expire_all()
+        seg = await db.get(Segment, seg_id)
+        assert seg.status == SegmentStatus.FAILED
+        assert seg.error_message == f"{name} {DRAFT_WORDS}."
+        assert seg.worker_id is None
+        assert (await db.get(Job, seg.job_id)).status == JobStatus.FAILED
+        assert presign == []
+
+    async def test_render_without_caption_refuses_a_draft(self, db):
+        c = await _character(db, char_lora=None)
+        seg = await _queued(db, _blob(c.name))
+        seg.status = SegmentStatus.CAPTION_FAILED
+        job = await db.get(Job, seg.job_id)
+        await db.flush()
+        user = await db.get(User, job.user_id)
+        app.dependency_overrides[get_current_user] = lambda: user
+        app.dependency_overrides[get_db] = lambda: db
+        try:
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                r = await client.post(f"/segments/{seg.id}/caption/skip")
+        finally:
+            app.dependency_overrides.clear()
+        assert r.status_code == 422 and DRAFT_WORDS in r.text

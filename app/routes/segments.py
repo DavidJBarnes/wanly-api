@@ -27,6 +27,7 @@ from app import caption_hold
 from app.enums import SEGMENT_HELD, JobStatus, SegmentStatus, VideoStatus, WorkerKind
 from app.ltx_stack import LTX_STACK
 from app.model_requirements import CHECKPOINT, canonical
+from app.character_registry import draft_message, is_draft
 from app.recipe_blob import (
     TRIGGER_PLACEHOLDER, character_phrase, fill_phrase, has_lora, placeholders_in,
     recipe_characters, render_prompt, trigger_phrase,
@@ -476,6 +477,42 @@ async def _refuse_empty_submit(db: AsyncSession, prompt: str | None,
         )
 
 
+async def _draft_refusal(db: AsyncSession, ltx_recipe: dict | None) -> str | None:
+    """Why this recipe cannot render because its character is a DRAFT, or None.
+
+    A draft (wanly-console#592) has neither a LoRA nor a sheet/face reference -- it exists so
+    Build sheet has a character to build onto. Rendering it would put a stranger on the base
+    model and call it this person, so it is refused, loudly, at submit and at the claim.
+
+    What renders is the blob's LoRA (passed through verbatim) and the ROW's reference (read at
+    claim time), so it is a draft render when the row is a draft AND the blob carries no LoRA.
+    Only the first person renders (see recipe_characters). A character with no row is left to
+    the blob, exactly as before.
+    """
+    people = recipe_characters(ltx_recipe)
+    person = people[0] if people else {}
+    name = person.get("name")
+    if not name or has_lora(person.get("char_lora")):
+        return None
+    row = (await db.execute(select(LtxCharacter).where(LtxCharacter.name == name))
+           ).scalar_one_or_none()
+    if row is None:
+        return None
+    first = None
+    if (row.kind or "solo") == "pair" and row.members:
+        first = (await db.execute(
+            select(LtxCharacter).where(LtxCharacter.name == row.members[0])
+        )).scalar_one_or_none()
+    return draft_message(row.name) if is_draft(row, first) else None
+
+
+async def _refuse_draft_submit(db: AsyncSession, ltx_recipe: dict | None) -> None:
+    """422 a submit whose character is a draft (wanly-console#592)."""
+    why = await _draft_refusal(db, ltx_recipe)
+    if why:
+        raise HTTPException(status_code=422, detail=why)
+
+
 def _empty_prompt_reason(unresolved: list[str]) -> str:
     """Why a claim refused to hand a segment out, for error_message."""
     why = (f"{' and '.join(unresolved)} had no saved words for the start frame"
@@ -616,6 +653,7 @@ async def add_segment(
     # Before anything is resolved or stored: a prompt that can only ever render as nothing is
     # a 422, not a segment that fails ten minutes into a GPU's time (console#577).
     await _refuse_empty_submit(db, body.prompt, body.ltx_recipe)
+    await _refuse_draft_submit(db, body.ltx_recipe)
 
     prompt = await _resolve_trigger(db, body.prompt, body.ltx_recipe)
     resolved_prompt, prompt_template = await _resolve_wildcards_outside_scene(db, prompt)
@@ -992,6 +1030,25 @@ async def claim_next_segment(
                 if prev_segment.last_frame_path and prev_segment.last_frame_path not in reference_frames:
                     reference_frames.append(prev_segment.last_frame_path)
                     reference_frames = reference_frames[-3:]
+
+    # A DRAFT CHARACTER NEVER RENDERS (wanly-console#592). The submit refuses one, but a
+    # character can become a draft after its job was queued (its sheet removed), and the
+    # reference is read here, at the claim. Failed with the reason, where Retry can see it:
+    # once the character has a sheet, a retry renders with it.
+    draft_why = (await _draft_refusal(db, segment.ltx_recipe)
+                 if segment.reprocess_type is None else None)
+    if draft_why:
+        segment.status = SegmentStatus.FAILED
+        segment.error_message = draft_why
+        segment.worker_id = None
+        segment.worker_name = None
+        segment.claimed_at = None
+        segment.gpu_name = None
+        job.status = JobStatus.FAILED
+        await db.commit()
+        logger.warning("Refused to hand out segment %s (job %s, index %d): %s",
+                       segment.id, job.id, segment.index, draft_why)
+        return None
 
     # A CONTINUATION WITH NO FRAME TO CONTINUE FROM IS NOT A TEXT-TO-VIDEO RENDER.
     #
@@ -1551,6 +1608,8 @@ async def render_without_caption(
     captioned live, and that is a caption nobody asked for and nobody saw.
     """
     segment, job = await _held_segment(db, segment_id, user)
+    # Released to pending, a draft character would only fail at the claim: say so now.
+    await _refuse_draft_submit(db, segment.ltx_recipe)
     path = caption_hold.hold_image(segment.start_image, segment.index, job.starting_image)
     meta = await db.get(ImageMeta, path) if path else None
     filled = caption_hold.fill_saved(segment.prompt, meta)
