@@ -47,6 +47,41 @@ class JobCreate(BaseModel):
     tags: Optional[str] = Field(None, max_length=500)
 
 
+class CaptionHoldDetail(BaseModel):
+    """What a caption-held job is waiting for, right now (console#562 follow-up).
+
+    `needs`: the halves not saved yet, "scene" and/or "motion". `queue_status`: "queued"
+    (with `queue_position`, 1 = next up), "running", "waiting" (its waiter is between
+    refusals -- the box beside the captioner is rendering), or None (no waiter yet; the sweep
+    gives it one within seconds). Computed per request, never stored.
+    """
+    image: Optional[str] = None
+    needs: list[str] = []
+    queue_status: Optional[str] = None
+    queue_position: Optional[int] = None
+    queue_depth: int = 0
+    note: Optional[str] = None
+
+
+class CaptionHoldImage(CaptionHoldDetail):
+    """One held image in the summary: how many segments and jobs wait on it."""
+    segments: int = 0
+    jobs: int = 0
+
+
+class CaptionHoldSummary(BaseModel):
+    """GET /caption-holds: how many jobs are waiting on captions, and how the queue looks."""
+    jobs_waiting: int = 0
+    segments_waiting: int = 0
+    jobs_failed: int = 0
+    segments_failed: int = 0
+    queue_depth: int = 0
+    queue_waiting: int = 0
+    running: Optional[str] = None
+    #: Held images, the next one to be captioned first.
+    images: list[CaptionHoldImage] = []
+
+
 class JobLoraSummary(BaseModel):
     lora_id: Optional[str] = None
     name: Optional[str] = None
@@ -81,6 +116,9 @@ class JobResponse(BaseModel):
     # caption (console#562), else None. The job's status stays "pending" -- it is queued --
     # so this is what says why it is not starting. Filled by the list and detail endpoints.
     caption_hold: Optional[str] = None
+    # While caption_hold is "awaiting_caption": the image, what it still needs and its place
+    # in the caption queue. Filled by the list and detail endpoints.
+    caption_hold_detail: Optional[CaptionHoldDetail] = None
     tags: Optional[str] = None
     continuation_mode: Optional[str] = None
     use_identity_ref: Optional[bool] = None

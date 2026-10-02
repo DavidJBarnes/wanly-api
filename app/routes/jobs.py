@@ -14,7 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from sqlalchemy import or_
 
-from app.auth import get_current_user
+from app.auth import get_current_user, verify_api_key_or_bearer
 from app.config import settings
 from app.database import get_db
 from app import caption_hold
@@ -23,7 +23,7 @@ from app.regularization import REG_PRIORITY_BASE
 from app.render_size import RECIPE_SQL, render_size, renders_through_recipe
 from app.seeds import new_seed
 from app.estimation import estimate_segment_time, get_estimation_rates, sum_estimated_queue_time
-from app.models import Job, Segment, User, Video, Worker
+from app.models import ImageMeta, Job, Segment, User, Video, Worker
 from app.model_requirements import (
     CHECKPOINT,
     describe,
@@ -47,7 +47,9 @@ def _image_ext(filename: str | None) -> str:
 
 def _starting_image_key(user_id: UUID, image_hash: str, ext: str) -> str:
     return f"users/{user_id}/starting_images/{image_hash}{ext}"
-from app.schemas.jobs import JobCreate, JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse, JobUpdate, StatsResponse, WorkerStatsItem
+from app.schemas.jobs import (CaptionHoldDetail, CaptionHoldImage, CaptionHoldSummary, JobCreate,
+                              JobDetailResponse, JobListResponse, JobReorderRequest, JobResponse,
+                              JobUpdate, StatsResponse, WorkerStatsItem)
 from app.schemas.segments import SegmentResponse
 from app.stitch import stitch_video
 
@@ -389,6 +391,7 @@ async def list_jobs(
                     est_map[seg_job_id] = est
 
     held_map = await _caption_holds(db, job_ids)
+    held_detail = await _caption_hold_details(db, job_ids)
 
     response_items = []
     for j in items:
@@ -411,6 +414,7 @@ async def list_jobs(
                 completed_segment_count=seg_completed,
                 estimated_run_time=est_map.get(j.id),
                 caption_hold=held_map.get(j.id),
+                caption_hold_detail=held_detail.get(j.id),
                 # Lynx engine fields. These responses are hand-built, so anything not
                 # listed here is silently dropped by Pydantic even though it is on the schema.
                 generation_engine=j.generation_engine,
@@ -540,13 +544,61 @@ async def _caption_holds(db: AsyncSession, job_ids: list) -> dict:
     return out
 
 
-def _annotate_held(job: Job, segments, seg_responses) -> str | None:
+async def _held_rows(db: AsyncSession, job_ids: list | None, statuses) -> list:
+    """(job_id, segment status, hold image, prompt) for live held segments."""
+    q = (select(Segment.job_id, Segment.status, Segment.start_image, Segment.index,
+                Segment.prompt, Job.starting_image)
+         .join(Job, Segment.job_id == Job.id)
+         .where(Segment.status.in_(list(statuses)), Segment.discarded.is_(False))
+         .order_by(Segment.created_at))
+    if job_ids is not None:
+        if not job_ids:
+            return []
+        q = q.where(Segment.job_id.in_(job_ids))
+    rows = (await db.execute(q)).all()
+    return [(job_id, st, caption_hold.hold_image(start, idx, job_start), prompt)
+            for job_id, st, start, idx, prompt, job_start in rows]
+
+
+async def _metas(db: AsyncSession, paths) -> dict:
+    paths = [p for p in set(paths) if p]
+    if not paths:
+        return {}
+    rows = (await db.execute(select(ImageMeta).where(ImageMeta.path.in_(paths)))).scalars()
+    return {m.path: m for m in rows}
+
+
+def _hold_detail(path: str | None, needs: list[str]) -> CaptionHoldDetail:
+    place = caption_hold.hold_place(path) if path else {
+        "queue_status": None, "queue_position": None, "queue_depth": 0, "note": None}
+    return CaptionHoldDetail(image=path, needs=needs, **place)
+
+
+async def _caption_hold_details(db: AsyncSession, job_ids: list) -> dict:
+    """{job_id: CaptionHoldDetail} for jobs with a segment awaiting its caption.
+
+    What the job row shows beside "Waiting for caption": the image, which halves it still
+    needs, and that image's place in the caption queue. The first held segment of a job
+    speaks for it -- a job renders in order, so that is the one it is stuck on.
+    """
+    rows = await _held_rows(db, job_ids, [SegmentStatus.AWAITING_CAPTION])
+    metas = await _metas(db, [r[2] for r in rows])
+    out: dict = {}
+    for job_id, _st, path, prompt in rows:
+        if job_id in out:
+            continue
+        out[job_id] = _hold_detail(path, caption_hold.missing_halves(prompt, metas.get(path)))
+    return out
+
+
+def _annotate_held(job: Job, segments, seg_responses, metas: dict | None = None) -> str | None:
     """Say what a caption-held segment is waiting on (console#562); return the job's state.
 
     The note and queue place are in-process facts about this moment, so they are computed
     per request like blocked_reason, never stored.
     """
     by_id = {sr.id: sr for sr in seg_responses}
+    metas = metas or {}
     state = None
     for seg in segments:
         if seg.status not in SEGMENT_HELD or seg.discarded:
@@ -560,7 +612,80 @@ def _annotate_held(job: Job, segments, seg_responses) -> str | None:
         sr.caption_image = path
         if seg.status == SegmentStatus.AWAITING_CAPTION and path:
             sr.caption_wait = caption_hold.wait_note(path)
+            sr.caption_needs = caption_hold.missing_halves(seg.prompt, metas.get(path))
+            place = caption_hold.hold_place(path)
+            sr.caption_queue_status = place["queue_status"]
+            sr.caption_queue_position = place["queue_position"]
+            sr.caption_queue_depth = place["queue_depth"]
     return state
+
+
+async def _held_metas(db: AsyncSession, job: Job, segments) -> dict:
+    """The ImageMeta rows a job's awaiting segments are held on, for _annotate_held."""
+    return await _metas(db, [
+        caption_hold.hold_image(s.start_image, s.index, job.starting_image)
+        for s in segments
+        if s.status == SegmentStatus.AWAITING_CAPTION and not s.discarded])
+
+
+def _held_detail_of(seg_responses) -> CaptionHoldDetail | None:
+    for sr in seg_responses:
+        if sr.status == SegmentStatus.AWAITING_CAPTION and sr.caption_image:
+            return CaptionHoldDetail(
+                image=sr.caption_image, needs=sr.caption_needs or [],
+                queue_status=sr.caption_queue_status, queue_position=sr.caption_queue_position,
+                queue_depth=sr.caption_queue_depth or 0, note=sr.caption_wait)
+    return None
+
+
+@router.get("/caption-holds", response_model=CaptionHoldSummary,
+            dependencies=[Depends(verify_api_key_or_bearer)])
+async def caption_hold_summary(db: AsyncSession = Depends(get_db)):
+    """How many jobs are waiting on captions, and how the caption queue looks.
+
+    The JobQueue page's summary line (console#562 follow-up): "5 jobs waiting for captions,
+    caption queue 12 deep". Each held image is listed with what it still needs and its place
+    in line, next-to-be-captioned first, so "is anything moving?" has an answer without
+    opening each job.
+    """
+    from app.caption_queue import queue as caption_queue
+
+    rows = await _held_rows(db, None, SEGMENT_HELD)
+    waiting = [r for r in rows if r[1] == SegmentStatus.AWAITING_CAPTION]
+    failed = [r for r in rows if r[1] == SegmentStatus.CAPTION_FAILED]
+    metas = await _metas(db, [r[2] for r in waiting])
+    images: dict[str, CaptionHoldImage] = {}
+    jobs_by_image: dict[str, set] = {}
+    for job_id, _st, path, prompt in waiting:
+        key = path or ""
+        img = images.get(key)
+        if img is None:
+            d = _hold_detail(path, [])
+            img = images[key] = CaptionHoldImage(**d.model_dump())
+            jobs_by_image[key] = set()
+        for half in caption_hold.missing_halves(prompt, metas.get(path)):
+            if half not in img.needs:
+                img.needs.append(half)
+        img.segments += 1
+        jobs_by_image[key].add(job_id)
+    for key, img in images.items():
+        img.jobs = len(jobs_by_image[key])
+        img.needs = [h for h in ("scene", "motion") if h in img.needs]
+    rank = {"running": 0, "queued": 1, "waiting": 2}
+
+    def order(img: CaptionHoldImage):
+        return (rank.get(img.queue_status or "", 3), img.queue_position or 0)
+
+    return CaptionHoldSummary(
+        jobs_waiting=len({r[0] for r in waiting}),
+        segments_waiting=len(waiting),
+        jobs_failed=len({r[0] for r in failed}),
+        segments_failed=len(failed),
+        queue_depth=caption_queue.depth(),
+        queue_waiting=len(caption_queue.waiting_paths()),
+        running=caption_queue.running_path(),
+        images=sorted(images.values(), key=order),
+    )
 
 
 async def _annotate_blocked(db: AsyncSession, segments, seg_responses) -> None:
@@ -652,7 +777,8 @@ async def get_job(
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
     await _annotate_blocked(db, segments, seg_responses)
-    caption_hold_state = _annotate_held(job, segments, seg_responses)
+    caption_hold_state = _annotate_held(job, segments, seg_responses,
+                                        await _held_metas(db, job, segments))
     render_width, render_height = _job_render_size(
         job, any(renders_through_recipe(s.ltx_recipe) for s in segments))
 
@@ -689,6 +815,7 @@ async def get_job(
         tags=job.tags,
         estimated_run_time=job_est,
         caption_hold=caption_hold_state,
+        caption_hold_detail=_held_detail_of(seg_responses),
         created_at=job.created_at,
         updated_at=job.updated_at,
         segments=seg_responses,
@@ -808,7 +935,8 @@ async def reopen_job(
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
     await _annotate_blocked(db, segments, seg_responses)
-    caption_hold_state = _annotate_held(job, segments, seg_responses)
+    caption_hold_state = _annotate_held(job, segments, seg_responses,
+                                        await _held_metas(db, job, segments))
     render_width, render_height = _job_render_size(
         job, any(renders_through_recipe(s.ltx_recipe) for s in segments))
 
@@ -837,6 +965,7 @@ async def reopen_job(
         tags=job.tags,
         estimated_run_time=job_est,
         caption_hold=caption_hold_state,
+        caption_hold_detail=_held_detail_of(seg_responses),
         created_at=job.created_at, updated_at=job.updated_at,
         segments=seg_responses, videos=job.videos,
         segment_count=len(segments), completed_segment_count=len(completed),

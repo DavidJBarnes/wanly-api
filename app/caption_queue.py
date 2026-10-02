@@ -24,9 +24,9 @@ WHY A TURNSTILE AND NOT A BACKGROUND WORKER
     contract intact -- the work still runs on the request's own session -- while making the
     waiting orderly.
 
-    Returning a ticket instead (202 + poll) is the next step, and it is what removes the
-    timeout cliff entirely rather than widening it. It needs the console to poll, so it is
-    not free, and it is not in here yet.
+    Returning a ticket instead (202 + poll) is what removes the timeout cliff entirely, and
+    since console#564 that is what describe does: app/caption_tickets.py takes the turn in a
+    background task and the console polls. The turn itself is unchanged.
 
 asyncio.Lock hands the lock to waiters in the order they arrived, which is the ordering this
 depends on.
@@ -40,24 +40,55 @@ from contextlib import asynccontextmanager
 logger = logging.getLogger(__name__)
 
 
+class _Entry:
+    """One place in line: the image, who asked (kind), and an optional token that identifies
+    this particular request -- a caption ticket's id -- so its own position can be read even
+    when the same image is in line twice."""
+    __slots__ = ("path", "kind", "token")
+
+    def __init__(self, path: str, kind: str, token: str | None) -> None:
+        self.path = path
+        self.kind = kind
+        self.token = token
+
+
 class CaptionQueue:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        #: Arrival order of the paths still waiting. Not a set: position is the point.
-        self._waiting: list[str] = []
-        self._running: str | None = None
+        #: Arrival order of the entries still waiting. Not a set: position is the point.
+        self._waiting: list[_Entry] = []
+        self._running: _Entry | None = None
+
+    def reserve(self, path: str, kind: str = "describe", token: str | None = None) -> _Entry:
+        """Take a place in line NOW, synchronously, for a turn() that starts a moment later.
+
+        A caption ticket answers its HTTP request before its task has run a single step; the
+        ticket it returns must already have a position, or the first poll says "not queued".
+        Pass the entry to turn(reserved=...). Discard it if the turn never happens.
+        """
+        entry = _Entry(path, kind, token)
+        self._waiting.append(entry)
+        return entry
 
     @asynccontextmanager
-    async def turn(self, path: str):
-        """Wait for the captioner, then hold it for the duration of the block."""
-        self._waiting.append(path)
+    async def turn(self, path: str, kind: str = "describe", token: str | None = None,
+                   reserved: _Entry | None = None):
+        """Wait for the captioner, then hold it for the duration of the block.
+
+        `kind` says who is asking -- "describe" (a caption ticket for the modal, the grid, a
+        dialog), "hold" (a held job), "dataset" (a training caption) or "try" (a Settings
+        preview that stores nothing) -- so a view can tell a caption that will land on the
+        image from one that will not.
+        """
+        if reserved is not None:
+            entry = reserved
+        else:
+            entry = _Entry(path, kind, token)
+            self._waiting.append(entry)
         try:
             async with self._lock:
-                try:
-                    self._waiting.remove(path)
-                except ValueError:
-                    pass
-                self._running = path
+                self.discard(entry)
+                self._running = entry
                 try:
                     yield
                 finally:
@@ -65,10 +96,14 @@ class CaptionQueue:
         finally:
             # Belt and braces: a cancellation between append and acquire must not leave a
             # phantom in the line, inflating every position reported after it.
-            try:
-                self._waiting.remove(path)
-            except ValueError:
-                pass
+            self.discard(entry)
+
+    def discard(self, entry: _Entry) -> None:
+        # By identity: the same image can be in line twice (a dataset caption and a describe).
+        for i, e in enumerate(self._waiting):
+            if e is entry:
+                del self._waiting[i]
+                return
 
     def status(self, path: str) -> dict:
         """Where this path sits, computed on read.
@@ -76,22 +111,35 @@ class CaptionQueue:
         Never stored: a position recorded a moment ago is wrong as soon as anything ahead
         of it finishes.
         """
-        if self._running == path:
+        if self._running is not None and self._running.path == path:
             return {"status": "running", "position": 0, "depth": self.depth()}
-        if path in self._waiting:
-            return {"status": "queued",
-                    "position": self._waiting.index(path) + 1,
-                    "depth": self.depth()}
+        for i, e in enumerate(self._waiting):
+            if e.path == path:
+                return {"status": "queued", "position": i + 1, "depth": self.depth()}
         return {"status": None, "position": None, "depth": self.depth()}
 
-    def in_flight(self, path: str) -> bool:
+    def token_status(self, token: str) -> dict:
+        """status(), for one request rather than for an image: a caption ticket's own place."""
+        if self._running is not None and self._running.token == token:
+            return {"status": "running", "position": 0, "depth": self.depth()}
+        for i, e in enumerate(self._waiting):
+            if e.token == token:
+                return {"status": "queued", "position": i + 1, "depth": self.depth()}
+        return {"status": None, "position": None, "depth": self.depth()}
+
+    def in_flight(self, path: str, kinds=None) -> bool:
         """Is a caption of this image queued or running right now, from anywhere?
 
         The single-flight check the caption hold makes (console#562): a job waiting on this
         image joins the caption the modal, the New Job dialog or another job already started,
         rather than queueing a second one that would overwrite the first with different words.
+        `kinds` narrows it to turns of those kinds (a dataset caption saves no scene words).
         """
-        return self._running == path or path in self._waiting
+        def match(e: _Entry) -> bool:
+            return e.path == path and (kinds is None or e.kind in kinds)
+        if self._running is not None and match(self._running):
+            return True
+        return any(match(e) for e in self._waiting)
 
     def depth(self) -> int:
         """Everything not yet finished, including the one in progress."""
@@ -99,11 +147,27 @@ class CaptionQueue:
 
     def running_path(self) -> str | None:
         """The image being captioned right now, if any."""
-        return self._running
+        return self._running.path if self._running is not None else None
 
     def waiting_paths(self) -> list[str]:
         """Everything still in line, in the order it will be taken."""
-        return list(self._waiting)
+        return [e.path for e in self._waiting]
+
+    def entries(self) -> list[dict]:
+        """The whole line, running first: {path, kind, token, status, position}.
+
+        What lets one poll annotate every image on a page (console#564) instead of one
+        request per image.
+        """
+        out = []
+        if self._running is not None:
+            r = self._running
+            out.append({"path": r.path, "kind": r.kind, "token": r.token,
+                        "status": "running", "position": 0})
+        for i, e in enumerate(self._waiting):
+            out.append({"path": e.path, "kind": e.kind, "token": e.token,
+                        "status": "queued", "position": i + 1})
+        return out
 
 
 #: One queue per process, because there is one captioner.

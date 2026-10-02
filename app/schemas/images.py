@@ -73,12 +73,54 @@ class CaptionTryResponse(BaseModel):
     motion_instruction_used: Optional[str] = None
 
 
+class CaptionTicket(BaseModel):
+    """One caption of one image, in the background (console#564, app/caption_tickets.py).
+
+    status: "queued" (position 1 = next up), "running" (position 0), "done" or "failed".
+    Null status means no caption of the image is in flight or remembered.
+    """
+    path: str
+    ticket_id: Optional[str] = None
+    status: Optional[str] = None
+    position: Optional[int] = None
+    #: Everything unfinished in the caption queue, including the one in progress.
+    depth: int = 0
+    #: "pair" (scene + motion) or "motion" (the paragraph alone, for a held job).
+    mode: Optional[str] = None
+    #: Who asked first: "describe" or "hold".
+    origin: Optional[str] = None
+    error: Optional[str] = None
+    #: Failed because the box beside the captioner is rendering -- try again later.
+    busy: bool = False
+    #: Done, but the motion half failed: the scene was saved without it.
+    motion_error: Optional[str] = None
+    #: True when this request joined a caption already in flight instead of queueing one.
+    joined: bool = False
+    created_at: Optional[datetime] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+class CaptionQueueEntry(BaseModel):
+    """One place in the caption queue."""
+    path: str
+    #: "describe", "hold" (both save words on the image), "dataset" or "try" (they do not).
+    kind: str
+    status: str  # "running" | "queued"
+    position: int
+    ticket_id: Optional[str] = None
+
+
 class CaptionQueueStatus(BaseModel):
     """The captioner's queue, for a view that is not about one image.
 
     Asked for because the per-image position only exists inside the modal of an image you
     are already describing -- there was no answer to "how is the queue looking?" without
     opening one.
+
+    Since console#564 it also lists every entry and every recently finished caption ticket,
+    so ONE poll lets the console mark any image on any page -- "In caption queue (#3)",
+    "Captioning…", "Failed: retry" -- without a request per image.
     """
     #: Everything unfinished, including the one in progress.
     depth: int = 0
@@ -86,6 +128,11 @@ class CaptionQueueStatus(BaseModel):
     waiting: int = 0
     #: The image being captioned right now, so the view can name it rather than just count.
     running: Optional[str] = None
+    #: The whole line, running first.
+    entries: list[CaptionQueueEntry] = []
+    #: The last finished ticket of each image that has one remembered (done or failed),
+    #: newest first.
+    recent: list[CaptionTicket] = []
 
 
 class ImageSceneResponse(BaseModel):
@@ -118,3 +165,6 @@ class ImageSceneResponse(BaseModel):
     queue_status: Optional[str] = None
     queue_position: Optional[int] = None
     queue_depth: int = 0
+    # The image's caption ticket (console#564): the one in flight, else the last finished one
+    # still remembered. Null when there is neither.
+    caption: Optional[CaptionTicket] = None

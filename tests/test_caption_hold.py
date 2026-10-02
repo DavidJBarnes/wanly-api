@@ -24,7 +24,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app import caption_hold
+from app import caption_hold, caption_tickets
 from app.auth import get_current_user, verify_api_key
 from app import caption_queue as caption_queue_module
 from app.config import settings
@@ -52,6 +52,7 @@ def shared_session(db, monkeypatch):
     async def _session():
         yield db
     monkeypatch.setattr(caption_hold, "async_session", _session)
+    monkeypatch.setattr(caption_tickets, "async_session", _session)
     return db
 
 
@@ -75,8 +76,10 @@ def fast(monkeypatch):
     monkeypatch.setattr(settings, "motion_caption_enabled", True)
     caption_hold._waiters.clear()
     caption_hold._notes.clear()
+    caption_tickets.reset()
     yield
     caption_hold._waiters.clear()
+    caption_tickets.reset()
 
 
 @pytest.fixture
@@ -88,7 +91,7 @@ def captioner(monkeypatch):
             motion=MOTION_WORDS, motion_instruction="i-motion"))
         motion = AsyncMock(return_value=(MOTION_WORDS, "i-motion"))
     monkeypatch.setattr("app.routes.captions.run_caption_pair", C.pair)
-    monkeypatch.setattr(caption_hold, "describe_motion", C.motion)
+    monkeypatch.setattr(caption_tickets, "describe_motion", C.motion)
     monkeypatch.setattr("app.routes.captions._caption_base", AsyncMock(return_value="http://c"))
     monkeypatch.setattr(caption_hold.s3, "download_bytes", lambda uri: b"png-bytes")
     return C
@@ -461,7 +464,8 @@ class TestRestartSweep:
         await _meta(db)
         assert caption_hold._waiters == {}
         assert await caption_hold.sweep() == 1
-        await asyncio.wait_for(caption_hold._waiters[IMG], 5)
+        # Released by the sweep itself; with the words already saved there is nothing for a
+        # waiter to wait on (console#562 follow-up).
         seg = await _fresh(db, seg)
         assert seg.status == SegmentStatus.PENDING
         captioner.pair.assert_not_called()

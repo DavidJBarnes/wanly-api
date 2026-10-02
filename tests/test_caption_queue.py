@@ -222,3 +222,54 @@ class TestTheQueueIsVisibleWithoutNamingAnImage:
         from app.routes.images import caption_queue_status
 
         assert list(inspect.signature(caption_queue_status).parameters) == []
+
+
+class TestKindsAndReservations:
+    """console#564: a ticket takes its place before its task runs, and the line says who
+    each place belongs to."""
+
+    @pytest.mark.asyncio
+    async def test_a_reserved_place_has_a_position_before_its_turn_starts(self):
+        q = CaptionQueue()
+        entry = q.reserve("s3://b/a.png", kind="describe", token="t1")
+        assert q.token_status("t1") == {"status": "queued", "position": 1, "depth": 1}
+        async with q.turn("s3://b/a.png", reserved=entry):
+            assert q.token_status("t1")["status"] == "running"
+            assert q.depth() == 1, "a reserved place must not be counted twice"
+        assert q.depth() == 0
+
+    @pytest.mark.asyncio
+    async def test_a_reservation_that_never_turns_can_be_discarded(self):
+        q = CaptionQueue()
+        entry = q.reserve("s3://b/a.png")
+        q.discard(entry)
+        assert q.depth() == 0 and q.entries() == []
+
+    @pytest.mark.asyncio
+    async def test_in_flight_can_be_narrowed_to_the_kinds_that_save_words(self):
+        q = CaptionQueue()
+        q.reserve("s3://b/a.png", kind="dataset")
+        assert q.in_flight("s3://b/a.png")
+        assert not q.in_flight("s3://b/a.png", kinds={"describe", "hold"})
+        q.reserve("s3://b/a.png", kind="describe")
+        assert q.in_flight("s3://b/a.png", kinds={"describe", "hold"})
+
+    @pytest.mark.asyncio
+    async def test_entries_list_the_line_in_order_with_their_kinds(self):
+        q = CaptionQueue()
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def hold():
+            async with q.turn("s3://b/run.png", kind="dataset"):
+                started.set()
+                await release.wait()
+        t = asyncio.create_task(hold())
+        await started.wait()
+        q.reserve("s3://b/a.png", kind="hold", token="t9")
+        assert [(e["path"], e["kind"], e["status"], e["position"], e["token"])
+                for e in q.entries()] == [
+            ("s3://b/run.png", "dataset", "running", 0, None),
+            ("s3://b/a.png", "hold", "queued", 1, "t9"),
+        ]
+        release.set()
+        await t
