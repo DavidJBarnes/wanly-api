@@ -136,12 +136,15 @@ class Settings(BaseSettings):
     # An ALWAYS-ON image-edit worker: any box whose image-edit runs without a mode switch
     # (SERVICES=image-edit with nothing that renders). Preferred while its /health is ok; when it
     # is not, full-mode jobs fall back to image_edit_url's edit mode above. Empty (the default)
-    # = there is none, and every edit uses edit mode. No box is named here on purpose: which
-    # boxes carry image-edit is being re-planned (3090a/3090b as symmetric workers), and that
-    # epic chooses the worker -- this is the seam it extends.
-    image_edit_standing_url: str = ""
-    # How a job's status names it ("<name> busy (A1111 generating); edit queued"). Empty = the
-    # URL's host.
+    # = there is none, and every edit uses edit mode.
+    #
+    # 3090b (the ex-2070 box, now an RTX 3090) IS that box as of 2026-10-01: the user chose it as
+    # the interactive edit/sheet box (#572 option 1), running SERVICES=image-edit full-time. The
+    # name is the ZeroTier hosts entry every machine already resolves; switch to 3090b.zero once
+    # EC2's /etc/hosts carries it. A down box costs one 5 s health check and the job falls back.
+    image_edit_standing_url: str = "http://2070.zero:8086"
+    # How a job's status names it ("<name> busy; edit queued"). Empty = the URL's host. Left empty
+    # so the name follows the URL (tests rely on that); set IMAGE_EDIT_STANDING_NAME to override.
     image_edit_standing_name: str = ""
     # Its /health is asked before every job; a box that is down must cost seconds, not the job.
     image_edit_standing_timeout_s: float = 5.0
