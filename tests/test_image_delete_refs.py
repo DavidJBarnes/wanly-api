@@ -16,6 +16,7 @@ import uuid
 from unittest.mock import patch
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Select
 
 from app.auth import get_current_user
@@ -271,3 +272,79 @@ class TestListingAgreesWithDelete:
         by_path = {item["path"]: item["in_use"] for item in resp.json()}
         assert by_path[FACE] is True
         assert by_path[LOOSE] is False
+
+
+class TestListingDotMeansJobNotDataset:
+    """in_use drives the green dot, and the dot says "Used in a job" (wanly-console#168).
+
+    The delete gate counts dataset membership and in-flight training runs on purpose
+    (#305/#274), but the listing endpoints fed in_use off that same wide answer, so every
+    member of any dataset got a dot with no video behind it (issue #389). A dataset member
+    with no job or segment reference must list grey — and must still refuse to delete.
+    """
+
+    def teardown_method(self):
+        app.dependency_overrides.clear()
+
+    @pytest.mark.asyncio
+    async def test_dataset_member_without_a_job_lists_grey_but_still_deletes_409(self):
+        ds = Dataset(id=uuid.uuid4(), name="set", images=[FACE])
+        _override(_FakeSession(datasets=[ds]))
+
+        objects = [
+            {"Key": FACE.split(f"{BUCKET}/")[1], "Size": 10, "LastModified": "2026-07-09T00:00:00"},
+            {"Key": LOOSE.split(f"{BUCKET}/")[1], "Size": 10, "LastModified": "2026-07-09T00:00:00"},
+        ]
+        with patch("app.routes.images.list_objects", return_value=objects):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get("/images/folder/2026-07-09")
+
+        assert resp.status_code == 200
+        by_path = {item["path"]: item["in_use"] for item in resp.json()}
+        assert by_path[FACE] is False
+        assert by_path[LOOSE] is False
+
+        del_resp, deleter = await _delete(FACE)
+        assert del_resp.status_code == 409
+        deleter.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_untagged_listing_shows_dataset_member_as_grey(self):
+        ds = Dataset(id=uuid.uuid4(), name="set", images=[FACE])
+        _override(_FakeSession(datasets=[ds]))
+
+        objects = [
+            {"Key": FACE.split(f"{BUCKET}/")[1], "Size": 10, "LastModified": "2026-07-09T00:00:00"},
+        ]
+        with patch("app.routes.images.list_objects", return_value=objects), \
+             patch("app.routes.images.list_common_prefixes", return_value=["2026-07-09/"]):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get("/images/untagged")
+
+        assert resp.status_code == 200
+        by_path = {item["path"]: item["in_use"] for item in resp.json()}
+        assert by_path[FACE] is False
+
+    @pytest.mark.asyncio
+    async def test_dataset_membership_alongside_a_job_still_lights_the_dot(self):
+        """Membership stops lighting the dot; a real reference still does."""
+        ds = Dataset(id=uuid.uuid4(), name="set", images=[FACE, START])
+        job = Job(id=uuid.uuid4(), name="j", width=832, height=480, fps=16, seed=1,
+                  starting_image=START, status=JobStatus.PENDING)
+        _override(_FakeSession(datasets=[ds], jobs=[job]))
+
+        objects = [
+            {"Key": FACE.split(f"{BUCKET}/")[1], "Size": 10, "LastModified": "2026-07-09T00:00:00"},
+            {"Key": START.split(f"{BUCKET}/")[1], "Size": 10, "LastModified": "2026-07-09T00:00:00"},
+        ]
+        with patch("app.routes.images.list_objects", return_value=objects):
+            transport = ASGITransport(app=app)
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                resp = await client.get("/images/folder/2026-07-09")
+
+        assert resp.status_code == 200
+        by_path = {item["path"]: item["in_use"] for item in resp.json()}
+        assert by_path[FACE] is False
+        assert by_path[START] is True
