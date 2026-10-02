@@ -192,6 +192,12 @@ async def _ticket_queued(path=IMG):
     await _until(lambda: caption_tickets.active(path) is not None)
 
 
+async def _all_done(body):
+    """Wait for every half a describe asked for (console#590: one ticket per half)."""
+    for t in body["tickets"]:
+        await caption_tickets.get(t["ticket_id"]).wait()
+
+
 async def _user(db) -> User:
     user = User(username=str(uuid.uuid4()), password_hash="x")
     db.add(user)
@@ -244,8 +250,11 @@ async def _describe(c, path=IMG, **body):
     return resp.json()
 
 
-async def _status(c, path=IMG):
-    resp = await c.get("/images/scene/status", params={"path": path})
+async def _status(c, path=IMG, half=None):
+    params = {"path": path}
+    if half:
+        params["half"] = half
+    resp = await c.get("/images/scene/status", params=params)
     assert resp.status_code == 200, resp.text
     return resp.json()
 
@@ -288,14 +297,18 @@ class TestDescribeAnswersAtOnce:
             assert body["depth"] == 2
             assert body["joined"] is False
             assert body["ticket_id"]
+            # No halves named: both, for an old client -- a ticket each, scene first.
+            assert body["half"] == "scene"
+            assert [t["half"] for t in body["tickets"]] == ["scene", "motion"]
             captioner.pair.assert_not_called()
 
             st = await _status(c)
             assert st["ticket_id"] == body["ticket_id"]
             assert st["status"] == "queued" and st["position"] == 1
+            assert st["motion"]["ticket_id"] == body["tickets"][1]["ticket_id"]
 
             await line.open()
-            await caption_tickets.get(body["ticket_id"]).wait()
+            await _all_done(body)
             done = await _status(c)
             assert done["status"] == "done"
             assert done["position"] is None and done["finished_at"]
@@ -361,7 +374,7 @@ class TestSingleFlight:
             resp = await asyncio.wait_for(sync, 5)
         assert resp.status_code == 200, resp.text
         assert resp.json()["scene_description"] == SCENE_WORDS
-        assert resp.json()["caption"]["ticket_id"] == ticket["ticket_id"]
+        assert resp.json()["scene_caption"]["ticket_id"] == ticket["ticket_id"]
         assert captioner.pair.await_count == 1
 
 
@@ -394,9 +407,12 @@ class TestFailureIsOnTheTicket:
                                                 motion_error="timed out")
         async with _client(db) as c:
             t = await _describe(c)
-            await caption_tickets.get(t["ticket_id"]).wait()
-            st = await _status(c)
-        assert st["status"] == "done" and st["motion_error"] == "timed out"
+            await _all_done(t)
+            scene = await _status(c, half="scene")
+            motion = await _status(c, half="motion")
+        # Each half reports on its own (console#590): the scene done, the motion failed.
+        assert scene["status"] == "done" and scene["half"] == "scene"
+        assert motion["status"] == "failed" and motion["error"] == "timed out"
         assert (await db.get(ImageMeta, IMG)).scene_description == SCENE_WORDS
 
     async def test_the_sync_post_keeps_its_status_codes(self, db, shared_session, captioner,
@@ -425,9 +441,9 @@ class TestTheWholeQueueInOnePoll:
             a = await _describe(c, IMG)
             b = await _describe(c, OTHER)
             q = (await c.get("/images/caption-queue")).json()
-            # The scene lane; the motion lane holds only the test's blocker (console#572).
-            assert [(e["path"], e["lane"]) for e in q["entries"] if e["lane"] == "motion"] == [
-                (BLOCKER, "motion")]
+            # Each image's motion waits in the motion lane (console#572, #590).
+            assert [(e["path"], e["kind"]) for e in q["entries"] if e["lane"] == "motion"] == [
+                (BLOCKER, "dataset"), (IMG, "describe"), (OTHER, "describe")]
             assert [(e["path"], e["kind"], e["status"], e["position"]) for e in q["entries"]
                     if e["lane"] == "scene"] == [
                 (BLOCKER, "dataset", "running", 0),
@@ -436,13 +452,18 @@ class TestTheWholeQueueInOnePoll:
             ]
             assert q["entries"][1]["ticket_id"] == a["ticket_id"]
             await line.open()
-            await caption_tickets.get(a["ticket_id"]).wait()
-            await caption_tickets.get(b["ticket_id"]).wait()
+            await _all_done(a)
+            await _all_done(b)
             q = (await c.get("/images/caption-queue")).json()
         assert q["entries"] == [] and q["depth"] == 0
-        recent = {r["path"]: r for r in q["recent"]}
-        assert recent[IMG]["status"] == "done"
-        assert recent[OTHER]["status"] == "failed" and recent[OTHER]["error"] == "boom"
+        recent = {(r["path"], r["half"]): r for r in q["recent"]}
+        assert recent[(IMG, "scene")]["status"] == "done"
+        assert recent[(IMG, "motion")]["status"] == "done"
+        assert recent[(OTHER, "scene")]["status"] == "failed"
+        assert recent[(OTHER, "scene")]["error"] == "boom"
+        # Its motion had no scene to ground on, and says so.
+        assert recent[(OTHER, "motion")]["status"] == "failed"
+        assert "no scene to ground" in recent[(OTHER, "motion")]["error"]
 
 
 # --- the hold and the modal's describe, end to end --------------------------------------------
@@ -505,15 +526,13 @@ class TestAHeldJobIsReleasedByTheModalsDescribe:
         assert row.status == SegmentStatus.PENDING
         assert row.prompt == f"k3lly2026, woman, {SCENE_WORDS}, {MOTION_WORDS}"
 
-    async def test_a_describe_replaces_a_queued_motion_only_hold_with_a_reroll(
+    async def test_a_scene_redo_while_the_holds_motion_waits_regrounds_the_motion(
             self, db, shared_session, captioner, fresh):
-        """The hold only needed the paragraph, but a person asked for a fresh description
-        before it ran: one caption, the pair, and the job renders the re-rolled words.
+        """The hold only needed the paragraph; a person redid the scene before it ran.
 
-        Since wanly-console#572 the motion-only ticket waits in the motion lane, where it
-        cannot become a scene caption, so the re-roll is a NEW pair and the queued motion
-        ticket is withdrawn (its paragraph would have been grounded on the old scene). The
-        hold follows the image's ticket to the pair."""
+        Per half since console#590: the redo is a scene ticket of its own and the hold's
+        motion ticket is left alone -- and because motion is grounded on the SAVED scene, the
+        paragraph the job renders is about the redone scene, not the old one."""
         await _meta(db, scene="the old scene", motion=None)
         captioner.pair.return_value = ScenePair(scene="the re-rolled scene",
                                                 scene_instruction="i", motion=MOTION_WORDS)
@@ -521,16 +540,17 @@ class TestAHeldJobIsReleasedByTheModalsDescribe:
         async with Line(fresh) as line, _client(db) as c:
             waiter = caption_hold.ensure(IMG)
             await _ticket_queued()
-            assert caption_tickets.active(IMG).mode == "motion"
-            motion_only = caption_tickets.active(IMG)
-            body = await _describe(c)
-            assert body["joined"] is False and body["mode"] == "pair"
-            assert motion_only.withdrawn
+            motion_only = caption_tickets.active(IMG, "motion")
+            assert motion_only is not None and caption_tickets.active(IMG, "scene") is None
+            body = await _describe(c, halves=["scene"])
+            assert body["joined"] is False and body["half"] == "scene"
+            assert [t["half"] for t in body["tickets"]] == ["scene"]
+            assert not motion_only.withdrawn
             await line.open()
             await asyncio.wait_for(waiter, 5)
-        captioner.motion.assert_not_called()
         assert captioner.pair.await_count == 1
         row = await _segment_row(db, seg.id)
+        assert row.status == SegmentStatus.PENDING
         assert row.prompt == f"k3lly2026, woman, the re-rolled scene, {MOTION_WORDS}"
 
     async def test_the_modals_motion_failure_is_made_up_by_the_hold(
@@ -605,7 +625,7 @@ class TestWhatAHeldJobShows:
         job = await _job(db, user)
         await _held(db, job)
         async with Line(fresh), _client(db, user) as c:
-            await _describe(c, OTHER)                  # someone else is ahead
+            await _describe(c, OTHER, halves=["scene"])  # someone else's scene is ahead
             caption_hold.ensure(IMG)
             await _ticket_queued()
             detail = (await c.get(f"/jobs/{job.id}")).json()
@@ -654,9 +674,9 @@ class TestWhatAHeldJobShows:
             s = (await c.get("/caption-holds")).json()
         assert s["jobs_waiting"] >= 2 and s["segments_waiting"] >= 2
         assert s["jobs_failed"] >= 1
-        # Both lanes count: the scene lane's blocker and ticket, and the motion lane's blocker.
-        assert s["queue_depth"] == 3 and s["running"] == BLOCKER
-        assert s["motion_queue_depth"] == 1
+        # Both lanes count: each lane's blocker, and the hold's ticket for each half.
+        assert s["queue_depth"] == 4 and s["running"] == BLOCKER
+        assert s["motion_queue_depth"] == 2
         mine = [i for i in s["images"] if i["image"] == IMG][0]
         assert mine["needs"] == ["scene", "motion"]
         assert mine["jobs"] == 2 and mine["segments"] == 2
@@ -749,10 +769,11 @@ class TestTwoLanes:
             # The motion is being made; the scene is saved and what needed only it is free.
             assert (await _segment_row(db, scene_only)).status == SegmentStatus.PENDING
             assert (await _segment_row(db, both)).status == SegmentStatus.AWAITING_CAPTION
-            st = await _status(c)
+            st = await _status(c, half="motion")
             assert st["status"] == "running" and st["lane"] == "motion"
+            assert (await _status(c, half="scene"))["status"] == "done"
             gate.set()
-            await caption_tickets.get(t["ticket_id"]).wait()
+            await _all_done(t)
         await caption_hold.settle(IMG)
         assert (await _segment_row(db, both)).status == SegmentStatus.PENDING
         assert (await db.get(ImageMeta, IMG)).motion_description == MOTION_WORDS
@@ -770,12 +791,12 @@ class TestTwoLanes:
             await asyncio.wait_for(started.wait(), 2)
             b = await _describe(c, OTHER)
             # OTHER's scene is made while IMG's motion is still held up.
-            await _until(lambda: (caption_tickets.get(b["ticket_id"]).lane == "motion"))
+            await _until(lambda: caption_tickets.get(b["ticket_id"]).finished)
             assert (await db.get(ImageMeta, OTHER)).scene_description == "another scene"
-            assert not caption_tickets.get(a["ticket_id"]).finished
+            assert not caption_tickets.get(a["tickets"][1]["ticket_id"]).finished
             gate.set()
-            await caption_tickets.get(a["ticket_id"]).wait()
-            await caption_tickets.get(b["ticket_id"]).wait()
+            await _all_done(a)
+            await _all_done(b)
         assert captioner.pair.await_count == 2
 
     async def test_a_refused_motion_keeps_the_scene_and_the_hold_waits_it_out(
@@ -799,20 +820,30 @@ class TestTwoLanes:
         assert captioner.pair.await_count == 1      # the scene was made once, not re-made
         assert calls["n"] == 2
 
-    async def test_a_motion_made_against_a_replaced_scene_is_dropped(
+    async def test_a_motion_made_against_a_replaced_scene_is_made_again(
             self, db, shared_session, captioner, monkeypatch):
-        gate, started, slow = await self._motion_gate(captioner)
+        """A scene redo landed while the paragraph was being made: it is made again against
+        the new scene, never saved beside one it did not see (console#590)."""
+        gate, started = asyncio.Event(), asyncio.Event()
+        grounded_on = []
+
+        async def slow_motion(image, scene_text, **kw):
+            grounded_on.append(scene_text)
+            started.set()
+            await gate.wait()
+            return f"motion about {scene_text}", "i-motion"
         captioner.pair.return_value = ScenePair(scene=SCENE_WORDS, scene_instruction="i")
-        monkeypatch.setattr(caption_tickets, "describe_motion", slow)
+        monkeypatch.setattr(caption_tickets, "describe_motion", slow_motion)
         async with _client(db) as c:
             t = await _describe(c)
             await asyncio.wait_for(started.wait(), 2)
             await _meta(db, scene="a re-rolled scene", motion=None)
             gate.set()
-            await caption_tickets.get(t["ticket_id"]).wait()
+            await _all_done(t)
         meta = await db.get(ImageMeta, IMG)
-        assert meta.motion_description is None
-        assert "replaced" in caption_tickets.get(t["ticket_id"]).motion_error
+        assert grounded_on == [SCENE_WORDS, "a re-rolled scene"]
+        assert meta.motion_description == "motion about a re-rolled scene"
+        assert caption_tickets.get(t["tickets"][1]["ticket_id"]).status == "done"
 
     async def test_the_queue_status_names_each_lane_and_the_scene_captioner(
             self, db, shared_session, captioner, fresh, monkeypatch):
@@ -821,7 +852,7 @@ class TestTwoLanes:
             await _describe(c)
             q = (await c.get("/images/caption-queue")).json()
         assert [lane["name"] for lane in q["lanes"]] == ["scene", "motion"]
-        assert q["lanes"][0]["depth"] == 2 and q["lanes"][1]["depth"] == 1
-        assert q["depth"] == 3
+        assert q["lanes"][0]["depth"] == 2 and q["lanes"][1]["depth"] == 2
+        assert q["depth"] == 4
         assert q["scene_captioner"]["url"] == "http://scene:11436"
         assert q["scene_captioner"]["up"] is True

@@ -247,28 +247,33 @@ class TestDescribeUntagged:
 
     def _patch_captioner(self, monkeypatch, *, caption="a woman on a sofa",
                          motion="she leans back", fail_with=None):
-        """Fake the download + caption pair; returns the list of caption calls."""
+        """Fake the download + the scene caption; returns the list of caption calls.
+
+        `motion` is unused since console#590 -- tagging makes the scene only -- and kept so a
+        test can say what a pair-maker WOULD have written, and check it was not."""
         from app.routes import images as images_mod
-        from app.routes.captions import ScenePair
 
         called = []
 
         def fake_download(path):  # sync, like boto3: the loop runs it in a thread
             return b"png bytes"
 
-        async def fake_pair(db, image, **kw):
+        async def fake_scene(db, image, **kw):
             called.append(image)
             if fail_with is not None:
                 raise fail_with
-            return ScenePair(scene=caption, scene_instruction="the instruction",
-                             motion=motion, motion_instruction="the motion instruction")
+            return caption, "the instruction"
+
+        async def no_pair(*a, **kw):
+            raise AssertionError("tagging must not make a motion caption (console#590)")
 
         monkeypatch.setattr(images_mod, "download_bytes", fake_download)
-        monkeypatch.setattr(images_mod, "caption_image_pair", fake_pair)
+        monkeypatch.setattr(images_mod, "caption_image_scene", fake_scene)
+        monkeypatch.setattr(images_mod, "caption_image_pair", no_pair)
         return called
 
     @pytest.mark.asyncio
-    async def test_it_describes_a_newly_tagged_row_completely(self, db, monkeypatch):
+    async def test_it_describes_only_the_scene_of_a_newly_tagged_row(self, db, monkeypatch):
         from app.routes.images import describe_untagged
 
         db.add(ImageMeta(path=A, tags="Kelly"))
@@ -280,9 +285,9 @@ class TestDescribeUntagged:
         assert meta.scene_description == "a woman on a sofa"
         assert meta.scene_instruction == "the instruction"
         assert meta.scene_described_at is not None
-        # Same call writes both halves, so the provenance matches POST /images/scene's.
-        assert meta.motion_description == "she leans back"
-        assert meta.motion_described_at is not None
+        # Scene only (console#590): tagging never spends a motion caption.
+        assert meta.motion_description is None
+        assert meta.motion_described_at is None
         # And it did not disturb the tags that queued it.
         assert meta.tags == "Kelly"
 
@@ -371,3 +376,25 @@ class TestDescribeUntagged:
         assert await describe_untagged(db, [A]) == 0
         assert called == []
         assert await db.get(ImageMeta, A) is None
+
+
+class TestTaggingKeepsASavedMotion:
+    @pytest.mark.asyncio
+    async def test_a_saved_motion_paragraph_survives_the_scene(self, db, monkeypatch):
+        """A row with a motion paragraph but no scene (a scene cleared by hand, say): the
+        tag's scene caption fills the scene and leaves the paragraph alone (console#590)."""
+        from app.routes import images as images_mod
+        from app.routes.images import describe_untagged
+
+        db.add(ImageMeta(path=A, tags="Kelly", motion_description="she leans back"))
+        await db.flush()
+
+        async def fake_scene(db, image, **kw):
+            return "a woman on a sofa", "i"
+        monkeypatch.setattr(images_mod, "download_bytes", lambda p: b"png")
+        monkeypatch.setattr(images_mod, "caption_image_scene", fake_scene)
+
+        assert await describe_untagged(db, [A]) == 1
+        meta = await db.get(ImageMeta, A)
+        assert meta.scene_description == "a woman on a sofa"
+        assert meta.motion_description == "she leans back"

@@ -189,16 +189,18 @@ class TestMotionHalf:
         assert meta.scene_description == "second"
 
     @pytest.mark.asyncio
-    async def test_an_absent_motion_clears_the_previous_one(self, db):
-        """Both halves always come from the same call. Keeping motion from an old session
-        beside a static half from this one would pair words minutes apart with words
-        produced months apart, invisibly."""
+    async def test_a_failed_motion_leaves_the_previous_one_alone(self, db):
+        """Per half since console#590: saving one half never clears the other. The new scene
+        is saved; the old paragraph stays (older than the scene, so the console says "Redo
+        motion to re-ground on the new scene") rather than being silently thrown away."""
         await _post_scene(db, PATH, caption="first", motion="motion one")
-        await _post_scene(db, PATH, caption="second")  # motion call failed
+        resp = await _post_scene(db, PATH, caption="second")  # motion call failed
+        assert resp.json()["motion_error"]
 
         meta = await db.get(ImageMeta, PATH)
-        assert meta.motion_description is None
-        assert meta.motion_described_at is None
+        assert meta.scene_description == "second"
+        assert meta.motion_description == "motion one"
+        assert meta.motion_described_at <= meta.scene_described_at
 
     @pytest.mark.asyncio
     async def test_a_row_holding_only_a_motion_caption_is_not_empty(self):
