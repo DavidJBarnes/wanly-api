@@ -119,6 +119,8 @@ class SegmentResponse(BaseModel):
     caption_queue_status: Optional[str] = None
     caption_queue_position: Optional[int] = None
     caption_queue_depth: Optional[int] = None
+    #: "scene" or "motion": which caption lane the position is in (wanly-console#572).
+    caption_queue_lane: Optional[str] = None
 
     model_config = {"from_attributes": True}
 

@@ -29,6 +29,8 @@ import base64
 import hashlib
 import logging
 import re
+import time
+from dataclasses import dataclass
 
 import httpx
 
@@ -39,6 +41,118 @@ logger = logging.getLogger(__name__)
 
 class CaptionError(RuntimeError):
     """The captioner could not be reached, or refused. Never fatal to a render."""
+
+
+class CaptionerUnreachable(CaptionError):
+    """No answer worth having: the connection failed or timed out, or the server said 5xx/4xx.
+
+    Distinct from an empty caption (the captioner answered, badly) because it is the case a
+    second captioner can fix -- the scene half falls back on exactly this.
+    """
+
+
+# ---------------------------------------------------------------------------------------
+# Which captioner (wanly-console#572 phase 1)
+#
+# One URL and one model used to serve both halves, so a 3090 swapped two vision models per
+# image. Now each half has its own captioner, resolved here, and the image_description_*
+# settings are the motion half's fallback for every value it leaves unset.
+# ---------------------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Captioner:
+    """Where one half of a caption is made, and how the request to it is shaped."""
+    #: "scene" (JoyCaption on the scene-caption service) or "motion" (the shared captioner,
+    #: which also does the scene when the scene service is down or not configured).
+    role: str
+    url: str
+    model: str
+    keep_alive: str
+    num_ctx: int
+    timeout_s: float
+    #: Does this captioner share a GPU with a render stack? Only such a captioner is ever
+    #: refused for a render (busy_render_beside_the_captioner). The scene service never does:
+    #: it is a small model on a card no render stack uses.
+    beside_render: bool
+
+
+def motion_captioner(url: str | None = None) -> Captioner:
+    """The motion half's captioner: motion_caption_*, each falling back to image_description_*.
+
+    Also THE captioner for anything that is not the scene service -- the scene half when the
+    scene service is down, and the single captioner of a deployment that has not split them.
+    `url` overrides the address (captioner_for's choice of primary or fallback) and keeps
+    everything else.
+    """
+    s = settings
+    return Captioner(
+        role="motion",
+        url=(url or s.motion_caption_url or s.image_description_url).rstrip("/"),
+        model=s.motion_caption_model or s.image_description_model,
+        keep_alive=s.motion_caption_keep_alive or s.image_description_keep_alive,
+        num_ctx=s.motion_caption_num_ctx or s.image_description_num_ctx,
+        timeout_s=s.motion_caption_timeout_s or s.image_description_timeout_s,
+        beside_render=True,
+    )
+
+
+def scene_captioner() -> Captioner | None:
+    """The scene half's own captioner, or None when the split is off (empty URL)."""
+    s = settings
+    url = (s.scene_caption_url or "").strip().rstrip("/")
+    if not url:
+        return None
+    return Captioner(role="scene", url=url, model=s.scene_caption_model,
+                     keep_alive=s.scene_caption_keep_alive, num_ctx=s.scene_caption_num_ctx,
+                     timeout_s=s.scene_caption_timeout_s, beside_render=False)
+
+
+#: The scene service's health, as last seen. Set when it fails to answer, so the captions
+#: after it go straight to the fallback for scene_caption_down_s instead of each paying a
+#: connect timeout; cleared by the first scene caption that works.
+_scene_down: dict = {"until": 0.0, "why": None, "since": None}
+
+
+def scene_status() -> dict:
+    """The scene captioner as the API reports it: where, and whether it is being skipped."""
+    cap = scene_captioner()
+    if cap is None:
+        return {"url": None, "model": None, "up": None, "why": None,
+                "fallback": motion_captioner().url}
+    down = time.monotonic() < _scene_down["until"]
+    return {"url": cap.url, "model": cap.model, "up": not down,
+            "why": _scene_down["why"] if down else None,
+            "fallback": motion_captioner().url}
+
+
+def reset_scene_health() -> None:
+    """Tests only."""
+    _scene_down.update(until=0.0, why=None, since=None)
+
+
+def scene_marked_down() -> str | None:
+    """Why the scene service is being skipped right now, or None when it is not."""
+    if time.monotonic() < _scene_down["until"]:
+        return _scene_down["why"]
+    return None
+
+
+def mark_scene_down(cap: Captioner, error: Exception) -> None:
+    """The scene service failed to answer: skip it for scene_caption_down_s, and say so."""
+    first = _scene_down["why"] is None
+    _scene_down.update(until=time.monotonic() + settings.scene_caption_down_s,
+                       why=str(error), since=_scene_down["since"] or time.time())
+    logger.warning(
+        "Scene captioner %s is DOWN (%s); falling back to the single captioner (%s) for "
+        "scene captions%s", cap.url, error, motion_captioner().url,
+        f" for the next {settings.scene_caption_down_s:.0f}s" if first else "")
+
+
+def mark_scene_up(cap: Captioner) -> None:
+    if _scene_down["why"] is not None:
+        logger.info("Scene captioner %s is back after %.0fs down", cap.url,
+                    time.time() - (_scene_down["since"] or time.time()))
+        _scene_down.update(until=0.0, why=None, since=None)
 
 
 # The verbosity presets exposed in Settings.
@@ -404,9 +518,11 @@ class CaptionerBusy(CaptionError):
 
 
 def captioner_host() -> str:
-    """The host part of image_description_url: `3090.zero` for http://3090.zero:11434."""
+    """The host of the captioner that shares a card with a render stack: the MOTION
+    captioner's (image_description_url unless motion_caption_url is set) -- `3090.zero` for
+    http://3090.zero:11434. The scene service is never this: it never shares a render card."""
     from urllib.parse import urlsplit
-    return (urlsplit(settings.image_description_url).hostname or "").lower()
+    return (urlsplit(motion_captioner().url).hostname or "").lower()
 
 
 def render_worker_beside_the_captioner(workers) -> "object | None":
@@ -512,7 +628,7 @@ def captioner_for(busy: str | None, interactive: bool) -> str | None:
                                       is about to load a 23 GB render, and a caption that
                                       races it timed out on the first night; else the primary
     """
-    primary = settings.image_description_url
+    primary = motion_captioner().url
     fallback = (settings.image_description_fallback_url or "").strip()
     if not interactive:
         return fallback or primary
@@ -521,23 +637,33 @@ def captioner_for(busy: str | None, interactive: bool) -> str | None:
     return primary
 
 
-async def describe(image_bytes: bytes, instruction: str, base_url: str | None = None) -> str:
-    """Caption one image. Raises CaptionError; callers must treat that as non-fatal."""
-    base = (base_url or settings.image_description_url).rstrip("/")
+async def describe(image_bytes: bytes, instruction: str, base_url: str | None = None,
+                   captioner: Captioner | None = None) -> str:
+    """Caption one image. Raises CaptionError; callers must treat that as non-fatal.
+
+    `captioner` says which one and how to ask it (model, keep_alive, context, timeout); the
+    default is the motion captioner, which is also the single captioner of an unsplit
+    deployment. `base_url` overrides only the address -- captioner_for's choice.
+    """
+    cap = captioner or motion_captioner()
+    base = (base_url or cap.url).rstrip("/")
     payload = {
-        "model": settings.image_description_model,
+        "model": cap.model,
         "prompt": instruction,
         "images": [base64.b64encode(image_bytes).decode()],
         "stream": False,
-        "keep_alive": settings.image_description_keep_alive,
+        "keep_alive": _keep_alive(cap.keep_alive),
         # num_ctx is not a tuning knob here, it is the difference between the model being
         # resident and not -- see image_description_num_ctx. Sending nothing let ollama size
         # the context from VRAM and push a third of the layers onto the CPU.
-        "options": {"num_ctx": settings.image_description_num_ctx},
+        "options": {"num_ctx": cap.num_ctx},
     }
     url = f"{base}/api/generate"
     try:
-        async with httpx.AsyncClient(timeout=settings.image_description_timeout_s) as client:
+        # A short CONNECT timeout whatever the read timeout: a box that is down must cost
+        # seconds, which is what lets the scene half fall back promptly.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(cap.timeout_s,
+                                                           connect=10.0)) as client:
             resp = await client.post(url, json=payload)
             # ollama answers 500 for a runner that died loading, which on this box is
             # almost always the GPU rather than the model. Ask the other tenant to let go
@@ -546,14 +672,25 @@ async def describe(image_bytes: bytes, instruction: str, base_url: str | None = 
             if resp.status_code == 500 and await _yield_the_gpu():
                 resp = await client.post(url, json=payload)
     except httpx.HTTPError as e:
-        raise CaptionError(f"captioner unreachable at {base}: {e!r}") from e
+        raise CaptionerUnreachable(f"captioner unreachable at {base}: {e!r}") from e
     if resp.status_code != 200:
-        raise CaptionError(f"captioner returned {resp.status_code}: {resp.text[:200]}")
+        raise CaptionerUnreachable(
+            f"captioner returned {resp.status_code}: {resp.text[:200]}")
 
     text = (resp.json().get("response") or "").strip()
     if not text:
         raise CaptionError("captioner returned an empty caption")
     return _tidy(text)
+
+
+def _keep_alive(value: str):
+    """ollama reads keep_alive as a duration string OR a number of seconds, and "-1" as a
+    string is not a duration it accepts. Send integers as integers."""
+    v = (value or "").strip()
+    try:
+        return int(v)
+    except ValueError:
+        return v
 
 
 def _tidy(text: str) -> str:

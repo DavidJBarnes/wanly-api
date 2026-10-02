@@ -75,6 +75,46 @@ class Settings(BaseSettings):
     # a model that cannot do it, producing plausible junk persisted as authoritative. Flip
     # this back to true when the captioner model can actually do the motion half.
     motion_caption_enabled: bool = True
+    # TWO CAPTIONERS, ONE PER HALF (wanly-console#572 phase 1).
+    #
+    # One URL and one model used to serve both halves of a video prompt, so a 3090 swapped
+    # two vision models in and out of VRAM per image: 30 images was 60 swaps across the
+    # ZeroTier link, and is the likeliest cause of 3090a hanging on 2026-10-02. The halves are
+    # different jobs and now go to different places:
+    #
+    #   scene   the static description, JoyCaption Beta One on its own always-resident ollama
+    #           (wanly-gpu-docker's scene-caption service). Small (~6 GB), never shares a card
+    #           with a render stack, so it is NEVER refused for a render; it is only ever slow
+    #           while an image edit has it unloaded on a shared card (interim, 3090b).
+    #   motion  the motion paragraph, Qwen3-VL 32B on a 3090's image-description service --
+    #           the captioner that used to do both halves.
+    #
+    # THE OLD image_description_* SETTINGS ARE THE MOTION HALF'S FALLBACK. Every motion_* value
+    # left empty (or 0) inherits its image_description_* twin, so the motion half -- and the
+    # scene half when the scene service is down -- goes exactly where both halves went before.
+    # The EC2 env pins image_description_url to 3090a's captioner, which is why the motion
+    # default is "inherit" rather than a hostname guessed here.
+    #
+    # An EMPTY scene_caption_url turns the split off: the scene half then goes to the motion
+    # captioner too, which is the pre-#572 behaviour.
+    scene_caption_url: str = "http://3090b.zero:11436"
+    scene_caption_model: str = "joycaption:beta-one"
+    # Always resident: the service exists to keep one small model on the card. The service
+    # enforces this itself; sending it too keeps a plain ollama behind the URL honest.
+    scene_caption_keep_alive: str = "-1"
+    scene_caption_num_ctx: int = 4096
+    # A warm JoyCaption caption is seconds. The rest is room for the interim shared card,
+    # where the service holds a caption while an image edit has the card (an edit can take
+    # minutes) rather than refusing it.
+    scene_caption_timeout_s: int = 900
+    # After the scene service fails to answer, how long to send scene captions straight to the
+    # fallback instead of paying a connect timeout per caption.
+    scene_caption_down_s: float = 60.0
+    motion_caption_url: str = ""
+    motion_caption_model: str = ""
+    motion_caption_keep_alive: str = ""
+    motion_caption_num_ctx: int = 0
+    motion_caption_timeout_s: int = 0
     # The caption hold (console#562): how long a segment waits for its start image's caption
     # before it goes to caption_failed and asks the person what to do. Generous on purpose:
     # the wait includes the captioner being refused while the box beside it renders, and a

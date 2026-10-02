@@ -80,3 +80,27 @@ async def db(db_engine):
         await session.close()
         await transaction.rollback()
         await connection.close()
+
+
+# ---------------------------------------------------------------------------
+# The scene captioner (wanly-console#572)
+#
+# Its default URL is a real box (3090b.zero). A test that captions must never reach it, so
+# the split is OFF by default here: every caption goes to the one (mocked) captioner, which is
+# the pre-#572 behaviour most tests were written against. Tests of the split turn it on with
+# an address of their own.
+# ---------------------------------------------------------------------------
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _no_real_scene_captioner(monkeypatch):
+    from app import caption_queue
+    from app.config import settings
+    from app.joycaption import reset_scene_health
+    monkeypatch.setattr(settings, "scene_caption_url", "")
+    monkeypatch.setattr(caption_queue, "motion_queue", caption_queue.CaptionQueue())
+    reset_scene_health()
+    yield
+    reset_scene_health()

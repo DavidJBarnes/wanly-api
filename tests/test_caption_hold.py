@@ -90,8 +90,8 @@ def captioner(monkeypatch):
             scene=SCENE_WORDS, scene_instruction="i-scene",
             motion=MOTION_WORDS, motion_instruction="i-motion"))
         motion = AsyncMock(return_value=(MOTION_WORDS, "i-motion"))
-    monkeypatch.setattr("app.routes.captions.run_caption_pair", C.pair)
-    monkeypatch.setattr(caption_tickets, "describe_motion", C.motion)
+    from tests.caption_fakes import drive_halves_from
+    drive_halves_from(monkeypatch, C.pair, C.motion)
     monkeypatch.setattr("app.routes.captions._caption_base", AsyncMock(return_value="http://c"))
     monkeypatch.setattr(caption_hold.s3, "download_bytes", lambda uri: b"png-bytes")
     return C
@@ -444,12 +444,13 @@ class TestFailureIsLoud:
 
     async def test_a_busy_box_that_frees_up_is_captioned(
             self, db, shared_session, captioner, monkeypatch):
-        base = AsyncMock(side_effect=[CaptionerBusy("rendering"), "http://c"])
+        # Refused once; then the scene's base and the motion's base (two lanes, two asks).
+        base = AsyncMock(side_effect=[CaptionerBusy("rendering"), "http://c", "http://c"])
         monkeypatch.setattr("app.routes.captions._caption_base", base)
         seg = await _held(db, await _job(db))
         await asyncio.wait_for(caption_hold.ensure(IMG), 5)
         assert (await _fresh(db, seg)).status == SegmentStatus.PENDING
-        assert base.await_count == 2
+        assert base.await_count == 3
 
 
 # --- restart -------------------------------------------------------------------------------

@@ -170,5 +170,25 @@ class CaptionQueue:
         return out
 
 
-#: One queue per process, because there is one captioner.
+#: THE SCENE LANE. One queue per captioner, because each is one ollama slot. Named `queue`
+#: because it was the only one, and everything that is not a caption ticket's motion half --
+#: dataset captions, Settings tries, the scene half of every describe -- still stands in it.
 queue = CaptionQueue()
+
+#: THE MOTION LANE (wanly-console#572). The motion paragraph is made on a different, slower
+#: captioner (Qwen3-VL 32B against JoyCaption's seconds), so it waits in a line of its own: a
+#: ticket takes a turn here only after its scene is saved, and the next image's scene does
+#: not wait for this image's motion.
+motion_queue = CaptionQueue()
+
+SCENE_LANE = "scene"
+MOTION_LANE = "motion"
+
+
+def lanes() -> list[tuple[str, CaptionQueue]]:
+    """Both lanes, scene first. Read at call time: tests replace the module attributes."""
+    return [(SCENE_LANE, queue), (MOTION_LANE, motion_queue)]
+
+
+def total_depth() -> int:
+    return sum(q.depth() for _, q in lanes())

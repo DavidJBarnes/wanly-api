@@ -345,16 +345,18 @@ def hold_place(path: str) -> dict:
     note = _notes.get(path)
     if t is not None:
         v = tickets.view(t)
+        # The depth of the lane the ticket is in: a motion paragraph's place is in the motion
+        # lane (wanly-console#572), and "#1 of 1" beside a 9-deep scene lane would be wrong.
         return {"queue_status": v["status"], "queue_position": v["position"],
-                "queue_depth": depth, "note": note}
+                "queue_depth": v["depth"], "note": note, "lane": v.get("lane")}
     st = caption_queue.status(path)
     if st["status"] is not None and caption_queue.in_flight(path, kinds=WRITES_WORDS):
         return {"queue_status": st["status"], "queue_position": st["position"],
-                "queue_depth": depth, "note": note}
+                "queue_depth": depth, "note": note, "lane": "scene"}
     task = _waiters.get(path)
     alive = task is not None and not task.done()
     return {"queue_status": "waiting" if alive else None, "queue_position": None,
-            "queue_depth": depth, "note": note}
+            "queue_depth": depth, "note": note, "lane": None}
 
 
 def wait_note(path: str) -> str | None:
@@ -364,7 +366,8 @@ def wait_note(path: str) -> str | None:
     if place["queue_status"] == "running":
         where = "captioning now"
     elif place["queue_status"] == "queued" and place["queue_position"]:
-        where = f"#{place['queue_position']} of {place['queue_depth']} in the caption queue"
+        lane = "motion caption queue" if place.get("lane") == "motion" else "caption queue"
+        where = f"#{place['queue_position']} of {place['queue_depth']} in the {lane}"
     else:
         where = None
     parts = [p for p in (note, where) if p]
@@ -423,15 +426,9 @@ async def _hold(path: str) -> None:
                 if t.busy:
                     # The box beside the captioner is rendering. Not a failure -- the modal
                     # is refused the same way -- so wait it out, up to the limit.
-                    now = time.monotonic()
-                    busy_since = busy_since if busy_since is not None else now
-                    if now - busy_since >= settings.caption_hold_timeout_s:
-                        await fail(path, f"{_timed_out()} ({t.error})")
+                    busy_since = busy_since if busy_since is not None else time.monotonic()
+                    if not await _wait_out_refusal(path, t.error, busy_since):
                         return
-                    _notes[path] = f"the captioner is unavailable: {t.error}"
-                    logger.info("Caption hold: %s refused (%s); asking again in %ds",
-                                path, t.error, BUSY_RETRY_S)
-                    await asyncio.sleep(BUSY_RETRY_S)
                     continue
                 if own:
                     await fail(path, t.error or "the caption failed")
@@ -440,15 +437,23 @@ async def _hold(path: str) -> None:
                 logger.info("Caption hold: the caption %s was waiting on failed (%s); "
                             "asking for its own", path, t.error)
                 continue
-            busy_since = None
-
             if tickets.active(path) is not None:
                 # Another caption of the image was queued behind that one -- a re-roll. Its
                 # words are the ones about to be on the person's screen.
+                busy_since = None
                 continue
             left = await settle(path)
             if not left:
                 return
+            if MOTION in left and t.motion_busy:
+                # The scene was saved (and what needed only it is released); the motion
+                # captioner refused for a render. A refusal, not a failure: wait it out and
+                # ask for the motion alone (wanly-console#572).
+                busy_since = busy_since if busy_since is not None else time.monotonic()
+                if not await _wait_out_refusal(path, t.motion_error, busy_since):
+                    return
+                continue
+            busy_since = None
             if own:
                 if MOTION in left and t.motion_error:
                     reason = (f"the scene was described but the motion caption failed: "
@@ -467,6 +472,17 @@ async def _hold(path: str) -> None:
         await fail(path, f"{type(e).__name__}: {e}")
     finally:
         _notes.pop(path, None)
+
+
+async def _wait_out_refusal(path: str, why: str | None, busy_since: float) -> bool:
+    """Sleep BUSY_RETRY_S before asking again; False (and the hold failed) past the limit."""
+    if time.monotonic() - busy_since >= settings.caption_hold_timeout_s:
+        await fail(path, f"{_timed_out()} ({why})")
+        return False
+    _notes[path] = f"the captioner is unavailable: {why}"
+    logger.info("Caption hold: %s refused (%s); asking again in %ds", path, why, BUSY_RETRY_S)
+    await asyncio.sleep(BUSY_RETRY_S)
+    return True
 
 
 async def _settled(path: str) -> bool:

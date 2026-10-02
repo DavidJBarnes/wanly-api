@@ -570,7 +570,8 @@ async def _metas(db: AsyncSession, paths) -> dict:
 
 def _hold_detail(path: str | None, needs: list[str]) -> CaptionHoldDetail:
     place = caption_hold.hold_place(path) if path else {
-        "queue_status": None, "queue_position": None, "queue_depth": 0, "note": None}
+        "queue_status": None, "queue_position": None, "queue_depth": 0, "note": None,
+        "lane": None}
     return CaptionHoldDetail(image=path, needs=needs, **place)
 
 
@@ -617,6 +618,7 @@ def _annotate_held(job: Job, segments, seg_responses, metas: dict | None = None)
             sr.caption_queue_status = place["queue_status"]
             sr.caption_queue_position = place["queue_position"]
             sr.caption_queue_depth = place["queue_depth"]
+            sr.caption_queue_lane = place.get("lane")
     return state
 
 
@@ -634,7 +636,8 @@ def _held_detail_of(seg_responses) -> CaptionHoldDetail | None:
             return CaptionHoldDetail(
                 image=sr.caption_image, needs=sr.caption_needs or [],
                 queue_status=sr.caption_queue_status, queue_position=sr.caption_queue_position,
-                queue_depth=sr.caption_queue_depth or 0, note=sr.caption_wait)
+                queue_depth=sr.caption_queue_depth or 0, note=sr.caption_wait,
+                lane=sr.caption_queue_lane)
     return None
 
 
@@ -648,6 +651,7 @@ async def caption_hold_summary(db: AsyncSession = Depends(get_db)):
     in line, next-to-be-captioned first, so "is anything moving?" has an answer without
     opening each job.
     """
+    from app import caption_queue as cq
     from app.caption_queue import queue as caption_queue
 
     rows = await _held_rows(db, None, SEGMENT_HELD)
@@ -681,9 +685,11 @@ async def caption_hold_summary(db: AsyncSession = Depends(get_db)):
         segments_waiting=len(waiting),
         jobs_failed=len({r[0] for r in failed}),
         segments_failed=len(failed),
-        queue_depth=caption_queue.depth(),
-        queue_waiting=len(caption_queue.waiting_paths()),
+        queue_depth=cq.total_depth(),
+        queue_waiting=sum(len(q.waiting_paths()) for _, q in cq.lanes()),
         running=caption_queue.running_path(),
+        motion_queue_depth=cq.motion_queue.depth(),
+        motion_running=cq.motion_queue.running_path(),
         images=sorted(images.values(), key=order),
     )
 
