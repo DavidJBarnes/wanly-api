@@ -228,7 +228,7 @@ async def gate(db, prompt: str, image_uri: str | None) -> tuple[str, bool] | Non
         return None
     meta = await db.get(ImageMeta, image_uri)
     missing = needs - saved_halves(meta).keys()
-    running = caption_in_flight(image_uri)
+    running = caption_in_flight(image_uri, needs)
     if not missing and not running:
         return fill_saved(prompt, meta), False
     logger.info("Caption hold: holding a segment on %s until its %s %s saved%s",
@@ -238,14 +238,17 @@ async def gate(db, prompt: str, image_uri: str | None) -> tuple[str, bool] | Non
     return prompt, True
 
 
-def caption_in_flight(path: str) -> bool:
+def caption_in_flight(path: str, halves=None) -> bool:
     """Is a caption that will SAVE words on this image queued or running?
 
-    A caption ticket (app/caption_tickets.py), or -- for anything that takes a queue turn
-    without one -- a describe-kind turn. Dataset captions and Settings tries take turns too,
-    but write nothing on the image's row, so they are not worth waiting for.
+    A caption ticket (app/caption_tickets.py) of one of `halves` (default: either), or -- for
+    anything that takes a queue turn without one -- a describe-kind turn. Dataset captions and
+    Settings tries take turns too, but write nothing on the image's row, so they are not worth
+    waiting for. Per half since console#590: a motion re-roll in flight does not hold a
+    segment that only uses the scene.
     """
-    return tickets.active(path) is not None or caption_queue.in_flight(
+    halves = tuple(halves) if halves else tickets.HALVES
+    return any(tickets.active(path, h) is not None for h in halves) or caption_queue.in_flight(
         path, kinds=WRITES_WORDS)
 
 
@@ -257,12 +260,18 @@ WRITES_WORDS = frozenset({"describe", "hold"})
 # Release and failure
 # ---------------------------------------------------------------------------------------
 
-async def settle(path: str) -> set[str]:
+async def settle(path: str, finishing=None) -> set[str]:
     """Release every held segment on `path` whose halves are all saved.
 
     Returns the halves still outstanding across the ones left waiting; empty means nothing
     on this image is held any more (all released, or none were). One short session, rows
     locked so a Retry or Render-without on the same segment cannot interleave.
+
+    A segment one of whose halves a person is re-rolling right now is NOT released, though
+    its words are saved (gate()'s rule, per half since console#590): the re-rolled words are
+    the ones on the person's screen. Its hold waits for that re-roll. `finishing` is the
+    ticket calling this as it saves -- it is still in flight, but it is not a re-roll to wait
+    for any more.
     """
     async with async_session() as db:
         rows = (await db.execute(
@@ -276,12 +285,17 @@ async def settle(path: str) -> set[str]:
             return set()
         meta = await db.get(ImageMeta, path)
         have = saved_halves(meta).keys()
+        rerolling = {h for h in tickets.HALVES
+                     if tickets.active(path, h) is not finishing and _needs_now(path, h)}
         outstanding: set[str] = set()
         for s in rows:
-            missing = needed_halves(s.prompt) - have
+            needs = needed_halves(s.prompt)
+            missing = needs - have
             if missing:
                 outstanding |= missing
                 continue
+            if needs & rerolling:
+                continue  # its hold is waiting for the re-roll
             s.prompt = fill_saved(s.prompt, meta)
             s.status = SegmentStatus.PENDING
             s.error_message = None
@@ -340,7 +354,7 @@ def hold_place(path: str) -> dict:
     again (the box beside the captioner is rendering), or about to ask. None: no waiter at
     all -- the sweep gives it one within caption_hold_sweep_s.
     """
-    t = tickets.active(path)
+    t = tickets.active(path)  # the scene's first: the motion may be waiting on it
     depth = caption_queue.depth()
     note = _notes.get(path)
     if t is not None:
@@ -380,12 +394,47 @@ def missing_halves(prompt: str | None, meta: ImageMeta | None) -> list[str]:
     return [h for h in (SCENE, MOTION) if h in missing]
 
 
+async def held_jobs(path: str) -> tuple[set[str], dict[str, list[dict]]]:
+    """What the segments held on `path` use, and the jobs by the half each still needs:
+    ({half}, {half: [{"job_id", "name"}]}).
+
+    The jobs are what a caption ticket the hold asks for carries as `requested_by`, so the
+    image can say "Motion requested by job ..." (console#590) -- a motion caption nobody
+    clicked for.
+    """
+    async with async_session() as db:
+        rows = (await db.execute(
+            select(Segment.prompt, Job.id, Job.name)
+            .join(Job, Segment.job_id == Job.id)
+            .where(Segment.status == SegmentStatus.AWAITING_CAPTION,
+                   Segment.discarded.is_(False), _held_at(path))
+            .order_by(Segment.created_at)
+        )).all()
+        if not rows:
+            return set(), {}
+        meta = await db.get(ImageMeta, path)
+    have = saved_halves(meta).keys()
+    used: set[str] = set()
+    out: dict[str, list[dict]] = {}
+    for prompt, job_id, name in rows:
+        used |= needed_halves(prompt)
+        for half in needed_halves(prompt) - have:
+            jobs = out.setdefault(half, [])
+            if all(j["job_id"] != str(job_id) for j in jobs):
+                jobs.append({"job_id": str(job_id), "name": name})
+    return used, out
+
+
 async def _hold(path: str) -> None:
     """Get `path` its words and release what is held on it.
 
     Everything goes through caption tickets (app/caption_tickets.py), the same single-flight
     table describe uses, so "join the caption already running" and "make one" are the same
-    call: request() hands back the image's ticket if there is one.
+    call: request() hands back the image's ticket for that half if there is one. One ticket
+    PER HALF the held segments still need (console#590): a job missing only its motion asks
+    for the motion alone, and the scene a person already read is never re-made for it. A
+    motion ticket on an image with no scene asks for the scene itself (it cannot be grounded
+    on nothing).
 
     TIME LIMIT. caption_hold_timeout_s bounds how long the captioner may keep REFUSING (the
     box beside it rendering), counted from the first refusal in a row. It does not bound time
@@ -396,8 +445,8 @@ async def _hold(path: str) -> None:
     busy_since: float | None = None
     try:
         while True:
-            t = tickets.active(path)
-            if t is None and caption_queue.in_flight(path, kinds=WRITES_WORDS):
+            if tickets.active(path) is None and caption_queue.in_flight(
+                    path, kinds=WRITES_WORDS):
                 # A describe-kind turn that is not a ticket. Nothing in the API takes one any
                 # more, but joining is cheap and a second caption is what this exists to stop.
                 _notes[path] = "waiting for the caption already running for this image"
@@ -405,66 +454,69 @@ async def _hold(path: str) -> None:
                     await asyncio.sleep(JOIN_POLL_S)
                 continue
 
-            own = False
-            if t is None:
-                outstanding = await settle(path)
-                if not outstanding:
-                    return
-                mode = tickets.PAIR if SCENE in outstanding else tickets.MOTION
-                t, joined = tickets.request(path, mode=mode, origin="hold",
-                                            precheck=lambda: _settled(path))
-                own = not joined
-                _notes[path] = f"waiting for the {' and '.join(sorted(outstanding))}"
-            else:
+            used, jobs = await held_jobs(path)
+            if not used:
+                return  # nothing held here any more
+            # A person's re-roll of a half these segments use is waited for, never released
+            # ahead of (gate()'s rule): its words are about to be on the person's screen.
+            rerolls = [tickets.active(path, h) for h in (SCENE, MOTION)
+                       if h in used and _needs_now(path, h)]
+            if rerolls:
                 _notes[path] = "waiting for the caption already running for this image"
+                for t in rerolls:
+                    t.add_requesters(jobs.get(t.half))
+                await asyncio.gather(*(t.wait() for t in rerolls))
+                continue  # whatever happened to it, look again
 
-            await t.wait()
+            outstanding = await settle(path)
+            if not outstanding:
+                return
+            waits: list[tuple[str, tickets.Ticket, bool]] = []
+            for half in (SCENE, MOTION):
+                if half in outstanding:
+                    t, joined = tickets.request(
+                        path, half, origin="hold", precheck=_precheck(path, half),
+                        requested_by=jobs.get(half))
+                    waits.append((half, t, not joined))
+            _notes[path] = "waiting for the " + " and ".join(h for h, _, _ in waits)
 
-            if t.status == tickets.FAILED and t.withdrawn:
-                continue  # the sweep found the words already saved; settle and return
-            if t.status == tickets.FAILED:
+            await asyncio.gather(*(t.wait() for _, t, _ in waits))
+
+            refused: str | None = None
+            for half, t, own in waits:
+                if t.status != tickets.FAILED or t.withdrawn:
+                    continue
                 if t.busy:
                     # The box beside the captioner is rendering. Not a failure -- the modal
                     # is refused the same way -- so wait it out, up to the limit.
-                    busy_since = busy_since if busy_since is not None else time.monotonic()
-                    if not await _wait_out_refusal(path, t.error, busy_since):
-                        return
-                    continue
-                if own:
-                    await fail(path, t.error or "the caption failed")
+                    refused = refused or t.error
+                elif own:
+                    await fail(path, f"the {half} caption failed: {t.error or 'no reason given'}")
                     return
-                # Somebody else's caption of this image failed. Make our own.
-                logger.info("Caption hold: the caption %s was waiting on failed (%s); "
-                            "asking for its own", path, t.error)
+                else:
+                    # Somebody else's caption of this image failed. Make our own.
+                    logger.info("Caption hold: the %s caption %s was waiting on failed (%s); "
+                                "asking for its own", half, path, t.error)
+            if refused is not None:
+                busy_since = busy_since if busy_since is not None else time.monotonic()
+                if not await _wait_out_refusal(path, refused, busy_since):
+                    return
                 continue
-            if tickets.active(path) is not None:
-                # Another caption of the image was queued behind that one -- a re-roll. Its
+            busy_since = None
+            if any(tickets.active(path, h) is not None for h, _, _ in waits):
+                # Another caption of a half was queued behind that one -- a re-roll. Its
                 # words are the ones about to be on the person's screen.
-                busy_since = None
                 continue
             left = await settle(path)
             if not left:
                 return
-            if MOTION in left and t.motion_busy:
-                # The scene was saved (and what needed only it is released); the motion
-                # captioner refused for a render. A refusal, not a failure: wait it out and
-                # ask for the motion alone (wanly-console#572).
-                busy_since = busy_since if busy_since is not None else time.monotonic()
-                if not await _wait_out_refusal(path, t.motion_error, busy_since):
-                    return
-                continue
-            busy_since = None
-            if own:
-                if MOTION in left and t.motion_error:
-                    reason = (f"the scene was described but the motion caption failed: "
-                              f"{t.motion_error}")
-                else:
-                    reason = (f"the caption was made but its {' and '.join(sorted(left))} "
-                              "half is still missing")
-                await fail(path, reason)
+            mine = [h for h, t, own in waits
+                    if own and h in left and t.status == tickets.DONE and not t.skipped]
+            if mine:
+                await fail(path, f"the caption was made but its {' and '.join(mine)} half is "
+                                 "still missing")
                 return
-            # Somebody else's caption landed without the half we need (a motion failure on a
-            # modal describe): make that half ourselves.
+            # Somebody else's caption landed without the half we need: ask for it ourselves.
     except asyncio.CancelledError:
         raise
     except Exception as e:  # noqa: BLE001 - whatever it was, a person must hear about it
@@ -472,6 +524,13 @@ async def _hold(path: str) -> None:
         await fail(path, f"{type(e).__name__}: {e}")
     finally:
         _notes.pop(path, None)
+
+
+def _needs_now(path: str, half: str) -> bool:
+    """Does the ticket in flight for this half count as a re-roll the hold must wait for?
+    A person's (or one a describe joined); the hold's own does not."""
+    t = tickets.active(path, half)
+    return t is not None and (t.origin != "hold" or t.precheck is None)
 
 
 async def _wait_out_refusal(path: str, why: str | None, busy_since: float) -> bool:
@@ -485,10 +544,13 @@ async def _wait_out_refusal(path: str, why: str | None, busy_since: float) -> bo
     return True
 
 
-async def _settled(path: str) -> bool:
+def _precheck(path: str, half: str):
     """A hold ticket's precheck, at the front of the line: release what can be, and say
-    whether anything is still missing. Whatever was ahead of it may have been this image."""
-    return not await settle(path)
+    whether this half is no longer needed. Whatever was ahead of it may have been this
+    image."""
+    async def check() -> bool:
+        return half not in await settle(path)
+    return check
 
 
 def _timed_out() -> str:
@@ -553,9 +615,10 @@ async def sweep() -> int:
             continue
         if not outstanding:
             released += 1
-            t = tickets.active(path)
-            if t is not None and t.origin == "hold" and t.status == tickets.QUEUED:
-                tickets.withdraw(t, "nothing on this image needs a caption any more")
+            for half in tickets.HALVES:
+                t = tickets.active(path, half)
+                if t is not None and t.origin == "hold" and t.status == tickets.QUEUED:
+                    tickets.withdraw(t, "nothing on this image needs a caption any more")
             continue
         ensure(path)
     if released:
@@ -571,9 +634,8 @@ def _waits_on_a_reroll(path: str) -> bool:
     screen, which is gate()'s rule. The hold's OWN ticket does not count, unless a describe
     has joined it (which drops its precheck): then it is a re-roll too.
     """
-    t = tickets.active(path)
-    if t is not None:
-        return t.origin != "hold" or t.precheck is None
+    if any(tickets.active(path, h) is not None for h in tickets.HALVES):
+        return any(_needs_now(path, h) for h in tickets.HALVES)
     return caption_queue.in_flight(path, kinds=WRITES_WORDS)
 
 

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -35,6 +35,10 @@ class ImageSceneRequest(BaseModel):
     motion_style: Optional[str] = None
     # A motion TEMPLATE since console#555, validated like the saved setting.
     motion_instruction: Optional[MotionTemplate] = None
+    # Which halves to make (console#590): ["scene"] (what tagging does, and Redo scene),
+    # ["motion"] (Describe motion / Redo motion -- grounded on the saved scene) or both.
+    # Omitted or empty: both, as before, for a client that predates the split.
+    halves: Optional[list[Literal["scene", "motion"]]] = None
 
 
 class CaptionTryRequest(BaseModel):
@@ -73,8 +77,15 @@ class CaptionTryResponse(BaseModel):
     motion_instruction_used: Optional[str] = None
 
 
+class CaptionRequester(BaseModel):
+    """A held job a caption is being made for (console#590)."""
+    job_id: str
+    name: Optional[str] = None
+
+
 class CaptionTicket(BaseModel):
-    """One caption of one image, in the background (console#564, app/caption_tickets.py).
+    """One HALF of the caption of one image, in the background (console#564, #590;
+    app/caption_tickets.py).
 
     status: "queued" (position 1 = next up), "running" (position 0), "done" or "failed".
     Null status means no caption of the image is in flight or remembered.
@@ -85,23 +96,33 @@ class CaptionTicket(BaseModel):
     position: Optional[int] = None
     #: Everything unfinished in the caption queue, including the one in progress.
     depth: int = 0
-    #: "pair" (scene + motion) or "motion" (the paragraph alone, for a held job).
+    #: "scene" or "motion" (console#590): the half this ticket makes, and nothing else.
+    half: Optional[str] = None
+    #: The same as `half`. Was "pair"/"motion" before the halves were split.
     mode: Optional[str] = None
     #: Who asked first: "describe" or "hold".
     origin: Optional[str] = None
     error: Optional[str] = None
     #: Failed because the box beside the captioner is rendering -- try again later.
     busy: bool = False
-    #: Done, but the motion half failed: the scene was saved without it.
+    #: Always null since console#590 (a ticket is one half; a motion failure is the motion
+    #: ticket's own `error`). Kept for clients that read it.
     motion_error: Optional[str] = None
+    #: The held jobs this caption is for -- "Motion requested by job ..." (console#590).
+    requested_by: list[CaptionRequester] = []
     #: True when this request joined a caption already in flight instead of queueing one.
     joined: bool = False
     created_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
-    #: While unfinished, which caption lane it is in: "scene" then "motion" (console#572).
+    #: While unfinished, which caption lane it is in -- the half's own (console#572).
     #: `position` and `depth` are that lane's.
     lane: Optional[str] = None
+    #: POST /images/scene/describe: every half's ticket, scene first.
+    tickets: Optional[list["CaptionTicket"]] = None
+    #: GET /images/scene/status: each half's ticket (in flight, else the last finished).
+    scene: Optional["CaptionTicket"] = None
+    motion: Optional["CaptionTicket"] = None
 
 
 class CaptionQueueEntry(BaseModel):
@@ -113,8 +134,10 @@ class CaptionQueueEntry(BaseModel):
     #: Within its lane.
     position: int
     ticket_id: Optional[str] = None
-    #: "scene" or "motion" (wanly-console#572).
+    #: "scene" or "motion" (wanly-console#572). For a caption ticket, the half it makes.
     lane: str = "scene"
+    #: The held jobs a ticket is for (console#590); empty when a person asked.
+    requested_by: list[CaptionRequester] = []
 
 
 class CaptionLane(BaseModel):
@@ -186,5 +209,9 @@ class ImageSceneResponse(BaseModel):
     queue_position: Optional[int] = None
     queue_depth: int = 0
     # The image's caption ticket (console#564): the one in flight, else the last finished one
-    # still remembered. Null when there is neither.
+    # still remembered. Null when there is neither. Per half since console#590:
+    # scene_caption / motion_caption; `caption` is whichever is in flight (scene first), else
+    # the newer finish.
     caption: Optional[CaptionTicket] = None
+    scene_caption: Optional[CaptionTicket] = None
+    motion_caption: Optional[CaptionTicket] = None

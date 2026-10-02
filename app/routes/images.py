@@ -2,6 +2,7 @@ import asyncio
 import logging
 import re
 import uuid
+from typing import Literal, Optional
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, UploadFile
@@ -20,7 +21,7 @@ from app.database import async_session, get_db, release_connection
 from app.joycaption import CaptionError, CaptionerBusy
 from app.enums import TRAINING_TERMINAL
 from app.models import Dataset, Favorite, ImageMeta, Job, LtxCharacter, Segment, TrainingJob, User
-from app.routes.captions import ScenePair, caption_image_pair
+from app.routes.captions import caption_image_pair, caption_image_scene
 from app.schemas.images import (BulkImageTagsUpdate, CaptionLane, CaptionQueueEntry,
                                 CaptionQueueStatus,
                                 CaptionTicket, CaptionTryRequest, CaptionTryResponse,
@@ -683,7 +684,11 @@ def _split_tags(blob: str | None) -> list[str]:
 
 
 async def describe_untagged(db: AsyncSession, paths: list[str]) -> int:
-    """Describe each of `paths` that has no scene description yet, serially.
+    """Describe the SCENE of each of `paths` that has none yet, serially.
+
+    Scene only (console#590): the motion paragraph is minutes of the motion captioner, and
+    is made only when someone clicks Describe motion or a held job needs it -- tagging must
+    not spend one. A saved motion paragraph is left as it is.
 
     The captioning half of bulk tagging (api#340): tagging an image is the moment someone
     decided it was worth keeping, which is the rule console#414 built single-image
@@ -704,11 +709,11 @@ async def describe_untagged(db: AsyncSession, paths: list[str]) -> int:
         meta = await db.get(ImageMeta, path)
         if meta is None or (meta.scene_description or "").strip():
             continue  # row gone, or someone described it in the meantime
-        if caption_tickets.active(path) is not None:
-            continue  # a caption of it is already coming (console#564); a second would race it
+        if caption_tickets.active(path, caption_tickets.SCENE) is not None:
+            continue  # a scene of it is already coming (console#564); a second would race it
         try:
             image = await asyncio.to_thread(download_bytes, path)
-            pair = await caption_image_pair(db, image)
+            scene, instruction = await caption_image_scene(db, image)
         except CaptionerBusy as e:
             logger.info("auto-describe batch stopping at %s: %s", path, e)
             break
@@ -723,10 +728,10 @@ async def describe_untagged(db: AsyncSession, paths: list[str]) -> int:
             # problem, not the batch's.
             logger.exception("auto-describe could not read %s; skipping", path)
             continue
-        if not pair.scene.strip():
+        if not (scene or "").strip():
             logger.warning("auto-describe got an empty caption for %s; skipping", path)
             continue
-        _apply_scene_pair(meta, pair)
+        caption_tickets.apply_scene(meta, scene, instruction)
         await db.commit()
         described += 1
     return described
@@ -881,6 +886,9 @@ def _scene_response(path: str, meta: ImageMeta | None,
         motion_words=len(motion.split()) if motion else 0,
         motion_error=motion_error,
         caption=_ticket_response(path, caption_tickets.latest(path)),
+        scene_caption=_ticket_response(path, caption_tickets.latest(path, caption_tickets.SCENE)),
+        motion_caption=_ticket_response(path,
+                                        caption_tickets.latest(path, caption_tickets.MOTION)),
         **_queue_fields(path),
     )
 
@@ -911,24 +919,6 @@ def _ticket_response(path: str, t, joined: bool = False) -> CaptionTicket | None
     return CaptionTicket(path=path, joined=joined, **caption_tickets.view(t))
 
 
-def _apply_scene_pair(meta: ImageMeta, pair: ScenePair) -> None:
-    """Write one caption pair onto a row — the write half of POST /images/scene.
-
-    Extracted so the background task behind bulk tagging writes the same columns with the
-    same rules as the interactive endpoint: same provenance columns, same rule that both
-    halves come from one call (an absent motion half clears any previous one — motion
-    from an old session would pair, invisibly, with a static half from this one).
-    Callers own commit and the blank-caption refusal; this only writes.
-    """
-    now = datetime.now(timezone.utc)
-    meta.scene_description = pair.scene.strip()
-    meta.scene_instruction = pair.scene_instruction
-    meta.scene_described_at = now
-    meta.motion_description = (pair.motion or "").strip() or None
-    meta.motion_instruction = pair.motion_instruction
-    meta.motion_described_at = now if pair.motion else None
-
-
 def _describable_buckets() -> tuple[str, ...]:
     """Where a frame this API will describe may live.
 
@@ -946,6 +936,13 @@ def _require_known_bucket(path: str) -> None:
             status_code=400,
             detail="Path must be in the images bucket or the jobs bucket",
         )
+
+
+def _requesters(ticket_id: str | None) -> list[dict]:
+    """The held jobs a queued ticket is for, so the queue poll alone can say "Motion requested
+    by job ..." (console#590)."""
+    t = caption_tickets.get(ticket_id) if ticket_id else None
+    return [dict(r) for r in t.requested_by] if t is not None else []
 
 
 @router.get("/images/caption-queue", response_model=CaptionQueueStatus,
@@ -969,7 +966,8 @@ async def caption_queue_status():
         waiting=sum(len(q.waiting_paths()) for _, q in lanes),
         running=cq.queue.running_path(),
         entries=[CaptionQueueEntry(path=e["path"], kind=e["kind"], status=e["status"],
-                                   position=e["position"], ticket_id=e["token"], lane=name)
+                                   position=e["position"], ticket_id=e["token"], lane=name,
+                                   requested_by=_requesters(e["token"]))
                  for name, q in lanes for e in q.entries()],
         lanes=[CaptionLane(name=name, depth=q.depth(), waiting=len(q.waiting_paths()),
                            running=q.running_path()) for name, q in lanes],
@@ -992,7 +990,20 @@ async def get_image_scene(path: str = Query(...), db: AsyncSession = Depends(get
 
 def _describe_params(body: ImageSceneRequest | None) -> dict:
     body = body or ImageSceneRequest()
-    return {k: v for k, v in body.model_dump().items() if v is not None}
+    return {k: v for k, v in body.model_dump(exclude={"halves"}).items() if v is not None}
+
+
+def _halves(body: ImageSceneRequest | None) -> list[str]:
+    """The halves asked for, scene first. None (an old client) means both."""
+    asked = body.halves if body is not None and body.halves else list(caption_tickets.HALVES)
+    return [h for h in caption_tickets.HALVES if h in asked]
+
+
+def _request_halves(path: str, body: ImageSceneRequest | None):
+    """One ticket per half asked for: [(ticket, joined)], scene first."""
+    params = _describe_params(body)
+    return [caption_tickets.request(path, half, origin="describe", params=params)
+            for half in _halves(body)]
 
 
 @router.post("/images/scene/describe", response_model=CaptionTicket, status_code=202,
@@ -1009,33 +1020,50 @@ async def request_image_scene(
     GET /images/caption-queue) and fills the words in when the ticket is done. Navigating
     away, closing the tab or a phone going to sleep loses nothing.
 
-    ALWAYS regenerates, like POST /images/scene -- unless a caption of this image is already
+    PER HALF (console#590): `halves` is ["scene"], ["motion"] or both (the default, for old
+    clients). Each half is a ticket of its own, in its own lane, and saving one never clears
+    or overwrites the other -- so this one call is Describe, Describe motion, Redo scene,
+    Redo motion and each half's Retry. Motion is grounded on the SAVED scene (the one in
+    flight, when a scene is being made).
+
+    ALWAYS regenerates the halves asked for -- unless a caption of that half is already
     queued or running, in which case this IS that caption (joined=true). Two captions of one
-    image would write two different descriptions, and a held job might already be using the
+    half would write two different descriptions, and a held job might already be using the
     first (console#562).
+
+    The answer is the first half's ticket, with every half's in `tickets`.
     """
     _require_known_bucket(path)
     # Nothing here waits, but the auth lookup opened a transaction; give the connection back.
     await release_connection(db)
-    t, joined = caption_tickets.request(path, mode=caption_tickets.PAIR, origin="describe",
-                                        params=_describe_params(body))
-    return _ticket_response(path, t, joined=joined)
+    asked = _request_halves(path, body)
+    t, joined = asked[0]
+    out = _ticket_response(path, t, joined=joined)
+    out.tickets = [_ticket_response(path, tt, joined=j) for tt, j in asked]
+    return out
 
 
 @router.get("/images/scene/status", response_model=CaptionTicket,
             dependencies=[Depends(verify_api_key_or_bearer)])
-async def image_scene_status(path: str = Query(...)):
+async def image_scene_status(path: str = Query(...),
+                             half: Optional[Literal["scene", "motion"]] = Query(None)):
     """This image's caption ticket: queued (with position), running, done or failed.
+
+    `half` picks the scene's or the motion's (console#590). Without it: whichever is in
+    flight (the scene first), else the one that finished last. `scene` and `motion` carry
+    both halves either way.
 
     status null: nothing in flight and nothing remembered -- either never asked for, or
     finished long enough ago (or before a restart) that the saved words are the answer.
     No database: tickets live in this process.
     """
     _require_known_bucket(path)
-    t = caption_tickets.latest(path)
-    if t is None:
-        return CaptionTicket(path=path, **caption_tickets.view(None))
-    return _ticket_response(path, t)
+    t = caption_tickets.latest(path, half)
+    out = (CaptionTicket(path=path, **caption_tickets.view(None)) if t is None
+           else _ticket_response(path, t))
+    out.scene = _ticket_response(path, caption_tickets.latest(path, caption_tickets.SCENE))
+    out.motion = _ticket_response(path, caption_tickets.latest(path, caption_tickets.MOTION))
+    return out
 
 
 @router.get("/images/scene/tickets/{ticket_id}", response_model=CaptionTicket,
@@ -1070,16 +1098,25 @@ async def describe_image_scene(
     # WITHOUT A DATABASE CONNECTION while waiting (console#559): the auth lookup opened this
     # session's transaction, and the wait can be minutes behind other captions.
     await release_connection(db)
-    t, _ = caption_tickets.request(path, mode=caption_tickets.PAIR, origin="describe",
-                                   params=_describe_params(body))
-    await t.wait()
-    if t.status == caption_tickets.FAILED:
+    asked = _request_halves(path, body)
+    for t, _ in asked:
+        await t.wait()
+    by_half = {t.half: t for t, _ in asked}
+    first = asked[0][0]
+    scene = by_half.get(caption_tickets.SCENE)
+    hard = scene if scene is not None else first
+    if hard.status == caption_tickets.FAILED:
         # 404 for an image that cannot be read; 503 for the captioner, as /captions/describe
         # does -- it being down is a temporary condition on another host.
-        raise HTTPException(status_code=404 if t.unreadable else 503,
-                            detail=t.error or "the caption failed")
+        raise HTTPException(status_code=404 if hard.unreadable else 503,
+                            detail=hard.error or "the caption failed")
+    motion = by_half.get(caption_tickets.MOTION)
+    # A motion failure beside a saved scene is the old partial success, not an error.
+    motion_error = (motion.error or "the motion caption failed") if (
+        motion is not None and motion is not hard and motion.status == caption_tickets.FAILED
+    ) else None
     meta = await db.get(ImageMeta, path, populate_existing=True)
-    return _scene_response(path, meta, motion_error=t.motion_error)
+    return _scene_response(path, meta, motion_error=motion_error)
 
 
 @router.post("/images/scene/try", response_model=CaptionTryResponse,

@@ -156,6 +156,21 @@ async def caption_image_pair(db: AsyncSession, image: bytes,
                                   motion_instruction=motion_instruction)
 
 
+async def caption_image_scene(db: AsyncSession, image: bytes,
+                              interactive: bool = True) -> tuple[str, str]:
+    """The scene half alone, with the saved settings: (scene, instruction_used).
+
+    What tagging an image spends (console#590): the scene, never the motion paragraph -- that
+    is minutes of the motion captioner, and is made only on an explicit Describe motion or a
+    held job's need.
+    """
+    cfg = await _get_all_settings(db)
+
+    async def base_for() -> str:
+        return await _caption_base(db, interactive)
+    return await caption_scene(image, cfg, base_for)
+
+
 async def caption_scene(image: bytes, cfg: dict, fallback_base,
                         style: str | None = None,
                         instruction: str | None = None) -> tuple[str, str]:
