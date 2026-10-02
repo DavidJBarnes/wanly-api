@@ -515,9 +515,12 @@ def _settle_identity(row: LtxCharacter) -> None:
         renders with its FIRST MEMBER's (see segments._identity_ref_for);
       * `identity_mode` defaults to the sheet when there is one, else the face, and follows a
         reference that was removed rather than pointing at nothing;
-      * an explicit mode must name a reference the row actually has;
-      * a character is a LoRA or a reference: char_lora NULL with no reference is refused.
-        The database CHECKs (ck_ltx_characters_*) back this up; the 422 just says it first.
+      * an explicit mode must name a reference the row actually has (a database CHECK,
+        ck_ltx_characters_identity_mode, backs this up; the 422 just says it first).
+
+    A row with NEITHER a LoRA nor a reference is allowed: a DRAFT (wanly-console#592,
+    migration 110), so Build sheet has a character to make the first sheet for. A draft is
+    refused where it would render instead -- see segments._draft_refusal.
     """
     has_ref = bool(row.sheet_uri or row.face_ref_uri)
     if (row.kind or "solo") == "pair" and has_ref:
@@ -530,10 +533,6 @@ def _settle_identity(row: LtxCharacter) -> None:
         raise HTTPException(status_code=422, detail="identity_mode 'face' needs a face_ref_uri")
     if row.identity_mode is None and has_ref:
         row.identity_mode = "sheet" if row.sheet_uri else "face"
-    if row.char_lora is None and not has_ref:
-        raise HTTPException(status_code=422,
-                            detail="a character needs a LoRA or a character sheet / face "
-                                   "reference")
 
 
 @router.post("/ltx/characters", response_model=LtxCharacterResponse, status_code=201)
@@ -546,17 +545,26 @@ async def create_character(
 
     The registry is now where a run's trigger and gender come from, so registering is the
     first step of training somebody new rather than something the first publish does. The
-    LoRA defaults to "none" (render on the base model) until a run publishes one.
+    LoRA defaults to "none" (render on the base model) until a run publishes one. Sent with
+    no trigger as well, it is a DRAFT (wanly-console#592): no LoRA and no trigger, waiting for
+    Build sheet to give it a sheet, and refused by every render path until then.
 
     A PAIR's trigger and gender are DERIVED from its members, whatever the request said:
     the phrase must be exactly the prefix the composition captions will carry.
     """
     data = body.model_dump()
     has_ref = bool(body.sheet_uri or body.face_ref_uri)
+    # A DRAFT (wanly-console#592): no LoRA, no reference and no trigger -- a name (and maybe
+    # a gender) for Build sheet to make the first sheet for. Stored like the sheet-only
+    # character it is about to become: char_lora and trigger NULL, so the name never ends up
+    # filling <TRIGGER> as a word the model never learned. It cannot render until it has a
+    # sheet or a LoRA.
+    draft = (body.kind == "solo" and not body.char_lora and not has_ref
+             and not (body.trigger or "").strip())
     # SHEET-ONLY (wanly-console#581): a reference and no LoRA stores NULL, which says what it
-    # is. With neither, the row is a registration ahead of training (#352) and keeps "none",
-    # exactly as before.
-    data["char_lora"] = data.get("char_lora") or (None if has_ref else "none")
+    # is. With neither but a trigger, the row is a registration ahead of training (#352) and
+    # keeps "none", exactly as before.
+    data["char_lora"] = data.get("char_lora") or (None if has_ref or draft else "none")
     if body.kind == "pair":
         members = await _pair_members(db, body.members, body.name)
         data["members"] = [m.name for m in members]
@@ -571,8 +579,10 @@ async def create_character(
         # NOT for a sheet-only character: it has no caption to match, and its <TRIGGER> fills
         # from `description` (or is dropped) -- the name would put a word in every prompt
         # that means nothing to the model.
-        if data["char_lora"] is not None or not has_ref:
+        if data["char_lora"] is not None:
             data["trigger"] = data.get("trigger") or data["name"]
+        else:
+            data["trigger"] = (data.get("trigger") or "").strip() or None
     c = LtxCharacter(**data)
     _settle_identity(c)
     db.add(c)

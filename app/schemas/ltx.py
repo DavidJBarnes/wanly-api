@@ -35,6 +35,9 @@ class LtxCharacterCreate(BaseModel):
     and no LoRA is SHEET-ONLY: its char_lora is stored NULL rather than "none", it needs no
     trigger or strengths, and <TRIGGER> fills from `description`. `identity_mode` defaults to
     the sheet when there is one, else the face.
+
+    A DRAFT (wanly-console#592): no LoRA, no reference and no trigger. Stored with char_lora
+    and trigger NULL, so Build sheet can make its first sheet; it cannot render until then.
     """
     name: str = Field(min_length=1, max_length=64)
     #: Omitted or null: "none". Stored as "none" rather than NULL because every reader of
@@ -108,8 +111,9 @@ class LtxCharacterUpdate(BaseModel):
     kind: Optional[Literal["solo", "pair"]] = None
     members: Optional[List[str]] = Field(default=None, max_length=2)
     # The identity reference (migration 107). Sent as null, each clears. `char_lora: null`
-    # removes the LoRA outright -- allowed only while a reference remains (a character must
-    # be one or the other); "none" is still the way to detach and re-register (#352).
+    # removes the LoRA outright; with no reference left the character is a DRAFT
+    # (wanly-console#592), which cannot render. "none" is still the way to detach and
+    # re-register (#352).
     sheet_uri: Optional[S3Uri] = None
     face_ref_uri: Optional[S3Uri] = None
     identity_mode: Optional[IdentityMode] = None

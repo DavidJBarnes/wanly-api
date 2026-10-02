@@ -31,7 +31,7 @@ from app.model_requirements import (
     unsatisfied,
 )
 from app.routes.segments import (
-    _refuse_empty_submit, _resolve_trigger, _resolve_wildcards_outside_scene,
+    _refuse_draft_submit, _refuse_empty_submit, _resolve_trigger, _resolve_wildcards_outside_scene,
 )
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
 from app.tag_filter import like_escape, tag_clause
@@ -100,6 +100,8 @@ async def create_job(
     # Before the job row or the start frame's upload: a prompt that can only ever render as
     # nothing is refused outright (console#577).
     await _refuse_empty_submit(db, body.first_segment.prompt, body.first_segment.ltx_recipe)
+    # A draft character (no LoRA, no sheet) cannot be this person (wanly-console#592).
+    await _refuse_draft_submit(db, body.first_segment.ltx_recipe)
 
     # Drawn below 2**53, the largest integer JavaScript represents exactly.
     #
