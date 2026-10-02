@@ -352,10 +352,11 @@ class TestTheStandingBox:
         await _drain()
         assert job.worker == "3090b"
 
-    def test_there_is_no_always_on_worker_by_default(self):
-        """Which boxes carry image-edit is being re-planned; nothing is assumed meanwhile."""
+    def test_the_always_on_worker_defaults_to_3090b(self):
+        """3090b is the standing edit/sheet box (#572 option 1); a down box falls back to edit mode."""
         from app.config import Settings
-        assert Settings.model_fields["image_edit_standing_url"].default == ""
+        assert Settings.model_fields["image_edit_standing_url"].default == "http://2070.zero:8086"
+        assert Settings.model_fields["image_edit_standing_name"].default == ""
 
     async def test_faces_come_from_the_standing_box_when_it_is_up(self, monkeypatch):
         monkeypatch.setattr(settings, "image_edit_standing_url", "")
