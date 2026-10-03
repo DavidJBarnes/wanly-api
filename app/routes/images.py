@@ -19,11 +19,11 @@ from app.config import settings
 from app.routes.datasets import DATASETS_PREFIX
 from app.database import async_session, get_db, release_connection
 from app.joycaption import CaptionError, CaptionerBusy
-from app.enums import TRAINING_TERMINAL
+from app.enums import TRAINING_TERMINAL, JobStatus, SegmentStatus, TrainingStatus
 from app.models import Dataset, Favorite, ImageMeta, Job, LtxCharacter, Segment, TrainingJob, User
 from app.routes.captions import caption_image_pair, caption_image_scene
 from app.schemas.images import (BulkImageTagsUpdate, CaptionLane, CaptionQueueEntry,
-                                CaptionQueueStatus,
+                                CaptionQueueStatus, ImagesInUseRequest,
                                 CaptionTicket, CaptionTryRequest, CaptionTryResponse,
                                 ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate)
 from app.tag_filter import like_escape, normalise_tag
@@ -200,6 +200,136 @@ def _job_referenced_paths(refs: dict[str, dict[str, list[str]]]) -> set[str]:
     means output exists.
     """
     return {p for p, r in refs.items() if r["job_ids"] or r["segment_ids"]}
+
+
+# What a holder is doing with the image right now (console#594). The bulk-delete dialog splits
+# holders by whether a force delete would break something that is going to run:
+#
+#   queued -- waiting for, or on, a worker. Deleting the file fails it at claim time.
+#   held   -- parked, and will run again without anyone re-queueing it: a paused job, or a
+#             segment waiting on a caption. Same failure, just later.
+#   idle   -- finished, archived, failed or awaiting the next segment. Only a deliberate re-run
+#             would fetch the image again.
+#
+# Only queued and held count as "needed". Idle holders are still named -- a reroll of an
+# archived job's first segment 404s just the same -- but they are not the warning.
+_JOB_STATE = {
+    JobStatus.PENDING: "queued", JobStatus.PROCESSING: "queued",
+    JobStatus.PAUSED: "held",
+}
+_SEGMENT_STATE = {
+    SegmentStatus.PENDING: "queued", SegmentStatus.CLAIMED: "queued",
+    SegmentStatus.PROCESSING: "queued",
+    SegmentStatus.AWAITING_CAPTION: "held", SegmentStatus.CAPTION_FAILED: "held",
+}
+_TRAINING_STATE = {
+    TrainingStatus.PENDING: "queued", TrainingStatus.CLAIMED: "queued",
+    TrainingStatus.RUNNING: "queued",
+}
+
+
+async def describe_image_holders(db: AsyncSession, paths: list[str]) -> dict[str, dict]:
+    """find_image_references, plus what a person needs to decide: names and states.
+
+    The ids alone are what the single-image 409 has always returned, and a dialog listing
+    eight UUIDs per image is not something anyone can act on. This adds the dataset name, the
+    job name and status, each segment's job and index, and whether any holder still *needs*
+    the file (queued or held, see _JOB_STATE) -- the line between "a dataset keeps a dead
+    entry" and "a render that is queued will fail".
+
+    Read-only. One reference scan, then one lookup per holder table, whatever the path count.
+    """
+    refs = await find_image_references(db, paths)
+    if not refs:
+        return {}
+
+    job_ids = {i for r in refs.values() for i in r["job_ids"]}
+    seg_ids = {i for r in refs.values() for i in r["segment_ids"]}
+    train_ids = {i for r in refs.values() for i in r["training_ids"]}
+    ds_ids = {i for r in refs.values() for i in r["dataset_ids"]}
+
+    segments: dict[str, dict] = {}
+    if seg_ids:
+        rows = await db.execute(
+            select(Segment.id, Segment.job_id, Segment.index, Segment.status)
+            .where(Segment.id.in_([uuid.UUID(i) for i in seg_ids]))
+        )
+        for sid, jid, idx, status in rows.all():
+            segments[str(sid)] = {"id": str(sid), "job_id": str(jid), "index": idx,
+                                  "status": status,
+                                  "state": _SEGMENT_STATE.get(status, "idle")}
+
+    # A segment's job is looked up too, so the dialog can say "segment 3 of <job name>".
+    jobs: dict[str, dict] = {}
+    want_jobs = job_ids | {s["job_id"] for s in segments.values()}
+    if want_jobs:
+        rows = await db.execute(
+            select(Job.id, Job.name, Job.status)
+            .where(Job.id.in_([uuid.UUID(i) for i in want_jobs]))
+        )
+        for jid, name, status in rows.all():
+            jobs[str(jid)] = {"id": str(jid), "name": name, "status": status,
+                              "state": _JOB_STATE.get(status, "idle")}
+    for seg in segments.values():
+        seg["job_name"] = jobs.get(seg["job_id"], {}).get("name")
+
+    trainings: dict[str, dict] = {}
+    if train_ids:
+        rows = await db.execute(
+            select(TrainingJob.id, TrainingJob.character, TrainingJob.version,
+                   TrainingJob.status)
+            .where(TrainingJob.id.in_([uuid.UUID(i) for i in train_ids]))
+        )
+        for tid, character, version, status in rows.all():
+            trainings[str(tid)] = {"id": str(tid), "character": character,
+                                   "version": version, "status": status,
+                                   "state": _TRAINING_STATE.get(status, "idle")}
+
+    datasets: dict[str, dict] = {}
+    if ds_ids:
+        rows = await db.execute(
+            select(Dataset.id, Dataset.name)
+            .where(Dataset.id.in_([uuid.UUID(i) for i in ds_ids]))
+        )
+        for did, name in rows.all():
+            datasets[str(did)] = {"id": str(did), "name": name}
+
+    out: dict[str, dict] = {}
+    for path, r in refs.items():
+        held_jobs = [jobs[i] for i in r["job_ids"] if i in jobs]
+        held_segs = [segments[i] for i in r["segment_ids"] if i in segments]
+        held_train = [trainings[i] for i in r["training_ids"] if i in trainings]
+        out[path] = {
+            "job_ids": r["job_ids"],
+            "segment_ids": r["segment_ids"],
+            "training_ids": r["training_ids"],
+            "dataset_ids": r["dataset_ids"],
+            "jobs": held_jobs,
+            "segments": held_segs,
+            "trainings": held_train,
+            # A dataset deleted between the two reads simply drops out; its id stays above.
+            "datasets": [datasets[i] for i in r["dataset_ids"] if i in datasets],
+            "needed": any(h["state"] != "idle"
+                          for h in (*held_jobs, *held_segs, *held_train)),
+        }
+    return out
+
+
+@router.post("/images/in-use", dependencies=[Depends(get_current_user)])
+async def images_in_use(body: ImagesInUseRequest, db: AsyncSession = Depends(get_db)):
+    """The bulk-delete pre-check (console#594): which of these paths is still held, by what.
+
+    Bulk delete used to send a DELETE per image and count the 409s, so the person learned
+    only "M still in use" -- no names, no holders, no choice. This answers for the whole
+    selection in one call, before anything is deleted, with the same gate DELETE /images
+    applies (jobs, segments, archived jobs, live training runs, datasets).
+
+    Only held paths appear in `paths`; a path absent from it is free to delete. Read-only:
+    nothing is changed here, and the force decision stays with DELETE /images?force=true.
+    """
+    paths = list(dict.fromkeys(body.paths))
+    held = await describe_image_holders(db, paths)
+    return {"checked": len(paths), "in_use_count": len(held), "paths": held}
 
 
 @router.post("/images/upload", dependencies=[Depends(verify_api_key_or_bearer)])
@@ -569,6 +699,9 @@ async def delete_image(
                     "job_ids": refs[path]["job_ids"],
                     "segment_ids": refs[path]["segment_ids"],
                     "dataset_ids": refs[path]["dataset_ids"],
+                    # A live training run was always part of the gate but missing from the
+                    # body, so the console saw a 409 with no holders (console#594).
+                    "training_ids": refs[path]["training_ids"],
                 },
             )
     await _forget_images(db, [path])
