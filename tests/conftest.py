@@ -104,3 +104,27 @@ def _no_real_scene_captioner(monkeypatch):
     reset_scene_health()
     yield
     reset_scene_health()
+
+
+# ---------------------------------------------------------------------------
+# LoRA provenance (wanly-console#596)
+#
+# A PATCH that hits the trained-character lock now asks the LoRA's provenance whether the
+# change is a correction, which lists the LoRA bucket. A test must never reach S3 (and in CI,
+# with no credentials, boto3 would spend seconds failing), so the listing is empty unless a
+# test supplies one, and the header cache starts clean.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_real_lora_bucket(monkeypatch):
+    from app import lora_provenance
+    from app.routes import ltx_recipes
+
+    async def _empty():
+        return []
+
+    monkeypatch.setattr(ltx_recipes, "_lora_listing", _empty)
+    lora_provenance.clear_cache()
+    yield
+    lora_provenance.clear_cache()

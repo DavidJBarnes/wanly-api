@@ -27,6 +27,7 @@ from app.s3 import list_bucket
 from app.auth import get_current_user, verify_api_key_or_bearer
 from app.database import get_db
 from app.character_registry import has_trained, pair_phrase
+from app import lora_provenance
 from app.checkpoint_sources import CHECKPOINT_SOURCES
 from app.ltx_stack import LTX_STACK
 from app.models import LtxBook, LtxCharacter, LtxRecipe, User, Worker
@@ -377,6 +378,36 @@ async def list_available_loras():
     return out
 
 
+async def _lora_listing() -> list[dict]:
+    """The bucket listing for provenance. A listing failure degrades to "runs only" rather
+    than failing the request: the run lookup needs no S3 at all."""
+    try:
+        return await asyncio.to_thread(list_bucket, settings.s3_loras_bucket)
+    except Exception as e:  # noqa: BLE001 - logged; provenance falls back to training runs
+        logger.warning("LoRA bucket listing failed for provenance: %s", e)
+        return []
+
+
+@router.get("/loras/{name}/provenance")
+async def lora_provenance_route(
+    name: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """What a character LoRA trained on: {trigger, gender, source, run_id?, ...} (console#596).
+
+    `source` is "training_run" (the wanly run that wrote the file), "lora_metadata" (the
+    safetensors header of a LoRA trained elsewhere), or "none" -- a 200, not a 404, because
+    "nothing on record" is an answer the editor shows, not an error. The header is read with
+    two small ranged GETs and cached per file etag; the file itself is never downloaded.
+    See app/lora_provenance.py.
+    """
+    runs = await lora_provenance.load_runs(db)
+    listing = await _lora_listing()
+    p = await lora_provenance.provenance(name, runs, lora_provenance.lora_objects(listing))
+    return p.public()
+
+
 @router.post("/ltx/books", response_model=LtxBookResponse, status_code=201)
 async def create_book(
     body: LtxBookCreate,
@@ -595,6 +626,36 @@ async def create_character(
     return c
 
 
+@router.get("/ltx/characters/provenance-check")
+async def character_provenance_check(
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every character whose trigger or gender disagrees with how its LoRA trained.
+
+    One call for the whole Characters page (console#596): the bucket is listed once, runs
+    are loaded once, and headers come from the per-etag cache. Read-only -- fixing a row is
+    a PATCH the user confirms. Returns {characters: [{id, name, char_lora, provenance,
+    mismatches: [{field, stored, trained}]}]}, one entry per character with a LoRA,
+    mismatched or not, so the console can also show where each value came from.
+    """
+    rows = (await db.execute(select(LtxCharacter).order_by(LtxCharacter.name))).scalars().all()
+    runs = await lora_provenance.load_runs(db)
+    listing = await _lora_listing()
+    objects = lora_provenance.lora_objects(listing)
+    out = []
+    for c in rows:
+        lora = (c.char_lora or "").strip()
+        if not lora or lora.lower() == "none":
+            continue
+        p = await lora_provenance.provenance(lora, runs, objects)
+        out.append({"id": str(c.id), "name": c.name, "char_lora": lora,
+                    "provenance": p.public(),
+                    "mismatches": lora_provenance.mismatches(
+                        {"trigger": c.trigger, "gender": c.gender}, p)})
+    return {"characters": out}
+
+
 @router.get("/ltx/characters", response_model=list[LtxCharacterResponse])
 async def list_characters(
     user: User = Depends(get_current_user),
@@ -607,6 +668,28 @@ async def list_characters(
 #: What a trained character may no longer change. Each is part of the caption its LoRA
 #: learned (or, for a pair, of the phrase its composition captions carried).
 LOCKED_WHEN_TRAINED = ("trigger", "gender", "kind", "members")
+
+
+async def _matches_training(db: AsyncSession, data: dict, c: LtxCharacter,
+                            changing: list[str]) -> bool:
+    """Is this locked-field change a CORRECTION to what the LoRA actually trained on?
+
+    The lock exists so a row cannot drift away from its weights. A row that already has
+    drifted -- typed wrong before the lock, or registered by hand for a CLI LoRA -- must be
+    able to come back, and "Use trained values" (console#596) is exactly that: the new
+    trigger/gender equal the LoRA's provenance, so the change is allowed. Anything else
+    still needs the detach.
+    """
+    if not set(changing) <= {"trigger", "gender"}:
+        return False
+    lora = (data.get("char_lora") or c.char_lora or "").strip()
+    if not lora or lora.lower() == "none":
+        return False
+    runs = await lora_provenance.load_runs(db)
+    listing = await _lora_listing()
+    p = await lora_provenance.provenance(lora, runs, lora_provenance.lora_objects(listing))
+    trained = lora_provenance.trained_values(p)
+    return all(f in trained and (data[f] or None) == (trained[f] or None) for f in changing)
 
 
 @router.patch("/ltx/characters/{character_id}", response_model=LtxCharacterResponse)
@@ -637,7 +720,8 @@ async def update_character(
     data = body.model_dump(exclude_unset=True)
     changing = [k for k in LOCKED_WHEN_TRAINED if k in data and data[k] != getattr(c, k)]
     detaching = str(data.get("char_lora") or "").strip().lower() == "none"
-    if changing and has_trained(c) and not detaching:
+    if changing and has_trained(c) and not detaching \
+            and not await _matches_training(db, data, c, changing):
         raise HTTPException(
             status_code=409,
             detail=f"{c.name} has trained a LoRA against its current "
