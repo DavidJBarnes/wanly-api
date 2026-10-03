@@ -23,6 +23,17 @@ class BulkImageTagsUpdate(BaseModel):
     mode: str = Field("add", pattern="^(add|remove)$")
 
 
+class ImagesInUseRequest(BaseModel):
+    """Which of these images is something still holding? (console#594)
+
+    The bulk-delete pre-check: one call for the whole selection instead of a refused DELETE
+    per image. Capped so a runaway selection cannot turn into an unbounded IN list.
+    """
+
+    paths: list[str] = Field(..., min_length=1, max_length=2000,
+                             description="s3:// URIs in the images bucket")
+
+
 class ImageSceneRequest(BaseModel):
     """Describe this image now. Both "first description" and "re-roll" are this call.
 
