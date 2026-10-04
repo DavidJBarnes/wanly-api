@@ -54,6 +54,12 @@ MAX_PASSES_WARNING = 40
 #: How many final captions per group the preview shows.
 SAMPLE_CAPTIONS = 5
 
+#: SDXL START-IMAGE LoRAs (#398): the "aio" recipe the trainer reproduces. 8 repeats, and
+#: the base the aio LoRAs were trained on (BigaspV2Lustify, on the trainer's models mount
+#: under sdxl/). The trainer owns the rest of the recipe.
+SDXL_REPEATS = 8
+SDXL_BASE_CHECKPOINT = "BigaspV2Lustify"
+
 
 @dataclass
 class Group:
@@ -95,6 +101,9 @@ class Plan:
     members: list[LtxCharacter] = field(default_factory=list)
     steps: int = 0
     base_checkpoint: str = LTX_STACK["checkpoint"]
+    arch: str = "ltx"
+    #: The identity groups' repeats -- what one epoch shows each character image.
+    character_repeats: int = CHARACTER_REPEATS
 
     def problem(self, code: str, message: str) -> None:
         self.problems.append({"code": code, "message": message})
@@ -121,7 +130,7 @@ class Plan:
         spe = self.samples_per_epoch
         if not spe:
             return 0.0
-        return round(self.steps / spe * CHARACTER_REPEATS, 2)
+        return round(self.steps / spe * self.character_repeats, 2)
 
     def public(self) -> dict:
         return {
@@ -133,6 +142,7 @@ class Plan:
             "samples_per_epoch": self.samples_per_epoch,
             "passes_per_image": self.passes_per_image,
             "base_checkpoint": self.base_checkpoint,
+            "arch": self.arch,
         }
 
 
@@ -147,7 +157,14 @@ def _final_caption(prefix: str, body: str | None) -> str:
 
 
 def _captions_for(body: TrainingCreate, prefix: str, ds: Dataset) -> list[str]:
-    """Every image's final caption. trigger_only ignores the stored bodies entirely."""
+    """Every image's final caption. trigger_only ignores the stored bodies entirely.
+
+    SDXL (#398): the bare trigger. The trainer re-captions every image with WD14 tags at
+    stage time -- the stored bodies are qwen sentences written for LTX, and this base was
+    trained and is prompted in booru tags -- so this is a placeholder the preview shows, not
+    what trains."""
+    if body.arch == "sdxl":
+        return [prefix for _ in ds.images]
     if body.caption_mode == "trigger_only":
         return [prefix for _ in ds.images]
     return [_final_caption(prefix, (ds.captions or {}).get(u)) for u in ds.images]
@@ -159,11 +176,22 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
     Never raises for a bad configuration: a checklist that stops at the first failure makes
     somebody fix things one refusal at a time. Everything that can be checked is.
     """
-    plan = Plan(steps=body.steps)
+    plan = Plan(steps=body.steps, arch=body.arch)
+    sdxl = body.arch == "sdxl"
+    if sdxl:
+        plan.character_repeats = SDXL_REPEATS
+        plan.base_checkpoint = SDXL_BASE_CHECKPOINT
+        if body.mode != "solo":
+            plan.problem("sdxl_solo_only",
+                         "SDXL start-image LoRAs are solo only — train a pair as LTX")
+        plan.warn("sdxl_wd14",
+                  "SDXL: the trainer captions every image with WD14 tags (trigger first) "
+                  "and ignores the stored captions. No regularization; not published to the "
+                  "character — download it from the run.")
     if body.base_checkpoint:
         name = body.base_checkpoint.removesuffix(".safetensors")
         plan.base_checkpoint = name
-        if name != LTX_STACK["checkpoint"]:
+        if not sdxl and name != LTX_STACK["checkpoint"]:
             plan.warn("base_differs",
                       f"training against {name!r}; renders use {LTX_STACK['checkpoint']!r}. A "
                       f"LoRA fits the base it was trained on -- compare in the real pipeline.")
@@ -270,10 +298,11 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
             ds = own[0]
         if not _use(ds, m.name):
             continue
-        prefix = identity_phrase(m.trigger, m.gender)
+        # SDXL: the trigger alone leads the WD14 tags, as aio's captions did -- no gender word.
+        prefix = m.trigger if sdxl else identity_phrase(m.trigger, m.gender)
         g = Group(kind="identity", character=m.name, trigger=m.trigger, gender=m.gender,
                   dataset=ds, images=list(ds.images),
-                  captions=_captions_for(body, prefix, ds))
+                  captions=_captions_for(body, prefix, ds), num_repeats=plan.character_repeats)
         _check_character_set(plan, ds, body.allow_low_scores)
         plan.groups.append(g)
 
@@ -324,7 +353,10 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
     # ---- regularization, one pool per gender present
     genders = list(dict.fromkeys(m.gender for m in plan.members if m.gender))
     reg_groups: list[Group] = []
-    if not body.regularization:
+    if sdxl:
+        # aio had none, and the trainer's SDXL path takes one group. Said in sdxl_wd14.
+        genders = []
+    elif not body.regularization:
         plan.warn("no_regularization",
                   "no regularization pool: identity trains strongest this way, but "
                   + " and ".join(repr(g) for g in genders)
@@ -365,7 +397,8 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
         g.num_repeats = max(1, round(share / len(g.images))) if g.images else 1
     plan.groups.extend(reg_groups)
 
-    if plan.passes_per_image > MAX_PASSES_WARNING:
+    # Not for SDXL: aio's 12 epochs x 8 repeats is 96 passes, and is the recipe.
+    if not sdxl and plan.passes_per_image > MAX_PASSES_WARNING:
         plan.warn("passes_high",
                   f"{plan.passes_per_image:g} passes over each character image — above "
                   f"{MAX_PASSES_WARNING} a run is into memorising the set. Fewer steps?")

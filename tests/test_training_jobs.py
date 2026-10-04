@@ -1332,7 +1332,7 @@ class TestThePreflightOutput:
         await _world(db)
         out = await _preflight(db, **SOLO, steps=2000)
         assert set(out) == {"ok", "problems", "warnings", "groups", "steps",
-                            "samples_per_epoch", "passes_per_image", "base_checkpoint"}
+                            "samples_per_epoch", "passes_per_image", "base_checkpoint", "arch"}
         g = out["groups"][0]
         assert set(g) == {"kind", "character", "trigger", "gender", "dataset_id",
                           "dataset_name", "images", "num_repeats", "sample_captions"}
@@ -1985,3 +1985,81 @@ class TestARegisteredRunRetriesFromItsSnapshot:
         assert e.value.status_code == 422
         await db.refresh(job)
         assert job.status == TrainingStatus.FAILED
+
+
+SDXL = {**SOLO, "arch": "sdxl", "steps": 960}
+
+
+class TestSDXLStartImageLoras:
+    """#398: SDXL character LoRAs for the START IMAGES, trained by the same queue with the
+    hand-made "aio" recipe. Never an LTX character: the engine cannot load one."""
+
+    def test_absent_arch_is_ltx(self):
+        assert TrainingCreate(**SOLO).arch == "ltx"
+
+    async def test_the_plan_is_the_aio_shape(self, db):
+        await _world(db)
+        out = await _preflight(db, **SDXL)
+        assert out["ok"], out["problems"]
+        assert out["arch"] == "sdxl"
+        assert out["base_checkpoint"] == "BigaspV2Lustify"
+        # One group, 8 repeats, no regularization -- aio had none.
+        assert [(g["kind"], g["num_repeats"]) for g in out["groups"]] == [("identity", 8)]
+        # The trigger alone; the trainer's WD14 tags follow it.
+        assert set(out["groups"][0]["sample_captions"]) == {"d@vid"}
+        assert "sdxl_wd14" in {w["code"] for w in out["warnings"]}
+
+    async def test_aios_passes_are_not_warned_about(self, db):
+        """12 epochs x 8 repeats = 96 passes is the recipe, not a mistake."""
+        await _world(db)
+        out = await _preflight(db, **{**SDXL, "steps": 10 * 8 * 12})
+        assert out["passes_per_image"] == 96
+        assert "passes_high" not in {w["code"] for w in out["warnings"]}
+
+    async def test_a_pair_is_refused(self, db):
+        await _world(db)
+        assert "sdxl_solo_only" in _codes(await _preflight(db, **{**PAIR, "arch": "sdxl"}))
+
+    async def test_the_set_must_still_be_one_person(self, db):
+        """The anchor/score gates are about the dataset, not the model -- they still apply."""
+        w = await _world(db)
+        w["david"].anchor_uri = None
+        await db.flush()
+        assert "anchor_missing" in _codes(await _preflight(db, **SDXL))
+
+    async def test_create_snapshots_the_sdxl_recipe(self, db):
+        from app.routes.training import create_training_job
+        await _world(db)
+        job = await create_training_job(TrainingCreate(**SDXL), user=_U(), db=db)
+        c = job.config
+        assert c["arch"] == "sdxl"
+        assert (c["network_dim"], c["network_alpha"], c["learning_rate"],
+                c["text_encoder_lr"], c["num_repeats"]) == (128, 64, 8e-5, 2e-5, 8)
+        assert "lora_target_preset" not in c
+        assert c["base_checkpoint"] == "BigaspV2Lustify"
+        assert job.identities is None
+
+    def test_the_files_cannot_collide_with_an_ltx_lora(self):
+        """Workers flatten the prefix and skip BOTH files of a name under two prefixes, so a
+        shared basename would knock the LTX character out of every worker."""
+        from app.routes.training import _artifact_key, _belongs_to
+        ltx = _job(character="David", version=1, config={"lora_name": "David"})
+        sdxl = _job(character="David", version=1, config={"lora_name": "David", "arch": "sdxl"})
+        assert _artifact_key(sdxl, 3, False) == "character/sdxl/David_sdxl_v1_e03.safetensors"
+        assert _artifact_key(sdxl, None, True) == "character/sdxl/David_sdxl_v1_final.safetensors"
+        assert _artifact_key(sdxl, None, True).rsplit("/", 1)[1] != \
+            _artifact_key(ltx, None, True).rsplit("/", 1)[1]
+        assert _belongs_to(sdxl, "s3://ltx-loras/character/sdxl/David_sdxl_v1_e03.safetensors")
+        assert not _belongs_to(sdxl, "s3://ltx-loras/character/David_v1_e03.safetensors")
+
+    async def test_completing_never_touches_a_character_row(self, db):
+        from sqlalchemy import select
+        db.add(LtxCharacter(name="David", trigger="d@vid", gender="man", char_lora="david_v4"))
+        await db.flush()
+        j = _job(character="David", config={"arch": "sdxl", "mode": "solo"},
+                 output_lora_path="s3://ltx-loras/character/sdxl/David_sdxl_v1_final.safetensors")
+        await _publish_character(db, j)
+        await db.flush()
+        row = (await db.execute(select(LtxCharacter).where(
+            LtxCharacter.name == "David"))).scalar_one()
+        assert row.char_lora == "david_v4"
