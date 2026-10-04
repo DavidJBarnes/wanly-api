@@ -58,6 +58,16 @@ RECIPE_DEFAULTS = {
     "num_repeats": 10,
     "seed": 42,
 }
+#: SDXL (#398): the "aio" recipe, the values the trainer is told to use. Mirrors the
+#: trainer's SDXL_DEFAULTS; snapshotted for the same reason as the LTX set.
+SDXL_RECIPE_DEFAULTS = {
+    "network_dim": 128,
+    "network_alpha": 64,
+    "learning_rate": 8e-5,
+    "text_encoder_lr": 2e-5,
+    "num_repeats": 8,
+    "seed": 42,
+}
 
 
 def _default_lora_name(character: str) -> str:
@@ -128,7 +138,8 @@ async def create_training_job(
         trigger=g0.trigger,
         version=body.version,
         dataset_images=g0.images,
-        config={**RECIPE_DEFAULTS,
+        config={**(SDXL_RECIPE_DEFAULTS if body.arch == "sdxl" else RECIPE_DEFAULTS),
+                "arch": body.arch,
                 "seed": RECIPE_DEFAULTS["seed"] if body.seed is None else body.seed,
                 "steps": body.steps,
                 "num_repeats": g0.num_repeats,
@@ -451,6 +462,10 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
     """
     if not job.output_lora_path:
         return
+    if (job.config or {}).get("arch") == "sdxl":
+        # A START-IMAGE LoRA (#398). The LTX engine cannot load it, so pointing a character
+        # row at it would break every render of that character. It is downloaded from the run.
+        return
     if (job.config or {}).get("mode") in ("solo", "pair"):
         await _publish_registered(db, job)
         return
@@ -608,6 +623,14 @@ def _artifact_key(job: TrainingJob, epoch: int | None, final: bool) -> str:
     """
     stem = (job.config or {}).get("lora_name") or _default_lora_name(job.character)
     tag = "_final" if final else (f"_e{epoch:02d}" if epoch is not None else "")
+    if (job.config or {}).get("arch") == "sdxl":
+        # SDXL (#398): under character/ because that is all the API's role may write, in its
+        # own folder so the listing files it as kind "character/sdxl" -- which render
+        # workers do NOT sync eagerly (they take kind == "character") -- and with "_sdxl" IN
+        # THE NAME, because workers flatten the prefix away and skip BOTH files of a name
+        # that appears under two prefixes. Without it k3lly's SDXL v1 would knock her LTX v1
+        # out of every worker.
+        return f"character/sdxl/{stem}_sdxl_v{job.version}{tag}.safetensors"
     return f"character/{stem}_v{job.version}{tag}.safetensors"
 
 

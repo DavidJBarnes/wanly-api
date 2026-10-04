@@ -115,6 +115,12 @@ class TrainingCreate(BaseModel):
     #: Training seed. Default 42, as every run so far. Varying it with everything else fixed is
     #: how run-to-run noise is measured -- the floor any other comparison must clear.
     seed: int | None = Field(default=None, ge=0, le=2**31 - 1)
+    #: WHICH MODEL THE LoRA IS FOR (#398). "ltx" is the video LoRA every run before this was.
+    #: "sdxl" is a START-IMAGE LoRA for the SDXL generator David makes start images in
+    #: (A1111, outside Wanly): the hand-trained "aio" recipe, solo only, captioned by the
+    #: trainer's WD14 tagger rather than the stored bodies, and never published to a
+    #: character row -- the LTX engine cannot load it. Downloaded from the run instead.
+    arch: Literal["ltx", "sdxl"] = "ltx"
 
     @model_validator(mode="before")
     @classmethod
@@ -162,6 +168,8 @@ class TrainingPreflight(BaseModel):
     samples_per_epoch: int
     passes_per_image: float
     base_checkpoint: str
+    #: "ltx" or "sdxl" (#398) -- what the plan was resolved for.
+    arch: str = "ltx"
 
 
 class TrainingResponse(BaseModel):
