@@ -504,10 +504,16 @@ class TrainingJob(Base):
     __tablename__ = "training_jobs"
     __table_args__ = (
         Index("ix_training_jobs_status", "status"),
-        # One live run per character+version. A second attempt at v2 while the first is still
-        # going would train two LoRAs into the same output name and the second would win
-        # silently -- the same class of collision that made new_character.sh mix versions.
-        Index("uq_training_jobs_character_version_live", "character", "version",
+        # One live run per character+version PER ARCH. A second attempt at v2 while the first
+        # is still going would train two LoRAs into the same output name and the second would
+        # win silently -- the same class of collision that made new_character.sh mix versions.
+        #
+        # Per arch (wanly-api#402): an SDXL LoRA and an LTX LoRA are different models, not
+        # versions of each other, and nothing downstream can mix them -- run dirs (sdxl-vN /
+        # ltx23b-vN) and S3 keys (character/sdxl/..._sdxl_vN) are already apart. An absent
+        # config.arch is "ltx": every run before SDXL existed.
+        Index("uq_training_jobs_character_version_arch_live", "character", "version",
+              text("coalesce(config->>'arch', 'ltx')"),
               unique=True,
               postgresql_where=text("status NOT IN ('completed','failed','cancelled')")),
     )
@@ -815,3 +821,11 @@ class LtxRecipe(Base):
     def book_name(self) -> str | None:
         """The shelf's name, for the response. Eager-loaded (selectin) so async never lazy-loads."""
         return self.book.name if self.book is not None else None
+
+
+def training_arch():
+    """`coalesce(config->>'arch', 'ltx')` as a column expression: the arch a training row is
+    for, with every pre-SDXL row read as LTX. The same expression the live unique index is
+    built on, so a check written with it agrees with the database (wanly-api#402)."""
+    from sqlalchemy import func
+    return func.coalesce(TrainingJob.config["arch"].astext, "ltx")
