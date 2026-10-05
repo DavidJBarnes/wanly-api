@@ -7,7 +7,9 @@ from fastapi.responses import RedirectResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import get_current_user, verify_api_key, verify_api_key_or_token
+from app.auth import (
+    get_current_user, verify_api_key, verify_api_key_or_bearer, verify_api_key_or_token,
+)
 from app.config import settings
 from app.database import get_db
 from app.enums import JobStatus, SegmentStatus, VideoStatus
@@ -73,6 +75,35 @@ async def download_file(path: str):
         status_code=307,
         headers={"Cache-Control": "public, max-age=18000"},
     )
+
+
+#: generate_presigned_url's default lifetime, said out loud to the caller.
+PRESIGNED_TTL_S = 21600
+
+
+@router.get("/files/presigned", dependencies=[Depends(verify_api_key_or_bearer)])
+async def presigned_file_url(path: str):
+    """The presigned S3 URL /files would redirect to, as JSON (wanly-api#400).
+
+    For copying a download into a shell -- pulling a trained LoRA onto 3090b with curl. The
+    console's Download link carries the user's JWT in its query string (an <a href> cannot send
+    a header); pasted into a terminal, that is a long-lived login sitting in shell history. The
+    presigned URL is the same object, expires in six hours and carries no credential. Auth is
+    the header kind, so this is a fetch from the console, never a link.
+    """
+    if not path.startswith("s3://"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Path must be an S3 URI (s3://...)",
+        )
+    try:
+        url = await asyncio.to_thread(generate_presigned_url, path, PRESIGNED_TTL_S)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"File not found: {e}",
+        )
+    return {"url": url, "expires_in": PRESIGNED_TTL_S, "filename": path.rsplit("/", 1)[-1]}
 
 
 @router.post("/segments/{segment_id}/upload", response_model=SegmentResponse, dependencies=[Depends(verify_api_key)])
