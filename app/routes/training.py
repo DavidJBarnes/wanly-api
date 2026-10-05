@@ -203,12 +203,17 @@ def _group_row(g) -> dict:
             dependencies=[Depends(verify_api_key_or_bearer)])
 async def list_training_jobs(
     status: str | None = Query(None),
+    #: One character's runs, every arch (#404): the character card's versions table. Exact
+    #: name match -- TrainingJob.character is the registry name, not a foreign key.
+    character: str | None = Query(None, max_length=64),
     limit: int = Query(50, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
     q = select(TrainingJob).order_by(TrainingJob.created_at.desc()).limit(limit)
     if status:
         q = q.where(TrainingJob.status == status)
+    if character:
+        q = q.where(TrainingJob.character == character)
     return list((await db.execute(q)).scalars().all())
 
 

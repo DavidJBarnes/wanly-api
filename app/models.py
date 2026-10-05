@@ -680,6 +680,14 @@ class LtxCharacter(Base):
     # A few words that fill <TRIGGER> when there is no trigger ("a woman with auburn hair").
     # A LoRA character's trigger always wins: it is the caption the weights learned.
     description = mapped_column(String(255), nullable=True)
+    #: THE CHARACTER'S ICON (wanly-api#404, migration 112): the one image that stands for it
+    #: wherever it is shown or picked -- the Characters grid, every dropdown, the Training
+    #: page. Chosen by hand. NULL falls back (console-side) to image_uri / face_ref_uri /
+    #: sheet_uri, so every character has *something* before anyone picks.
+    icon_uri = mapped_column(Text, nullable=True)
+    #: HIDDEN (wanly-api#404): left out of every picker. Not deleted, not disabled -- it keeps
+    #: its runs, its LoRA and its place in any job that already uses it, and still renders.
+    hidden = mapped_column(Boolean, nullable=False, default=False, server_default=text("false"))
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
     # There is NO cascade to recipes: `ltx_recipes` has no character_id and no relationship

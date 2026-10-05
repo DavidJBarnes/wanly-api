@@ -269,6 +269,12 @@ async def get_recipe_book(
                 "face_ref_uri": c.face_ref_uri,
                 "identity_mode": c.identity_mode,
                 "description": c.description,
+                #: The icon, the image it falls back to, and whether pickers offer it
+                #: (wanly-api#404). Hidden characters are listed -- the Characters page and
+                #: any job already using one need them -- and every picker filters.
+                "icon_uri": c.icon_uri,
+                "image_uri": c.image_uri,
+                "hidden": bool(c.hidden),
             }
             for c in chars
         ],
@@ -718,6 +724,9 @@ async def update_character(
     """
     c = await _character(db, character_id)
     data = body.model_dump(exclude_unset=True)
+    # `hidden: null` means "leave it" -- the column is NOT NULL, and there is nothing to clear.
+    if data.get("hidden", False) is None:
+        data.pop("hidden")
     changing = [k for k in LOCKED_WHEN_TRAINED if k in data and data[k] != getattr(c, k)]
     detaching = str(data.get("char_lora") or "").strip().lower() == "none"
     if changing and has_trained(c) and not detaching \

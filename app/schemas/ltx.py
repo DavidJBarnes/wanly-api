@@ -58,6 +58,9 @@ class LtxCharacterCreate(BaseModel):
     face_ref_uri: Optional[S3Uri] = None
     identity_mode: Optional[IdentityMode] = None
     description: Optional[str] = Field(default=None, max_length=255)
+    #: The character's icon (#404). Null: the console falls back to image/face/sheet.
+    icon_uri: Optional[S3Uri] = None
+    hidden: bool = False
 
 
 class LtxCharacterResponse(BaseModel):
@@ -85,6 +88,8 @@ class LtxCharacterResponse(BaseModel):
     face_ref_uri: Optional[str] = None
     identity_mode: Optional[str] = None
     description: Optional[str] = None
+    icon_uri: Optional[str] = None
+    hidden: bool = False
 
 
 class LtxCharacterUpdate(BaseModel):
@@ -118,6 +123,10 @@ class LtxCharacterUpdate(BaseModel):
     face_ref_uri: Optional[S3Uri] = None
     identity_mode: Optional[IdentityMode] = None
     description: Optional[str] = Field(default=None, max_length=255)
+    #: Sent as null, it clears back to the fallback image (#404).
+    icon_uri: Optional[S3Uri] = None
+    #: Hide from / return to the pickers (#404). Null means "leave it", never "clear".
+    hidden: Optional[bool] = None
 
 
 class LtxBookCreate(BaseModel):
