@@ -2063,3 +2063,42 @@ class TestSDXLStartImageLoras:
         row = (await db.execute(select(LtxCharacter).where(
             LtxCharacter.name == "David"))).scalar_one()
         assert row.char_lora == "david_v4"
+
+
+class TestVersionsArePerArch:
+    """#402: KimJule's SDXL v1 training must not block her LTX v1 -- different models, kept
+    apart everywhere downstream. Same arch still collides, as it always has."""
+
+    async def _live(self, db, arch):
+        cfg = {"arch": arch} if arch else {}
+        j = _job(character="David", version=1, status=TrainingStatus.RUNNING, config=cfg)
+        db.add(j)
+        await db.flush()
+        return j
+
+    async def test_a_live_sdxl_v1_leaves_ltx_v1_free(self, db):
+        await _world(db)
+        await self._live(db, "sdxl")
+        assert "version_taken" not in _codes(await _preflight(db, **{**SOLO, "version": 1}))
+
+    async def test_a_live_ltx_v1_leaves_sdxl_v1_free(self, db):
+        await _world(db)
+        await self._live(db, None)          # pre-SDXL row: no arch = LTX
+        assert "version_taken" not in _codes(
+            await _preflight(db, **{**SOLO, "arch": "sdxl", "version": 1}))
+
+    async def test_same_arch_still_collides(self, db):
+        await _world(db)
+        await self._live(db, "sdxl")
+        out = await _preflight(db, **{**SOLO, "arch": "sdxl", "version": 1})
+        assert "version_taken" in _codes(out)
+        assert any("SDXL v1" in p["message"] for p in out["problems"])
+
+    async def test_the_database_allows_one_live_run_per_arch(self, db):
+        """The unique index, not just the preflight: both arches live at v1 is fine, a second
+        live LTX v1 is not -- including when one row predates config.arch."""
+        from sqlalchemy.exc import IntegrityError
+        await self._live(db, "sdxl")
+        await self._live(db, None)
+        with pytest.raises(IntegrityError):
+            await self._live(db, "ltx")

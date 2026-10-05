@@ -29,7 +29,7 @@ from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
 from app.config import settings
 from app.database import get_db
 from app.enums import TRAINING_TERMINAL, TrainingStatus, WorkerKind, worker_can
-from app.models import Dataset, LtxCharacter, TrainingJob, User, Worker
+from app.models import Dataset, LtxCharacter, TrainingJob, User, Worker, training_arch
 from app.character_registry import identity_phrase
 from app.schemas.training import (
     MIN_DATASET_IMAGES, TrainingClaimResponse, TrainingCreate, TrainingNotes,
@@ -1036,6 +1036,8 @@ async def retry_training_job(
         select(TrainingJob).where(
             TrainingJob.character == job.character,
             TrainingJob.version == job.version,
+            # Per arch (#402), as the live unique index is.
+            training_arch() == ((job.config or {}).get("arch") or "ltx"),
             TrainingJob.id != job.id,
             TrainingJob.status.not_in(list(TRAINING_TERMINAL)),
         )

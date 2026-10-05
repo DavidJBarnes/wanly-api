@@ -35,7 +35,7 @@ from app.character_registry import identity_phrase
 from app.config import settings
 from app.enums import TRAINING_TERMINAL
 from app.ltx_stack import LTX_STACK
-from app.models import Dataset, LtxCharacter, TrainingJob
+from app.models import Dataset, LtxCharacter, TrainingJob, training_arch
 from app.schemas.training import MAX_DATASET_IMAGES, MIN_DATASET_IMAGES, TrainingCreate
 
 #: Repeats for every identity and composition group: the trainer's long-standing default,
@@ -403,13 +403,16 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
                   f"{plan.passes_per_image:g} passes over each character image — above "
                   f"{MAX_PASSES_WARNING} a run is into memorising the set. Fewer steps?")
 
+    # PER ARCH (#402): KimJule's SDXL v1 training does not take LTX v1 -- different models,
+    # different run dirs and files. Same expression as the live unique index.
     dupe = (await db.execute(select(TrainingJob).where(
         TrainingJob.character == body.character, TrainingJob.version == body.version,
+        training_arch() == body.arch,
         TrainingJob.status.not_in(list(TRAINING_TERMINAL))))).scalars().first()
     if dupe:
         plan.problem("version_taken",
-                     f"{body.character} v{body.version} is already {dupe.status} — cancel it, "
-                     f"or pick another version")
+                     f"{body.character} {body.arch.upper()} v{body.version} is already "
+                     f"{dupe.status} — cancel it, or pick another version")
     return plan
 
 
