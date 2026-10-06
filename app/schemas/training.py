@@ -148,7 +148,8 @@ class TrainingProblem(BaseModel):
 class TrainingPlanGroup(BaseModel):
     """One group as the preflight shows it. `sample_captions` are FINAL captions, prefix
     included, exactly as the trainer will write them."""
-    kind: Literal["identity", "composition", "regularization"]
+    #: "clip" (#411): a member's video clips, trained as video beside its stills.
+    kind: Literal["identity", "composition", "regularization", "clip"]
     character: str | None = None
     trigger: str | None = None
     gender: str | None = None
@@ -156,6 +157,8 @@ class TrainingPlanGroup(BaseModel):
     dataset_name: str | None = None
     images: int
     num_repeats: int
+    #: Samples per item per repeat: 3 for a clip group's windows (#411), 1 otherwise.
+    windows: int = 1
     sample_captions: list[str]
 
 

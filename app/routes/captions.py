@@ -112,6 +112,17 @@ async def caption_image_bytes(db: AsyncSession, image: bytes,
     return await describe_scene(image, instruction, fallback_base), instruction
 
 
+async def caption_clip_sheet(db: AsyncSession, sheet: bytes, instruction: str) -> str:
+    """Caption a clip's contact sheet (wanly-api#411) on the MOTION captioner.
+
+    Never the scene captioner: JoyCaption describes one photograph, and a 2x2 grid reads to it
+    as four photographs. Qwen3-VL reads the grid as moments in order, which is the only reason
+    to send a sheet. Same render gate and fallback as any motion caption.
+    """
+    base = await _caption_base(db, True)
+    return await describe(sheet, instruction, base_url=base)
+
+
 @dataclass
 class ScenePair:
     """What one describe call produced. Motion None + error set is a partial success.
