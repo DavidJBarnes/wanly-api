@@ -211,7 +211,8 @@ class TestCropping:
         """A training job may still record the first batch's keys."""
         import inspect
         from app.routes import datasets as mod
-        assert 'faces-{uuid.uuid4().hex[:6]}' in inspect.getsource(mod.crop_faces)
+        # A fresh suffix per batch, whatever the framing calls it (#409).
+        assert '{kind}-{uuid.uuid4().hex[:6]}' in inspect.getsource(mod.crop_faces)
 
     def test_the_anchor_is_cleared_because_it_was_a_photograph(self):
         import inspect
@@ -306,10 +307,14 @@ class _CropResp:
 
     def json(self):
         # One face per image submitted, which is what a solo-face dataset produces.
-        return {"faces": [{"source_index": i, "face_index": 0,
-                           "png_b64": b"eA==", "format": "jpeg"}
-                          for i in range(self.n)],
-                "no_face": []}
+        out = {"faces": [{"source_index": i, "face_index": 0,
+                          "png_b64": b"eA==", "format": "jpeg"}
+                         for i in range(self.n)],
+               "no_face": []}
+        # A service that knows framing echoes it (#409); `old_service` is one that predates it.
+        if not getattr(_crop_client, "old_service", False):
+            out["framing"] = getattr(self, "framing", "face")
+        return out
 
 
 def _crop_client(n_images_seen_by_service):
@@ -327,6 +332,7 @@ def _crop_client(n_images_seen_by_service):
             _crop_client.last_payload = json
             r = _CropResp()
             r.n = len(json["images"])
+            r.framing = json.get("framing", "face")
             return r
 
     return _Client
@@ -355,7 +361,7 @@ class TestCropSelectionOverTheWire:
         await db.flush()
         return d
 
-    async def _crop(self, db, monkeypatch, ds, query=None):
+    async def _crop(self, db, monkeypatch, ds, query=None, extra=""):
         from app.auth import get_current_user
         from app.config import settings
         from app.database import get_db
@@ -373,6 +379,8 @@ class TestCropSelectionOverTheWire:
             async with AsyncClient(transport=ASGITransport(app=app),
                                    base_url="http://test") as c:
                 q = "" if query is None else "?" + "&".join(f"uris={u}" for u in query)
+                if extra:
+                    q += ("&" if q else "?") + extra
                 resp = await c.post(f"/datasets/{ds.id}/crop{q}",
                                     content=None,
                                     headers={"Content-Type": "application/json"})
@@ -409,6 +417,42 @@ class TestCropSelectionOverTheWire:
         assert "1 selected images" in resp.json()["notes"]
         resp, _ = await self._crop(db, monkeypatch, ds)
         assert "every image" in resp.json()["notes"]
+
+    async def test_the_default_framing_is_the_face_crop(self, db, monkeypatch):
+        """#409: absent means face -- every caller that predates framing keeps its crop."""
+        resp, _ = await self._crop(db, monkeypatch, await self._ds(db))
+        assert resp.status_code == 200, resp.text
+        assert _crop_client.last_payload["framing"] == "face"
+        assert all("/faces-" in u for u in resp.json()["images"] if u not in self.IMGS)
+
+    async def test_head_and_shoulders_is_passed_through_and_filed_as_portraits(self, db,
+                                                                             monkeypatch):
+        resp, _ = await self._crop(db, monkeypatch, await self._ds(db),
+                                   extra="framing=head_shoulders")
+        assert resp.status_code == 200, resp.text
+        assert _crop_client.last_payload["framing"] == "head_shoulders"
+        crops = [u for u in resp.json()["images"] if u not in self.IMGS]
+        assert crops and all("/portraits-" in u for u in crops)
+        assert "head-and-shoulders crops" in resp.json()["notes"]
+
+    async def test_an_older_service_cannot_pass_off_face_crops_as_portraits(self, db,
+                                                                          monkeypatch):
+        """It ignores `framing` and sends face crops. Stored, the set would silently be the
+        wrong framing; refused, nothing changes."""
+        ds = await self._ds(db)
+        monkeypatch.setattr(_crop_client, "old_service", True, raising=False)
+        resp, _ = await self._crop(db, monkeypatch, ds, extra="framing=head_shoulders")
+        assert resp.status_code == 503
+        assert "does not support" in resp.json()["detail"]
+        await db.refresh(ds)
+        assert ds.images == self.IMGS
+        # The old service is still fine for what it does support.
+        resp, _ = await self._crop(db, monkeypatch, ds)
+        assert resp.status_code == 200, resp.text
+
+    async def test_an_unknown_framing_is_a_422(self, db, monkeypatch):
+        resp, _ = await self._crop(db, monkeypatch, await self._ds(db), extra="framing=body")
+        assert resp.status_code == 422
 
     async def test_a_selection_of_only_stale_uris_refuses_rather_than_cropping_all(self, db,
                                                                                    monkeypatch):

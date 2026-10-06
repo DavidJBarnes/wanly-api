@@ -14,6 +14,7 @@ import base64
 import logging
 import uuid
 from datetime import datetime, timezone
+from typing import Literal
 
 import random
 
@@ -577,6 +578,7 @@ async def crop_faces(
     # ran on the whole set no matter what was selected (api#336).
     uris: list[str] | None = Query(None),
     save_as: bool = False,
+    framing: Literal["face", "head_shoulders"] = "face",
     _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -609,6 +611,11 @@ async def crop_faces(
     `largest_only` DEFAULTS FALSE: KEEP EVERY FACE. In a photo of two people "largest" is
     whoever stood closer to the camera. An unwanted crop is one click to remove; a missing
     one is a re-run.
+
+    `framing` (#409): "face" is the tight square crop, as always; "head_shoulders" is a 4:5
+    portrait from just above the hairline to the upper chest. A face-crop service that predates
+    it ignores the field and sends face crops, so a head-and-shoulders request whose response
+    does not echo the framing is refused rather than stored as the wrong thing.
     """
     ds = await db.get(Dataset, dataset_id)
     if not ds:
@@ -637,6 +644,7 @@ async def crop_faces(
         "images": [base64.b64encode(b).decode() for b in blobs],
         "reference": [],
         "largest_only": largest_only,
+        "framing": framing,
     }
     async with httpx.AsyncClient(timeout=settings.face_crop_timeout_s) as client:
         try:
@@ -645,6 +653,11 @@ async def crop_faces(
         except httpx.HTTPError as e:
             raise HTTPException(status_code=503, detail=f"face-crop unreachable: {e}") from e
     result = r.json()
+    if result.get("framing", "face") != framing:
+        raise HTTPException(
+            status_code=503,
+            detail=f"the face-crop service does not support {framing!r} crops yet — it needs "
+                   f"the worker image updated (wanly-gpu-docker#187)")
     faces = result["faces"]
     if not faces:
         raise HTTPException(status_code=422, detail="no faces were detected in any image")
@@ -659,7 +672,9 @@ async def crop_faces(
     # overwrite the first batch's files while a training job still records them. save_as does
     # NOT mean overwrite the originals with the crop: a URI a finished training job's
     # dataset_images points at must keep meaning the photograph it was created with.
-    batch = f"{ds.prefix}/faces-{uuid.uuid4().hex[:6]}"
+    # Head-and-shoulders batches say so in the bucket (#409).
+    kind = "portraits" if framing == "head_shoulders" else "faces"
+    batch = f"{ds.prefix}/{kind}-{uuid.uuid4().hex[:6]}"
 
     # Uploaded concurrently, for the same reason the fetch is: independent, network-bound, and
     # serial round trips are the whole cost.
@@ -675,7 +690,8 @@ async def crop_faces(
     scope = "every image" if uris is None else f"{len(targets)} selected images"
     crop_uris = list(await asyncio.gather(*(put(i, f) for i, f in enumerate(faces))))
     no_face = len(result.get("no_face", []))
-    note = (f"Cropped {len(faces)} faces from {scope} "
+    what = "head-and-shoulders crops" if framing == "head_shoulders" else "faces"
+    note = (f"Cropped {len(faces)} {what} from {scope} "
             f"({'largest only' if largest_only else 'every face'})"
             + (f", {no_face} with none detected" if no_face else "")
             + ("; the set kept its photos and the crops joined it" if save_as else "") + ".")
