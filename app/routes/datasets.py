@@ -29,7 +29,8 @@ from app.auth import get_current_user, verify_api_key_or_bearer
 from app.config import settings
 from app.database import async_session, get_db, release_connection
 from app.enums import JobStatus, SegmentStatus, TrainingStatus
-from app.joycaption import TRAINING_CAPTION, CaptionError
+from app import clips
+from app.joycaption import TRAINING_CAPTION, TRAINING_MOTION_CAPTION, CaptionError
 from app.models import Dataset, Job, LtxCharacter, Segment, TrainingJob, User
 from app.ltx_stack import LTX_STACK
 from app.regularization import (
@@ -312,6 +313,18 @@ async def update_dataset(
     if (_is_locked(ds, trained_by) and body.images is not None
             and list(body.images) != list(ds.images)):
         raise HTTPException(status_code=409, detail=_lock_detail(ds, trained_by))
+    # A CLIP ARRIVES ONLY THROUGH UPLOAD (#411), which normalizes it. One added by URI -- from
+    # the Image Repo, say -- would be whatever fps, size and length it was rendered at, with its
+    # audio, and could be too short for the trainer to cut a single window from. A clip already
+    # under datasets/ came through an upload (another set's, or a clone), so it may move.
+    if body.images is not None:
+        foreign = [u for u in body.images if clips.is_clip(u) and u not in ds.images
+                   and f"/{DATASETS_PREFIX}/" not in u]
+        if foreign:
+            raise HTTPException(
+                status_code=422,
+                detail=f"{len(foreign)} clip(s) can't be added from the repo — upload clips "
+                       f"with Add images or clips, so they are converted for training")
     if body.name is not None and body.name != ds.name:
         dupe = (await db.execute(
             select(Dataset).where(Dataset.name == body.name, Dataset.id != ds.id)
@@ -371,7 +384,14 @@ async def add_images(
     _user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Upload images into a dataset. Many at once, because a dataset is 13-50 of them."""
+    """Upload images -- and video clips (#411) -- into a dataset. Many at once, because a
+    dataset is 13-50 of them.
+
+    A CLIP IS NORMALIZED BEFORE ANYTHING IS STORED (app/clips.py), and every clip in the batch
+    is converted first: one that cannot train (too short, unreadable) refuses the whole upload
+    with its name, rather than landing the rest and leaving the person to work out which file
+    went missing.
+    """
     ds = await db.get(Dataset, dataset_id)
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
@@ -379,17 +399,33 @@ async def add_images(
     # which on a locked set would change a trained image under its LoRA's record.
     await _refuse_if_locked(db, ds)
 
-    added: list[str] = []
-    replaced: set[str] = set()
+    staged: list[tuple[str, bytes]] = []
+    refused: list[str] = []
     for f in files:
         name = (f.filename or "image.jpg").rsplit("/", 1)[-1]
         ext = ("." + name.rsplit(".", 1)[1].lower()) if "." in name else ".jpg"
+        if ext in clips.CLIP_SUFFIXES:
+            try:
+                data = await clips.normalize(await f.read(), ext)
+            except clips.ClipError as e:
+                refused.append(f"{name}: {e}")
+                continue
+            # Stored as what it now is, whatever it arrived as.
+            staged.append((name.rsplit(".", 1)[0] + ".mp4", data))
+            continue
         if ext not in IMAGE_SUFFIXES:
             # Skipped rather than fatal: one stray file in a folder drag-and-drop should not
             # reject the other forty-nine.
-            logger.info("dataset %s: skipping %s (not an image)", ds.name, name)
+            logger.info("dataset %s: skipping %s (not an image or clip)", ds.name, name)
             continue
-        data = await f.read()
+        staged.append((name, await f.read()))
+    if refused:
+        raise HTTPException(status_code=422,
+                            detail="Nothing was added. " + "; ".join(refused))
+
+    added: list[str] = []
+    replaced: set[str] = set()
+    for name, data in staged:
         uri = await asyncio.to_thread(
             s3.upload_bytes, data, f"{ds.prefix}/{name}", settings.s3_images_bucket)
         if uri not in ds.images:
@@ -409,7 +445,7 @@ async def add_images(
     if added or replaced:
         await db.commit()
         await db.refresh(ds)
-    logger.info("dataset %s: added %d image(s), now %d", ds.name, len(added), len(ds.images))
+    logger.info("dataset %s: added %d item(s), now %d", ds.name, len(added), len(ds.images))
     return _respond(ds, None)
 
 
@@ -630,11 +666,15 @@ async def crop_faces(
     if not ds.images:
         raise HTTPException(status_code=422, detail="this dataset has no images")
 
-    targets = ds.images if uris is None else [u for u in ds.images if u in set(uris)]
+    # Stills only (#411): a clip is the face in motion, and cropping one frame out of it would
+    # throw the motion away. Clips are left in the set untouched.
+    targets = [u for u in (ds.images if uris is None else
+                           [u for u in ds.images if u in set(uris)]) if not clips.is_clip(u)]
     if not targets:
         raise HTTPException(
             status_code=422,
-            detail="none of the selected images are in this dataset — they may have been removed")
+            detail="none of the selected images are in this dataset — they may have been "
+                   "removed, or they are clips, which are not cropped")
 
     # CONCURRENTLY. Fetched one at a time this was fourteen serial round trips to S3 before any
     # work started; they are independent and the wait is entirely network.
@@ -764,26 +804,26 @@ async def score_against_anchor(
         raise HTTPException(
             status_code=422,
             detail="the anchor is not in this dataset — it may have been removed; pick another")
+    if clips.is_clip(uri):
+        raise HTTPException(status_code=422, detail="the anchor must be a still image, not a clip")
 
     embeddings = await _embed_all(ds.images)
-    anchor_vec = embeddings[ds.images.index(uri)]
+    anchor_vec = embeddings[ds.images.index(uri)][0]
     if not anchor_vec:
         raise HTTPException(
             status_code=422,
             detail="no face was detected in the anchor image — pick one that is a clear face")
 
     floor = settings.face_cos_floor
-    scores = [
-        DatasetScore(
-            uri=u,
-            # -2.0 is _cos's "one side had no embedding", which is not a low score but an
-            # absent one. Surfaced as null so the console can say "no face" rather than
-            # rendering it as the worst match in the set.
-            cos=None if not e else round(_cos(e, anchor_vec), 4),
-            is_anchor=(u == uri),
-        )
-        for u, e in zip(ds.images, embeddings)
-    ]
+    # -2.0 is _cos's "one side had no embedding", which is not a low score but an absent one.
+    # Surfaced as null so the console can say "no face" rather than rendering it as the worst
+    # match in the set. A clip is the median over its frames (app/clips.clip_score).
+    def score(vecs: list[list[float]]) -> float | None:
+        cosines = [None if not e else round(_cos(e, anchor_vec), 4) for e in vecs]
+        return cosines[0] if len(cosines) == 1 else clips.clip_score(cosines)
+
+    scores = [DatasetScore(uri=u, cos=score(vecs), is_anchor=(u == uri))
+              for u, vecs in zip(ds.images, embeddings)]
 
     # Remembered only once it has been shown to work on this set -- the anchor AND what the
     # set scored against it (#352). The training route reads the scores to refuse a
@@ -796,13 +836,18 @@ async def score_against_anchor(
     return DatasetScores(anchor_uri=uri, cos_floor=floor, scores=scores)
 
 
-async def _embed_all(uris: list[str]) -> list[list[float]]:
+async def _embed_all(uris: list[str]) -> list[list[list[float]]]:
+    """Each item's embeddings, parallel to `uris`: one for a still, one per sampled frame for
+    a clip (#411). An empty embedding is "no face". One /embed call for the whole set."""
     blobs = await asyncio.gather(*(asyncio.to_thread(s3.download_bytes, u) for u in uris))
-    body = {"images": [base64.b64encode(b).decode() for b in blobs]}
+    per_item = [await clips.frames(b) if clips.is_clip(u) else [b] for u, b in zip(uris, blobs)]
+    flat = [img for imgs in per_item for img in imgs]
+    body = {"images": [base64.b64encode(b).decode() for b in flat]}
     async with httpx.AsyncClient(timeout=settings.face_crop_timeout_s) as client:
         r = await client.post(f"{settings.face_crop_url.rstrip('/')}/embed", json=body)
         r.raise_for_status()
-    return r.json()["embeddings"]
+    vecs = iter(r.json()["embeddings"])
+    return [[next(vecs) for _ in imgs] for imgs in per_item]
 
 
 def _cos(a: list[float], b: list[float]) -> float:
@@ -858,7 +903,7 @@ async def caption_dataset_images(db: AsyncSession, ds_id: uuid.UUID, overwrite: 
     image removed, is not overwritten from a stale copy.
     """
     from app.caption_queue import queue as caption_queue
-    from app.routes.captions import caption_image_bytes
+    from app.routes.captions import caption_clip_sheet, caption_image_bytes
 
     ds = await db.get(Dataset, ds_id)
     if ds is None:
@@ -874,7 +919,12 @@ async def caption_dataset_images(db: AsyncSession, ds_id: uuid.UUID, overwrite: 
         try:
             async with caption_queue.turn(uri, kind="dataset"):
                 image = await asyncio.to_thread(s3.download_bytes, uri)
-                text, _ = await caption_image_bytes(db, image, instruction=TRAINING_CAPTION)
+                if clips.is_clip(uri):
+                    # What CHANGES across the clip, from a 2x2 sheet of its frames (#411).
+                    text = await caption_clip_sheet(db, await clips.contact_sheet(image),
+                                                    TRAINING_MOTION_CAPTION)
+                else:
+                    text, _ = await caption_image_bytes(db, image, instruction=TRAINING_CAPTION)
         except CaptionError as e:
             # Box-wide (busy, render mode, unreachable) and per-image refusals look alike
             # from here; stopping costs one press of the button, hammering costs the box.

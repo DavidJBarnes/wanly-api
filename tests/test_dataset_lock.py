@@ -453,7 +453,8 @@ class TestAllowedWhileLocked:
         monkeypatch.setattr(settings, "face_crop_url", "http://crop.test")
 
         async def _embed(uris):
-            return [[1.0, 0.0] for _ in uris]
+            # One embedding per still (#411: a clip would have one per frame).
+            return [[[1.0, 0.0]] for _ in uris]
         monkeypatch.setattr(mod, "_embed_all", _embed)
         out = await mod.score_against_anchor(ds.id, anchor_uri=ds.images[0], _user=None, db=db)
         assert len(out.scores) == 4

@@ -1335,7 +1335,8 @@ class TestThePreflightOutput:
                             "samples_per_epoch", "passes_per_image", "base_checkpoint", "arch"}
         g = out["groups"][0]
         assert set(g) == {"kind", "character", "trigger", "gender", "dataset_id",
-                          "dataset_name", "images", "num_repeats", "sample_captions"}
+                          "dataset_name", "images", "num_repeats", "windows",
+                          "sample_captions"}
 
     async def test_identity_captions_carry_the_registrys_trigger_and_gender(self, db):
         await _world(db)

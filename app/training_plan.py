@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import clips
 from app.character_registry import identity_phrase
 from app.config import settings
 from app.enums import TRAINING_TERMINAL
@@ -58,6 +59,15 @@ SAMPLE_CAPTIONS = 5
 #: the base the aio LoRAs were trained on (BigaspV2Lustify, on the trainer's models mount
 #: under sdxl/). The trainer owns the rest of the recipe.
 SDXL_REPEATS = 8
+
+#: VIDEO CLIPS (#411): a member's clips train as their own group beside its stills, through
+#: musubi's video dataset (wanly-gpu-docker#189). Each clip yields CLIP_WINDOWS 49-frame
+#: windows spread across it, so a clip group's epoch is clips x windows x repeats.
+#: PROVISIONAL, like the trainer's 512/49: a 49-frame sample costs far more than a still, and
+#: these are set properly by a measured run, not before. 5 x 3 = 15 samples a clip an epoch
+#: against a still's 10 -- ten clips beside fifty stills is about a quarter of the epoch.
+CLIP_REPEATS = 5
+CLIP_WINDOWS = 3
 SDXL_BASE_CHECKPOINT = "BigaspV2Lustify"
 #: The booru class tag each registry gender trains under in an SDXL PAIR (#407). WD14 strips
 #: 1girl/1boy from what it tags, so a solo trigger absorbs "person" generally (the man-bleed);
@@ -87,6 +97,8 @@ class Group:
     images: list[str] = field(default_factory=list)
     captions: list[str] = field(default_factory=list)
     num_repeats: int = CHARACTER_REPEATS
+    #: Training samples each item yields per repeat: 1 for a still, CLIP_WINDOWS for a clip.
+    windows: int = 1
 
     def provenance(self) -> dict:
         ds = self.dataset
@@ -104,6 +116,7 @@ class Group:
             "dataset_name": ds.name if ds else None,
             "images": len(self.images),
             "num_repeats": self.num_repeats,
+            "windows": self.windows,
             "sample_captions": self.captions[:SAMPLE_CAPTIONS],
         }
 
@@ -132,7 +145,7 @@ class Plan:
 
     @property
     def samples_per_epoch(self) -> int:
-        return sum(len(g.images) * g.num_repeats for g in self.groups)
+        return sum(len(g.images) * g.num_repeats * g.windows for g in self.groups)
 
     @property
     def passes_per_image(self) -> float:
@@ -284,6 +297,7 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
         used[ds.id] = label
         return True
 
+    clip_groups: list[Group] = []
     for m in plan.members:
         chosen = (body.datasets or {}).get(m.name)
         if chosen is not None:
@@ -318,11 +332,25 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
                       else m.trigger)
         else:
             prefix = identity_phrase(m.trigger, m.gender)
+        # STILLS AND CLIPS SPLIT (#411): the stills are the identity group, exactly as before;
+        # the clips, if any, are a group of their own -- the trainer reads them as video.
+        # _captions_for keeps captions paired with images, so it is filtered after.
+        caps = dict(zip(ds.images, _captions_for(body, prefix, ds)))
+        stills = [u for u in ds.images if not clips.is_clip(u)]
+        moving = [u for u in ds.images if clips.is_clip(u)]
         g = Group(kind="identity", character=m.name, trigger=m.trigger, gender=m.gender,
-                  dataset=ds, images=list(ds.images),
-                  captions=_captions_for(body, prefix, ds), num_repeats=plan.character_repeats)
+                  dataset=ds, images=stills, captions=[caps[u] for u in stills],
+                  num_repeats=plan.character_repeats)
         _check_character_set(plan, ds, body.allow_low_scores)
         plan.groups.append(g)
+        if moving and sdxl:
+            plan.warn("sdxl_ignores_clips",
+                      f"{ds.name!r}: {len(moving)} clip(s) left out — SDXL trains stills only")
+        elif moving:
+            clip_groups.append(Group(
+                kind="clip", character=m.name, trigger=m.trigger, gender=m.gender, dataset=ds,
+                images=moving, captions=[caps[u] for u in moving], num_repeats=CLIP_REPEATS,
+                windows=CLIP_WINDOWS))
 
     # ---- the composition set (pairs only)
     if body.mode == "solo":
@@ -366,10 +394,16 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
                                       for m in plan.members)
             else:
                 prefix = body.character  # unreachable in a valid plan; keeps previews sane
+            comp_caps = dict(zip(comp.images, _captions_for(body, prefix, comp)))
+            comp_stills = [u for u in comp.images if not clips.is_clip(u)]
+            if len(comp_stills) != len(comp.images):
+                plan.warn("composition_clips",
+                          f"{comp.name!r}: {len(comp.images) - len(comp_stills)} clip(s) left "
+                          f"out — the composition set trains on stills")
             plan.groups.append(Group(
                 kind="composition", character=body.character, trigger=None, gender=None,
-                dataset=comp, images=list(comp.images),
-                captions=_captions_for(body, prefix, comp),
+                dataset=comp, images=comp_stills,
+                captions=[comp_caps[u] for u in comp_stills],
                 # The identity groups' repeats: CHARACTER_REPEATS for LTX, as always, and
                 # aio's 8 for an SDXL pair (#407).
                 num_repeats=plan.character_repeats))
@@ -413,9 +447,13 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
     # onto every plain image.
     for g in plan.groups + reg_groups:
         _check_common(plan, g)
+    # After the checks: a clip group has no 8-item floor (#411) -- three good clips are three
+    # good clips -- and its items are the same set's, already checked for duplicates above.
+    # Placed after composition, before regularization, which is sized against all of them.
+    plan.groups.extend(clip_groups)
 
     # ---- regularization repeats, sized against what the character groups contribute
-    character_samples = sum(len(g.images) * g.num_repeats for g in plan.groups)
+    character_samples = sum(len(g.images) * g.num_repeats * g.windows for g in plan.groups)
     for g in reg_groups:
         share = character_samples * REG_RATIO / len(reg_groups)
         g.num_repeats = max(1, round(share / len(g.images))) if g.images else 1

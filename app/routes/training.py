@@ -194,6 +194,8 @@ def _group_row(g) -> dict:
         "captions": g.captions,
         "images": g.images,
         "num_repeats": g.num_repeats,
+        #: Samples per item per repeat: CLIP_WINDOWS for a clip group (#411), else 1.
+        "windows": g.windows,
         #: Provenance, snapshot at creation: a rename must not rewrite what trained.
         "dataset": g.provenance(),
     }
@@ -287,6 +289,8 @@ async def claim_next_training_job(
                 #: how the trainer read it then.
                 "kind": g.get("kind") or ("identity" if g.get("trigger") else "composition"),
                 "num_repeats": g.get("num_repeats"),
+                #: Windows per clip for a clip group (#411); absent means 1.
+                "windows": g.get("windows") or 1,
                 #: So the trainer can say WHICH dataset it is staging, not just how many.
                 "dataset_name": (g.get("dataset") or {}).get("name"),
                 "download_urls": g_urls,
@@ -940,8 +944,8 @@ def _reresolve_images(label: str, images: list, ds: Dataset | None) -> tuple[lis
     return fresh, provenance
 
 
-def _reresolve_captioned(label: str, images: list, captions: list,
-                         ds: Dataset | None) -> tuple[list, list, dict | None]:
+def _reresolve_captioned(label: str, images: list, captions: list, ds: Dataset | None,
+                         minimum: int = MIN_DATASET_IMAGES) -> tuple[list, list, dict | None]:
     """`_reresolve_images` for a group with a caption snapshot (#352).
 
     The dataset decides WHICH images (in its current order); the snapshot decides every
@@ -952,11 +956,11 @@ def _reresolve_captioned(label: str, images: list, captions: list,
     if ds is None:
         return list(images), list(captions), None
     fresh = [u for u in ds.images if u in snap]
-    if len(fresh) < MIN_DATASET_IMAGES:
+    if len(fresh) < minimum:
         raise HTTPException(
             status_code=422,
             detail=f"{label}: dataset {ds.name!r} now has {len(fresh)} of this run's captioned "
-                   f"images — at least {MIN_DATASET_IMAGES} are needed. Create a new run to "
+                   f"images — at least {minimum} are needed. Create a new run to "
                    f"train on its current images and captions.")
     if len(set(fresh)) != len(fresh):
         raise HTTPException(
@@ -1024,8 +1028,10 @@ async def retry_training_job(
         g_id = _provenance_dataset_id(prov)
         gds = await db.get(Dataset, g_id) if g_id else None
         if g.get("captions") is not None:
+            # A clip group has no 8-item floor (#411); one clip still trains.
             g_images, g_caps, g_refreshed = _reresolve_captioned(
-                f"group {i + 2}", g.get("images") or [], g["captions"], gds)
+                f"group {i + 2}", g.get("images") or [], g["captions"], gds,
+                minimum=1 if g.get("kind") == "clip" else MIN_DATASET_IMAGES)
             g["captions"] = g_caps
             g["caption"] = g_caps[0] if g_caps else None
         else:

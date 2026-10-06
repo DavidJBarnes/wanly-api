@@ -559,7 +559,7 @@ class TestTheAnchor:
         the set rather than as 'no face'."""
         import inspect
         from app.routes import datasets as mod
-        assert "cos=None if not e else" in inspect.getsource(mod.score_against_anchor)
+        assert "None if not e else" in inspect.getsource(mod.score_against_anchor)
 
 
 class TestTheCropRoundTripFitsThroughTheWire:
@@ -675,7 +675,8 @@ class TestCaptionsAndScoresFollowTheImages:
         ds = await _ds(db, images=imgs)
 
         async def _embed(uris):
-            return [[1.0, 0.0], [0.6, 0.8], []]  # anchor, a match, no face
+            # anchor, a match, no face -- one embedding per still (#411)
+            return [[[1.0, 0.0]], [[0.6, 0.8]], [[]]]
         monkeypatch.setattr(mod, "_embed_all", _embed)
         monkeypatch.setattr(settings, "face_crop_url", "http://crop.test")
         out = await mod.score_against_anchor(ds.id, anchor_uri=imgs[0], _user=None, db=db)

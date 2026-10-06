@@ -231,6 +231,28 @@ TRAINING_CAPTION = (
 )
 
 
+#: The TRAINING caption for a dataset CLIP (wanly-api#411), asked of the motion captioner over
+#: a 2x2 sheet of the clip's frames in reading order.
+#:
+#: WHY VERBS OF CHANGE. A clip is in the set to teach the face IN MOTION. A caption of stative
+#: adjectives ("smiling, looking left") describes one frame and trains a frozen face -- the
+#: same failure the render prompts had (temporal phrasing fixed it there). So the expression
+#: and head are described as what they DO across the clip, and everything else as for a still.
+#: The bans are TRAINING_CAPTION's, for the same reason.
+TRAINING_MOTION_CAPTION = (
+    "These four frames, read left to right then top to bottom, are moments in order from one "
+    "short video of a single person. Write a training caption for the video as one line of "
+    "short comma-separated phrases, in this order: shot scale and framing, what the person's "
+    "head and body do over the clip (turns, tilts, leans, nods), how their facial expression "
+    "changes over the clip using verbs of change (breaks into a smile, laughs, glances away "
+    "then back), clothing, hair styling, lighting, and the setting. Describe ONLY those "
+    "things. Do NOT describe who the person is or what they look like: no facial features, "
+    "no eye or skin colour, no age, no ethnicity, no body type or build, and no names. Do not "
+    "mention frames, a grid, a video, the camera, or image quality, and do not start with any "
+    "preamble."
+)
+
+
 def instruction_for(style: str, custom: str = "") -> str:
     """The instruction to send. A non-empty custom instruction always wins.
 
