@@ -2016,9 +2016,42 @@ class TestSDXLStartImageLoras:
         assert out["passes_per_image"] == 96
         assert "passes_high" not in {w["code"] for w in out["warnings"]}
 
-    async def test_a_pair_is_refused(self, db):
+    async def test_a_pair_trains_each_trigger_beside_its_class_tag(self, db):
+        """#407: the LTX pair shape at aio's repeats. Every caption is the WD14 prefix the
+        trainer tags after: each trigger bound to its booru class tag, both in the composition
+        set. No regularization -- aio had none."""
         await _world(db)
-        assert "sdxl_solo_only" in _codes(await _preflight(db, **{**PAIR, "arch": "sdxl"}))
+        out = await _preflight(db, **{**PAIR, "arch": "sdxl", "steps": 960})
+        assert out["ok"], out["problems"]
+        assert [(g["kind"], g["character"], g["num_repeats"]) for g in out["groups"]] == [
+            ("identity", "David", 8), ("identity", "Kelly-2026", 8),
+            ("composition", "DavidKelly-2026", 8)]
+        assert [set(g["sample_captions"]) for g in out["groups"]] == [
+            {"d@vid, 1boy"}, {"k3lly2026, 1girl"}, {"d@vid, k3lly2026, 1boy, 1girl"}]
+
+    async def test_an_sdxl_pair_still_needs_its_composition_set(self, db):
+        w = await _world(db)
+        w["comp"].kind = None
+        await db.flush()
+        assert "composition_missing" in _codes(
+            await _preflight(db, **{**PAIR, "arch": "sdxl"}))
+
+    async def test_an_ltx_pair_is_unchanged(self, db):
+        """The SDXL prefix must not leak into LTX: the composition set keeps its sentence
+        prefix and the long-standing 10 repeats."""
+        await _world(db)
+        out = await _preflight(db, **PAIR)
+        comp = [g for g in out["groups"] if g["kind"] == "composition"][0]
+        assert comp["num_repeats"] == 10
+        assert all(c.startswith("d@vid, man and k3lly2026, woman")
+                   for c in comp["sample_captions"])
+
+    def test_the_class_tags(self):
+        from app.training_plan import sdxl_pair_prefix
+        assert sdxl_pair_prefix(["a", "b"], ["woman", "woman"]) == "a, b, 2girls"
+        assert sdxl_pair_prefix(["a", "b"], ["man", "man"]) == "a, b, 2boys"
+        assert sdxl_pair_prefix(["a", "b"], ["woman", "person"]) == "a, b, 1girl"
+        assert sdxl_pair_prefix(["a"], ["person"]) == "a"
 
     async def test_the_set_must_still_be_one_person(self, db):
         """The anchor/score gates are about the dataset, not the model -- they still apply."""

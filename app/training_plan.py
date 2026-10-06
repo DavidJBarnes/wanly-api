@@ -59,6 +59,21 @@ SAMPLE_CAPTIONS = 5
 #: under sdxl/). The trainer owns the rest of the recipe.
 SDXL_REPEATS = 8
 SDXL_BASE_CHECKPOINT = "BigaspV2Lustify"
+#: The booru class tag each registry gender trains under in an SDXL PAIR (#407). WD14 strips
+#: 1girl/1boy from what it tags, so a solo trigger absorbs "person" generally (the man-bleed);
+#: a pair puts the class tag back beside each trigger, the SDXL counterpart of the LTX
+#: "<trigger>, <gender>" caption. "person" has no single tag and trains under the trigger alone.
+SDXL_CLASS_TAG = {"woman": "1girl", "man": "1boy"}
+
+
+def sdxl_pair_prefix(triggers: list[str], genders: list[str | None]) -> str:
+    """The WD14 prefix an SDXL pair group trains under: its trigger(s), then the class tags of
+    the people in frame -- "k3lly, 1girl" for one member, "k3lly, d@vid, 1girl, 1boy" for the
+    composition set (two women are "2girls", as booru tags them)."""
+    tags = [SDXL_CLASS_TAG[g] for g in genders if g in SDXL_CLASS_TAG]
+    if len(tags) == 2 and tags[0] == tags[1]:
+        tags = ["2girls" if tags[0] == "1girl" else "2boys"]
+    return ", ".join([*triggers, *tags])
 
 
 @dataclass
@@ -181,13 +196,11 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
     if sdxl:
         plan.character_repeats = SDXL_REPEATS
         plan.base_checkpoint = SDXL_BASE_CHECKPOINT
-        if body.mode != "solo":
-            plan.problem("sdxl_solo_only",
-                         "SDXL start-image LoRAs are solo only — train a pair as LTX")
         plan.warn("sdxl_wd14",
-                  "SDXL: the trainer captions every image with WD14 tags (trigger first) "
-                  "and ignores the stored captions. No regularization; not published to the "
-                  "character — download it from the run.")
+                  "SDXL: the trainer captions every image with WD14 tags (trigger first"
+                  + (", then the class tag — 1girl / 1boy" if body.mode == "pair" else "")
+                  + ") and ignores the stored captions. No regularization; not published to "
+                  "the character — download it from the run.")
     if body.base_checkpoint:
         name = body.base_checkpoint.removesuffix(".safetensors")
         plan.base_checkpoint = name
@@ -299,7 +312,12 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
         if not _use(ds, m.name):
             continue
         # SDXL: the trigger alone leads the WD14 tags, as aio's captions did -- no gender word.
-        prefix = m.trigger if sdxl else identity_phrase(m.trigger, m.gender)
+        # An SDXL pair adds the class tag (#407): see SDXL_CLASS_TAG.
+        if sdxl:
+            prefix = (sdxl_pair_prefix([m.trigger], [m.gender]) if body.mode == "pair"
+                      else m.trigger)
+        else:
+            prefix = identity_phrase(m.trigger, m.gender)
         g = Group(kind="identity", character=m.name, trigger=m.trigger, gender=m.gender,
                   dataset=ds, images=list(ds.images),
                   captions=_captions_for(body, prefix, ds), num_repeats=plan.character_repeats)
@@ -340,7 +358,10 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
                       "training a pair with no composition set: the LoRA has never seen the "
                       "two people in one frame, and tends to hold one face and drop the other")
         if comp is not None and _use(comp, "the composition set"):
-            if len(plan.members) == 2:
+            if len(plan.members) == 2 and sdxl:
+                prefix = sdxl_pair_prefix([m.trigger for m in plan.members],
+                                          [m.gender for m in plan.members])
+            elif len(plan.members) == 2:
                 prefix = " and ".join(identity_phrase(m.trigger, m.gender)
                                       for m in plan.members)
             else:
@@ -348,13 +369,16 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
             plan.groups.append(Group(
                 kind="composition", character=body.character, trigger=None, gender=None,
                 dataset=comp, images=list(comp.images),
-                captions=_captions_for(body, prefix, comp)))
+                captions=_captions_for(body, prefix, comp),
+                # The identity groups' repeats: CHARACTER_REPEATS for LTX, as always, and
+                # aio's 8 for an SDXL pair (#407).
+                num_repeats=plan.character_repeats))
 
     # ---- regularization, one pool per gender present
     genders = list(dict.fromkeys(m.gender for m in plan.members if m.gender))
     reg_groups: list[Group] = []
     if sdxl:
-        # aio had none, and the trainer's SDXL path takes one group. Said in sdxl_wd14.
+        # aio had none, and the trainer's SDXL path refuses one. Said in sdxl_wd14.
         genders = []
     elif not body.regularization:
         plan.warn("no_regularization",
