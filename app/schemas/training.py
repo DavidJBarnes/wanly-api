@@ -88,10 +88,12 @@ class TrainingCreate(BaseModel):
     #: filename, and stripping gives `py` while the file this project renders is `pay_...` --
     #: a human read `@` as `a`, and no rule produces that.
     lora_name: str | None = Field(default=None, max_length=64, pattern=r"^[A-Za-z0-9._-]+$")
-    #: Which checkpoints to upload as they are written. "final" is the default: a 650 MB
-    #: checkpoint takes ~18 minutes to leave the 3090. Every epoch stays on the trainer and
-    #: can be published afterwards.
-    publish: Literal["final", "all"] = "final"
+    #: Which checkpoints to upload as they are written. "none" is the default (#413): every
+    #: checkpoint stays on the trainer until it has been tried and then uploaded or deleted
+    #: from the Training page -- most epochs are judged and thrown away, and each one used to
+    #: cost ~18 minutes of the 3090's uplink and a slot in the bucket first. "final" uploads
+    #: the last as it is written; "all" uploads every epoch.
+    publish: Literal["none", "final", "all"] = "none"
     #: HOW IMAGES ARE CAPTIONED. "per_image" trains each image under "<trigger>, <gender>,
     #: <its stored body>". "trigger_only" is the recipe every LoRA before #352 used -- every
     #: image under the bare "<trigger>, <gender>" -- and stored bodies are ignored, so a set
@@ -204,6 +206,8 @@ class TrainingResponse(BaseModel):
     # for through publish_requests, and `checkpoints` records the ones that arrived.
     epochs: list | None = None
     publish_requests: list | None = None
+    #: Labels deleted forever (#413), for the trainer to remove from its disk.
+    delete_requests: list | None = None
     # Operator notes, written through the console's own route (wanly-console#484). The
     # trainer's PATCH deliberately cannot reach this: its conditional writes exist so a
     # report that omits a field never blanks a previous one, and a human note deserves the
