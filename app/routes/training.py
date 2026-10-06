@@ -19,8 +19,8 @@ import re
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from sqlalchemy import and_, or_, select
+from fastapi import APIRouter, Depends, File, HTTPException, Path, Query, UploadFile
+from sqlalchemy import String, and_, cast, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -29,7 +29,8 @@ from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
 from app.config import settings
 from app.database import get_db
 from app.enums import TRAINING_TERMINAL, TrainingStatus, WorkerKind, worker_can
-from app.models import Dataset, LtxCharacter, TrainingJob, User, Worker, training_arch
+from app.models import (Dataset, LtxCharacter, Segment, TrainingJob, User, Worker,
+                        training_arch)
 from app.character_registry import identity_phrase
 from app.schemas.training import (
     MIN_DATASET_IMAGES, TrainingClaimResponse, TrainingCreate, TrainingNotes,
@@ -404,6 +405,11 @@ async def update_training_job(
         value = getattr(body, field)
         if value is not None:
             setattr(job, field, value)
+    # A DELETED CHECKPOINT STAYS DELETED (#413). The trainer reports what is on its disk, and
+    # until its poll has removed the files that includes labels already deleted here.
+    gone = set(job.delete_requests or [])
+    if gone and body.epochs is not None:
+        job.epochs = [e for e in body.epochs if e.get("label") not in gone] or None
 
     # A CANCEL IS STICKY.
     #
@@ -673,7 +679,12 @@ def _record_checkpoint(job: TrainingJob, uri: str) -> None:
     if uri not in existing:
         # Reassigned, never appended: JSONB does not see an in-place mutation.
         job.checkpoints = existing + [uri]
-    job.output_lora_path = uri
+    # THE FINAL KEEPS IT (#413). Under publish "all" the final goes up first and the epochs
+    # still queued follow it, so "the most recent" was an epoch -- and the character row,
+    # published from this at completion, pointed at e03 instead of the finished LoRA.
+    if uri.endswith("_final.safetensors") or not any(
+            c.endswith("_final.safetensors") for c in existing):
+        job.output_lora_path = uri
 
 
 @router.post("/training/{job_id}/artifact-url", dependencies=[Depends(verify_api_key)])
@@ -728,6 +739,14 @@ async def commit_training_artifact(
         raise HTTPException(
             status_code=422,
             detail=f"{uri} is not a checkpoint of {job.character} v{job.version}")
+    # DELETED WHILE IT WAS UPLOADING (#413). The person threw this checkpoint away after the
+    # trainer had started its PUT; recording it now would bring it back, unlisted in `epochs`
+    # and so with no row to delete it from again. The object goes; the trainer is told.
+    deleted = next((lbl for lbl in (job.delete_requests or [])
+                    if uri.endswith(f"_{lbl}.safetensors")), None)
+    if deleted:
+        await asyncio.to_thread(s3.delete_object, uri)
+        raise HTTPException(status_code=410, detail=f"{deleted} was deleted; not recording it")
     head = await asyncio.to_thread(s3.head_object, uri)
     if head is None:
         raise HTTPException(status_code=409, detail=f"{uri} is not in the bucket — the PUT did not land")
@@ -833,6 +852,85 @@ async def request_publish(
         job.publish_requests = wanted + [label]
         await db.commit()
         await db.refresh(job)
+    return job
+
+
+#: Segment statuses that will still load a LoRA: a checkpoint they name must not vanish
+#: under them (#413). Terminal segments only hold a record of what they used.
+_LIVE_SEGMENT = ("pending", "claimed", "processing", "awaiting_caption")
+
+
+@router.delete("/training/{job_id}/checkpoints/{label}", response_model=TrainingResponse)
+async def delete_checkpoint(
+    job_id: uuid.UUID,
+    label: str = Path(..., pattern=r"^(e\d{2}|final)$"),
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Delete ONE checkpoint forever: its S3 copy now, its files on the trainer next poll.
+
+    THE POINT IS TO TRY, THEN KEEP OR THROW AWAY (#413). Most epochs are looked at once and
+    discarded; with nothing uploading by default they sit on the trainer, and this is the
+    other half of that -- the disk does not fill with runs nobody wanted.
+
+    REFUSED while anything still depends on it, because "forever" cannot be taken back:
+      * the run is live -- the trainer is still writing and reporting this list;
+      * a character renders with it (any character, pairs included, as the run delete);
+      * a segment that has not finished names it -- its LoRA is loaded at claim, and a file
+        gone from the bucket would fail that render (or every worker's next sync) instead.
+    The S3 delete happens before anything is written, so a failure changes nothing.
+    """
+    job = await db.get(TrainingJob, job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Training job not found")
+    if job.status not in TRAINING_TERMINAL:
+        raise HTTPException(status_code=409,
+                            detail=f"still {job.status} — checkpoints can be deleted once it ends")
+    if label in (job.delete_requests or []) or not any(
+            e.get("label") == label for e in (job.epochs or [])):
+        raise HTTPException(status_code=404, detail=f"this run has no checkpoint {label}")
+
+    tag = f"_{label}.safetensors"
+    uploaded = [c for c in (job.checkpoints or []) if isinstance(c, str) and c.endswith(tag)]
+    for uri in uploaded:
+        stem = uri.rsplit("/", 1)[-1].removesuffix(".safetensors")
+        using = (await db.execute(
+            select(LtxCharacter).where(LtxCharacter.char_lora == stem))).scalars().all()
+        if using:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{', '.join(c.name for c in using)} renders with {stem} — point the "
+                       f"character at another LoRA first")
+        live = (await db.execute(
+            select(func.count()).select_from(Segment).where(
+                Segment.status.in_(_LIVE_SEGMENT),
+                cast(Segment.ltx_recipe, String).contains(stem)))).scalar_one()
+        if live:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{live} queued or running segment(s) render with {stem} — let them "
+                       f"finish, or remove them, first")
+    try:
+        await asyncio.gather(*(asyncio.to_thread(s3.delete_object, u) for u in uploaded))
+    except Exception as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"could not delete {label} from the bucket ({type(e).__name__}: {e}); "
+                   f"nothing was changed") from e
+
+    # Reassigned throughout: JSONB does not see in-place mutation.
+    left = [c for c in (job.checkpoints or []) if c not in uploaded]
+    job.checkpoints = left or None
+    if job.output_lora_path in uploaded or job.output_lora_path not in left:
+        finals = [c for c in left if c.endswith("_final.safetensors")]
+        job.output_lora_path = (finals or left or [None])[-1]
+    job.publish_requests = [p for p in (job.publish_requests or []) if p != label] or None
+    job.epochs = [e for e in (job.epochs or []) if e.get("label") != label] or None
+    job.delete_requests = list(job.delete_requests or []) + [label]
+    await db.commit()
+    await db.refresh(job)
+    logger.info("deleted checkpoint %s of %s v%d (%s)", label, job.character, job.version,
+                "bucket + trainer" if uploaded else "trainer only")
     return job
 
 
@@ -1078,6 +1176,9 @@ async def retry_training_job(
     job.checkpoints = None
     job.output_lora_path = None
     job.publish_requests = None
+    # The retry writes the SAME version-named files again (#413): an old delete request left
+    # here would have the trainer delete the new attempt's checkpoint of that label.
+    job.delete_requests = None
     try:
         await db.commit()
     except Exception:

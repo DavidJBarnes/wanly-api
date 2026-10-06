@@ -585,6 +585,9 @@ class TrainingJob(Base):
     # for through publish_requests, and `checkpoints` records the ones that arrived.
     epochs = mapped_column(JSONB, nullable=True)
     publish_requests = mapped_column(JSONB, nullable=True)
+    # Labels deleted forever (#413). Their S3 copies are gone already; the trainer reads this
+    # on its poll and removes the files from its disk -- it cannot be called, only asked.
+    delete_requests = mapped_column(JSONB, nullable=True)
     # Free-form operator notes, exactly as Dataset.notes: what was learned about this run,
     # why a checkpoint was picked. Written only by a human through the console's own route --
     # not through the trainer's PATCH, whose conditional writes must never be able to clobber

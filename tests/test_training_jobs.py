@@ -783,13 +783,17 @@ class TestOperatorNotes:
 
 
 
-class TestOnlyTheFinalGoesUpByDefault:
+class TestNothingGoesUpByDefault:
     """A 650 MB checkpoint takes ~18 minutes to leave the 3090 and "I often only want 1 or 2
-    epochs". Every epoch stays on the trainer; the rest are asked for."""
+    epochs". Since #413 nothing uploads unasked: each checkpoint is tried, then uploaded or
+    deleted from the Training page."""
 
-    def test_the_default_policy_is_final(self):
+    def test_the_default_policy_is_none(self):
         req = TrainingCreate(mode="solo", character="p@y")
-        assert req.publish == "final"
+        assert req.publish == "none"
+
+    def test_final_is_still_a_choice(self):
+        assert TrainingCreate(mode="solo", character="p@y", publish="final").publish == "final"
 
     def test_all_is_the_other_choice_and_nothing_else_is(self):
         assert TrainingCreate(mode="solo", character="p@y", publish="all").publish == "all"
