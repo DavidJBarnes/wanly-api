@@ -196,3 +196,15 @@ async def test_retry_forgets_the_delete_requests():
     import inspect
     from app.routes import training as mod
     assert "job.delete_requests = None" in inspect.getsource(mod.retry_training_job)
+
+
+@pytest.mark.asyncio
+async def test_a_trainer_report_cannot_bring_a_deleted_label_back(db):
+    """Until its poll removes the files, the trainer's disk still holds the label."""
+    from app.routes.training import update_training_job
+    from app.schemas.training import TrainingProgress
+    job = _job(delete_requests=["e01"])
+    db.add(job)
+    await db.commit()
+    out = await update_training_job(job.id, TrainingProgress(epochs=list(EPOCHS)), db=db)
+    assert [e["label"] for e in out.epochs] == ["e02", "final"]

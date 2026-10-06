@@ -405,6 +405,11 @@ async def update_training_job(
         value = getattr(body, field)
         if value is not None:
             setattr(job, field, value)
+    # A DELETED CHECKPOINT STAYS DELETED (#413). The trainer reports what is on its disk, and
+    # until its poll has removed the files that includes labels already deleted here.
+    gone = set(job.delete_requests or [])
+    if gone and body.epochs is not None:
+        job.epochs = [e for e in body.epochs if e.get("label") not in gone] or None
 
     # A CANCEL IS STICKY.
     #
