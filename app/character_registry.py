@@ -57,7 +57,7 @@ def _no_lora(char_lora: str | None) -> bool:
     return not lora or lora == "none"
 
 
-def is_draft(c: LtxCharacter, first_member: LtxCharacter | None = None) -> bool:
+def is_draft(c: LtxCharacter) -> bool:
     """A DRAFT character has neither a LoRA nor an identity reference (wanly-console#592).
 
     Allowed since migration 110 so a brand-new, LoRA-less character can exist long enough for
@@ -65,14 +65,15 @@ def is_draft(c: LtxCharacter, first_member: LtxCharacter | None = None) -> bool:
     draft cannot render: nothing in it carries the person, so the submit and the claim refuse
     it (see segments._draft_refusal) rather than render a stranger on the base model.
 
-    A PAIR has no reference of its own; it renders with its FIRST member's. So a pair with no
-    joint LoRA is a draft exactly when that member (passed in by the caller, which has the
-    session) has no reference either.
+    A PAIR is a draft exactly when it has no joint LoRA (wanly-api#417). A face reference or a
+    sheet is optional and applies only to the character it is set on; a pair never borrows a
+    member's -- one face conditions every face in frame, which is how David's face drifted
+    onto Joana's.
     """
     if not _no_lora(c.char_lora):
         return False
     if (c.kind or "solo") == "pair":
-        return first_member is None or not (first_member.sheet_uri or first_member.face_ref_uri)
+        return True
     return not (c.sheet_uri or c.face_ref_uri)
 
 

@@ -498,12 +498,7 @@ async def _draft_refusal(db: AsyncSession, ltx_recipe: dict | None) -> str | Non
            ).scalar_one_or_none()
     if row is None:
         return None
-    first = None
-    if (row.kind or "solo") == "pair" and row.members:
-        first = (await db.execute(
-            select(LtxCharacter).where(LtxCharacter.name == row.members[0])
-        )).scalar_one_or_none()
-    return draft_message(row.name) if is_draft(row, first) else None
+    return draft_message(row.name) if is_draft(row) else None
 
 
 async def _refuse_draft_submit(db: AsyncSession, ltx_recipe: dict | None) -> None:
@@ -788,11 +783,11 @@ async def _identity_ref_for(db: AsyncSession, job: Job,
     the segment is not a recipe render of a known character, or when that character has no
     reference.
 
-    PAIRS (one reference per render, wanly-console#581): a pair is a joint LoRA over two
-    people and carries no reference of its own. It renders with its FIRST MEMBER's reference
-    -- the member listed first, as the pair was registered -- or with none when that member
-    has none. The second member never contributes one: the conditioning node takes a single
-    identity, and conditioning both people on one face is the wrong answer for one of them.
+    PAIRS never get one (wanly-api#417). A face reference or sheet is optional and applies
+    only to the character it is set on; a pair has none of its own and never borrows a
+    member's. Best-Face-ID conditions on one face and pulls EVERY face in frame toward it:
+    DavidJoana used to render with its first member's (David's) and Joana's face drifted into
+    his over the clip. The joint LoRA carries both people; a pair without one is a draft.
 
     Never raises. This is the claim path, where a 500 stops the queue; a reference that cannot
     be presigned is logged and the segment renders without it.
@@ -805,11 +800,7 @@ async def _identity_ref_for(db: AsyncSession, job: Job,
         return None
     row = (await db.execute(select(LtxCharacter).where(LtxCharacter.name == name))
            ).scalar_one_or_none()
-    if row is not None and (row.kind or "solo") == "pair":
-        first = (row.members or [None])[0]
-        row = (await db.execute(select(LtxCharacter).where(LtxCharacter.name == first))
-               ).scalar_one_or_none() if first else None
-    if row is None:
+    if row is None or (row.kind or "solo") == "pair":
         return None
     mode = row.identity_mode or ("sheet" if row.sheet_uri else "face" if row.face_ref_uri
                                  else None)

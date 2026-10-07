@@ -11,7 +11,7 @@ now be a LoRA, an identity reference (a sheet or a face close-up), or both. What
   * <TRIGGER> for a character with no trigger: its description, or dropped -- and a prompt that
     is then empty is still refused (the #577 guards);
   * the claim: a presigned reference URL for the segment's character, honouring the job's
-    `use_identity_ref`, and for a PAIR the first member's reference or none.
+    `use_identity_ref`; a PAIR never gets one (wanly-api#417).
 
 Run against a real database: the CHECK constraints and the claim query are the subject.
 """
@@ -149,7 +149,7 @@ class TestCreate:
                         json={"name": n, "trigger": n, "gender": "woman"})
         r = await _call(db, "post", "/ltx/characters", json={
             "name": _name("pair"), "kind": "pair", "members": [a, b], "sheet_uri": SHEET})
-        assert r.status_code == 422 and "first member" in r.text
+        assert r.status_code == 422 and "no reference of its own" in r.text
 
 
 @pytest.mark.asyncio
@@ -373,27 +373,19 @@ class TestTheClaim:
         await _queued(db, None)
         assert (await _claim(db))["identity_ref"] is None
 
-    async def test_a_pair_renders_with_its_first_members_sheet(self, db, presign):
-        """One reference per render: the pair's FIRST member's, as registered."""
-        first = await _character(db, char_lora="a_v1", trigger="a", gender="woman",
-                                 sheet_uri=SHEET)
-        second = await _character(db, char_lora="b_v1", trigger="b", gender="man",
+    async def test_a_pair_with_a_joint_lora_sends_none(self, db, presign):
+        """wanly-api#417: one face conditions EVERY face in frame. DavidJoana rendered with
+        David's (its first member's) and Joana's face drifted into his. The joint LoRA
+        carries both people, so a pair with one renders with no reference at all."""
+        first = await _character(db, char_lora="a_v1", trigger="a", gender="man",
+                                 face_ref_uri=FACE, identity_mode="face")
+        second = await _character(db, char_lora="b_v1", trigger="b", gender="woman",
                                   sheet_uri="s3://wanly-images/chars/second.png")
-        pair = await _character(db, char_lora="ab_v1", trigger="a, woman and b, man",
+        pair = await _character(db, char_lora="ab_v1", trigger="a, man and b, woman",
                                 kind="pair", members=[first.name, second.name])
         await _queued(db, _blob(pair.name, char_lora="ab_v1"))
-        ref = (await _claim(db))["identity_ref"]
-        assert ref["uri"] == SHEET and ref["character"] == first.name
-
-    async def test_a_pair_whose_first_member_has_none_sends_none(self, db, presign):
-        """Not the second member's: conditioning both people on one face is wrong for one."""
-        first = await _character(db, char_lora="a_v1", trigger="a", gender="woman")
-        second = await _character(db, char_lora="b_v1", trigger="b", gender="man",
-                                  sheet_uri=SHEET)
-        pair = await _character(db, char_lora="ab_v1", trigger="a and b", kind="pair",
-                                members=[first.name, second.name])
-        await _queued(db, _blob(pair.name, char_lora="ab_v1"))
         assert (await _claim(db))["identity_ref"] is None
+        assert presign == []
 
     async def test_a_presign_failure_renders_without_rather_than_stopping_the_queue(
             self, db, monkeypatch):
@@ -536,16 +528,20 @@ class TestDraftsNeverRender:
         assert await seg_routes._draft_refusal(db, None) is None
         assert await seg_routes._draft_refusal(db, _blob(_name("gone"))) is None
 
-    async def test_a_pair_is_a_draft_only_when_its_first_member_has_no_sheet(self, db):
-        first = await _character(db, char_lora=None, trigger="a", gender="woman")
+    async def test_a_pair_is_a_draft_exactly_when_it_has_no_joint_lora(self, db):
+        """wanly-api#417: a pair never borrows a member's sheet, so with no joint LoRA nothing
+        carries anyone -- even when both members have sheets."""
+        first = await _character(db, char_lora=None, trigger="a", gender="woman",
+                                 sheet_uri=SHEET)
         second = await _character(db, char_lora=None, trigger="b", gender="man",
                                   sheet_uri=SHEET)
         pair = await _character(db, char_lora="none", trigger="a and b", kind="pair",
                                 members=[first.name, second.name])
         assert DRAFT_WORDS in (await seg_routes._draft_refusal(db, _blob(pair.name)))
-        first.sheet_uri = SHEET
-        await db.flush()
-        assert await seg_routes._draft_refusal(db, _blob(pair.name)) is None
+        joint = await _character(db, char_lora="ab_v1", trigger="a and b", kind="pair",
+                                 members=[first.name, second.name])
+        assert await seg_routes._draft_refusal(
+            db, _blob(joint.name, char_lora="ab_v1")) is None
 
     async def test_the_claim_fails_a_draft_with_the_reason(self, db, presign):
         """A character can become a draft after its job queued (its sheet removed): the
