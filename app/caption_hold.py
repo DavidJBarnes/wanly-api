@@ -373,6 +373,17 @@ def hold_place(path: str) -> dict:
             "queue_depth": depth, "note": note, "lane": None}
 
 
+#: Images whose hold is waiting because no box is in motion mode (wanly-api#392), with the
+#: reason. Their tickets are not in any lane while they wait, so the per-mode summary counts
+#: them from here.
+_mode_waits: dict[str, str] = {}
+
+
+def mode_waiting() -> dict[str, str]:
+    """{image path: reason} for every hold waiting on a mode no box is in."""
+    return dict(_mode_waits)
+
+
 def wait_note(path: str) -> str | None:
     """What the hold on this image is waiting for, in words, with its place in the queue."""
     place = hold_place(path)
@@ -445,6 +456,7 @@ async def _hold(path: str) -> None:
     busy_since: float | None = None
     try:
         while True:
+            _mode_waits.pop(path, None)
             if tickets.active(path) is None and caption_queue.in_flight(
                     path, kinds=WRITES_WORDS):
                 # A describe-kind turn that is not a ticket. Nothing in the API takes one any
@@ -483,6 +495,8 @@ async def _hold(path: str) -> None:
             await asyncio.gather(*(t.wait() for _, t, _ in waits))
 
             refused: str | None = None
+            #: Every refusal was "no GPU in motion mode" (wanly-api#392): no time limit.
+            mode_only = True
             for half, t, own in waits:
                 if t.status != tickets.FAILED or t.withdrawn:
                     continue
@@ -490,6 +504,7 @@ async def _hold(path: str) -> None:
                     # The box beside the captioner is rendering. Not a failure -- the modal
                     # is refused the same way -- so wait it out, up to the limit.
                     refused = refused or t.error
+                    mode_only = mode_only and t.mode_wait
                 elif own:
                     await fail(path, f"the {half} caption failed: {t.error or 'no reason given'}")
                     return
@@ -497,6 +512,18 @@ async def _hold(path: str) -> None:
                     # Somebody else's caption of this image failed. Make our own.
                     logger.info("Caption hold: the %s caption %s was waiting on failed (%s); "
                                 "asking for its own", half, path, t.error)
+            if refused is not None and mode_only:
+                # No box is in the mode this caption needs. Not the captioner refusing -- there
+                # is no captioner to refuse -- so the hold's time limit does not apply: the
+                # person switches a box (the reason says how), and the next ask goes to it.
+                busy_since = None
+                # The bare reason: the console prefixes "Waiting: " to a hold's note.
+                _notes[path] = refused
+                _mode_waits[path] = refused
+                logger.info("Caption hold: %s waits (%s); asking again in %ds", path, refused,
+                            BUSY_RETRY_S)
+                await asyncio.sleep(BUSY_RETRY_S)
+                continue
             if refused is not None:
                 busy_since = busy_since if busy_since is not None else time.monotonic()
                 if not await _wait_out_refusal(path, refused, busy_since):
@@ -524,6 +551,7 @@ async def _hold(path: str) -> None:
         await fail(path, f"{type(e).__name__}: {e}")
     finally:
         _notes.pop(path, None)
+        _mode_waits.pop(path, None)
 
 
 def _needs_now(path: str, half: str) -> bool:

@@ -10,11 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import verify_api_key, verify_api_key_or_bearer
 from app.database import get_db
-from app.enums import JobStatus, SegmentStatus, WorkerKind, WorkerStatus, ordered_kinds
+from app.enums import (JobStatus, SegmentStatus, TrainingStatus, WorkerKind, WorkerStatus,
+                       ordered_kinds)
 from app.models import Job, Segment, Worker
 from app.queue_health import COUNTED_KINDS, assess
 from app.config import settings
-from app.schemas.workers import QueueHealthResponse, WorkerDrain, WorkerHeartbeat, WorkerMode, WorkerModeResponse, WorkerRegister, WorkerRename, WorkerResponse, WorkerStatusUpdate
+from app import worker_modes
+from app.schemas.workers import (ModeBox, ModeWaiting, QueueHealthResponse, WorkerDrain,
+                                 WorkerHeartbeat, WorkerMode, WorkerModeResponse,
+                                 WorkerModesResponse, WorkerRegister, WorkerRename,
+                                 WorkerResponse, WorkerStatusUpdate)
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +267,7 @@ async def get_worker_mode(worker_id: uuid.UUID, db: AsyncSession = Depends(get_d
             status_code=502,
             detail=f"{worker.friendly_name} did not answer on "
                    f":{settings.worker_control_port} ({e})") from e
+    st = worker_modes.parse_health(worker.friendly_name, body)
     return WorkerModeResponse(
         mode=body.get("mode") or "ltx-engine",
         equipped=body.get("equipped") or [],
@@ -269,6 +275,11 @@ async def get_worker_mode(worker_id: uuid.UUID, db: AsyncSession = Depends(get_d
                   for s in body.get("services", []) if not s.get("stopped")],
         pending_mode=body.get("pending_mode"),
         mode_error=body.get("mode_error"),
+        mode_name=st.mode or "render",
+        pending_mode_name=st.pending,
+        modes=st.modes,
+        last_unload=st.last_unload,
+        gpu=st.gpu,
     )
 
 
@@ -277,7 +288,8 @@ async def get_worker_mode(worker_id: uuid.UUID, db: AsyncSession = Depends(get_d
 async def set_worker_mode(
     worker_id: uuid.UUID, body: WorkerMode, db: AsyncSession = Depends(get_db)
 ):
-    """Flip a box between rendering and captioning, in place.
+    """Switch a box's mode in place: render / train / motion / edit, or the old names
+    (ltx-engine, caption) -- the box accepts both (wanly-gpu-docker#164).
 
     A relay, deliberately thin: the container owns what a mode means (which services, in
     what order, and the GPU-sharing rules between them). Duplicating that here would give
@@ -304,6 +316,8 @@ async def set_worker_mode(
         detail = r.json().get("detail") if r.headers.get("content-type", "").startswith("application/json") else r.text
         raise HTTPException(status_code=r.status_code, detail=detail or "the worker refused")
     out = r.json()
+    # The picker must not route to this box by the mode it had a moment ago.
+    worker_modes.forget(worker.friendly_name)
     logger.info("Worker %s mode -> %s (%s)%s", worker.friendly_name,
                 out.get("pending_mode") or out.get("pending") or out.get("mode"),
                 ",".join(out.get("services") or []),
@@ -314,6 +328,11 @@ async def set_worker_mode(
         services=out.get("services") or [],
         changed=bool(out.get("changed")),
         pending_mode=out.get("pending"),
+        mode_name=(worker_modes.canonical(out.get("mode_name"))
+                   or worker_modes.canonical(out.get("mode"))
+                   or worker_modes.canonical(body.mode)),
+        pending_mode_name=(worker_modes.canonical(out.get("pending_mode_name"))
+                           or worker_modes.canonical(out.get("pending"))),
     )
 
 
@@ -438,6 +457,85 @@ async def list_workers(
         stmt = stmt.where(Worker.status == status)
     result = await db.execute(stmt)
     return result.scalars().all()
+
+
+@router.get("/worker-modes", response_model=WorkerModesResponse,
+            dependencies=[Depends(verify_api_key_or_bearer)])
+async def worker_modes_summary(db: AsyncSession = Depends(get_db)):
+    """Every box's mode, and what is waiting on each mode (wanly-api#392, console#589).
+
+    One call for the Workers page's summary line -- "render: 4 segments · motion: 12 captions
+    (no GPU in motion mode) · edit: 2 · train: 1 run" -- so "why isn't my caption moving?" is
+    answered without opening jobs one by one. The modes are read from the boxes, like
+    everything else about a mode; the counts from this API's own queues.
+    """
+    from app import caption_hold, caption_queue
+    from app import full_edit
+    from app.joycaption import scene_status
+    from app.models import TrainingJob
+
+    rows = (await db.execute(
+        select(Worker).where(Worker.status != "offline").order_by(Worker.friendly_name)
+    )).scalars().all()
+    states = await worker_modes.live_boxes(db)
+    by_name = {b.name.lower(): b for b in states}
+    boxes = []
+    seen = set()
+    for w in rows:
+        key = (w.friendly_name or "").lower()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        b = by_name.get(key) or worker_modes.BoxState(name=w.friendly_name)
+        boxes.append(ModeBox(
+            worker_id=w.id, friendly_name=w.friendly_name, status=w.status,
+            reachable=b.reachable, mode_name=b.mode, pending_mode_name=b.pending,
+            modes=b.modes, mode_error=b.mode_error, last_unload=b.last_unload, gpu=b.gpu))
+
+    def served_by(*modes: str) -> bool:
+        return any(b.reachable and b.mode in modes for b in states)
+
+    reporting = [b for b in states if b.reachable and b.mode]
+
+    pending_segments = (await db.execute(
+        select(func.count()).select_from(Segment).join(Job, Segment.job_id == Job.id)
+        .where(Segment.status == SegmentStatus.PENDING,
+               Job.status.in_([JobStatus.PENDING, JobStatus.PROCESSING]))
+    )).scalar() or 0
+    pending_runs = (await db.execute(
+        select(func.count()).select_from(TrainingJob)
+        .where(TrainingJob.status == TrainingStatus.PENDING)
+    )).scalar() or 0
+    mode_waits = caption_hold.mode_waiting()
+    motion_count = caption_queue.motion_queue.depth() + len(mode_waits)
+    edits = [j for j in full_edit.queue.jobs.values()
+             if j.state in ("queued", "waiting", "running")]
+
+    def reason_unless(count: int, served: bool, mode: str) -> str | None:
+        if not count or not reporting or served:
+            return None
+        return worker_modes.no_gpu_in(mode, reporting)
+
+    motion_reason = None
+    if motion_count and reporting:
+        p = worker_modes.choose("motion", states)
+        motion_reason = p.wait or (next(iter(mode_waits.values())) if mode_waits else None)
+    edit_reason = next((j.message for j in edits if j.state == "waiting" and j.message), None)
+
+    waiting = [
+        ModeWaiting(mode="render", count=pending_segments, unit="segments",
+                    reason=reason_unless(pending_segments, served_by("render"), "render")),
+        ModeWaiting(mode="motion", count=motion_count, unit="captions", reason=motion_reason),
+        ModeWaiting(mode="edit", count=len(edits), unit="edits", reason=edit_reason),
+        # Until wanly-gpu-docker#165 the trainer also claims on a box in render mode.
+        ModeWaiting(mode="train", count=pending_runs, unit="runs",
+                    reason=reason_unless(pending_runs, served_by("train", "render"), "train")),
+    ]
+    sc = scene_status()
+    return WorkerModesResponse(
+        boxes=boxes, waiting=waiting,
+        scene={"depth": caption_queue.queue.depth(), "up": sc.get("up"), "url": sc.get("url"),
+               "fallback": sc.get("fallback"), "why": sc.get("why")})
 
 
 @router.get("/queue-health", response_model=QueueHealthResponse,

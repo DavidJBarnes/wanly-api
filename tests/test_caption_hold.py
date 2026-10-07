@@ -643,3 +643,64 @@ class TestTheTwoWaysOut:
             resp = await c.post(f"/segments/{seg.id}/cancel")
         assert resp.status_code == 200, resp.text
         assert resp.json()["status"] == SegmentStatus.FAILED
+
+
+# --- no GPU in motion mode (wanly-api#392) ------------------------------------------------
+
+@pytest.mark.asyncio
+class TestNoGpuInTheMode:
+    async def test_it_waits_past_the_time_limit_and_a_switch_releases_it(
+            self, db, shared_session, captioner, monkeypatch):
+        """Nothing in motion mode is a wait only a person can end, so the hour limit that
+        bounds a captioner REFUSING does not apply -- with the limit at zero, a busy box fails
+        the segment at once (test above), while this waits and is released by the switch."""
+        from app.joycaption import NoGpuInMode
+        why = "no GPU in motion mode (3090a: render, 3090b: edit); switch one to motion"
+        switched = asyncio.Event()
+
+        async def base(db, interactive):
+            if not switched.is_set():
+                raise NoGpuInMode(why)
+            return "http://c"
+        monkeypatch.setattr("app.routes.captions._caption_base", base)
+        monkeypatch.setattr(settings, "caption_hold_timeout_s", 0)
+        monkeypatch.setattr(caption_hold, "BUSY_RETRY_S", 0.05)
+        seg = await _held(db, await _job(db))
+        task = caption_hold.ensure(IMG)
+        counted = None
+        for _ in range(200):
+            if caption_hold.mode_waiting():
+                counted = caption_hold.mode_waiting()
+                break
+            await asyncio.sleep(0.01)
+        switched.set()
+        await asyncio.wait_for(task, 5)
+        assert (await _fresh(db, seg)).status == SegmentStatus.PENDING
+        # While it waited the summary could count it, with the reason; once released, not.
+        assert counted == {IMG: why}
+        assert caption_hold.mode_waiting() == {}
+
+    async def test_the_wait_is_on_the_job_in_words(
+            self, db, shared_session, captioner, monkeypatch):
+        from app.joycaption import NoGpuInMode
+        gate = asyncio.Event()
+        notes = []
+
+        async def base(db, interactive):
+            if not gate.is_set():
+                raise NoGpuInMode("no GPU in motion mode")
+            return "http://c"
+        monkeypatch.setattr("app.routes.captions._caption_base", base)
+        monkeypatch.setattr(caption_hold, "BUSY_RETRY_S", 0.05)
+        await _held(db, await _job(db))
+        task = caption_hold.ensure(IMG)
+        for _ in range(100):
+            note = caption_hold.wait_note(IMG)
+            if note and "no GPU" in note:
+                notes.append(note)
+                break
+            await asyncio.sleep(0.01)
+        gate.set()
+        await asyncio.wait_for(task, 5)
+        # The bare reason: the console shows a waiting hold as "Waiting: <note>".
+        assert notes and notes[0].startswith("no GPU in motion mode")

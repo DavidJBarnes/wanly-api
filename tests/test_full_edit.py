@@ -551,3 +551,55 @@ class TestOverHTTP:
         monkeypatch.setattr(mod.face_edit, "edit", fake_edit)
         r = await _http(db, "post", "/images/edit", json={"source_uri": SRC, "preset": "smile"})
         assert r.status_code == 200 and r.json()["mode"] == "face"
+
+
+@pytest.mark.asyncio
+class TestRoutedByMode:
+    """wanly-api#392: a box already in edit mode takes the edit -- whichever box it is."""
+
+    @pytest.fixture
+    def in_edit(self, monkeypatch):
+        from app import worker_modes as wm
+
+        def set_(**bodies):
+            async def live():
+                return [wm.parse_health(n, b) for n, b in bodies.items()]
+            monkeypatch.setattr(wm, "live_boxes_own_session", live)
+        return set_
+
+    async def test_a_box_in_edit_mode_takes_it_with_no_switch(self, box, in_edit):
+        b = box(mode="ltx-engine")
+        in_edit(**{"3090b": {"mode": "edit", "mode_name": "edit", "services": [
+            {"name": "image-edit", "group": "image-edit", "ready": True}]},
+                   "3090a.zero": {"mode": "ltx-engine", "mode_name": "render"}})
+        job = full_edit.queue.submit(SRC, b"src", {"instruction": "red sweater"}, "full")
+        await _drain()
+        assert job.state == "done", job.error
+        assert job.worker == "3090b"
+        assert b.urls == ["http://3090b:8086"]
+        assert b.modes_asked == [], "nothing switched, nothing to hand back"
+
+    async def test_no_box_in_edit_mode_keeps_the_switch_path(self, box, in_edit):
+        b = box(mode="ltx-engine")
+        in_edit(**{"3090a.zero": {"mode": "ltx-engine", "mode_name": "render"}})
+        job = full_edit.queue.submit(SRC, b"src", {"instruction": "red sweater"}, "full")
+        await _drain()
+        assert job.state == "done", job.error
+        assert b.modes_asked == ["edit", "ltx-engine"]
+
+    async def test_an_edit_mode_box_that_does_not_answer_is_fallen_back_from(
+            self, box, in_edit, monkeypatch):
+        b = box(mode="ltx-engine")
+        in_edit(**{"3090b": {"mode": "edit", "mode_name": "edit"}})
+        real_edit = b.edit
+
+        async def edit(source, request, url=None):
+            if url and "3090b" in url:
+                raise full_edit.FullEditError(503, "connection refused", unreachable=True)
+            return await real_edit(source, request, url=url)
+        monkeypatch.setattr(full_edit, "_edit", edit)
+        job = full_edit.queue.submit(SRC, b"src", {"instruction": "red sweater"}, "full")
+        await _drain()
+        assert job.state == "done", job.error
+        assert job.worker == settings.image_edit_worker
+        assert b.modes_asked == ["edit", "ltx-engine"]

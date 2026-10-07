@@ -128,3 +128,26 @@ def _no_real_lora_bucket(monkeypatch):
     lora_provenance.clear_cache()
     yield
     lora_provenance.clear_cache()
+
+
+# ---------------------------------------------------------------------------
+# Routing by mode (wanly-api#392)
+#
+# Motion captions and edits ask every live box for its mode before using the configured URL.
+# A test must never reach a real box's control API, so by default no box reports a mode --
+# which is exactly the old single-URL behaviour most tests were written against. Tests of the
+# routing stub worker_modes._fetch with boxes of their own.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _no_real_worker_modes(monkeypatch):
+    from app import worker_modes
+
+    async def _nothing(name):
+        return None
+
+    monkeypatch.setattr(worker_modes, "_fetch", _nothing)
+    worker_modes.forget()
+    yield
+    worker_modes.forget()

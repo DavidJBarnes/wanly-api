@@ -266,8 +266,11 @@ class FullEditQueue:
                 else f"generating on {job.worker}")
 
     async def _place(self, job: Job) -> dict:
-        """The always-on worker when it is up, else the main 3090's edit mode; then the work."""
-        out = await self._on_standing(job)
+        """A box already in edit mode, else the always-on worker when it is up, else the main
+        3090's edit mode (switched into, and handed back); then the work."""
+        out = await self._on_edit_mode_box(job)
+        if out is None:
+            out = await self._on_standing(job)
         if out is None:
             await self._box_ready(job)
             await _require_features(settings.image_edit_url, _needs(job),
@@ -277,6 +280,39 @@ class FullEditQueue:
                 "running", self._running(job), time.time())
             out = await self._call(job, None)
         return out
+
+    async def _on_edit_mode_box(self, job: Job) -> dict | None:
+        """Run the job on a box that is ALREADY in edit mode, or None to carry on as before.
+
+        Routing by mode (wanly-api#392): with two symmetric 3090s, whichever is in edit mode
+        is the edit box -- no switch to ask for, nothing to hand back, and no config naming
+        it. None when no box reports edit mode, or the chosen one stops answering before the
+        edit is sent; then the standing worker and the switch-into-edit-mode path below run
+        exactly as they did. That path still never sends an edit to a box in another mode: it
+        switches the box first and waits for edit mode to land.
+        """
+        from app import worker_modes
+        try:
+            p = worker_modes.choose("edit", await worker_modes.live_boxes_own_session())
+        except Exception as e:                      # noqa: BLE001 -- routing is best effort
+            logger.warning("full edit %s: could not read the boxes' modes (%s)", job.id, e)
+            return None
+        if not p.box:
+            return None
+        url = worker_modes.edit_url(p.box)
+        job.worker = p.box
+        job.state, job.message, job.started_at = "running", self._running(job), time.time()
+        try:
+            await _require_features(url, _needs(job), p.box)
+            return await self._call(job, url)
+        except FullEditError as e:
+            if e.unreachable:
+                logger.warning("full edit %s: %s (edit mode) unreachable (%s); falling back",
+                               job.id, p.box, e.detail)
+                job.worker, job.started_at = None, None
+                worker_modes.forget(p.box)
+                return None
+            raise
 
     async def _on_standing(self, job: Job) -> dict | None:
         """Run the job on the always-on image-edit worker, or None to fall back to edit mode.
@@ -466,8 +502,9 @@ async def _require_features(url: str, request: dict, who: str,
             async with httpx.AsyncClient(timeout=15) as client:
                 health = (await client.get(f"{url.rstrip('/')}/health")).json()
         except Exception as e:                      # noqa: BLE001
-            raise FullEditError(503, f"image-edit on {who} did not answer /health ({e!r})") \
-                from e
+            # unreachable: nothing was sent, so a caller with somewhere else to go may go there.
+            raise FullEditError(503, f"image-edit on {who} did not answer /health ({e!r})",
+                                unreachable=True) from e
     have = set((health or {}).get("features") or ("angle", "instruction"))
     missing = [f for f in wanted if f not in have]
     if missing:
