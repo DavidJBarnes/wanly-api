@@ -80,6 +80,15 @@ class TestChoosing:
             {"name": "image-description", "group": "image-description", "ready": False}])}))
         assert p.box is None and "starting" in p.wait
 
+    def test_a_box_in_the_mode_without_the_service_is_not_used(self):
+        """3090b, SERVICES=image-edit,scene-caption, lists motion among its modes. In motion
+        mode it would still have no captioner: a caption sent there is a connection refused."""
+        p = wm.choose("motion", _boxes(**{"3090b": _health("motion", services=[
+            {"name": "image-edit", "group": "image-edit", "ready": True}])}))
+        assert p.box is None
+        assert "does not run image-description" in p.wait
+        assert "no GPU in motion mode" in p.wait
+
     def test_nothing_reporting_means_the_old_way(self):
         p = wm.choose("motion", [wm.parse_health("3090a", None)])
         assert p.reporting is False and p.box is None and p.wait is None

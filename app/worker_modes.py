@@ -178,26 +178,33 @@ _turns = itertools.count()
 def choose(mode: str, boxes: list[BoxState]) -> Pick:
     """Pick a box in `mode` from what the boxes reported. Pure: no I/O.
 
-    A box qualifies when it is in the mode, not switching away from it, and the service the
-    mode's work needs is not reported down. Two qualify: take turns. None qualifies: say why,
-    in the words that tell the person what to do.
+    A box qualifies when it is in the mode, not switching away from it, and RUNS the service
+    the mode's work needs, ready. Listed and ready, not merely "not reported down": a box
+    without the service can still report itself in the mode (3090b, SERVICES=image-edit,
+    scene-caption, lists motion among its modes), and sending it a caption is a connection
+    refused. Two qualify: take turns. None qualifies: say why, in words that say what to do.
     """
     reporting = [b for b in boxes if b.reachable and b.mode]
     if not reporting:
         return Pick(mode=mode, reporting=False)
     group = SERVICE_FOR.get(mode)
     ready = [b for b in reporting if b.mode == mode and not b.pending
-             and (group is None or b.service_ready(group) is not False)]
+             and (group is None or b.service_ready(group) is True)]
     if ready:
         return Pick(mode=mode, box=ready[next(_turns) % len(ready)].name)
     switching = [b for b in reporting if b.pending == mode]
     if switching:
         b = switching[0]
         return Pick(mode=mode, wait=f"{b.name} is switching to {mode} mode")
-    starting = [b for b in reporting if b.mode == mode and not b.pending]
+    in_mode = [b for b in reporting if b.mode == mode and not b.pending]
+    starting = [b for b in in_mode if b.service_ready(group) is False]
     if starting:
         b = starting[0]
         return Pick(mode=mode, wait=f"{b.name} is in {mode} mode; its {group} is starting")
+    if in_mode:
+        b = in_mode[0]
+        return Pick(mode=mode, wait=(f"{b.name} is in {mode} mode but does not run {group}; "
+                                     f"{no_gpu_in(mode, reporting)}"))
     return Pick(mode=mode, wait=no_gpu_in(mode, reporting))
 
 
