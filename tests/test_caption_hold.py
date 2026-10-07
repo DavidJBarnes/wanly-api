@@ -702,4 +702,5 @@ class TestNoGpuInTheMode:
             await asyncio.sleep(0.01)
         gate.set()
         await asyncio.wait_for(task, 5)
-        assert notes and notes[0].startswith("waiting: no GPU in motion mode")
+        # The bare reason: the console shows a waiting hold as "Waiting: <note>".
+        assert notes and notes[0].startswith("no GPU in motion mode")

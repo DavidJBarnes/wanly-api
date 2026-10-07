@@ -517,7 +517,8 @@ async def _hold(path: str) -> None:
                 # is no captioner to refuse -- so the hold's time limit does not apply: the
                 # person switches a box (the reason says how), and the next ask goes to it.
                 busy_since = None
-                _notes[path] = f"waiting: {refused}"
+                # The bare reason: the console prefixes "Waiting: " to a hold's note.
+                _notes[path] = refused
                 _mode_waits[path] = refused
                 logger.info("Caption hold: %s waits (%s); asking again in %ds", path, refused,
                             BUSY_RETRY_S)
