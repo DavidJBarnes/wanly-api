@@ -562,8 +562,8 @@ def _settle_identity(row: LtxCharacter) -> None:
     has_ref = bool(row.sheet_uri or row.face_ref_uri)
     if (row.kind or "solo") == "pair" and has_ref:
         raise HTTPException(status_code=422,
-                            detail="a pair has no reference of its own — it renders with its "
-                                   "first member's character sheet")
+                            detail="a pair has no reference of its own and renders "
+                                   "with its joint LoRA alone (wanly-api#417)")
     if row.identity_mode == "sheet" and not row.sheet_uri:
         raise HTTPException(status_code=422, detail="identity_mode 'sheet' needs a sheet_uri")
     if row.identity_mode == "face" and not row.face_ref_uri:

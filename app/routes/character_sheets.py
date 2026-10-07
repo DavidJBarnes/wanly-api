@@ -38,8 +38,8 @@ def _http(e: sheet_gen.SheetError) -> HTTPException:
 
 def _no_pair(c: LtxCharacter) -> None:
     if (c.kind or "solo") == "pair":
-        raise HTTPException(422, f"{c.name} is a pair: a pair renders with its first member's "
-                                 f"sheet -- build the sheet on that character")
+        raise HTTPException(422, f"{c.name} is a pair: a pair renders with its joint LoRA alone, "
+                                 f"never a sheet (wanly-api#417)")
 
 
 @router.get("/ltx/characters/sheet/presets", response_model=SheetPresets,
