@@ -539,6 +539,13 @@ class CaptionerBusy(CaptionError):
     """The box that captions is rendering right now; ask again when it finishes."""
 
 
+class NoGpuInMode(CaptionerBusy):
+    """No box is in motion mode (wanly-api#392). Waited out like any refusal, but WITHOUT the
+    caption hold's time limit: nothing ends this wait except a person switching a box, and the
+    reason says so. Failing the job an hour in would only make them queue it again."""
+    mode_wait = True
+
+
 def captioner_host() -> str:
     """The host of the captioner that shares a card with a render stack: the MOTION
     captioner's (image_description_url unless motion_caption_url is set) -- `3090.zero` for

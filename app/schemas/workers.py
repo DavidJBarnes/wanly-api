@@ -102,6 +102,52 @@ class WorkerModeResponse(BaseModel):
     #: Why the last switch failed, if it did. It fails after the request that asked for it
     #: has been answered, so this is the only place it can be reported.
     mode_error: str | None = None
+    #: The four-mode spelling (render / train / motion / edit, wanly-gpu-docker#164) of `mode`
+    #: and `pending_mode`, which keep the old one (ltx-engine / caption) for older consoles.
+    #: A box from before #164 sends only the old one; these are then derived from it.
+    mode_name: str | None = None
+    pending_mode_name: str | None = None
+    #: The modes this box can enter, from its SERVICES. Empty when the box does not say.
+    modes: list[str] = []
+    #: What the last switch found on the card and what was left after the unload:
+    #: {from, to, found_mib, after_mib, limit_mib, seconds, ok}.
+    last_unload: dict[str, Any] | None = None
+    #: The card right now: {name, vram_total_mib, vram_used_mib, vram_free_mib}.
+    gpu: dict[str, Any] | None = None
+
+
+class ModeBox(BaseModel):
+    """One box in the per-mode summary (wanly-console#589)."""
+    worker_id: uuid.UUID
+    friendly_name: str
+    status: str
+    #: False when the box's control API did not answer; the mode fields are then empty.
+    reachable: bool
+    mode_name: str | None = None
+    pending_mode_name: str | None = None
+    modes: list[str] = []
+    mode_error: str | None = None
+    last_unload: dict[str, Any] | None = None
+    gpu: dict[str, Any] | None = None
+
+
+class ModeWaiting(BaseModel):
+    """What is waiting on one mode, and why it is not moving when nothing serves it."""
+    mode: str
+    count: int
+    #: "segments", "captions", "edits", "runs".
+    unit: str
+    #: Set when the work cannot move: "no GPU in motion mode (...)". None when it can.
+    reason: str | None = None
+
+
+class WorkerModesResponse(BaseModel):
+    """GET /worker-modes: every box's mode, and what waits on each mode (wanly-api#392)."""
+    boxes: list[ModeBox]
+    waiting: list[ModeWaiting]
+    #: Scene captions run on the scene-caption service, never a mode (wanly-console#572):
+    #: {depth, up, url, fallback, why}.
+    scene: dict[str, Any]
 
 
 class QueueHealthResponse(BaseModel):

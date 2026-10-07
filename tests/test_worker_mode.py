@@ -209,3 +209,78 @@ class TestASwitchThatIsStillRunning:
             cl.return_value.__aenter__.return_value.post = post
             await routes.set_worker_mode(w.id, routes.WorkerMode(mode="caption"), db)
         assert cl.call_args[1]["timeout"] <= 30
+
+
+class TestFourModes:
+    """wanly-gpu-docker#164 reports both spellings; the console reads the four-mode one."""
+
+    @pytest.mark.asyncio
+    async def test_the_read_carries_the_four_mode_fields(self):
+        w = _worker()
+        db = AsyncMock()
+        db.get.return_value = w
+        body = {"mode": "train", "mode_name": "train", "pending_mode": None,
+                "modes": ["render", "train", "motion", "edit"],
+                "last_unload": {"from": "render", "to": "train", "found_mib": 23100,
+                                "after_mib": 410, "limit_mib": 8192, "seconds": 6.0,
+                                "ok": True},
+                "gpu": {"name": "RTX 3090", "vram_total_mib": 24576, "vram_used_mib": 410,
+                        "vram_free_mib": 24166},
+                "equipped": ["ltx-engine", "lora-trainer"], "services": []}
+        get = AsyncMock(return_value=_Resp(body=body))
+        with patch("httpx.AsyncClient") as cl:
+            cl.return_value.__aenter__.return_value.get = get
+            out = await routes.get_worker_mode(w.id, db)
+        assert out.mode == "train" and out.mode_name == "train"
+        assert out.modes == ["render", "train", "motion", "edit"]
+        assert out.last_unload["after_mib"] == 410
+        assert out.gpu["vram_used_mib"] == 410
+        # Through the response model too: hand-built responses drop unknown fields silently.
+        dumped = routes.WorkerModeResponse.model_validate(out.model_dump()).model_dump()
+        assert {"mode_name", "pending_mode_name", "modes", "last_unload", "gpu"} <= set(dumped)
+
+    @pytest.mark.asyncio
+    async def test_a_box_from_before_164_gets_its_mode_name_derived(self):
+        w = _worker()
+        db = AsyncMock()
+        db.get.return_value = w
+        get = AsyncMock(return_value=_Resp(body={"mode": "caption", "pending_mode": "ltx-engine",
+                                                 "equipped": [], "services": []}))
+        with patch("httpx.AsyncClient") as cl:
+            cl.return_value.__aenter__.return_value.get = get
+            out = await routes.get_worker_mode(w.id, db)
+        assert (out.mode, out.mode_name, out.pending_mode_name) == (
+            "caption", "motion", "render")
+
+    @pytest.mark.asyncio
+    async def test_a_switch_returns_both_spellings_and_drops_the_cached_mode(
+            self, monkeypatch):
+        from app import worker_modes
+        w = _worker(name="3090b")
+        db = AsyncMock()
+        db.get.return_value = w
+        forgotten = []
+        monkeypatch.setattr(worker_modes, "forget", lambda name=None: forgotten.append(name))
+        post = AsyncMock(return_value=_Resp(body={
+            "mode": "ltx-engine", "pending": "caption", "mode_name": "render",
+            "pending_mode_name": "motion", "services": ["ltx-engine"], "changed": True}))
+        with patch("httpx.AsyncClient") as cl:
+            cl.return_value.__aenter__.return_value.post = post
+            out = await routes.set_worker_mode(w.id, routes.WorkerMode(mode="motion"), db)
+        assert post.call_args[1]["json"] == {"mode": "motion"}, "the new names pass straight on"
+        assert (out.mode_name, out.pending_mode_name) == ("render", "motion")
+        assert forgotten == ["3090b"]
+
+    @pytest.mark.asyncio
+    async def test_a_training_refusal_is_the_boxs_409_verbatim(self):
+        w = _worker()
+        db = AsyncMock()
+        db.get.return_value = w
+        post = AsyncMock(return_value=_Resp(status_code=409, body={
+            "detail": "training Joana v3 on this box; switch to motion after it finishes"}))
+        with patch("httpx.AsyncClient") as cl:
+            cl.return_value.__aenter__.return_value.post = post
+            with pytest.raises(HTTPException) as e:
+                await routes.set_worker_mode(w.id, routes.WorkerMode(mode="motion"), db)
+        assert e.value.status_code == 409
+        assert "training Joana v3" in e.value.detail

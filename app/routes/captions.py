@@ -12,11 +12,11 @@ from dataclasses import dataclass
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import s3
+from app import s3, worker_modes
 from app.auth import get_current_user
 from app.config import settings
 from app.database import get_db
-from app.joycaption import (CaptionError, CaptionerBusy, CaptionerUnreachable,
+from app.joycaption import (CaptionError, CaptionerBusy, CaptionerUnreachable, NoGpuInMode,
                             busy_render_beside_the_captioner, captioner_for, describe,
                             describe_motion, instruction_for, mark_scene_down, mark_scene_up,
                             scene_captioner, scene_marked_down)
@@ -41,7 +41,24 @@ async def _caption_base(db: AsyncSession, interactive: bool) -> str:
     otherwise refused with the box's name. Claim-time <SCENE> resolution passes
     interactive=False and prefers the fallback outright: the claiming box is about to load
     the render. See captioner_for.
+
+    ROUTED BY MODE FIRST (wanly-api#392). When the boxes say what mode they are in, a motion
+    caption goes to a box in MOTION mode -- whichever one it is, no config change -- and never to
+    a box in another mode. None in motion mode: the fallback captioner if one is configured,
+    else NoGpuInMode, which a held job waits out with that reason (no time limit: switching a
+    box is what ends it). Only when no box reports a mode does the old single-URL path below run.
     """
+    pick = await worker_modes.pick(db, "motion")
+    if pick.box:
+        return worker_modes.motion_url(pick.box)
+    if pick.reporting:
+        fallback = (settings.image_description_fallback_url or "").strip()
+        if fallback:
+            logger.info("No box in motion mode (%s); captioning on the fallback captioner %s",
+                        pick.wait, fallback)
+            return fallback
+        raise NoGpuInMode(pick.wait or "no GPU in motion mode")
+
     busy = await busy_render_beside_the_captioner(db) if interactive else None
     base = captioner_for(busy, interactive)
     if base is None:

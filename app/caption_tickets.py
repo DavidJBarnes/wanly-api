@@ -73,7 +73,7 @@ from app import caption_queue as cq
 from app import s3
 from app.config import settings
 from app.database import async_session
-from app.joycaption import CaptionError, CaptionerBusy, describe_motion
+from app.joycaption import CaptionError, CaptionerBusy, NoGpuInMode, describe_motion
 from app.models import ImageMeta
 
 logger = logging.getLogger(__name__)
@@ -112,6 +112,9 @@ class Ticket:
     #: The captioner refused because the box beside it is rendering (or in render mode).
     #: Waited out by the hold; shown as the reason to the person.
     busy: bool = False
+    #: ...and the refusal is "no GPU in motion mode" (wanly-api#392): waited out with no time
+    #: limit, because only a person switching a box ends it.
+    mode_wait: bool = False
     unreadable: bool = False
     #: Taken out of line before it ran, because nothing needed it any more (withdraw()).
     withdrawn: bool = False
@@ -298,6 +301,7 @@ def view(t: Ticket | None) -> dict:
     if t is None:
         return {"ticket_id": None, "status": None, "position": None, "depth": q.depth(),
                 "half": None, "mode": None, "origin": None, "error": None, "busy": False,
+                "mode_wait": False,
                 "created_at": None, "started_at": None, "finished_at": None, "lane": None,
                 "requested_by": []}
     position = None
@@ -307,7 +311,7 @@ def view(t: Ticket | None) -> dict:
         position = 0
     return {"ticket_id": t.id, "status": t.status, "position": position, "depth": q.depth(),
             "half": t.half, "mode": t.half, "origin": t.origin, "error": t.error,
-            "busy": t.busy, "created_at": t.created_at, "started_at": t.started_at,
+            "busy": t.busy, "mode_wait": t.mode_wait, "created_at": t.created_at, "started_at": t.started_at,
             "finished_at": t.finished_at, "lane": None if t.finished else t.lane,
             "requested_by": [dict(r) for r in t.requested_by]}
 
@@ -358,6 +362,7 @@ async def _run(t: Ticket) -> None:
         # Withdrawn: an ordinary ending, not a shutdown -- do not propagate.
     except CaptionerBusy as e:
         t.status, t.error, t.busy = FAILED, str(e), True
+        t.mode_wait = bool(getattr(e, "mode_wait", False))
         logger.info("Caption ticket %s on %s: %s refused, the captioner is busy (%s)",
                     t.id, t.path, t.half, e)
     except ImageUnreadable as e:
@@ -486,7 +491,7 @@ async def _ensure_scene(t: Ticket) -> None:
                 return
     why = s.error or "the scene caption failed"
     if s.busy:
-        raise CaptionerBusy(why)
+        raise (NoGpuInMode(why) if s.mode_wait else CaptionerBusy(why))
     if s.unreadable:
         raise ImageUnreadable(why)
     raise CaptionError(f"no scene to ground the motion on: {why}")
