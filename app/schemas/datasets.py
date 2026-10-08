@@ -124,13 +124,13 @@ class DatasetRegularizeStatus(BaseModel):
 
 
 class DatasetTrainedBy(BaseModel):
-    """One training run that used a set (#356), read from the run's recorded provenance."""
+    """One training run that used a set, or an image: its character, version and arch."""
     job_id: str
     character: str
     version: int
     status: str
-    #: When the run was created. A set's lock only counts runs created after its
-    #: `unlocked_at` (#363), so this is what that is compared against.
+    #: ltx | sdxl -- "v1" is per arch (#402), so a badge needs both.
+    arch: str | None = None
     created_at: datetime | None = None
 
 
@@ -151,20 +151,22 @@ class DatasetResponse(BaseModel):
     scores: dict[str, float | None] = Field(default_factory=dict)
     created_at: datetime | None = None
     updated_at: datetime | None = None
-    #: LOCKED ONCE IT HAS TRAINED (#356): some run that is not failed or cancelled used this
-    #: set, so a LoRA came -- or is coming -- of exactly these images and captions. Not
-    #: columns: derived from training_jobs on every read, so a run that fails unlocks the set
-    #: with nothing to keep in step. The ORM row has neither attribute, so a response built
-    #: straight from it reads unlocked; the routes fill both (datasets._respond).
+    #: READ-ONLY: locked by hand (#358) or archived (#419). Training no longer locks a set
+    #: (#420) -- each run records what it trained on (GET /training/{id}/trained-on), so the
+    #: set stays the subject's living set. Filled by the routes (datasets._respond).
     locked: bool = False
-    #: Every run that locks it, oldest first -- what the console's lock chip names.
+    #: Every run with a LoRA that trained on this set, oldest first. Information, not a lock.
     trained_by: list[DatasetTrainedBy] = Field(default_factory=list)
-    #: LOCKED BY HAND (#358): columns, unlike the above. `locked` is true when either is set.
+    #: {uri: the runs that trained on that image} -- the "used in v1, v3" badges (#422).
+    #: Images no run used are absent. Filled by the routes.
+    used_in: dict[str, list[DatasetTrainedBy]] = Field(default_factory=dict)
+    #: LOCKED BY HAND (#358): optional, off by default.
     locked_at: datetime | None = None
     locked_reason: str | None = None
-    #: ONE-TIME UNLOCK (#363): when POST /datasets/{id}/unlock was last called. From then on
-    #: only runs created after it lock the set, so `trained_by` lists only those.
+    #: When POST /datasets/{id}/unlock was last called (#363).
     unlocked_at: datetime | None = None
+    #: ARCHIVED (#419): a version set folded into its subject's living set. Hidden, read-only.
+    archived_at: datetime | None = None
 
     @field_validator("captions", "scores", mode="before")
     @classmethod

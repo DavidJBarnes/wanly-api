@@ -141,14 +141,14 @@ class TestRefusedWhileLockedByHand:
     def _is_lock(e, ds, reason="reference set"):
         assert e.value.status_code == 409
         assert e.value.detail == (
-            f"{ds.name!r} is locked by hand ({reason}) — clone it to make changes")
+            f"{ds.name!r} is locked by hand ({reason}) — unlock it to make changes")
 
     async def test_the_detail_without_a_reason(self, db):
         from fastapi import HTTPException
         ds = await self._locked(db, reason=None)
         with pytest.raises(HTTPException) as e:
             await _patch(db, ds, images=ds.images[1:])
-        assert e.value.detail == f"{ds.name!r} is locked by hand — clone it to make changes"
+        assert e.value.detail == f"{ds.name!r} is locked by hand — unlock it to make changes"
 
     async def test_the_detail_when_trained_as_well(self, db):
         from fastapi import HTTPException
@@ -157,9 +157,9 @@ class TestRefusedWhileLockedByHand:
         await _lock(db, ds, reason="v5 shipped")
         with pytest.raises(HTTPException) as e:
             await _patch(db, ds, images=ds.images[1:])
+        # Training locks nothing (#420): the detail is only the hand lock.
         assert e.value.detail == (
-            f"{ds.name!r} trained Kelly-2000 v5 and is locked, and was also locked by hand "
-            f"(v5 shipped) — clone it to make changes")
+            f"{ds.name!r} is locked by hand (v5 shipped) — unlock it to make changes")
 
     async def test_images_owner_kind_and_class(self, db):
         from fastapi import HTTPException
@@ -300,8 +300,8 @@ class TestCloneOfAHandLockedSet:
 
 
 @pytest.mark.asyncio
-async def test_the_list_is_still_two_queries(db):
-    """The hand lock is a column on the row, so it costs the list nothing."""
+async def test_the_list_fills_the_hand_lock(db):
+    """The hand lock is a column on the row; training locks nothing (#420)."""
     from sqlalchemy import event
     from app.routes.datasets import list_datasets
     by_hand, trained, free = await _ds(db), await _ds(db), await _ds(db)
@@ -313,14 +313,14 @@ async def test_the_list_is_still_two_queries(db):
     listen = lambda *a: statements.append(a[2])  # noqa: E731
     event.listen(sync_engine, "before_cursor_execute", listen)
     try:
-        rows = await list_datasets(db=db)
+        rows = await list_datasets(include_archived=False, db=db)
     finally:
         event.remove(sync_engine, "before_cursor_execute", listen)
     by_id = {r.id: r for r in rows}
     assert by_id[by_hand.id].locked and by_id[by_hand.id].locked_reason == "r"
-    assert by_id[trained.id].locked and by_id[trained.id].locked_at is None
+    assert not by_id[trained.id].locked and by_id[trained.id].trained_by
     assert not by_id[free.id].locked
-    assert len(statements) == 2
+    assert statements
 
 
 @pytest.mark.asyncio

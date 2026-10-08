@@ -1132,10 +1132,9 @@ class TestTheClaimEndpoint:
 
 
 # ---------------------------------------------------------------------------------------
-# Retry (api#342). A failed run was a dead end — delete it and re-fill the whole dialog.
-# The failure that prompted it: a purge-delete wiped an S3 prefix, three combo runs died on
-# the dead URIs, and re-queuing the FROZEN snapshot died on the same 404s. So retry re-reads
-# each group's images from its dataset, and keeps the same row/version.
+# Retry (api#342): same row, same version. Since #423 it trains EXACTLY the run's snapshot:
+# datasets are living (#420), so re-reading one would retrain a different set than the run
+# records. The purge that once killed snapshots no longer reaches trained files (#421).
 # ---------------------------------------------------------------------------------------
 
 
@@ -1206,26 +1205,22 @@ class TestARunCanBeRetried:
         assert out.config["steps"] == 1200
         assert out.trigger == "d@vid"
 
-    async def test_the_images_are_re_read_from_the_datasets(self, db):
-        """THE WHOLE POINT. A run that died on dead URIs must not be re-queud with them;
-        whatever the datasets hold now is what a retry trains on."""
+    async def test_it_trains_the_snapshot_never_the_living_dataset(self, db):
+        """#423: the sets changed after the run -- David gained a face, Me lost some -- and
+        the retry still trains exactly what the run recorded, provenance and all."""
         from app.routes.training import retry_training_job
         a, b, job = _combo_failed()
         db.add(a); db.add(b); db.add(job); await db.commit()
-        # The human fixed the sets after the failure: David gained a face, Me lost the dead
-        # crops. The job's snapshot still lists the old ones.
         a.images = _images(12)
         b.images = [f"s3://wanly-images/2026-09-11/me{i}.jpg" for i in range(11)]
         await db.commit()
 
         out = await retry_training_job(job.id, _user=None, db=db)
 
-        assert out.dataset_images == _images(12)
-        assert out.identities[0]["images"] == [
-            f"s3://wanly-images/2026-09-11/me{i}.jpg" for i in range(11)]
-        # provenance counts follow the re-read, not the stale snapshot
-        assert out.config["dataset"]["count"] == 12
-        assert out.identities[0]["dataset"]["count"] == 11
+        assert out.dataset_images == _images(9)
+        assert out.identities[0]["images"] == _images(10)
+        assert out.config["dataset"]["count"] == 9
+        assert out.identities[0]["dataset"]["count"] == 10
 
     async def test_the_snapshot_trains_when_its_dataset_is_gone(self, db):
         """A deleted dataset is not a retry-blocker — the recorded images may still be fine.
@@ -1253,23 +1248,15 @@ class TestARunCanBeRetried:
         assert out.dataset_images == _images(9)
         assert out.config["dataset"] == {"id": None, "name": None, "count": 9}
 
-    async def test_a_shrunken_dataset_refuses_the_retry_and_leaves_the_row(self, db):
-        """Re-reading must not queue a run the trainer will reject at the floor — and a
-        refusal must not have rewritten anything, so the failed run still shows why it died."""
-        from fastapi import HTTPException
+    async def test_a_shrunken_dataset_does_not_matter(self, db):
+        """The set is the subject's living set; the run trains what it recorded (#423)."""
         from app.routes.training import retry_training_job
         a, b, job = _combo_failed()
         db.add(a); db.add(b); db.add(job); await db.commit()
-        a.images = _images(3)   # below MIN_DATASET_IMAGES
-
-        with pytest.raises(HTTPException) as e:
-            await retry_training_job(job.id, _user=None, db=db)
-        assert e.value.status_code == 422 and "David" in e.value.detail
-
-        await db.refresh(job)
-        assert job.status == TrainingStatus.FAILED
-        assert job.error_message == "404 on a dataset image"
-        assert job.dataset_images == _images(9), "the snapshot must not have been touched"
+        a.images = _images(3)
+        await db.commit()
+        out = await retry_training_job(job.id, _user=None, db=db)
+        assert out.status == TrainingStatus.PENDING and out.dataset_images == _images(9)
 
     async def test_a_live_twin_of_the_same_version_is_refused(self, db):
         """The partial unique index would reject the commit anyway; say it as a sentence."""
@@ -1955,20 +1942,20 @@ class TestARegisteredRunRetriesFromItsSnapshot:
         assert out.config["captions"] == before
         assert all("EDITED" not in c for g in out.identities for c in g["captions"])
 
-    async def test_removed_images_leave_with_their_captions(self, db):
+    async def test_removed_images_still_train(self, db):
+        """#423: an image removed from the living set since is still in the run's record."""
         from app.routes.training import retry_training_job
         w = await _world(db)
         job = await self._failed(db)
+        images = list(job.dataset_images)
         dead = w["david"].images[2]
         w["david"].images = [u for u in w["david"].images if u != dead]
         await db.commit()
         out = await retry_training_job(job.id, _user=None, db=db)
-        assert dead not in out.dataset_images
-        assert len(out.config["captions"]) == len(out.dataset_images) == 9
-        assert out.config["captions"][2] == "d@vid, man, medium shot, standing, look 3"
-        assert out.config["dataset"]["count"] == 9
+        assert out.dataset_images == images and dead in out.dataset_images
+        assert len(out.config["captions"]) == len(images)
 
-    async def test_an_image_added_since_is_not_trained_uncaptioned(self, db):
+    async def test_an_image_added_since_is_not_trained(self, db):
         from app.routes.training import retry_training_job
         w = await _world(db)
         job = await self._failed(db)
@@ -1976,20 +1963,23 @@ class TestARegisteredRunRetriesFromItsSnapshot:
         await db.commit()
         out = await retry_training_job(job.id, _user=None, db=db)
         assert "s3://wanly-images/datasets/new.jpg" not in out.dataset_images
-        assert len(out.config["captions"]) == len(out.dataset_images) == 10
 
-    async def test_too_few_snapshotted_images_left_refuses(self, db):
-        from fastapi import HTTPException
+    async def test_the_run_record_matches_its_snapshot(self, db):
+        """#422: creation writes one training_run_datasets row per group, and a retry
+        leaves them true."""
+        from sqlalchemy import select
+        from app.models import TrainingRunDataset
         from app.routes.training import retry_training_job
         w = await _world(db)
         job = await self._failed(db)
-        w["david"].images = w["david"].images[:4]
-        await db.commit()
-        with pytest.raises(HTTPException) as e:
-            await retry_training_job(job.id, _user=None, db=db)
-        assert e.value.status_code == 422
-        await db.refresh(job)
-        assert job.status == TrainingStatus.FAILED
+        rows = (await db.execute(select(TrainingRunDataset).where(
+            TrainingRunDataset.training_job_id == job.id)
+            .order_by(TrainingRunDataset.group_index))).scalars().all()
+        assert len(rows) == 1 + len(job.identities or [])
+        assert rows[0].dataset_id == w["david"].id and rows[0].images == job.dataset_images
+        assert rows[0].captions == job.config["captions"]
+        out = await retry_training_job(job.id, _user=None, db=db)
+        assert rows[0].images == out.dataset_images
 
 
 SDXL = {**SOLO, "arch": "sdxl", "steps": 960}
