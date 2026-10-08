@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import clips
+from app import clips, face_size
 from app.character_registry import identity_phrase
 from app.config import settings
 from app.enums import TRAINING_TERMINAL
@@ -350,6 +350,7 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
                   dataset=ds, images=stills, captions=[caps[u] for u in stills],
                   num_repeats=plan.character_repeats)
         _check_character_set(plan, ds, body.allow_low_scores)
+        _check_face_sizes(plan, ds, stills)
         plan.groups.append(g)
         if moving and sdxl:
             plan.warn("sdxl_ignores_clips",
@@ -523,6 +524,26 @@ def _check_character_set(plan: Plan, ds: Dataset, allow_low: bool = False) -> No
         plan.problem("score_below_floor",
                      f"{ds.name!r}: {len(low)} image(s) score below {floor:g} against the "
                      f"anchor (or show no face) — remove them, or they teach a different face")
+
+
+def _check_face_sizes(plan: Plan, ds: Dataset, stills: list[str]) -> None:
+    """A WARNING, never a block (#432): how many stills show the face under the small-face line
+    AT TRAINING SIZE. Joana v3 had 29 of 48 and took ~2x the steps v4 did to learn her face
+    once crops and upscales were added (#431). Both recipes train with bucket_no_upscale, so a
+    small face is learned small whatever the base. Unmeasured stills are said separately --
+    silence about them would read as "no small faces"."""
+    faces = ds.faces or {}
+    measured = [u for u in stills if u in faces]
+    small = [u for u in measured if face_size.is_small(faces[u])]
+    if small:
+        plan.warn("small_faces",
+                  f"{ds.name!r}: {len(small)} of {len(stills)} images show the face under "
+                  f"{settings.small_face_px} px at training size — 'Fix small faces' on the "
+                  f"dataset page adds upscaled head-and-shoulders crops")
+    if len(measured) < len(stills):
+        plan.warn("faces_unmeasured",
+                  f"{ds.name!r}: face size not measured for {len(stills) - len(measured)} of "
+                  f"{len(stills)} images — open the dataset to measure them")
 
 
 def _check_common(plan: Plan, g: Group) -> None:

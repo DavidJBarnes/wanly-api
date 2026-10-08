@@ -193,6 +193,13 @@ class Settings(BaseSettings):
     # people who got into this project's training sets got there past a human eye, not past a
     # number nobody was shown.
     face_cos_floor: float = 0.4
+    # SMALL FACES (wanly-api#432): a face under this many pixels tall AT TRAINING SIZE (after
+    # the trainer's downscale to the 1024^2 area; it never upscales) is flagged and offered to
+    # "Fix small faces". Joana v3 had 29 of 48 under it and learned her face slowly (#431).
+    small_face_px: int = 250
+    # An image whose short side is under this is upscaled WHOLE by the fix rather than cropped:
+    # a close-up that small is already all face.
+    small_image_short_side: int = 600
     a1111_url: str = "http://2070.zero:7860"
     # Unloading is a few seconds of torch teardown. Short, because failing to free the card
     # only costs the caption, which is never fatal to a render.

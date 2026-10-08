@@ -30,6 +30,7 @@ from app.config import settings
 from app.database import async_session, get_db, release_connection
 from app.enums import JobStatus, SegmentStatus, TrainingStatus
 from app import clips
+from app import face_size
 from app.joycaption import TRAINING_CAPTION, TRAINING_MOTION_CAPTION, CaptionError
 from app.models import Dataset, Job, LtxCharacter, Segment, TrainingJob, TrainingRunDataset, User
 from app import run_datasets
@@ -39,7 +40,7 @@ from app.regularization import (
 )
 from app.schemas.datasets import (
     DatasetCaptionEdit, DatasetCaptionStatus, DatasetCaptionsRun, DatasetClone, DatasetCreate,
-    DatasetLock, DatasetRegularize, DatasetRegularizeStatus, DatasetResponse, DatasetScore, DatasetScores,
+    DatasetFixStatus, DatasetLock, DatasetRegularize, DatasetRegularizeStatus, DatasetResponse, DatasetScore, DatasetScores,
     DatasetTrainedBy, DatasetUpdate,
 )
 from app.seeds import new_seed
@@ -68,7 +69,7 @@ def _prefix(ds_id: uuid.UUID) -> str:
 
 
 def _prune_annotations(ds: Dataset, also_drop: set[str] | None = None) -> None:
-    """Drop captions and scores for URIs that are no longer in the set (#352).
+    """Drop captions, scores and face sizes for URIs that are no longer in the set (#352).
 
     Both are keyed by URI, so an entry for a removed or cropped-away image is not harmful on
     its own -- but it is a caption nobody can see or edit, and a crop that reuses a filename
@@ -81,10 +82,14 @@ def _prune_annotations(ds: Dataset, also_drop: set[str] | None = None) -> None:
     keep = set(ds.images) - (also_drop or set())
     captions = {u: c for u, c in (ds.captions or {}).items() if u in keep}
     scores = {u: v for u, v in (ds.scores or {}).items() if u in keep}
+    # Face measurements too (#432): a re-upload's old size is a different picture's.
+    faces = {u: v for u, v in (ds.faces or {}).items() if u in keep}
     if captions != (ds.captions or {}):
         ds.captions = captions
     if scores != (ds.scores or {}):
         ds.scores = scores
+    if faces != (ds.faces or {}):
+        ds.faces = faces
 
 
 async def _validate_ownership(db: AsyncSession, kind: str | None, character: str | None,
@@ -255,7 +260,7 @@ async def create_dataset(
     ds_id = uuid.uuid4()
     ds = Dataset(id=ds_id, user_id=user.id, name=body.name, tags=body.tags, notes=body.notes,
                  images=[], prefix=_prefix(ds_id), kind=kind, character=character,
-                 reg_class=reg_class, captions={}, scores={})
+                 reg_class=reg_class, captions={}, scores={}, faces={})
     db.add(ds)
     await db.commit()
     await db.refresh(ds)
@@ -539,7 +544,7 @@ async def clone_dataset(
                  images=list(src.images or []), prefix=_prefix(ds_id),
                  anchor_uri=src.anchor_uri, kind=src.kind, character=src.character,
                  reg_class=src.reg_class, captions=dict(src.captions or {}),
-                 scores=dict(src.scores or {}))
+                 scores=dict(src.scores or {}), faces=dict(src.faces or {}))
     db.add(ds)
     await db.commit()
     await db.refresh(ds)
@@ -871,6 +876,160 @@ async def score_against_anchor(
     await db.commit()
 
     return DatasetScores(anchor_uri=uri, cos_floor=floor, scores=scores)
+
+
+@router.post("/datasets/{dataset_id}/faces/measure", response_model=DatasetResponse)
+async def measure_faces(
+    dataset_id: uuid.UUID,
+    overwrite: bool = False,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Measure each still's face height AT TRAINING SIZE (#432) -- the unmeasured ones, or all
+    of them with `overwrite`. Synchronous: about a second an image on the face-crop box.
+
+    The console calls it when a set has stills with no measurement, so "refresh when images
+    change" needs no hook in every route that adds one: removing or replacing an image drops
+    its entry (_prune_annotations), and whatever is new is simply unmeasured until this runs.
+
+    Not refused on a locked set: a measurement describes the images, it does not change them,
+    the same as scoring.
+    """
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    if not settings.face_crop_url:
+        raise HTTPException(
+            status_code=503,
+            detail="no face-crop service is configured (face_crop_url is empty)")
+    have = ds.faces or {}
+    todo = [u for u in face_size.stills(ds.images) if overwrite or u not in have]
+    if todo:
+        # No connection held across the face-crop calls: a 70-image set is a minute of them.
+        await release_connection(db)
+        try:
+            measured = await face_size.measure_uris(todo)
+        except face_size.FaceCropTooOld as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        except httpx.HTTPError as e:
+            raise HTTPException(status_code=503, detail=f"face-crop failed: {e}") from e
+        # Merged into the row as it is NOW, for images still in it -- one removed while this
+        # ran must not come back as a measurement nobody can see. An existing entry's fix
+        # bookkeeping (crop_uri, upscaled_from) survives a re-measure.
+        await db.refresh(ds, with_for_update=True)
+        keep = set(ds.images)
+        faces = {u: e for u, e in (ds.faces or {}).items() if u in keep}
+        for u, entry in measured.items():
+            if u in keep:
+                faces[u] = {**faces.get(u, {}), **entry}
+        ds.faces = faces
+        await db.commit()
+        await db.refresh(ds)
+    return await _respond_one(db, ds)
+
+
+def _fix_status(ds_id: uuid.UUID) -> DatasetFixStatus:
+    return DatasetFixStatus(**(face_size.FIX_RUNS.get(ds_id) or {}))
+
+
+async def fix_small_faces_job(ds_id: uuid.UUID) -> None:
+    """BackgroundTasks entry for "Fix small faces": its own session, like captioning's.
+
+    ALL THE WORK FIRST, ONE WRITE AT THE END. Every service call and upload happens with no row
+    lock and no connection held; then the row is re-read under FOR UPDATE and the result is
+    applied to the set as it is THEN. An interrupted or failed run changes nothing in the set
+    (its uploads are orphans under a fresh sub-folder, never in place of anything).
+    """
+    run = face_size.FIX_RUNS.setdefault(ds_id, {"running": True})
+    run.update(error=None, summary=None)
+    async with async_session() as db:
+        try:
+            ds = await db.get(Dataset, ds_id)
+            if ds is None:
+                return
+            images, anchor = list(ds.images), ds.anchor_uri
+            prefix = ds.prefix or _prefix(ds.id)
+            faces = dict(ds.faces or {})
+            todo = [u for u in face_size.stills(images) if u not in faces]
+            await release_connection(db)
+            run.update(stage="measuring")
+            measured = await face_size.measure_uris(todo)
+            faces.update(measured)
+            fix = await face_size.run_fix(ds_id, images, faces, prefix, anchor)
+
+            await db.refresh(ds, with_for_update=True)
+            if _is_locked(ds):
+                run["error"] = _lock_detail(ds)
+                await db.rollback()
+                return
+            # The measurements taken on the way are kept whatever the fix found to do.
+            keep = set(ds.images)
+            ds.faces = {**(ds.faces or {}), **{u: e for u, e in measured.items() if u in keep}}
+            if fix["replaced"] or fix["added"]:
+                note = face_size.apply_fix(ds, fix)
+            else:
+                note = "No small faces to fix."
+            await db.commit()
+            run.update(stage="done", summary=note)
+            logger.info("dataset %s: %s", ds.name, note)
+        except face_size.FaceCropTooOld as e:
+            run["error"] = str(e)
+        except Exception as e:
+            logger.exception("fix small faces on dataset %s failed", ds_id)
+            run["error"] = f"{type(e).__name__}: {e}"
+        finally:
+            run["running"] = False
+
+
+@router.post("/datasets/{dataset_id}/fix-small-faces", response_model=DatasetFixStatus,
+             status_code=202)
+async def fix_small_faces(
+    dataset_id: uuid.UUID,
+    background_tasks: BackgroundTasks,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """"Fix small faces" (#432, evidence in #431). For every still whose face trains under
+    `small_face_px`:
+
+      a big photo     a head-and-shoulders crop, Real-ESRGAN-upscaled to the trainer's 1024
+                      ceiling, ADDED beside it -- the photo keeps the body and context
+      a small image   (short side under `small_image_short_side`) upscaled whole and put IN
+                      PLACE of itself; the original stays in S3 and in any run that used it
+
+    Returns at once; poll GET .../fix-small-faces/status. A second press while one runs returns
+    that run's progress. The face-crop service is asked what it can do FIRST, so an older one
+    is refused here with what it needs, not half way through a batch.
+    """
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    await _refuse_if_locked(db, ds)
+    if not settings.face_crop_url:
+        raise HTTPException(
+            status_code=503,
+            detail="no face-crop service is configured (face_crop_url is empty)")
+    run = face_size.FIX_RUNS.get(ds.id)
+    if run and run.get("running"):
+        return _fix_status(ds.id)
+    try:
+        missing = {"measure", "upscale"} - await face_size.features()
+    except face_size.FaceCropTooOld as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if missing:
+        raise HTTPException(
+            status_code=503,
+            detail=face_size.TOO_OLD.format(what=" or ".join(sorted(missing))))
+    face_size.FIX_RUNS[ds.id] = {"running": True, "stage": "measuring", "done": 0, "total": 0,
+                                 "error": None, "summary": None}
+    background_tasks.add_task(fix_small_faces_job, ds.id)
+    return _fix_status(ds.id)
+
+
+@router.get("/datasets/{dataset_id}/fix-small-faces/status", response_model=DatasetFixStatus,
+            dependencies=[Depends(verify_api_key_or_bearer)])
+async def fix_small_faces_status(dataset_id: uuid.UUID):
+    return _fix_status(dataset_id)
 
 
 async def _embed_all(uris: list[str]) -> list[list[list[float]]]:

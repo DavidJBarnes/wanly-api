@@ -1,0 +1,307 @@
+"""Face size at training size, and "Fix small faces" (wanly-api#432).
+
+WHY. Both still recipes train with `bucket_no_upscale`: a photo is scaled DOWN to the trainer's
+1024^2 area and a small image is never enlarged. So the size a face is learned at is its height
+after that, not in the photograph -- and on Joana v3, 29 of 48 faces were under 250 px by that
+measure, and none was ever seen large. v4 added head-and-shoulders crops of those shots and
+upscaled the tiny close-ups, and reached v3-e11 likeness in about half the steps (#431).
+
+This module is the API side of making that routine instead of a session at a terminal:
+
+  measure           each still's face height at training size, from the face-crop service's
+                    /measure (wanly-gpu-docker#206), stored on the set as `faces`
+  the warning       the training preflight says "N of M images show the face under 250 px"
+  Fix small faces   head-and-shoulders crop + Real-ESRGAN upscale of each flagged photo,
+                    ADDED beside it; and tiny whole images upscaled IN PLACE of themselves
+
+THE ORIGINALS ARE NEVER TOUCHED IN S3. An upscaled image is a new object under a new key; the
+set's list points at it instead. A run that trained on the original keeps meaning those bytes
+(#421), and the original is still in the bucket if the upscale turns out worse.
+
+AN OLDER FACE-CROP SERVICE IS REFUSED, NOT TRUSTED. It ignores `upscale` and returns plain
+crops, and has no /measure at all. Storing either as if it had worked would put wrong numbers
+on the badges and un-upscaled crops in the set, both silently. So /health's `features` is
+checked before a fix starts, the crop response's `upscale` echo is checked before anything is
+stored, and a 404 from /measure is reported as "needs the worker image", the same way the
+head-and-shoulders framing is checked.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import logging
+import uuid
+
+import httpx
+
+from app import clips, s3
+from app.config import settings
+
+logger = logging.getLogger(__name__)
+
+#: How many images go to the face-crop service per call. Each call is a full base64 copy of
+#: every image in it, and the service works through them one by one on CPU, so a whole set in
+#: one request is a ~300 MB body against a 300 s read timeout. Measuring is ~1 s an image;
+#: an upscaled crop is a few seconds more.
+MEASURE_CHUNK = 16
+FIX_CHUNK = 4
+
+TOO_OLD = ("the face-crop service cannot {what} yet — it needs the worker image updated "
+           "(wanly-gpu-docker#206)")
+
+
+class FaceCropTooOld(Exception):
+    """The deployed face-crop service predates #206. The message says what it needs."""
+
+
+def _url(path: str) -> str:
+    return f"{settings.face_crop_url.rstrip('/')}{path}"
+
+
+def is_small(entry: dict | None) -> bool:
+    """Measured, a face was found, and it trains under the small-face line. No face is a
+    different problem -- the anchor scores already catch it -- and not counted here."""
+    if not entry:
+        return False
+    px = entry.get("face_px")
+    return px is not None and px < settings.small_face_px
+
+
+def is_small_image(entry: dict | None) -> bool:
+    """Short side under the line: a close-up too small for a crop to help. Upscaled whole."""
+    if not entry or not entry.get("width") or not entry.get("height"):
+        return False
+    return min(entry["width"], entry["height"]) < settings.small_image_short_side
+
+
+def stills(images: list[str]) -> list[str]:
+    """Measurement is of stills. A clip's face is measured by nobody yet (#411)."""
+    return [u for u in images if not clips.is_clip(u)]
+
+
+def entry_from(result: dict | None) -> dict:
+    """One /measure result, as stored per URI. The LARGEST face is taken as the subject's --
+    the same rule the crop's face 0 follows, and the same caveat: in a two-person photo the
+    bigger face may be the other person's. `faces` says how many there were."""
+    if not result:
+        return {"width": None, "height": None, "face_px": None, "faces": 0}
+    faces = result.get("faces") or []
+    top = faces[0] if faces else {}
+    return {
+        "width": result.get("width"),
+        "height": result.get("height"),
+        "face_px": top.get("face_px_at_train"),
+        "face_h": top.get("face_h"),
+        "yaw": top.get("yaw"),
+        "pitch": top.get("pitch"),
+        "roll": top.get("roll"),
+        "det_score": top.get("det_score"),
+        "faces": len(faces),
+    }
+
+
+async def features() -> set[str]:
+    """What the deployed face-crop service says it can do. Empty for one that predates the
+    list -- which is exactly the service that cannot measure or upscale."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            r = await client.get(_url("/health"))
+            r.raise_for_status()
+        except httpx.HTTPError as e:
+            raise FaceCropTooOld(f"face-crop unreachable: {e}") from e
+    return set(r.json().get("features") or [])
+
+
+async def measure_blobs(blobs: list[bytes]) -> list[dict]:
+    """Stored entries for each image's bytes, in order, via /measure in chunks."""
+    out: list[dict] = []
+    async with httpx.AsyncClient(timeout=settings.face_crop_timeout_s) as client:
+        for i in range(0, len(blobs), MEASURE_CHUNK):
+            body = {"images": [base64.b64encode(b).decode() for b in blobs[i:i + MEASURE_CHUNK]]}
+            try:
+                r = await client.post(_url("/measure"), json=body)
+            except httpx.HTTPError as e:
+                raise FaceCropTooOld(f"face-crop unreachable: {e}") from e
+            # 404 is an older service with no /measure: say what it needs, not "not found".
+            if r.status_code == 404:
+                raise FaceCropTooOld(TOO_OLD.format(what="measure face size"))
+            r.raise_for_status()
+            out.extend(entry_from(res) for res in r.json()["results"])
+    return out
+
+
+async def measure_uris(uris: list[str]) -> dict[str, dict]:
+    """{uri: entry} for these stills. Downloads concurrently, like crop does.
+
+    An image that cannot be downloaded (deleted under the set: the 409 dialog's dead entry) is
+    left out rather than failing the rest -- it simply stays unmeasured."""
+    if not uris:
+        return {}
+    got = await asyncio.gather(*(asyncio.to_thread(s3.download_bytes, u) for u in uris),
+                               return_exceptions=True)
+    ok = [(u, b) for u, b in zip(uris, got) if isinstance(b, (bytes, bytearray))]
+    for u, b in zip(uris, got):
+        if not isinstance(b, (bytes, bytearray)):
+            logger.warning("face size: could not download %s (%s); not measured", u, b)
+    entries = await measure_blobs([b for _, b in ok])
+    return {u: e for (u, _), e in zip(ok, entries)}
+
+
+# ---------------------------------------------------------------------------------------
+# Fix small faces
+# ---------------------------------------------------------------------------------------
+
+#: The fix runs THIS PROCESS is doing, by dataset id. In memory, like captioning's: a run is
+#: a task in this process and a restart ends it. Nothing is written to the set until the end,
+#: so an interrupted run leaves the set as it was -- and pressing the button again starts over.
+FIX_RUNS: dict[uuid.UUID, dict] = {}
+
+
+def plan_fix(images: list[str], faces: dict[str, dict]) -> tuple[list[str], list[str]]:
+    """(whole images to upscale, photographs to crop) from the measurements.
+
+    A SMALL IMAGE IS UPSCALED WHOLE, not cropped: a 300 px close-up is already all face, and
+    cropping it only makes a smaller image to enlarge. A BIG PHOTO WITH A SMALL FACE IS
+    CROPPED: the face is there at full resolution, the trainer just shrinks the frame around
+    it. The two are exclusive, smallest-image rule first.
+
+    IDEMPOTENT. A photo whose crop from an earlier fix is still in the set is not cropped again
+    -- the photo itself stays small-faced forever, so without this every press added another
+    copy. An upscaled image is ~1024 px and never qualifies a second time.
+    """
+    present = set(images)
+    upscale, crop = [], []
+    for u in stills(images):
+        e = faces.get(u)
+        if not e:
+            continue
+        if is_small_image(e):
+            upscale.append(u)
+        elif is_small(e) and e.get("crop_uri") not in present:
+            crop.append(u)
+    return upscale, crop
+
+
+def _progress(ds_id: uuid.UUID, **kw) -> None:
+    FIX_RUNS.setdefault(ds_id, {}).update(kw)
+
+
+async def run_fix(ds_id: uuid.UUID, images: list[str], faces: dict[str, dict], prefix: str,
+                  anchor_uri: str | None) -> dict:
+    """Do the work -- every service call and upload -- and return what to apply to the set.
+    Writes nothing to the database: the route applies the result under a row lock, against
+    the set as it is THEN (an image removed meanwhile is not resurrected by this)."""
+    upscale_uris, crop_uris = plan_fix(images, faces)
+    total = len(upscale_uris) + len(crop_uris)
+    _progress(ds_id, stage="upscaling", done=0, total=total)
+    # A batch of its own under the set's prefix, so a second fix can never overwrite the
+    # first's files while a run records them; the index keeps two same-named sources apart.
+    tag = uuid.uuid4().hex[:6]
+    replaced: dict[str, str] = {}          # original -> its upscaled copy
+    added: dict[str, str] = {}             # original -> its head-and-shoulders crop
+    crop_cos: dict[str, float] = {}        # crop -> likeness to the anchor, if there is one
+    done = 0
+
+    async with httpx.AsyncClient(timeout=settings.face_crop_timeout_s) as client:
+        # ---- tiny whole images, upscaled
+        for i in range(0, len(upscale_uris), FIX_CHUNK):
+            chunk = upscale_uris[i:i + FIX_CHUNK]
+            blobs = await asyncio.gather(*(asyncio.to_thread(s3.download_bytes, u) for u in chunk))
+            r = await client.post(_url("/upscale"),
+                                  json={"images": [base64.b64encode(b).decode() for b in blobs]})
+            if r.status_code == 404:
+                raise FaceCropTooOld(TOO_OLD.format(what="upscale images"))
+            r.raise_for_status()
+            for u, res in zip(chunk, r.json()["images"]):
+                if res and res.get("upscaled") and res.get("b64"):
+                    stem = u.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                    replaced[u] = await asyncio.to_thread(
+                        s3.upload_bytes, base64.b64decode(res["b64"]),
+                        f"{prefix}/upscaled-{tag}/{len(replaced):03d}_{stem}.jpg",
+                        settings.s3_images_bucket)
+            done += len(chunk)
+            _progress(ds_id, done=done)
+
+        # ---- big photos with small faces: head-and-shoulders, upscaled, added beside them
+        _progress(ds_id, stage="cropping")
+        anchor_vec: list[float] = []
+        if anchor_uri and crop_uris:
+            # One /embed of the anchor, so the new crops arrive scored and the set does not
+            # fail the training preflight's "not scored" check until someone re-scores it.
+            # The crop response already carries each crop's embedding.
+            blob = await asyncio.to_thread(s3.download_bytes, anchor_uri)
+            r = await client.post(_url("/embed"), json={"images": [base64.b64encode(blob).decode()]})
+            r.raise_for_status()
+            anchor_vec = (r.json().get("embeddings") or [[]])[0] or []
+        for i in range(0, len(crop_uris), FIX_CHUNK):
+            chunk = crop_uris[i:i + FIX_CHUNK]
+            blobs = await asyncio.gather(*(asyncio.to_thread(s3.download_bytes, u) for u in chunk))
+            r = await client.post(_url("/crop"), json={
+                "images": [base64.b64encode(b).decode() for b in blobs],
+                "reference": [], "largest_only": True,
+                "framing": "head_shoulders", "upscale": True,
+            })
+            r.raise_for_status()
+            result = r.json()
+            # THE ECHO CHECK, before anything is stored: an older service ignores both fields
+            # and sends plain face crops, which would join the set as if they were the fix.
+            if result.get("framing") != "head_shoulders" or result.get("upscale") is not True:
+                raise FaceCropTooOld(TOO_OLD.format(what="crop with upscale"))
+            for f in result["faces"]:
+                src = chunk[f["source_index"]]
+                stem = src.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                ext = {"jpeg": "jpg"}.get(str(f.get("format", "png")).lower(), "png")
+                crop = await asyncio.to_thread(
+                    s3.upload_bytes, base64.b64decode(f["png_b64"]),
+                    f"{prefix}/portraits-{tag}/{len(added):03d}_{stem}.{ext}",
+                    settings.s3_images_bucket)
+                added[src] = crop
+                emb = f.get("embedding") or []
+                if anchor_vec and emb:
+                    crop_cos[crop] = round(sum(a * b for a, b in zip(emb, anchor_vec)), 4)
+            done += len(chunk)
+            _progress(ds_id, done=done)
+
+    # ---- measure what was made, so the badges show the fix
+    _progress(ds_id, stage="measuring results")
+    new_faces = await measure_uris(list(replaced.values()) + list(added.values()))
+    for orig, new in replaced.items():
+        new_faces.setdefault(new, {})["upscaled_from"] = orig
+    return {"replaced": replaced, "added": added, "crop_cos": crop_cos, "faces": new_faces}
+
+
+def apply_fix(ds, fix: dict) -> str:
+    """Apply run_fix's result to the set (the ORM row, already locked by the caller) and
+    return the note. Only for images still in the set: one removed while the fix ran stays
+    removed, and its crop is not added."""
+    replaced = {o: n for o, n in fix["replaced"].items() if o in ds.images}
+    added = {o: c for o, c in fix["added"].items() if o in ds.images}
+    faces = dict(ds.faces or {})
+    # The upscaled copy IS the photograph: same caption, and the same face against the anchor
+    # (a re-score moves it a little at most). The original's measurement goes with it.
+    captions = dict(ds.captions or {})
+    scores = dict(ds.scores or {})
+    for orig, new in replaced.items():
+        if orig in captions:
+            captions[new] = captions.pop(orig)
+        if orig in scores:
+            scores[new] = scores.pop(orig)
+        faces.pop(orig, None)
+        if ds.anchor_uri == orig:
+            ds.anchor_uri = new
+    # A crop is a new image, scored against the anchor from its own embedding; no caption,
+    # as with any crop -- the photograph's caption describes a different framing.
+    for orig, crop in added.items():
+        if crop in fix["crop_cos"]:
+            scores[crop] = fix["crop_cos"][crop]
+        faces[orig] = {**faces.get(orig, {}), "crop_uri": crop}
+    for uri, entry in fix["faces"].items():
+        if uri in replaced.values() or uri in added.values():
+            faces[uri] = {**faces.get(uri, {}), **entry}
+    # JSONB columns do not see in-place mutation: reassign every one.
+    ds.images = [replaced.get(u, u) for u in ds.images] + list(added.values())
+    ds.captions, ds.scores, ds.faces = captions, scores, faces
+    note = (f"Fixed small faces: {len(replaced)} small image(s) upscaled in place (originals "
+            f"kept in S3), {len(added)} head-and-shoulders crop(s) added.")
+    ds.notes = f"{ds.notes}\n{note}".strip() if ds.notes else note
+    return note

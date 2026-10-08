@@ -134,6 +134,38 @@ class DatasetTrainedBy(BaseModel):
     created_at: datetime | None = None
 
 
+class DatasetFaceSize(BaseModel):
+    """One still's face measurement (#432). `face_px` is the LARGEST face's height in pixels at
+    TRAINING size -- after the trainer's downscale to the 1024^2 area, which never upscales --
+    and null when no face was found. Pose is insightface's, in degrees."""
+    width: int | None = None
+    height: int | None = None
+    face_px: float | None = None
+    face_h: float | None = None
+    yaw: float | None = None
+    pitch: float | None = None
+    roll: float | None = None
+    det_score: float | None = None
+    #: How many faces the detector found. >1 means face_px may be the wrong person's.
+    faces: int = 0
+    #: The head-and-shoulders crop "Fix small faces" made of this photo, if any.
+    crop_uri: str | None = None
+    #: On an upscaled copy: the original it replaced in the set (still in S3).
+    upscaled_from: str | None = None
+
+
+class DatasetFixStatus(BaseModel):
+    """GET/POST /datasets/{id}/fix-small-faces: the run's progress, and the set's tally."""
+    running: bool = False
+    #: upscaling | cropping | measuring results | done
+    stage: str | None = None
+    done: int = 0
+    total: int = 0
+    error: str | None = None
+    #: The note the finished run appended to the set.
+    summary: str | None = None
+
+
 class DatasetResponse(BaseModel):
     id: uuid.UUID
     name: str
@@ -149,6 +181,8 @@ class DatasetResponse(BaseModel):
     captions: dict[str, str] = Field(default_factory=dict)
     #: {uri: cos} against the anchor as of the last scoring pass; null = no face found.
     scores: dict[str, float | None] = Field(default_factory=dict)
+    #: {uri: face measurement} for stills (#432). An absent still has not been measured yet.
+    faces: dict[str, DatasetFaceSize] = Field(default_factory=dict)
     created_at: datetime | None = None
     updated_at: datetime | None = None
     #: READ-ONLY: locked by hand (#358) or archived (#419). Training no longer locks a set
@@ -168,7 +202,7 @@ class DatasetResponse(BaseModel):
     #: ARCHIVED (#419): a version set folded into its subject's living set. Hidden, read-only.
     archived_at: datetime | None = None
 
-    @field_validator("captions", "scores", mode="before")
+    @field_validator("captions", "scores", "faces", mode="before")
     @classmethod
     def _none_is_empty(cls, v):
         # A row created by the ORM before its server default is read back holds None.

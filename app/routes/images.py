@@ -632,6 +632,7 @@ async def move_images(body: dict, db: AsyncSession = Depends(get_db)):
             ds.images = [renames.get(u, u) for u in ds.images]
             ds.captions = {renames.get(u, u): c for u, c in (ds.captions or {}).items()}
             ds.scores = {renames.get(u, u): v for u, v in (ds.scores or {}).items()}
+            ds.faces = {renames.get(u, u): v for u, v in (ds.faces or {}).items()}
             if ds.anchor_uri in renames:
                 ds.anchor_uri = renames[ds.anchor_uri]
     await db.commit()
@@ -679,7 +680,8 @@ async def _forget_images(db: AsyncSession, paths: list[str]) -> None:
         keys = pg_array(paths)
         holders = (await db.execute(
             select(Dataset)
-            .where(or_(Dataset.captions.has_any(keys), Dataset.scores.has_any(keys)))
+            .where(or_(Dataset.captions.has_any(keys), Dataset.scores.has_any(keys),
+                       Dataset.faces.has_any(keys)))
             .with_for_update()
         )).scalars().all()
     except DBAPIError as e:
@@ -696,6 +698,7 @@ async def _forget_images(db: AsyncSession, paths: list[str]) -> None:
         # Reassigned, never mutated: JSONB does not see an in-place change.
         ds.captions = {u: c for u, c in (ds.captions or {}).items() if u not in gone}
         ds.scores = {u: v for u, v in (ds.scores or {}).items() if u not in gone}
+        ds.faces = {u: v for u, v in (ds.faces or {}).items() if u not in gone}
     if holders:
         logger.info("delete: dropped caption/score entries for %d image(s) from dataset(s) %s",
                     len(gone), ", ".join(ds.name for ds in holders))
