@@ -83,6 +83,22 @@ class TestTrainedOn:
         assert g0["dataset_exists"] is False and g0["dataset_name"] == "David"
         assert len(g0["images"]) == len(job.dataset_images)
 
+    async def test_a_sets_other_group_is_not_added_since(self, db):
+        """Joana v3 trained a set's stills and its clips as two groups: neither half is
+        'added since' the other."""
+        from app.models import TrainingJob
+        ds = await _ds(db, images=[f"s3://wanly-images/j/{i}.jpg" for i in range(3)]
+                       + ["s3://wanly-images/j/c.mp4"])
+        prov = {"id": str(ds.id), "name": ds.name}
+        job = TrainingJob(character="J", trigger="j", version=1, status="completed",
+                          dataset_images=ds.images[:3], config={"dataset": prov},
+                          identities=[{"kind": "clip", "images": ds.images[3:],
+                                       "dataset": prov}])
+        db.add(job)
+        await db.commit()
+        body = (await _http(db, "get", f"/training/{job.id}/trained-on")).json()
+        assert [g["added_since"] for g in body["groups"]] == [[], []]
+
     async def test_unknown_run_is_404(self, db):
         r = await _http(db, "get", f"/training/{uuid.uuid4()}/trained-on")
         assert r.status_code == 404
@@ -322,3 +338,25 @@ async def test_migration_114_up_and_down(db_engine):
         finally:
             await trans.rollback()
     assert gone == (False, False) and back == (True, True)
+
+
+async def test_the_report_names_each_links_own_living_set(db, heads):
+    """Two subjects merged in one pass: each run's link line names its own subject's set."""
+    from app.backfill_living_datasets import render, run
+    from app.models import TrainingJob
+    tag = uuid.uuid4().hex[:6]
+    lines = []
+    for who in (f"Aa{tag}", f"Bb{tag}"):
+        await _subject(db, who, who.lower())
+        v1 = await _set(db, f"{who} v1", who, [f"s3://wanly-images/{who}/1.jpg"], age_days=2)
+        await _set(db, f"{who} v2", who, [f"s3://wanly-images/{who}/2.jpg"])
+        db.add(TrainingJob(character=who, trigger=who.lower(), version=1, status="completed",
+                           dataset_images=list(v1.images),
+                           config={"dataset": {"id": str(v1.id), "name": v1.name},
+                                   "captions": ["c"]}))
+        lines.append(who)
+    await db.commit()
+    text = render(await run(apply=False, db=db), apply=False)
+    for who in lines:
+        line = next(ln for ln in text.splitlines() if ln.strip().startswith(f"{who} v1 ltx"))
+        assert f"-> '{who}'" in line, line

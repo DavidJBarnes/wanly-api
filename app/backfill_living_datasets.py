@@ -77,6 +77,8 @@ class SubjectPlan:
     near_dups: list[tuple[str, str, str]] = field(default_factory=list)
     #: Plain copies for the report: after a dry run's rollback the ORM rows are expired.
     source_labels: list[tuple[str, int]] = field(default_factory=list)
+    #: Images in the living set whose file is gone from S3 -- listed for David, kept in the set.
+    missing: list[str] = field(default_factory=list)
     existing_name: str | None = None
 
 
@@ -153,6 +155,7 @@ def _merge(subject: str, sets: list[Dataset], heads: dict[str, dict | None]) -> 
         plan.anchor = newest.anchor_uri
         plan.scores = {u: v for u, v in (newest.scores or {}).items() if u in seen}
     plan.near_dups = _near_duplicates(plan.images, heads)
+    plan.missing = [u for u in plan.images if heads.get(u) is None]
     return plan
 
 
@@ -219,6 +222,9 @@ async def _run(apply: bool, db) -> Report:
         if d.kind == "character" and d.character:
             by_subject[d.character].append(d)
     living_id: dict[uuid.UUID, uuid.UUID] = {}  # any set id -> its subject's living set id
+    # The report names each link by the set it lands in -- new living sets included, which
+    # are not in `datasets`.
+    living_names: dict[uuid.UUID, str] = {}
     for subject, sets in sorted(by_subject.items()):
         if len(sets) == 1:
             d = sets[0]
@@ -244,6 +250,7 @@ async def _run(apply: bool, db) -> Report:
                              notes=("Living set (#424), merged from "
                                     + ", ".join(s.name for s in plan.sources) + "."))
             db.add(target)
+            living_names[new_id] = plan.target_name
         target.images = plan.images
         target.captions = plan.captions
         target.scores = plan.scores
@@ -275,6 +282,7 @@ async def _run(apply: bool, db) -> Report:
 
     # ---- 5. link every run
     names = {d.id: d.name for d in datasets}
+
     for j in jobs:
         label = f"{j.character} v{j.version} {(j.config or {}).get('arch') or 'ltx'} [{j.status}]"
         if j.id in linked_jobs:
@@ -306,11 +314,7 @@ async def _run(apply: bool, db) -> Report:
                 dataset_name=as_trained, kind=g["kind"], character=g["character"],
                 images=g["images"], captions=captions, num_repeats=g["num_repeats"],
                 windows=g["windows"], source="backfill"))
-            tname = None
-            if target is not None:
-                tname = next((p.target_name for p in rep.merges
-                              if p.target_existing is None and living_id.get(ds_id) == target
-                              and ds_id != target), None) or names.get(target)
+            tname = (living_names.get(target) or names.get(target)) if target else None
             parts.append(f"g{g['index']} {g['kind']} {len(g['images'])} img "
                          f"{as_trained!r} -> {tname!r} ({how})")
         rep.links.append(f"{label}: " + "; ".join(parts))
@@ -343,6 +347,8 @@ def render(rep: Report, apply: bool) -> str:
                    f" -> {into}: {len(p.images)} images ({p.duplicates} exact duplicates "
                    f"collapsed), {len(p.captions)} captioned, anchor "
                    f"{'kept' if p.anchor else 'none'}; archive {len(p.source_labels)}")
+        for u in p.missing:
+            out.append(f"      file missing from S3 (kept in the set): {u}")
         for u, entries in p.caption_conflicts:
             out.append(f"      caption conflict {_basename(u)}: "
                        + " | ".join(f"{n}: {c[:50]!r}" for n, c in entries))
