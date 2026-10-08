@@ -416,6 +416,31 @@ class TestTheClaim:
 # ---------------------------------------------------------------------- the job toggle
 
 @pytest.mark.asyncio
+class TestNoFrameToContinueFrom:
+    async def test_it_fails_the_job_as_well_as_the_segment(self, db, presign):
+        """wanly-api#428: both earlier segments discarded, a new index-1 added. The claim
+        refuses it (never a continuation from noise) -- and the JOB must fail with it, or it
+        shows Processing forever on a queue whose workers are idle."""
+        first = await _queued(db, None)
+        first.status = SegmentStatus.COMPLETED
+        first.discarded = True
+        first.last_frame_path = "s3://b/last.png"
+        cont = Segment(job_id=first.job_id, index=1, prompt="she keeps moving",
+                       status=SegmentStatus.PENDING, ltx_recipe=None)
+        db.add(cont)
+        await db.flush()
+        job_id, cont_id = first.job_id, cont.id
+        assert await _claim(db) is None
+        seg = await db.get(Segment, cont_id)
+        job = await db.get(Job, job_id)
+        await db.refresh(seg)
+        await db.refresh(job)
+        assert seg.status == SegmentStatus.FAILED
+        assert "No frame to continue from" in (seg.error_message or "")
+        assert job.status == JobStatus.FAILED
+
+
+@pytest.mark.asyncio
 class TestTheJobToggle:
     async def _create(self, db, **extra):
         user = await _user(db)

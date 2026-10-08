@@ -1064,6 +1064,10 @@ async def claim_next_segment(
         segment.worker_id = None
         segment.worker_name = None
         segment.claimed_at = None
+        # The job fails with it, as a refused draft does above (wanly-api#428). Left alone it
+        # stayed `processing` with nothing claimed and nothing claimable -- a job that looks
+        # busy on a queue whose workers are idle.
+        job.status = JobStatus.FAILED
         await db.commit()
         logger.warning("Segment %s cannot continue: no predecessor frame", segment.id)
         return None
