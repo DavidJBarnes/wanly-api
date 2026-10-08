@@ -68,7 +68,10 @@ async def _world(db, *, floor_ok=True):
             anchor_uri=imgs[0] if kind == "character" else None,
             captions={u: f"medium shot, standing, look {i}" for i, u in enumerate(imgs)},
             scores=({u: (1.0 if i == 0 else 0.7) for i, u in enumerate(imgs)}
-                    if scored and kind == "character" else {}))
+                    if scored and kind == "character" else {}),
+            # Measured, every face comfortably big at training size (#432).
+            faces=({u: {"width": 1024, "height": 1024, "face_px": 420.0, "faces": 1}
+                    for u in imgs} if kind == "character" else {}))
 
     w = {
         "david_c": LtxCharacter(name="David", trigger="d@vid", gender="man", char_lora="none"),
@@ -1648,6 +1651,38 @@ class TestTheWarnings:
         await _world(db)
         out = await _preflight(db, **SOLO, steps=150)
         assert out["warnings"] == []
+
+    async def test_small_faces_warn_with_the_count(self, db):
+        """#432: a warning, never a block -- Joana v3 trained, just slowly (#431)."""
+        w = await _world(db)
+        imgs = w["david"].images
+        w["david"].faces = {**w["david"].faces,
+                            imgs[1]: {"width": 1080, "height": 1440, "face_px": 180.0},
+                            imgs[2]: {"width": 1080, "height": 1440, "face_px": 249.9}}
+        await db.flush()
+        out = await _preflight(db, **SOLO, steps=150)
+        assert out["ok"]
+        msg = {x["code"]: x["message"] for x in out["warnings"]}
+        assert "2 of 10 images show the face under 250 px" in msg["small_faces"]
+
+    async def test_no_face_is_not_a_small_face(self, db):
+        """No face is the anchor scores' problem, and already caught there."""
+        w = await _world(db)
+        w["david"].faces = {**w["david"].faces,
+                            w["david"].images[1]: {"width": 900, "height": 900, "face_px": None}}
+        await db.flush()
+        out = await _preflight(db, **SOLO, steps=150)
+        assert "small_faces" not in {x["code"] for x in out["warnings"]}
+
+    async def test_unmeasured_images_are_said_not_passed_over(self, db):
+        """Silence about them would read as "no small faces"."""
+        w = await _world(db)
+        w["david"].faces = {}
+        await db.flush()
+        out = await _preflight(db, **SOLO, steps=150)
+        assert out["ok"]
+        msg = {x["code"]: x["message"] for x in out["warnings"]}
+        assert "not measured for 10 of 10" in msg["faces_unmeasured"]
 
 
 class TestTheV1Recipe:

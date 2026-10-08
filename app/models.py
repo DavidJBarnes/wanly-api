@@ -476,6 +476,12 @@ class Dataset(Base):
     #: Kept rather than recomputed because the training route refuses a character set with a
     #: face below the floor, and that must not depend on the face-crop box being up.
     scores = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    #: {uri: face measurement} (wanly-api#432): the largest face's height AT TRAINING SIZE
+    #: (`face_px`, null = no face found), the image's size, pose and how many faces there were,
+    #: from the face-crop service's /measure. Stills only. Kept rather than measured on demand
+    #: because the training preflight warns on it, and that must not need the face-crop box up.
+    #: "Fix small faces" adds `crop_uri` (the crop it made of a photo) and `upscaled_from`.
+    faces = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
     #: LOCKED BY HAND (#358, migration 104). The training lock (#356) is derived from
     #: training_jobs and so only covers sets that trained; these say a person locked it anyway.
     #: Set by POST /datasets/{id}/lock, cleared only by /unlock, not copied by a clone.
