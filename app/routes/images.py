@@ -17,9 +17,10 @@ from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_
 from app import caption_tickets
 from app.config import settings
 from app.routes.datasets import DATASETS_PREFIX
+from app import run_datasets
 from app.database import async_session, get_db, release_connection
 from app.joycaption import CaptionError, CaptionerBusy
-from app.enums import TRAINING_TERMINAL, JobStatus, SegmentStatus, TrainingStatus
+from app.enums import JobStatus, SegmentStatus, TrainingStatus
 from app.models import Dataset, Favorite, ImageMeta, Job, LtxCharacter, Segment, TrainingJob, User
 from app.routes.captions import caption_image_pair, caption_image_scene
 from app.schemas.images import (BulkImageTagsUpdate, CaptionLane, CaptionQueueEntry,
@@ -36,6 +37,7 @@ from app.s3 import (
     head_object,
     list_common_prefixes,
     list_objects,
+    copy_object,
     move_object,
     upload_bytes,
 )
@@ -163,13 +165,21 @@ async def find_image_references(db: AsyncSession, paths: list[str]) -> dict[str,
     # Matched in Python rather than SQL because the paths live inside a JSON array; the row
     # count here is tiny (one per training run, ever) so a containment query would be more
     # machinery than the problem deserves.
+    #
+    # EVERY RUN, ANY STATUS, EVERY GROUP (#421). A finished run's snapshot is now the only
+    # record of what its LoRA learned from (#419: datasets stay editable), and a retry trains
+    # that snapshot exactly (#423) -- so a finished run holds its files as surely as a queued
+    # one. Group 0 is dataset_images; the rest are identities[].images. Finished runs show as
+    # idle holders, which force still overrides, deliberately.
     train_rows = await db.execute(
-        select(TrainingJob.id, TrainingJob.dataset_images)
-        .where(TrainingJob.status.not_in(list(TRAINING_TERMINAL)))
-    )
-    for job_id, images in train_rows.all():
+        select(TrainingJob.id, TrainingJob.dataset_images, TrainingJob.identities))
+    for job_id, images, identities in train_rows.all():
         for value in images or []:
             _hold(value, "training_ids", job_id)
+        for g in identities if isinstance(identities, list) else []:
+            if isinstance(g, dict):
+                for value in g.get("images") or []:
+                    _hold(value, "training_ids", job_id)
 
     # DATASET MEMBERSHIP COUNTS TOO (wanly-api#305). A photograph in a dataset that could be
     # deleted from the repo silently vanished from every set holding it: the set keeps a dead
@@ -556,11 +566,18 @@ async def move_images(body: dict, db: AsyncSession = Depends(get_db)):
     if not target_folder:
         raise HTTPException(status_code=400, detail="target_folder is required")
     bucket = settings.s3_images_bucket
+    # A FILE A RUN TRAINED ON IS COPIED, NOT MOVED (#421). The run's snapshot names the old
+    # path and a retry trains exactly that snapshot (#423), so the original must stay; the
+    # image's metadata, its character refs and the datasets holding it follow the copy.
+    trained = await run_datasets.trained_uris(db)
 
     async def _move_one(src_key: str) -> tuple[str, str]:
         filename = src_key.split("/", 1)[1] if "/" in src_key else src_key
         dst_key = f"{target_folder}/{filename}"
-        await asyncio.to_thread(move_object, bucket, src_key, dst_key)
+        if f"s3://{bucket}/{src_key}" in trained:
+            await asyncio.to_thread(copy_object, bucket, src_key, dst_key)
+        else:
+            await asyncio.to_thread(move_object, bucket, src_key, dst_key)
         return src_key, dst_key
 
     moved = await asyncio.gather(*[_move_one(k) for k in keys])
@@ -603,6 +620,20 @@ async def move_images(body: dict, db: AsyncSession = Depends(get_db)):
             continue
         for col in (LtxCharacter.sheet_uri, LtxCharacter.face_ref_uri):
             await db.execute(update(LtxCharacter).where(col == src).values({col.key: dst}))
+    # A DATASET HOLDING THE IMAGE FOLLOWS IT TOO (#419). Its list, captions, scores and anchor
+    # are keyed by URI; left behind they name a file that is gone (or, for a trained file, a
+    # copy the set no longer means). Reassigned, never mutated: JSONB does not see in-place
+    # changes. Training runs are NOT rewritten -- their snapshot is the record of what trained.
+    renames = {f"s3://{bucket}/{a}": f"s3://{bucket}/{b}" for a, b in moved if a != b}
+    if renames:
+        for ds in (await db.execute(select(Dataset))).scalars().all():
+            if not any(u in renames for u in ds.images or []):
+                continue
+            ds.images = [renames.get(u, u) for u in ds.images]
+            ds.captions = {renames.get(u, u): c for u, c in (ds.captions or {}).items()}
+            ds.scores = {renames.get(u, u): v for u, v in (ds.scores or {}).items()}
+            if ds.anchor_uri in renames:
+                ds.anchor_uri = renames[ds.anchor_uri]
     await db.commit()
 
     return {"moved": len(moved)}

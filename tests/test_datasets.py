@@ -765,8 +765,8 @@ class TestOwnership:
         out = await _patch(db, ds, notes="x")
         assert (out.kind, out.reg_class) == ("regularization", "man")
 
-    async def test_ownership_is_locked_while_a_run_trains_on_the_set(self, db):
-        from fastapi import HTTPException
+    async def test_ownership_can_change_while_a_run_trains_on_the_set(self, db):
+        """#420: the run snapshotted its owner's trigger and its images; the set stays living."""
         from app.enums import TrainingStatus
         from app.models import TrainingJob
         await self._chars(db)
@@ -775,10 +775,7 @@ class TestOwnership:
                            dataset_images=ds.images, status=TrainingStatus.RUNNING,
                            config={"dataset": {"id": str(ds.id), "name": ds.name}}))
         await db.commit()
-        with pytest.raises(HTTPException) as e:
-            await _patch(db, ds, kind=None)
-        assert e.value.status_code == 409
-        # ...while everything else is still editable.
+        assert (await _patch(db, ds, kind=None)).kind is None
         assert (await _patch(db, ds, notes="fine")).notes == "fine"
 
 

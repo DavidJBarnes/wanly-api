@@ -485,9 +485,57 @@ class Dataset(Base):
     #: created AFTER it, so the runs that already trained stop locking the set and the next
     #: one locks it again. Set by POST /datasets/{id}/unlock, not copied by a clone.
     unlocked_at = mapped_column(DateTime(timezone=True), nullable=True)
+    #: ARCHIVED (#419, migration 114): a version set folded into its subject's living set by the
+    #: backfill. Hidden from lists and pickers and read-only, never deleted -- runs still link
+    #: to it, and its images are what they trained on.
+    archived_at = mapped_column(DateTime(timezone=True), nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc),
                                onupdate=lambda: datetime.now(timezone.utc))
+
+
+class TrainingRunDataset(Base):
+    """One group of a training run, as it trained, keyed by the dataset it came from (#422).
+
+    THE RUN IS THE RECORD (#419). Datasets stay editable, so "what did Joana v3 learn from"
+    cannot be read off the dataset; it is read here. Written when the run is created, one row
+    per plan group -- each member's identity set, a pair's composition set, a clip group, a
+    regularization pool -- and by the backfill (#424) for runs from before this table.
+
+    The job's own snapshot columns (dataset_images, config.captions, identities) are untouched
+    and remain what the trainer reads; this restates them per dataset so they can be queried.
+    `dataset_id` is SET NULL when a set is deleted: the record outlives the set, by name.
+    """
+    __tablename__ = "training_run_datasets"
+    __table_args__ = (
+        UniqueConstraint("training_job_id", "group_index", name="uq_training_run_datasets_group"),
+        Index("ix_training_run_datasets_job", "training_job_id"),
+        Index("ix_training_run_datasets_dataset", "dataset_id"),
+    )
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    training_job_id = mapped_column(UUID(as_uuid=True),
+                                    ForeignKey("training_jobs.id", ondelete="CASCADE"),
+                                    nullable=False)
+    #: 0 is the job's flat group (the first member / the character); 1.. follow `identities`.
+    group_index = mapped_column(Integer, nullable=False)
+    dataset_id = mapped_column(UUID(as_uuid=True), ForeignKey("datasets.id", ondelete="SET NULL"),
+                               nullable=True)
+    #: The set's name AS IT TRAINED: a rename or a delete must not rewrite history.
+    dataset_name = mapped_column(String(100), nullable=True)
+    #: identity | composition | regularization | clip
+    kind = mapped_column(String(20), nullable=False)
+    character = mapped_column(String(64), nullable=True)
+    images = mapped_column(JSONB, nullable=False, default=list)
+    #: Final captions, trigger prefix included, parallel to `images`. NULL only where the run
+    #: never recorded any and the backfill could not say (it records the bare trigger phrase
+    #: for pre-#352 runs instead).
+    captions = mapped_column(JSONB, nullable=True)
+    num_repeats = mapped_column(Integer, nullable=True)
+    windows = mapped_column(Integer, nullable=False, default=1)
+    #: created (at run creation) | backfill (#424)
+    source = mapped_column(String(20), nullable=False, default="created")
+    created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 class TrainingJob(Base):

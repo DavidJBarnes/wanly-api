@@ -1,10 +1,8 @@
-"""A dataset that trained a LoRA is locked; a clone is how it changes (wanly-api#356).
+"""A set that trained a LoRA stays living (wanly-api#420, retiring #356's lock).
 
-A set edited after its LoRA trained leaves the LoRA's record pointing at a dataset that no
-longer holds what it learned from. So once a run that is not failed or cancelled has used a
-set -- group 0's `config.dataset.id`, or any `identities[].dataset.id` -- every mutation of
-its training data is a 409 naming the run, and POST /datasets/{id}/clone makes an unlocked
-copy that shares the same image URIs.
+Each run records what it trained on (training_run_datasets, #422), so the dataset is the
+subject's living set: edits go through, `trained_by` and `used_in` only inform, and no file a
+run trained on is ever deleted or overwritten (#421). Clone stays, for a separate set.
 
 Sharing URIs is only safe if nothing that edits one set can delete an object the other
 still lists. The S3 tests below run the real app.s3 functions against an in-memory bucket,
@@ -123,191 +121,92 @@ def bucket(monkeypatch):
 
 
 @pytest.mark.asyncio
-class TestWhatLocks:
-    async def test_a_set_nobody_trained_on_is_unlocked(self, db):
-        from app.routes.datasets import get_dataset
-        ds = await _ds(db)
-        out = await get_dataset(ds.id, db=db)
-        assert out.locked is False and out.trained_by == []
+class TestATrainedSetStaysLiving:
+    """#420: training no longer locks a set. Every run records what it trained on, so the
+    set is the subject's living set -- each of these was a 409 under #356."""
+
+    async def _trained(self, db, **kw):
+        ds = await _ds(db, name=f"Kelly 2000 v5 {uuid.uuid4().hex[:4]}", **kw)
+        await _run(db, ds, version=5)
+        return ds
 
     @pytest.mark.parametrize("status", [TrainingStatus.PENDING, TrainingStatus.CLAIMED,
                                         TrainingStatus.RUNNING, TrainingStatus.COMPLETED])
-    async def test_a_queued_running_or_finished_run_locks_its_set(self, db, status):
+    async def test_any_run_is_listed_but_locks_nothing(self, db, status):
         from app.routes.datasets import get_dataset
         ds = await _ds(db)
         job = await _run(db, ds, status=status, version=5)
         out = await get_dataset(ds.id, db=db)
-        assert out.locked is True
+        assert out.locked is False
         assert [t.model_dump() for t in out.trained_by] == [
             {"job_id": str(job.id), "character": "Kelly-2000", "version": 5,
-             "status": str(status), "created_at": job.created_at}]
+             "status": str(status), "arch": "ltx", "created_at": job.created_at}]
 
     @pytest.mark.parametrize("status", [TrainingStatus.FAILED, TrainingStatus.CANCELLED])
-    async def test_a_failed_or_cancelled_run_leaves_it_editable(self, db, status):
-        """No LoRA came of it, so there is no record for an edit to falsify."""
+    async def test_a_failed_or_cancelled_run_is_not_listed(self, db, status):
         from app.routes.datasets import get_dataset
         ds = await _ds(db)
         await _run(db, ds, status=status)
         out = await get_dataset(ds.id, db=db)
         assert out.locked is False and out.trained_by == []
-        # ...and the mutations the lock refuses go through.
-        assert (await _patch(db, ds, images=ds.images[:2])).images == ds.images[:2]
 
-    async def test_a_failing_run_unlocks_the_set(self, db):
-        from app.routes.datasets import get_dataset
-        ds = await _ds(db)
-        job = await _run(db, ds, status=TrainingStatus.RUNNING)
-        assert (await get_dataset(ds.id, db=db)).locked
-        job.status = TrainingStatus.FAILED
-        await db.commit()
-        assert not (await get_dataset(ds.id, db=db)).locked
-
-    async def test_an_identity_group_locks_its_set_too(self, db):
-        """A joint run's second member, composition set or regularization pool lives in
-        `identities`, not group 0 -- and trained the LoRA just the same."""
+    async def test_an_identity_group_lists_its_set_too(self, db):
         from app.routes.datasets import get_dataset
         g0, comp, other = await _ds(db), await _ds(db), await _ds(db)
         job = await _run(db, g0, identities_ds=[comp])
         assert (await get_dataset(comp.id, db=db)).trained_by[0].job_id == str(job.id)
-        assert (await get_dataset(g0.id, db=db)).locked
-        assert not (await get_dataset(other.id, db=db)).locked
+        assert (await get_dataset(other.id, db=db)).trained_by == []
 
-    async def test_trained_by_lists_every_locking_run_and_only_those(self, db):
+    async def test_used_in_badges_each_image_its_runs(self, db):
         from app.routes.datasets import get_dataset
         ds = await _ds(db)
         a = await _run(db, ds, version=4)
-        await _run(db, ds, version=5, status=TrainingStatus.FAILED)
-        b = await _run(db, None, identities_ds=[ds], version=6, status=TrainingStatus.PENDING,
-                       character="DavidKelly-2026")
+        await _patch(db, ds, images=ds.images[:2] + [ds.images[3]])
         out = await get_dataset(ds.id, db=db)
-        assert [(t.job_id, t.character, t.version, t.status) for t in out.trained_by] == [
-            (str(a.id), "Kelly-2000", 4, "completed"),
-            (str(b.id), "DavidKelly-2026", 6, "pending")]
+        assert set(out.used_in) == set(out.images)
+        assert [r.job_id for r in out.used_in[ds.images[0]]] == [str(a.id)]
 
-    async def test_a_clone_does_not_inherit_the_lock_by_sharing_uris(self, db):
-        """Locking reads recorded provenance, never URI overlap."""
-        from app.routes.datasets import clone_dataset, get_dataset
-        from app.schemas.datasets import DatasetClone
-        src = await _ds(db)
-        await _run(db, src)
-        c = await clone_dataset(src.id, DatasetClone(name=f"c-{uuid.uuid4().hex[:6]}"),
-                                user=_Usr(), db=db)
-        assert c.locked is False and c.images == src.images
-        assert (await get_dataset(c.id, db=db)).locked is False
+    async def test_removing_reordering_and_renaming_go_through(self, db):
+        ds = await self._trained(db)
+        want = list(reversed(ds.images[1:]))
+        out = await _patch(db, ds, name=f"n-{uuid.uuid4().hex[:6]}", images=want)
+        assert out.images == want and out.locked is False
 
-    async def test_the_list_fills_the_lock_for_every_set(self, db):
-        from sqlalchemy import event
-        from app.routes.datasets import list_datasets
-        locked, free = await _ds(db), await _ds(db)
-        await _run(db, locked)
-        await _run(db, None, identities_ds=[locked])
+    async def test_changing_the_owner_or_class(self, db):
+        ds = await self._trained(db, kind="regularization", reg_class="woman")
+        assert (await _patch(db, ds, reg_class="man")).reg_class == "man"
 
-        statements = []
-        sync_engine = db.bind.sync_engine if hasattr(db.bind, "sync_engine") else db.bind
-        listen = lambda *a: statements.append(a[2])  # noqa: E731
-        event.listen(sync_engine, "before_cursor_execute", listen)
-        try:
-            rows = await list_datasets(db=db)
-        finally:
-            event.remove(sync_engine, "before_cursor_execute", listen)
-        by_id = {r.id: r for r in rows}
-        assert by_id[locked.id].locked and len(by_id[locked.id].trained_by) == 2
-        assert not by_id[free.id].locked and by_id[free.id].trained_by == []
-        assert len(statements) == 2, "one query for the sets, one for the runs -- not N+1"
-
-
-@pytest.mark.asyncio
-class TestRefusedWhileLocked:
-    """Everything that changes what a run would train on is a 409 naming the run."""
-
-    async def _locked(self, db, **kw):
-        ds = await _ds(db, name=f"Kelly 2000 v5 {uuid.uuid4().hex[:4]}", **kw)
-        await _run(db, ds, version=5)
-        return ds
-
-    @staticmethod
-    def _is_lock(e, ds):
-        assert e.value.status_code == 409
-        assert e.value.detail.startswith(f"{ds.name!r} trained Kelly-2000 v5 and is locked")
-        assert "clone it" in e.value.detail
-
-    async def test_removing_or_reordering_images(self, db):
-        from fastapi import HTTPException
-        ds = await self._locked(db)
-        for images in (ds.images[1:], list(reversed(ds.images)), ds.images + ["s3://x/y.jpg"]):
-            with pytest.raises(HTTPException) as e:
-                await _patch(db, ds, images=images)
-            self._is_lock(e, ds)
-
-    async def test_a_patch_that_also_renames_is_refused_whole(self, db):
-        from fastapi import HTTPException
-        ds = await self._locked(db)
-        name = ds.name
-        with pytest.raises(HTTPException):
-            await _patch(db, ds, name="renamed-" + uuid.uuid4().hex[:6], images=ds.images[1:])
-        await db.refresh(ds)
-        assert ds.name == name and len(ds.images) == 4
-
-    async def test_changing_a_pools_class(self, db):
-        from fastapi import HTTPException
-        ds = await self._locked(db, kind="regularization", reg_class="woman")
-        with pytest.raises(HTTPException) as e:
-            await _patch(db, ds, reg_class="man")
-        self._is_lock(e, ds)
-
-    async def test_changing_the_owner_or_kind(self, db):
-        """Composition, because its owner need not be registered -- so what refuses these is
-        the lock, not ownership validation."""
-        from fastapi import HTTPException
-        ds = await self._locked(db, kind="composition", character="KellyPair-2000")
-        with pytest.raises(HTTPException) as e:
-            await _patch(db, ds, character="OtherPair-2000")
-        self._is_lock(e, ds)
-        with pytest.raises(HTTPException) as e:
-            await _patch(db, ds, kind=None)
-        self._is_lock(e, ds)
-
-    async def test_uploading_images(self, db, bucket):
-        from fastapi import HTTPException
+    async def test_uploading_into_a_trained_set(self, db, bucket):
         from app.routes.datasets import add_images
-        ds = await self._locked(db)
-        with pytest.raises(HTTPException) as e:
-            await add_images(ds.id, files=[_Upload()], _user=None, db=db)
-        self._is_lock(e, ds)
-        assert bucket.objects == {}, "refused before anything was uploaded"
+        ds = await self._trained(db)
+        out = await add_images(ds.id, files=[_Upload()], _user=None, db=db)
+        assert len(out.images) == 5
 
-    async def test_cropping(self, db):
-        from fastapi import HTTPException
-        from app.routes.datasets import crop_faces
-        ds = await self._locked(db)
-        for save_as in (False, True):
-            with pytest.raises(HTTPException) as e:
-                await crop_faces(ds.id, largest_only=False, uris=None, save_as=save_as,
-                                 _user=None, db=db)
-            self._is_lock(e, ds)
+    async def test_reuploading_a_trained_file_never_overwrites_it(self, db, bucket):
+        """#421: the bytes under a run's recorded URI stay the bytes it learned from."""
+        from app.routes.datasets import add_images
 
-    async def test_generating_captions(self, db):
-        from fastapi import BackgroundTasks, HTTPException
-        from app.routes.datasets import caption_dataset
-        ds = await self._locked(db)
-        tasks = BackgroundTasks()
-        with pytest.raises(HTTPException) as e:
-            await caption_dataset(ds.id, tasks, body=None, _user=None, db=db)
-        self._is_lock(e, ds)
-        assert tasks.tasks == []
+        class _Same(_Upload):
+            filename = "0.jpg"
+        ds = await self._trained(db)
+        before = list(ds.images)
+        trained = ds.images[0]
+        b, k = trained[len("s3://"):].split("/", 1)
+        bucket.objects[(b, k)] = b"original"
+        out = await add_images(ds.id, files=[_Same()], _user=None, db=db)
+        assert bucket.objects[(b, k)] == b"original"
+        fresh = [u for u in out.images if u not in before]
+        assert len(fresh) == 1 and fresh[0].rsplit("/", 1)[1].startswith("0-")
 
-    async def test_editing_a_caption(self, db):
-        from fastapi import HTTPException
+    async def test_captions_edit(self, db):
         from app.routes.datasets import edit_dataset_caption
         from app.schemas.datasets import DatasetCaptionEdit
-        ds = await self._locked(db)
-        with pytest.raises(HTTPException) as e:
-            await edit_dataset_caption(ds.id, DatasetCaptionEdit(uri=ds.images[0], caption="x"),
-                                       _user=None, db=db)
-        self._is_lock(e, ds)
+        ds = await self._trained(db)
+        out = await edit_dataset_caption(ds.id, DatasetCaptionEdit(uri=ds.images[0], caption="x"),
+                                         _user=None, db=db)
+        assert out.captions[ds.images[0]] == "x"
 
-    async def test_a_caption_run_stops_when_the_set_locks_under_it(self, db, monkeypatch):
-        """The Train button does not wait for captioning to finish."""
+    async def test_a_caption_run_does_not_stop_when_a_run_is_queued(self, db, monkeypatch):
         from app.routes import captions as cap_mod
         from app.routes import datasets as mod
         ds = await _ds(db)
@@ -328,68 +227,31 @@ class TestRefusedWhileLocked:
         monkeypatch.setattr(cap_mod, "caption_image_bytes", _caption)
         monkeypatch.setattr(mod, "s3", _S3())
         n = await mod.caption_dataset_images(db, ds.id, overwrite=False)
-        await db.refresh(ds)
-        assert n == 1 and len(ds.captions) == 1
-        assert "is locked" in mod._CAPTION_RUNS.pop(ds.id)["error"]
+        assert n == 4
+        mod._CAPTION_RUNS.pop(ds.id, None)
 
-    async def test_regularizing(self, db):
-        from fastapi import HTTPException
-        from app.routes.datasets import regularize_dataset
-        from app.schemas.datasets import DatasetRegularize
-        ds = await self._locked(db, kind="regularization", reg_class="woman")
-        with pytest.raises(HTTPException) as e:
-            await regularize_dataset(ds.id, DatasetRegularize(count=3), user=_Usr(), db=db)
-        self._is_lock(e, ds)
-
-    async def test_a_locked_pool_does_not_collect_late_renders(self, db, bucket):
-        """Renders queued before the pool trained can finish after it."""
-        from app.enums import JobStatus, SegmentStatus
-        from app.models import Job, Segment, User
-        from app.regularization import reg_tag
-        from app.routes.datasets import regularize_status
-        user = User(username=f"u{uuid.uuid4().hex[:6]}", password_hash="x")
-        db.add(user)
-        await db.flush()
-        ds = await _ds(db, images=[], kind="regularization", reg_class="man")
-        j = Job(user_id=user.id, name="r", width=832, height=1216, fps=24, seed=1,
-                tags=f"regularization, {reg_tag(ds.id)}", status=JobStatus.PROCESSING)
-        db.add(j)
-        await db.flush()
-        frame = f"s3://wanly-jobs/{j.id}/last_frame.png"
-        bucket.objects[("wanly-jobs", f"{j.id}/last_frame.png")] = b"png"
-        db.add(Segment(job_id=j.id, index=0, prompt="p", status=SegmentStatus.COMPLETED,
-                       last_frame_path=frame))
-        await db.commit()
-        run = await _run(db, None, identities_ds=[ds], status=TrainingStatus.RUNNING)
-
-        held = await regularize_status(ds.id, _user=None, db=db)
-        await db.refresh(ds)
-        assert (held.collected_now, held.running, ds.images) == (0, 1, [])
-        assert j.status == JobStatus.PROCESSING
-
-        run.status = TrainingStatus.CANCELLED
-        await db.commit()
-        got = await regularize_status(ds.id, _user=None, db=db)
-        assert got.collected_now == 1
-
-    async def test_deleting_with_or_without_purge(self, db, bucket):
-        from fastapi import HTTPException
+    async def test_deleting_a_trained_set_keeps_every_trained_file(self, db, bucket):
+        """#421: the row may go -- the run keeps its own record -- but a purge never deletes
+        a file any run trained on."""
         from app.models import Dataset
         from app.routes.datasets import delete_dataset
-        ds = await self._locked(db)
-        for purge in (False, True):
-            with pytest.raises(HTTPException) as e:
-                await delete_dataset(ds.id, purge=purge, _user=None, db=db)
-            self._is_lock(e, ds)
-        assert await db.get(Dataset, ds.id) is not None
-        assert bucket.deleted == []
+        ds = await self._trained(db)
+        for u in ds.images:
+            b, k = u[len("s3://"):].split("/", 1)
+            bucket.objects[(b, k)] = b"x"
+        k = f"{ds.prefix}/untrained.jpg"
+        bucket.objects[(BUCKET, k)] = b"x"
+        ds_id = ds.id
+        await delete_dataset(ds_id, purge=True, _user=None, db=db)
+        assert await db.get(Dataset, ds_id) is None
+        assert bucket.deleted == [f"s3://{BUCKET}/{k}"]
 
-    async def test_the_refusal_over_http(self, db):
+    async def test_over_http(self, db):
         from httpx import ASGITransport, AsyncClient
         from app.auth import get_current_user, verify_api_key_or_bearer
         from app.database import get_db
         from app.main import app
-        ds = await self._locked(db)
+        ds = await self._trained(db)
         app.dependency_overrides[get_db] = lambda: db
         app.dependency_overrides[get_current_user] = lambda: _Usr()
         app.dependency_overrides[verify_api_key_or_bearer] = lambda: None
@@ -397,77 +259,34 @@ class TestRefusedWhileLocked:
             async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as c:
                 r = await c.patch(f"/datasets/{ds.id}", json={"images": ds.images[:1]})
                 g = await c.get(f"/datasets/{ds.id}")
-                lst = await c.get("/datasets")
         finally:
             app.dependency_overrides.clear()
-        assert r.status_code == 409 and "trained Kelly-2000 v5" in r.json()["detail"]
+        assert r.status_code == 200
         body = g.json()
-        assert body["locked"] is True
-        assert body["trained_by"][0]["character"] == "Kelly-2000"
+        assert body["locked"] is False and body["trained_by"][0]["arch"] == "ltx"
+        assert body["used_in"][ds.images[0]][0]["version"] == 5
         assert set(body["trained_by"][0]) == {"job_id", "character", "version", "status",
-                                            "created_at"}
-        assert next(d for d in lst.json() if d["id"] == str(ds.id))["locked"] is True
+                                            "arch", "created_at"}
 
+    async def test_the_list_is_not_n_plus_one(self, db):
+        from sqlalchemy import event
+        from app.routes.datasets import list_datasets
 
-@pytest.mark.asyncio
-class TestAllowedWhileLocked:
-    """Rename, notes, tags, anchor and scoring do not change the training data."""
-
-    async def _locked(self, db):
-        ds = await _ds(db)
-        await _run(db, ds)
-        return ds
-
-    async def test_rename_notes_and_tags(self, db):
-        ds = await self._locked(db)
-        name = f"renamed-{uuid.uuid4().hex[:6]}"
-        out = await _patch(db, ds, name=name, notes="kept for v5", tags="a, b")
-        assert (out.name, out.notes, out.tags) == (name, "kept for v5", "a, b")
-        assert out.locked is True and out.trained_by
-
-    async def test_sending_the_same_list_back_is_not_a_change(self, db):
-        """A form that PATCHes every field with a new name must still work."""
-        ds = await self._locked(db)
-        out = await _patch(db, ds, name=f"n-{uuid.uuid4().hex[:6]}", images=list(ds.images))
-        assert out.images == ds.images
-
-    async def test_the_same_owner_resent_is_not_a_change(self, db):
-        from app.models import LtxCharacter
-        who = f"Kel-{uuid.uuid4().hex[:6]}"
-        db.add(LtxCharacter(name=who, trigger="k", gender="woman", char_lora="none"))
-        ds = await _ds(db, kind="character", character=who)
-        await _run(db, ds)
-        out = await _patch(db, ds, kind="character", character=who.lower())
-        assert out.character == who
-
-    async def test_the_anchor(self, db):
-        ds = await self._locked(db)
-        out = await _patch(db, ds, anchor_uri=ds.images[1])
-        assert out.anchor_uri == ds.images[1]
-        assert (await _patch(db, ds, anchor_uri="")).anchor_uri is None
-
-    async def test_scoring(self, db, monkeypatch):
-        from app.config import settings
-        from app.routes import datasets as mod
-        ds = await self._locked(db)
-        monkeypatch.setattr(settings, "face_crop_url", "http://crop.test")
-
-        async def _embed(uris):
-            # One embedding per still (#411: a clip would have one per frame).
-            return [[[1.0, 0.0]] for _ in uris]
-        monkeypatch.setattr(mod, "_embed_all", _embed)
-        out = await mod.score_against_anchor(ds.id, anchor_uri=ds.images[0], _user=None, db=db)
-        assert len(out.scores) == 4
-        await db.refresh(ds)
-        assert ds.anchor_uri == ds.images[0] and len(ds.scores) == 4
-
-    async def test_cloning(self, db):
-        from app.routes.datasets import clone_dataset
-        from app.schemas.datasets import DatasetClone
-        ds = await self._locked(db)
-        out = await clone_dataset(ds.id, DatasetClone(name=f"v6-{uuid.uuid4().hex[:6]}"),
-                                  user=_Usr(), db=db)
-        assert out.locked is False
+        async def count():
+            statements = []
+            sync_engine = db.bind.sync_engine if hasattr(db.bind, "sync_engine") else db.bind
+            listen = lambda *a: statements.append(a[2])  # noqa: E731
+            event.listen(sync_engine, "before_cursor_execute", listen)
+            try:
+                await list_datasets(include_archived=False, db=db)
+            finally:
+                event.remove(sync_engine, "before_cursor_execute", listen)
+            return len(statements)
+        await _run(db, await _ds(db))
+        before = await count()
+        for _ in range(3):
+            await _run(db, await _ds(db))
+        assert await count() == before, "the query count must not grow with sets or runs"
 
 
 @pytest.mark.asyncio

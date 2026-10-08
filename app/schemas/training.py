@@ -270,3 +270,38 @@ class TrainingNotes(BaseModel):
     so it has its own tiny shape and its own route.
     """
     notes: str | None = Field(default=None, max_length=20000)
+
+
+class TrainedOnImage(BaseModel):
+    uri: str
+    #: The final caption as trained (trigger prefix included); None when the run kept none.
+    caption: str | None = None
+    #: Whether the dataset still holds it; None when the dataset is gone.
+    still_in_dataset: bool | None = None
+
+
+class TrainedOnGroup(BaseModel):
+    """One group of a run, as it trained, and how its dataset differs now (#422)."""
+    group_index: int
+    kind: str
+    character: str | None = None
+    dataset_id: str | None = None
+    #: The set's name now, or as it trained when it is gone.
+    dataset_name: str | None = None
+    dataset_name_as_trained: str | None = None
+    dataset_exists: bool = False
+    num_repeats: int | None = None
+    windows: int = 1
+    images: list[TrainedOnImage] = Field(default_factory=list)
+    #: In the dataset now, not in this run.
+    added_since: list[str] = Field(default_factory=list)
+    #: In this run, not in the dataset now.
+    removed_since: list[str] = Field(default_factory=list)
+
+
+class TrainedOn(BaseModel):
+    job_id: str
+    character: str
+    version: int
+    arch: str
+    groups: list[TrainedOnGroup] = Field(default_factory=list)

@@ -238,6 +238,17 @@ def get_folder_info(bucket: str, prefix: str) -> dict | None:
     return {"key": key, "created_at": created_at}
 
 
+def copy_object(bucket: str, src_key: str, dst_key: str) -> None:
+    """Copy an object within the same bucket, leaving the original where it is."""
+    client = _get_client()
+    client.copy_object(
+        Bucket=bucket,
+        CopySource={"Bucket": bucket, "Key": src_key},
+        Key=dst_key,
+    )
+    logger.info("Copied %s/%s → %s/%s", bucket, src_key, bucket, dst_key)
+
+
 def move_object(bucket: str, src_key: str, dst_key: str) -> None:
     """Copy an object within the same bucket then delete the original."""
     client = _get_client()
@@ -324,6 +335,9 @@ def head_object(uri: str) -> dict | None:
             "Key": key,
             "Size": resp["ContentLength"],
             "LastModified": resp["LastModified"].isoformat(),
+            #: An MD5 of the bytes for a single-part upload (a "-N" suffix means multipart,
+            #: which is not a content hash). The backfill (#424) compares them for duplicates.
+            "ETag": resp.get("ETag"),
         }
     except Exception:
         return None

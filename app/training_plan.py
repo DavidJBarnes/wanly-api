@@ -222,8 +222,12 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
                       f"training against {name!r}; renders use {LTX_STACK['checkpoint']!r}. A "
                       f"LoRA fits the base it was trained on -- compare in the real pipeline.")
     chars = {c.name: c for c in (await db.execute(select(LtxCharacter))).scalars().all()}
-    datasets = list((await db.execute(select(Dataset))).scalars().all())
-    by_id = {d.id: d for d in datasets}
+    every_set = list((await db.execute(select(Dataset))).scalars().all())
+    by_id = {d.id: d for d in every_set}
+    # ARCHIVED SETS NEVER TRAIN (#419): a version set folded into its subject's living set is
+    # history. Left out of every automatic pick -- so a subject with one living set is picked
+    # without asking -- and refused when chosen by id.
+    datasets = [d for d in every_set if d.archived_at is None]
 
     # ---- who
     row = chars.get(body.character)
@@ -305,6 +309,10 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
             if ds is None:
                 plan.problem("dataset_not_found", f"the dataset chosen for {m.name!r} does not exist")
                 continue
+            if ds.archived_at is not None:
+                plan.problem("dataset_archived",
+                             f"{ds.name!r} is archived — train from {m.name!r}'s living set")
+                continue
             if ds.kind != "character" or not _same(ds.character, m.name):
                 plan.problem("dataset_wrong_owner",
                              f"{ds.name!r} is not a character set owned by {m.name!r} "
@@ -362,6 +370,9 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
             comp = by_id.get(body.composition_dataset_id)
             if comp is None:
                 plan.problem("dataset_not_found", "the chosen composition dataset does not exist")
+            elif comp.archived_at is not None:
+                plan.problem("dataset_archived", f"{comp.name!r} is archived")
+                comp = None
             elif comp.kind != "composition" or not _same(comp.character, body.character):
                 plan.problem("dataset_wrong_owner",
                              f"{comp.name!r} is not a composition set owned by "

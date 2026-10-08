@@ -390,13 +390,15 @@ class TestOverHTTP:
         assert calls == [] and s3.uploaded == [] and s3.downloaded == []
         assert (await db.get(Dataset, ds.id)).images == ds.images
 
-    async def test_a_trained_dataset_is_refused_too(self, db, wired):
+    async def test_a_trained_dataset_takes_the_edit(self, db, wired):
+        """#420: training no longer locks a set -- its runs recorded what they trained on."""
         s3, calls, _ = wired
         ds = await _ds(db)
         await _run(db, ds)
         r = await _http(db, "post", "/images/edit",
                         json={"source_uri": SRC, "preset": "smile", "dataset_id": str(ds.id)})
-        assert r.status_code == 409 and calls == [] and s3.uploaded == []
+        assert r.status_code == 200, r.text
+        assert calls and s3.uploaded
 
     async def test_an_unknown_dataset_is_404(self, db, wired):
         r = await _http(db, "post", "/images/edit",
