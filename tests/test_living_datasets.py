@@ -83,6 +83,22 @@ class TestTrainedOn:
         assert g0["dataset_exists"] is False and g0["dataset_name"] == "David"
         assert len(g0["images"]) == len(job.dataset_images)
 
+    async def test_a_sets_other_group_is_not_added_since(self, db):
+        """Joana v3 trained a set's stills and its clips as two groups: neither half is
+        'added since' the other."""
+        from app.models import TrainingJob
+        ds = await _ds(db, images=[f"s3://wanly-images/j/{i}.jpg" for i in range(3)]
+                       + ["s3://wanly-images/j/c.mp4"])
+        prov = {"id": str(ds.id), "name": ds.name}
+        job = TrainingJob(character="J", trigger="j", version=1, status="completed",
+                          dataset_images=ds.images[:3], config={"dataset": prov},
+                          identities=[{"kind": "clip", "images": ds.images[3:],
+                                       "dataset": prov}])
+        db.add(job)
+        await db.commit()
+        body = (await _http(db, "get", f"/training/{job.id}/trained-on")).json()
+        assert [g["added_since"] for g in body["groups"]] == [[], []]
+
     async def test_unknown_run_is_404(self, db):
         r = await _http(db, "get", f"/training/{uuid.uuid4()}/trained-on")
         assert r.status_code == 404

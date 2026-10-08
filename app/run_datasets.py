@@ -148,8 +148,15 @@ async def link_rows(db: AsyncSession, job: TrainingJob) -> list[TrainingRunDatas
 async def trained_on(db: AsyncSession, job: TrainingJob) -> list[dict]:
     """Per group: the dataset, what trained (images + captions as trained), and the diff
     against what that dataset holds NOW -- added since, removed since."""
+    rows = await link_rows(db, job)
+    # One dataset can feed several groups of a run -- a set's stills and its clips (#411) --
+    # so "added since" is measured against everything the RUN took from that set, not this
+    # group alone: the clips are not "added since" just because they trained in their own group.
+    took: dict[Any, set[str]] = {}
+    for row in rows:
+        took.setdefault(row.dataset_id, set()).update(row.images or [])
     out = []
-    for row in await link_rows(db, job):
+    for row in rows:
         ds = await db.get(Dataset, row.dataset_id) if row.dataset_id else None
         trained = list(row.images or [])
         captions = row.captions if isinstance(row.captions, list) else None
@@ -169,7 +176,8 @@ async def trained_on(db: AsyncSession, job: TrainingJob) -> list[dict]:
                         "caption": captions[i] if captions and i < len(captions) else None,
                         "still_in_dataset": (u in set(now)) if now is not None else None}
                        for i, u in enumerate(trained)],
-            "added_since": [u for u in now if u not in trained_set] if now is not None else [],
+            "added_since": ([u for u in now if u not in took.get(row.dataset_id, trained_set)]
+                            if now is not None else []),
             "removed_since": ([u for u in trained if u not in set(now)]
                               if now is not None else []),
         })
