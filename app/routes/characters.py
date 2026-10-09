@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 from sqlalchemy import func, select
@@ -48,6 +49,31 @@ def _ref(c: LtxCharacter) -> CharacterRef:
     return CharacterRef(id=c.id, name=c.name, kind=c.kind or "solo", hidden=bool(c.hidden))
 
 
+async def character_runs(db: AsyncSession, c: LtxCharacter, living: Dataset | None = None,
+                         archived: list[Dataset] | None = None) -> list[dict]:
+    """Every run a character's page lists, newest first, each once: the living set's runs AND
+    those homed on its archived version sets. Payton's render LoRA came from Payton-Synthetic,
+    whose home is the archived "Payton v1" -- listing the living set alone hid the very run the
+    character renders with."""
+    if living is None and archived is None:
+        sets = (await db.execute(select(Dataset).where(
+            Dataset.character == c.name, Dataset.kind == _set_kind(c)))).scalars().all()
+        living = next((d for d in sets if d.archived_at is None), None)
+        archived = [d for d in sets if d.archived_at is not None]
+    out: list[dict] = []
+    seen: set[str] = set()
+    for d in ([living] if living is not None else []) + list(archived or []):
+        for r in await run_datasets.runs_for_dataset(db, d):
+            if r["job_id"] not in seen:
+                seen.add(r["job_id"])
+                out.append(r)
+    started = {str(j.id): j.created_at for j in (await db.execute(select(TrainingJob).where(
+        TrainingJob.id.in_([uuid.UUID(k) for k in seen])))).scalars().all()} if seen else {}
+    out.sort(key=lambda r: started.get(r["job_id"]) or datetime.min.replace(tzinfo=timezone.utc),
+             reverse=True)
+    return out
+
+
 @router.get("/ltx/characters/{key}/full", response_model=CharacterFull,
             dependencies=[Depends(verify_api_key_or_bearer)])
 async def character_full(key: str, db: AsyncSession = Depends(get_db)):
@@ -60,18 +86,7 @@ async def character_full(key: str, db: AsyncSession = Depends(get_db)):
     living = next((d for d in sets if d.archived_at is None), None)
     archived = sorted((d for d in sets if d.archived_at is not None),
                       key=lambda d: d.archived_at, reverse=True)
-    runs: list[dict] = []
-    if living is not None:
-        runs = await run_datasets.runs_for_dataset(db, living)
-    else:
-        # No living set (registered before its images, or deleted): the runs still belong
-        # here. Gathered from the archived sets, each run once.
-        seen: set[str] = set()
-        for d in archived:
-            for r in await run_datasets.runs_for_dataset(db, d):
-                if r["job_id"] not in seen:
-                    seen.add(r["job_id"])
-                    runs.append(r)
+    runs = await character_runs(db, c, living, archived)
     members: list[CharacterRef] = []
     if c.members:
         rows = {r.name: r for r in (await db.execute(select(LtxCharacter).where(
@@ -110,7 +125,10 @@ async def star(
     if (job.config or {}).get("arch") == "sdxl":
         raise HTTPException(status_code=422, detail="an SDXL checkpoint is for A1111 — renders "
                                                     "use an LTX one, so only LTX can be starred")
-    if job.character != c.name:
+    # The run must be one this character's page lists: its own, or one homed on its sets
+    # (Payton renders with Payton-Synthetic's checkpoint, homed on "Payton v1").
+    if job.character != c.name and str(job.id) not in {
+            r["job_id"] for r in await character_runs(db, c)}:
         raise HTTPException(status_code=422,
                             detail=f"that run trained {job.character!r}, not {c.name!r}")
     if not any(e.get("label") == body.label for e in (job.epochs or [])):
