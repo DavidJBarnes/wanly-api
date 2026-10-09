@@ -646,3 +646,25 @@ class TestFixOnAPairSet:
         out = await mod.measure_faces(ds.id, overwrite=False, _user=None, db=db)
         assert out.faces[pair_small].pair_px == 140.0
         assert out.faces[pair_small].boxes and len(out.faces[pair_small].boxes) == 2
+
+
+class TestFixNeverRecropsItsOwnResults:
+    """2026-10-09, DavidJoana: 19 of 24 two-person crops were still under 250 px, and each press
+    of Fix cropped those crops again (52 -> 71 -> 90 images)."""
+
+    def test_a_small_crop_is_not_cropped_again(self):
+        orig, crop = "s3://b/p.jpg", "s3://b/pairs-x/p_crop.jpg"
+        faces = {orig: {"width": 3000, "height": 4000, "face_px": 90.0, "pair_px": 90.0,
+                        "crop_uri": crop},
+                 crop: {"width": 1024, "height": 683, "face_px": 180.0, "pair_px": 180.0}}
+        up, crops = face_size.plan_fix([orig, crop], faces, pair=True)
+        assert up == [] and crops == []
+
+    def test_an_in_place_upscale_is_never_a_candidate(self):
+        u = "s3://b/up.jpg"
+        faces = {u: {"width": 1024, "height": 1024, "face_px": 200.0, "upscaled_from": "s3://b/o.jpg"}}
+        assert face_size.plan_fix([u], faces) == ([], [])
+
+    def test_derived_lists_crops_and_upscales(self):
+        faces = {"a": {"crop_uri": "c"}, "u": {"upscaled_from": "o"}, "c": {}, "x": None}
+        assert face_size.derived(faces) == {"c", "u"}

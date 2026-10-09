@@ -537,7 +537,10 @@ def _check_face_sizes(plan: Plan, ds: Dataset, stills: list[str]) -> None:
     # A small photo whose upscaled crop is in the set has been dealt with: its crop is where
     # the face is learned big. Counting it kept the warning up after a successful fix.
     present = set(ds.images or [])
-    small = [u for u in measured if face_size.is_small(faces[u])
+    # Fix's own results are never open small faces either (face_size.derived): a still-small
+    # crop is a framing limit, and counting it re-offered the fix that made it.
+    made = face_size.derived(faces)
+    small = [u for u in measured if u not in made and face_size.is_small(faces[u])
              and not face_size.is_fixed(faces[u], present)]
     if small:
         plan.warn("small_faces",
