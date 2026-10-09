@@ -58,13 +58,33 @@ async def test_solo_pair_and_orphan_runs_land_on_the_right_pages(db):
     assert homes == {solo.id: str(jo.id), duo.id: str(pair.id), orphan.id: str(me.id)}
 
 
-async def test_an_archived_set_does_not_collect_orphans(db):
-    from datetime import datetime, timezone
+async def test_an_orphan_with_no_living_set_still_lands_somewhere(db):
+    """Payton, 2026-10-09: the living set was deleted after the backfill, leaving only
+    archived version sets. A run named after its set lands on that set; otherwise on the
+    character's newest set, archived or not. No run may become unreachable."""
+    from datetime import datetime, timedelta, timezone
     tag = uuid.uuid4().hex[:6]
-    old = await _set(db, f"Old{tag}", f"Ann{tag}", [], archived_at=datetime.now(timezone.utc))
-    orphan = await _run(db, f"Ann{tag}", 1, [("identity", None)])
+    now = datetime.now(timezone.utc)
+    v1 = await _set(db, f"Pay{tag} v1", f"Pay{tag}", [], archived_at=now, age_days=3)
+    v2 = await _set(db, f"Pay{tag} v2", f"Pay{tag}", [], archived_at=now, age_days=1)
+    synth = await _run(db, f"Pay{tag}-Synthetic", 1, [("identity", None)])
+    from app.models import TrainingRunDataset
+    from sqlalchemy import update
+    await db.execute(update(TrainingRunDataset)
+                     .where(TrainingRunDataset.training_job_id == synth.id)
+                     .values(dataset_name=v1.name))
+    plain = await _run(db, f"Pay{tag}", 1, [("identity", None)])
     await db.commit()
-    assert str(orphan.id) not in await _roles(db, old)
+    assert (await _roles(db, v1)).get(str(synth.id)) == ("orphan", None)
+    assert (await _roles(db, v2)).get(str(plain.id)) == ("orphan", None)
+    r = await _http(db, "get", f"/training/{plain.id}/home")
+    assert r.json()["dataset_id"] == str(v2.id)
+
+    # A living set, when there is one, wins over the archived ones.
+    living = await _set(db, f"Pay{tag}", f"Pay{tag}", [])
+    await db.commit()
+    assert (await _roles(db, living)).get(str(plain.id)) == ("orphan", None)
+    assert str(plain.id) not in await _roles(db, v2)
 
 
 async def test_runs_are_newest_first_and_unknown_sets_are_404(db):

@@ -208,6 +208,23 @@ def home_dataset_id(links: list, job) -> uuid.UUID | None:
     return first.dataset_id if first else None
 
 
+def orphan_home(job, links: list, sets: list):
+    """The page a run lands on when every set it trained on is gone (wanly-console#647). In
+    order: its character's living set; a set still named as one it trained on (even archived:
+    Payton-Synthetic trained on "Payton v1"); its character's newest set, archived or not. None
+    only when nothing of the character's is left at all."""
+    living = [d for d in sets if d.character == job.character and d.kind == "character"
+              and d.archived_at is None]
+    if living:
+        return living[0].id
+    names = {r.dataset_name for r in links if r.dataset_name}
+    named = [d for d in sets if d.name in names]
+    if named:
+        return max(named, key=lambda d: d.created_at or 0).id
+    own = [d for d in sets if d.character == job.character]
+    return max(own, key=lambda d: d.created_at or 0).id if own else None
+
+
 async def runs_for_dataset(db: AsyncSession, ds) -> list[dict]:
     """Every run the dataset page lists, newest first: {job_id, role, pair, groups}.
 
@@ -216,7 +233,7 @@ async def runs_for_dataset(db: AsyncSession, ds) -> list[dict]:
           pair_member  a pair run that also trained on this member's set; `pair` names the
                        pair and its composition set, which is the run's home
           orphan       no set the run trained on still exists (it was deleted); listed on the
-                       living set of the run's character so it does not become unreachable
+                       set orphan_home picks, so it never becomes unreachable
     """
     # Only the columns the roles need: the link rows' image lists and the runs' configs are
     # large, and this runs on every dataset page view (the 2 GB API box, wanly-api#434).
@@ -230,6 +247,7 @@ async def runs_for_dataset(db: AsyncSession, ds) -> list[dict]:
     jobs = {j.id: j for j in (await db.execute(select(
         TrainingJob.id, TrainingJob.character, TrainingJob.created_at,
         TrainingJob.config["mode"].astext.label("mode")))).all()}
+    sets = await _set_summaries(db)
     out: list[tuple[Any, dict]] = []
     for job_id, links in by_job.items():
         job = jobs.get(job_id)
@@ -244,8 +262,7 @@ async def runs_for_dataset(db: AsyncSession, ds) -> list[dict]:
             else:
                 role = "pair_member"
                 pair = {"character": job.character, "dataset_id": str(home) if home else None}
-        elif not alive and ds.kind == "character" and ds.archived_at is None \
-                and job.character == ds.character:
+        elif not alive and orphan_home(job, links, sets) == ds.id:
             role, pair = "orphan", None
         else:
             continue
@@ -256,3 +273,10 @@ async def runs_for_dataset(db: AsyncSession, ds) -> list[dict]:
         }))
     out.sort(key=lambda t: t[0] or 0, reverse=True)
     return [d for _, d in out]
+
+
+async def _set_summaries(db: AsyncSession) -> list:
+    from app.models import Dataset
+    return (await db.execute(select(
+        Dataset.id, Dataset.name, Dataset.character, Dataset.kind, Dataset.archived_at,
+        Dataset.created_at).order_by(Dataset.created_at.desc()))).all()
