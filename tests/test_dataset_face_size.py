@@ -173,6 +173,11 @@ class TestWhatCountsAsSmall:
 
     def test_a_small_image_is_by_its_short_side(self):
         assert face_size.is_small_image({"width": 254, "height": 373})
+        # #447: by LONG edge, as the upscaler judges. A 576x1024 portrait is already at the
+        # trainer's ceiling -- the service declines to upscale it -- so it is not "small";
+        # its small face goes to the crop path instead.
+        assert not face_size.is_small_image({"width": 576, "height": 1024})
+        assert face_size.is_small_image({"width": 480, "height": 800})
         assert not face_size.is_small_image({"width": 1080, "height": 1440})
         assert not face_size.is_small_image({"width": None, "height": None})
 
@@ -672,3 +677,16 @@ class TestFixNeverRecropsItsOwnResults:
     def test_derived_lists_crops_and_upscales(self):
         faces = {"a": {"crop_uri": "c"}, "u": {"upscaled_from": "o"}, "c": {}, "x": None}
         assert face_size.derived(faces) == {"c", "u"}
+
+
+def test_a_portrait_at_the_ceiling_with_a_small_face_is_cropped_not_upscaled():
+    """#447, Oakly: seven 576x1024 portraits went to a whole upscale the service declines,
+    so the fix did nothing and kept offering itself. Four had faces of 94-139 px."""
+    faces = {
+        "s3://b/small_face.png": {"face_px": 94.3, "width": 576, "height": 1024},
+        "s3://b/ok_face.png": {"face_px": 395.0, "width": 576, "height": 1024},
+        "s3://b/tiny_closeup.png": {"face_px": 300.0, "width": 400, "height": 600},
+    }
+    upscale, crop = face_size.plan_fix(list(faces), faces)
+    assert crop == ["s3://b/small_face.png"]
+    assert upscale == ["s3://b/tiny_closeup.png"]

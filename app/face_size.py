@@ -115,10 +115,14 @@ def derived(faces: dict[str, dict]) -> set[str]:
 
 
 def is_small_image(entry: dict | None) -> bool:
-    """Short side under the line: a close-up too small for a crop to help. Upscaled whole."""
+    """Long edge under the line: a close-up the upscaler will actually enlarge. Upscaled whole.
+
+    LONG EDGE, as the face-crop service judges it (#447). By short side, a 576x1024 portrait
+    was "small", planned for a whole upscale the service declines (already at the 1024
+    ceiling) -- so Fix small faces offered it forever and did nothing. Its face is cropped."""
     if not entry or not entry.get("width") or not entry.get("height"):
         return False
-    return min(entry["width"], entry["height"]) < settings.small_image_short_side
+    return max(entry["width"], entry["height"]) < settings.small_image_long_edge
 
 
 def stills(images: list[str]) -> list[str]:
@@ -283,10 +287,11 @@ def _progress(ds_id: uuid.UUID, **kw) -> None:
 
 
 async def _upscale_chunk(client, chunk: list[str], prefix: str, tag: str,
-                         replaced: dict[str, str]) -> None:
+                         replaced: dict[str, str], declined: list[str] | None = None) -> None:
     """Upscale one chunk of tiny whole images and upload each, recording it in `replaced`.
     Its own function, so one chunk's bytes are gone before the next is downloaded (#437) --
     what measure_uris does with `del` (#434)."""
+    declined = declined if declined is not None else []
     blobs = await asyncio.gather(*(asyncio.to_thread(s3.download_bytes, u) for u in chunk))
     r = await client.post(_url("/upscale"),
                           json={"images": [base64.b64encode(b).decode() for b in blobs]})
@@ -294,6 +299,11 @@ async def _upscale_chunk(client, chunk: list[str], prefix: str, tag: str,
         raise FaceCropTooOld(TOO_OLD.format(what="upscale images"))
     r.raise_for_status()
     for u, res in zip(chunk, r.json()["images"]):
+        if not (res and res.get("upscaled") and res.get("b64")):
+            # Declined (already near the ceiling) or unreadable: said in the summary (#447),
+            # never dropped silently into "No small faces to fix".
+            declined.append(u)
+            continue
         if res and res.get("upscaled") and res.get("b64"):
             stem = u.rsplit("/", 1)[-1].rsplit(".", 1)[0]
             replaced[u] = await asyncio.to_thread(
@@ -358,6 +368,7 @@ async def run_fix(ds_id: uuid.UUID, images: list[str], faces: dict[str, dict], p
     # first's files while a run records them; the index keeps two same-named sources apart.
     tag = uuid.uuid4().hex[:6]
     replaced: dict[str, str] = {}          # original -> its upscaled copy
+    declined: list[str] = []               # planned upscales the service left alone (#447)
     added: dict[str, str] = {}             # original -> its head-and-shoulders crop
     crop_cos: dict[str, float] = {}        # crop -> likeness to the anchor, if there is one
     done = 0
@@ -366,7 +377,7 @@ async def run_fix(ds_id: uuid.UUID, images: list[str], faces: dict[str, dict], p
         # ---- tiny whole images, upscaled
         for i in range(0, len(upscale_uris), FIX_CHUNK):
             chunk = upscale_uris[i:i + FIX_CHUNK]
-            await _upscale_chunk(client, chunk, prefix, tag, replaced)
+            await _upscale_chunk(client, chunk, prefix, tag, replaced, declined)
             done += len(chunk)
             _progress(ds_id, done=done)
 
@@ -391,6 +402,7 @@ async def run_fix(ds_id: uuid.UUID, images: list[str], faces: dict[str, dict], p
     for orig, new in replaced.items():
         new_faces.setdefault(new, {})["upscaled_from"] = orig
     return {"replaced": replaced, "added": added, "crop_cos": crop_cos, "faces": new_faces,
+            "declined": declined,
             "pair": pair,
             # Pair sets: photos with fewer than two faces, not cropped. The measurement's say
             # plus any the crop's own detection refused.

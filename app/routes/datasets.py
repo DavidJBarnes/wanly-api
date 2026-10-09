@@ -993,6 +993,11 @@ async def fix_small_faces_job(ds_id: uuid.UUID) -> None:
                     note = face_size.apply_fix(ds, fix)
                 else:
                     note = "No small faces to fix." + face_size.single_face_note(fix)
+                if fix.get("declined"):
+                    n = len(fix["declined"])
+                    note += (f" {n} image{'s' if n != 1 else ''} planned for upscaling "
+                             f"{'were' if n != 1 else 'was'} left as is by the upscaler "
+                             f"(already near the 1024 ceiling).")
                 await db.commit()
                 run.update(stage="done", summary=note)
                 logger.info("dataset %s: %s", ds.name, note)
@@ -1018,7 +1023,7 @@ async def fix_small_faces(
 
       a big photo     a head-and-shoulders crop, Real-ESRGAN-upscaled to the trainer's 1024
                       ceiling, ADDED beside it -- the photo keeps the body and context
-      a small image   (short side under `small_image_short_side`) upscaled whole and put IN
+      a small image   (long edge under `small_image_long_edge`) upscaled whole and put IN
                       PLACE of itself; the original stays in S3 and in any run that used it
 
     ON A COMPOSITION SET (#436) the crop is a TWO-PERSON crop -- the union of the two largest
