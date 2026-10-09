@@ -1665,6 +1665,21 @@ class TestTheWarnings:
         msg = {x["code"]: x["message"] for x in out["warnings"]}
         assert "2 of 10 images show the face under 250 px" in msg["small_faces"]
 
+    async def test_a_photo_whose_crop_is_in_the_set_is_fixed_not_small(self, db):
+        """Live on "Me" after a Fix: 12 originals with their crops in the set still warned
+        "12 of 45" -- the photo never changes. Its crop removed, it counts again."""
+        w = await _world(db)
+        imgs = w["david"].images
+        w["david"].faces = {**w["david"].faces,
+                            imgs[1]: {"width": 1080, "height": 1440, "face_px": 180.0,
+                                      "crop_uri": imgs[3]},
+                            imgs[2]: {"width": 1080, "height": 1440, "face_px": 120.0,
+                                      "crop_uri": "s3://wanly-images/gone.jpg"}}
+        await db.flush()
+        out = await _preflight(db, **SOLO, steps=150)
+        msg = {x["code"]: x["message"] for x in out["warnings"]}
+        assert "1 of 10 images show the face under 250 px" in msg["small_faces"]
+
     async def test_no_face_is_not_a_small_face(self, db):
         """No face is the anchor scores' problem, and already caught there."""
         w = await _world(db)

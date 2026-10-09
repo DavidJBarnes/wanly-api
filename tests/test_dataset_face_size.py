@@ -149,6 +149,13 @@ class TestWhatCountsAsSmall:
         assert face_size.is_small({"face_px": 249.9})
         assert not face_size.is_small({"face_px": 250.0})
 
+    def test_fixed_means_its_crop_is_still_in_the_set(self):
+        e = {"face_px": 120.0, "crop_uri": "s3://b/crop.jpg"}
+        assert face_size.is_fixed(e, {"s3://b/crop.jpg"})
+        assert not face_size.is_fixed(e, {"s3://b/other.jpg"})
+        assert not face_size.is_fixed({"face_px": 120.0}, {"s3://b/crop.jpg"})
+        assert not face_size.is_fixed(None, set())
+
     def test_no_face_and_unmeasured_are_not_small(self):
         """No face is the anchor scores' problem; unmeasured is unknown, not small."""
         assert not face_size.is_small({"face_px": None})

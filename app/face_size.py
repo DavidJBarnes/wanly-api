@@ -74,6 +74,14 @@ def is_small(entry: dict | None) -> bool:
     return px is not None and px < settings.small_face_px
 
 
+def is_fixed(entry: dict | None, images) -> bool:
+    """The crop "Fix small faces" made of this photo is still in the set. The photo itself never
+    changes -- its face is small forever -- so without this a set that had just been fixed still
+    warned "12 of 45 small" and offered the button again. The same rule plan_fix uses to skip
+    it: its crop removed, it counts as small (and is offered) again."""
+    return bool(entry and entry.get("crop_uri") and entry["crop_uri"] in images)
+
+
 def is_small_image(entry: dict | None) -> bool:
     """Short side under the line: a close-up too small for a crop to help. Upscaled whole."""
     if not entry or not entry.get("width") or not entry.get("height"):
@@ -205,7 +213,7 @@ def plan_fix(images: list[str], faces: dict[str, dict]) -> tuple[list[str], list
             continue
         if is_small_image(e):
             upscale.append(u)
-        elif is_small(e) and e.get("crop_uri") not in present:
+        elif is_small(e) and not is_fixed(e, present):
             crop.append(u)
     return upscale, crop
 
