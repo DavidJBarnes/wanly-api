@@ -102,6 +102,18 @@ def is_fixed(entry: dict | None, images) -> bool:
     return bool(entry and entry.get("crop_uri") and entry["crop_uri"] in images)
 
 
+def derived(faces: dict[str, dict]) -> set[str]:
+    """Every image "Fix small faces" MADE: the crops it recorded (`crop_uri`) and the in-place
+    upscales (`upscaled_from`). A result is never a candidate (2026-10-09, DavidJoana): a
+    two-person crop can still be under the line -- 19 of 24 were -- and each press then cropped
+    the crops, adding ~19 near-duplicate crops-of-crops per press (52 -> 71 -> 90). Whether a
+    result is still small is a framing question (gpu-docker#209), not something re-cropping
+    can fix, so it is neither offered again nor counted as an open small face."""
+    out = {e["crop_uri"] for e in faces.values() if e and e.get("crop_uri")}
+    out |= {u for u, e in faces.items() if e and e.get("upscaled_from")}
+    return out
+
+
 def is_small_image(entry: dict | None) -> bool:
     """Short side under the line: a close-up too small for a crop to help. Upscaled whole."""
     if not entry or not entry.get("width") or not entry.get("height"):
@@ -240,10 +252,11 @@ def plan_fix(images: list[str], faces: dict[str, dict],
     is in it and changes nothing about what the caption claims.
     """
     present = set(images)
+    made = derived(faces)
     upscale, crop = [], []
     for u in stills(images):
         e = faces.get(u)
-        if not e:
+        if not e or u in made:
             continue
         if is_small_image(e):
             upscale.append(u)
