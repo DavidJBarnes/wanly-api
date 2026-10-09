@@ -90,6 +90,8 @@ class LtxCharacterResponse(BaseModel):
     description: Optional[str] = None
     icon_uri: Optional[str] = None
     hidden: bool = False
+    #: A starred checkpoint still on the trainer: {training_job_id, label} (#452).
+    star_pending: Optional[dict] = None
 
 
 class LtxCharacterUpdate(BaseModel):
@@ -231,3 +233,9 @@ class LtxRecipeResponse(BaseModel):
     is_default: bool = False
     created_at: datetime
     updated_at: Optional[datetime]
+
+
+class CharacterStar(BaseModel):
+    """POST /ltx/characters/{id}/star: which LTX checkpoint this character renders with."""
+    training_job_id: uuid.UUID
+    label: str = Field(pattern=r"^(e\d{2}|final)$")

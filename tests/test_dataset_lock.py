@@ -311,10 +311,26 @@ class TestClone:
         assert row.images == src.images, "the same URIs, not copies"
         assert (row.captions, row.scores, row.anchor_uri) == (
             src.captions, src.scores, src.anchor_uri)
+        # ONE LIVING SET PER CHARACTER (#452): the source is KellyPair-2000's living set, so
+        # the clone comes out unassigned -- an experiment beside it, not a second one.
         assert (row.kind, row.character, row.reg_class, row.tags) == (
-            "composition", "KellyPair-2000", None, "kelly, v5")
+            None, None, None, "kelly, v5")
         assert row.notes == f"Cloned from {src.name!r}. culled twice"
         assert out.locked is False and out.trained_by == []
+
+    async def test_a_clone_of_an_archived_set_keeps_its_owner_when_none_is_living(self, db):
+        from datetime import datetime, timezone
+
+        from app.models import Dataset
+        from app.routes.datasets import clone_dataset
+        from app.schemas.datasets import DatasetClone
+        src = await _ds(db, kind="composition", character=f"Pair-{uuid.uuid4().hex[:6]}")
+        src.archived_at = datetime.now(timezone.utc)
+        await db.commit()
+        out = await clone_dataset(src.id, DatasetClone(name=f"x {uuid.uuid4().hex[:4]}"),
+                                  user=_Usr(), db=db)
+        row = await db.get(Dataset, out.id)
+        assert (row.kind, row.character) == ("composition", src.character)
 
     async def test_a_source_without_notes(self, db):
         from app.routes.datasets import clone_dataset
