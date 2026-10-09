@@ -534,7 +534,11 @@ def _check_face_sizes(plan: Plan, ds: Dataset, stills: list[str]) -> None:
     silence about them would read as "no small faces"."""
     faces = ds.faces or {}
     measured = [u for u in stills if u in faces]
-    small = [u for u in measured if face_size.is_small(faces[u])]
+    # A small photo whose upscaled crop is in the set has been dealt with: its crop is where
+    # the face is learned big. Counting it kept the warning up after a successful fix.
+    present = set(ds.images or [])
+    small = [u for u in measured if face_size.is_small(faces[u])
+             and not face_size.is_fixed(faces[u], present)]
     if small:
         plan.warn("small_faces",
                   f"{ds.name!r}: {len(small)} of {len(stills)} images show the face under "
