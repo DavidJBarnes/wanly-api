@@ -59,6 +59,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import lineage
 from app import face_edit, full_edit, s3
 from app.auth import get_current_user
 from app.config import settings
@@ -261,6 +262,7 @@ async def save_edit(
         await _refuse_if_locked(db, ds)
         # Reassigned, not appended in place: JSONB does not see an in-place mutation.
         ds.images = list(ds.images) + [uri]
+        lineage.record(ds, uri, body.source_uri, "edit")  # #445
         await db.commit()
 
     face = out.get("face_index")
@@ -396,6 +398,7 @@ async def save_edit_job(
     uri = await asyncio.to_thread(s3.upload_bytes, job.result, key, settings.s3_images_bucket)
     if ds is not None:
         ds.images = list(ds.images) + [uri]
+        lineage.record(ds, uri, job.source_uri, "edit")  # #445
         await db.commit()
     job.saved.append({"uri": uri, "dataset_id": str(ds.id) if ds is not None else None})
     ident = (job.meta.get("identity") or {}).get("aura")

@@ -281,6 +281,7 @@ class TestMeasure:
         import inspect
         from app.routes import datasets as mod
         assert "faces=dict(src.faces" in inspect.getsource(mod.clone_dataset)
+        assert "derived=dict(src.derived" in inspect.getsource(mod.clone_dataset)  # #445
 
 
 @pytest.fixture
@@ -333,6 +334,9 @@ class TestFixSmallFaces:
         assert ds.faces[up[0]]["upscaled_from"] == tiny
         assert ds.faces[far]["crop_uri"] == crops[0]
         assert tiny not in ds.faces
+        # Lineage (#445): the upscale from its small original, the crop from its photograph.
+        assert {u: (e["from"], e["how"]) for u, e in ds.derived.items()} == {
+            up[0]: (tiny, "upscale"), crops[0]: (far, "fix_crop")}
         # The crop request asked for exactly the fix.
         p = svc.crop_payloads[0]
         assert (p["framing"], p["upscale"], p["largest_only"]) == ("head_shoulders", True, True)

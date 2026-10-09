@@ -34,7 +34,7 @@ import uuid
 
 import httpx
 
-from app import clips, s3
+from app import clips, lineage, s3
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -433,6 +433,12 @@ def apply_fix(ds, fix: dict) -> str:
     for uri, entry in fix["faces"].items():
         if uri in replaced.values() or uri in added.values():
             faces[uri] = {**faces.get(uri, {}), **entry}
+    # Lineage (#445): the upscale from its small original (now out of the set), each crop from
+    # its photograph.
+    for orig, new in replaced.items():
+        lineage.record(ds, new, orig, "upscale")
+    for orig, crop in added.items():
+        lineage.record(ds, crop, orig, "fix_crop")
     # JSONB columns do not see in-place mutation: reassign every one.
     ds.images = [replaced.get(u, u) for u in ds.images] + list(added.values())
     ds.captions, ds.scores, ds.faces = captions, scores, faces

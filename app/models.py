@@ -482,6 +482,9 @@ class Dataset(Base):
     #: because the training preflight warns on it, and that must not need the face-crop box up.
     #: "Fix small faces" adds `crop_uri` (the crop it made of a photo) and `upscaled_from`.
     faces = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
+    #: Lineage (wanly-api#445): {derived_uri: {"from": source_uri, "how", "at"}} -- which image
+    #: in the set was made from which (a crop, an upscale, an edit, a duplicate). See app/lineage.
+    derived = mapped_column(JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb"))
     #: LOCKED BY HAND (#358, migration 104). The training lock (#356) is derived from
     #: training_jobs and so only covers sets that trained; these say a person locked it anyway.
     #: Set by POST /datasets/{id}/lock, cleared only by /unlock, not copied by a clone.
