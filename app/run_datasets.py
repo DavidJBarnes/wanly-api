@@ -182,3 +182,77 @@ async def trained_on(db: AsyncSession, job: TrainingJob) -> list[dict]:
                               if now is not None else []),
         })
     return out
+
+
+# ---------------------------------------------------------------------------------------
+# Runs per dataset page (wanly-console#647): training is reached through datasets only.
+# ---------------------------------------------------------------------------------------
+
+def _is_pair(job) -> bool:
+    """A full TrainingJob, or a row carrying just its `mode`."""
+    mode = getattr(job, "mode", None)
+    if mode is None and hasattr(job, "config"):
+        mode = (job.config or {}).get("mode")
+    return mode == "pair"
+
+
+def home_dataset_id(links: list, job) -> uuid.UUID | None:
+    """The one dataset a run belongs to. A pair run's home is its COMPOSITION set (the set a
+    pair is trained from); any other run's is its first group's. None when that set is gone."""
+    if _is_pair(job):
+        comp = next((r for r in links if r.kind == "composition" and r.dataset_id), None)
+        if comp:
+            return comp.dataset_id
+    first = min((r for r in links if r.dataset_id and r.kind != "regularization"),
+                key=lambda r: r.group_index, default=None)
+    return first.dataset_id if first else None
+
+
+async def runs_for_dataset(db: AsyncSession, ds) -> list[dict]:
+    """Every run the dataset page lists, newest first: {job_id, role, pair, groups}.
+
+    role  home         the run belongs here (a solo run of this set; a pair run on its
+                       composition set)
+          pair_member  a pair run that also trained on this member's set; `pair` names the
+                       pair and its composition set, which is the run's home
+          orphan       no set the run trained on still exists (it was deleted); listed on the
+                       living set of the run's character so it does not become unreachable
+    """
+    # Only the columns the roles need: the link rows' image lists and the runs' configs are
+    # large, and this runs on every dataset page view (the 2 GB API box, wanly-api#434).
+    rows = (await db.execute(select(
+        TrainingRunDataset.training_job_id, TrainingRunDataset.group_index,
+        TrainingRunDataset.dataset_id, TrainingRunDataset.dataset_name,
+        TrainingRunDataset.kind))).all()
+    by_job: dict[uuid.UUID, list] = {}
+    for r in rows:
+        by_job.setdefault(r.training_job_id, []).append(r)
+    jobs = {j.id: j for j in (await db.execute(select(
+        TrainingJob.id, TrainingJob.character, TrainingJob.created_at,
+        TrainingJob.config["mode"].astext.label("mode")))).all()}
+    out: list[tuple[Any, dict]] = []
+    for job_id, links in by_job.items():
+        job = jobs.get(job_id)
+        if job is None:
+            continue
+        mine = [r for r in links if r.dataset_id == ds.id]
+        alive = [r for r in links if r.dataset_id]
+        if mine:
+            home = home_dataset_id(links, job)
+            if home == ds.id or not _is_pair(job):
+                role, pair = "home", None
+            else:
+                role = "pair_member"
+                pair = {"character": job.character, "dataset_id": str(home) if home else None}
+        elif not alive and ds.kind == "character" and ds.archived_at is None \
+                and job.character == ds.character:
+            role, pair = "orphan", None
+        else:
+            continue
+        out.append((job.created_at, {
+            "job_id": str(job.id), "role": role, "pair": pair,
+            "groups": [{"kind": r.kind, "dataset_name": r.dataset_name,
+                        "here": r.dataset_id == ds.id} for r in sorted(links, key=lambda r: r.group_index)],
+        }))
+    out.sort(key=lambda t: t[0] or 0, reverse=True)
+    return [d for _, d in out]

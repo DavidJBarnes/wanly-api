@@ -238,3 +238,24 @@ class DatasetScores(BaseModel):
     #: buffalo_l's same-person floor. A line on a chart, not a delete rule.
     cos_floor: float
     scores: list[DatasetScore]
+
+
+class DatasetRunGroup(BaseModel):
+    kind: str
+    dataset_name: str | None = None
+    #: This group trained on the dataset being asked about.
+    here: bool = False
+
+
+class DatasetRunPair(BaseModel):
+    character: str
+    #: The pair's composition set: the run's home. None when it is gone.
+    dataset_id: str | None = None
+
+
+class DatasetRun(BaseModel):
+    """GET /datasets/{id}/runs (wanly-console#647): a run on a dataset's page."""
+    job_id: str
+    role: Literal["home", "pair_member", "orphan"]
+    pair: DatasetRunPair | None = None
+    groups: list[DatasetRunGroup] = []

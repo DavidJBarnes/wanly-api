@@ -41,7 +41,7 @@ from app.regularization import (
 )
 from app.schemas.datasets import (
     DatasetCaptionEdit, DatasetCaptionStatus, DatasetCaptionsRun, DatasetClone, DatasetCreate,
-    DatasetFixStatus, DatasetLock, DatasetRegularize, DatasetRegularizeStatus, DatasetResponse, DatasetScore, DatasetScores,
+    DatasetFixStatus, DatasetLock, DatasetRun, DatasetRegularize, DatasetRegularizeStatus, DatasetResponse, DatasetScore, DatasetScores,
     DatasetTrainedBy, DatasetUpdate,
 )
 from app.seeds import new_seed
@@ -297,6 +297,18 @@ async def get_dataset(dataset_id: uuid.UUID, db: AsyncSession = Depends(get_db))
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
     return await _respond_one(db, ds)
+
+
+@router.get("/datasets/{dataset_id}/runs", response_model=list[DatasetRun],
+            dependencies=[Depends(verify_api_key_or_bearer)])
+async def get_dataset_runs(dataset_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
+    """The runs this dataset's page lists (wanly-console#647), newest first, each with its role
+    here: `home`, `pair_member` (with the pair and its composition set, the run's home) or
+    `orphan` (every set it trained on is gone; listed on its character's living set)."""
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    return [DatasetRun(**r) for r in await run_datasets.runs_for_dataset(db, ds)]
 
 
 @router.patch("/datasets/{dataset_id}", response_model=DatasetResponse)
