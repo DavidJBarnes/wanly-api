@@ -157,7 +157,7 @@ class DatasetFaceSize(BaseModel):
 class DatasetFixStatus(BaseModel):
     """GET/POST /datasets/{id}/fix-small-faces: the run's progress, and the set's tally."""
     running: bool = False
-    #: upscaling | cropping | measuring results | done
+    #: waiting for another fix | measuring | upscaling | cropping | measuring results | done
     stage: str | None = None
     done: int = 0
     total: int = 0

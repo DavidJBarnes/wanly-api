@@ -392,3 +392,87 @@ class TestFixSmallFaces:
         assert (await mod.fix_small_faces(ds.id, again, _user=None, db=db)).running
         assert not again.tasks
         face_size.FIX_RUNS.pop(ds.id, None)
+
+
+class _CountingS3(_S3):
+    """Counts downloads, so a test can see how many images were in hand at each service call."""
+
+    def __init__(self, missing=()):
+        super().__init__()
+        self.downloads = 0
+        self.missing = set(missing)
+
+    def download_bytes(self, uri):
+        if uri in self.missing:
+            raise FileNotFoundError(uri)
+        self.downloads += 1
+        return super().download_bytes(uri)
+
+
+class _CountingService(_Service):
+    """Records, at every image-carrying call, how many images had been downloaded since the
+    previous one -- i.e. how many were held to make this call."""
+
+    def __init__(self, s3: _CountingS3):
+        super().__init__()
+        self.s3, self.seen, self.held = s3, 0, []
+
+    def handle(self, method, path, body):
+        if body and body.get("images"):
+            self.held.append(self.s3.downloads - self.seen)
+            self.seen = self.s3.downloads
+        return super().handle(method, path, body)
+
+
+@pytest.mark.asyncio
+class TestOneChunkInHand:
+    """#437/#434: never a whole set's bytes in hand. test_face_size_bounded.py pins measure's
+    lock and download-failure handling; this pins the per-call shape, for the fix too."""
+
+    async def test_measure_downloads_one_chunk_per_call(self, monkeypatch):
+        imgs = _imgs(40, "c1")
+        SIZES.update({u: (1080, 1440, 300.0) for u in imgs})
+        s3 = _CountingS3()
+        svc = _CountingService(s3)
+        _wire(monkeypatch, svc, s3)
+        out = await face_size.measure_uris(imgs)
+        assert set(out) == set(imgs)
+        assert svc.held == [16, 16, 8]
+
+    async def test_a_fix_holds_one_chunk_at_a_time(self, monkeypatch):
+        tiny, far = _imgs(6, "c5"), _imgs(9, "c6")
+        SIZES.update({u: (254, 373, 200.0) for u in tiny})
+        SIZES.update({u: (1080, 1440, 120.0) for u in far})
+        faces = {u: {"width": 254, "height": 373, "face_px": 200.0} for u in tiny}
+        faces.update({u: {"width": 1080, "height": 1440, "face_px": 120.0} for u in far})
+        s3 = _CountingS3()
+        svc = _CountingService(s3)
+        _wire(monkeypatch, svc, s3)
+        ds_id = uuid.uuid4()
+        out = await face_size.run_fix(ds_id, tiny + far, faces, "datasets/c", None)
+        face_size.FIX_RUNS.pop(ds_id, None)
+        assert len(out["replaced"]) == 6 and len(out["added"]) == 9
+        # upscale 4+2, crop 4+4+1, then the results measured in one chunk of 15.
+        assert svc.held == [4, 2, 4, 4, 1, 15]
+
+
+@pytest.mark.asyncio
+class TestOneFixAtATime:
+    async def test_a_second_fix_waits_and_says_so(self, db, monkeypatch, shared_session):
+        import asyncio
+        from app.routes import datasets as mod
+        imgs = _imgs(2, "w1")
+        SIZES.update({imgs[0]: (254, 373, 200.0), imgs[1]: (1080, 1440, 420.0)})
+        ds = await _ds(db, imgs)
+        _wire(monkeypatch, _Service(), _S3())
+        face_size.FIX_RUNS.pop(ds.id, None)
+        async with face_size.FIX_LOCK:
+            task = asyncio.create_task(mod.fix_small_faces_job(ds.id))
+            await asyncio.sleep(0.01)
+            assert face_size.FIX_RUNS[ds.id]["stage"] == "waiting for another fix"
+            await db.refresh(ds)
+            assert ds.images == imgs
+        await task
+        assert face_size.FIX_RUNS[ds.id]["stage"] == "done"
+        await db.refresh(ds)
+        assert any("/upscaled-" in u for u in ds.images)

@@ -894,6 +894,10 @@ async def measure_faces(
 
     Not refused on a locked set: a measurement describes the images, it does not change them,
     the same as scoring.
+
+    ONE MEASURE AT A TIME (#437): a second request, for this set or another, waits for the
+    first to finish -- with its DB connection already released, so waiting costs nothing --
+    and the console only asks for the set that is open, not for every card on the list.
     """
     ds = await db.get(Dataset, dataset_id)
     if not ds:
@@ -942,43 +946,49 @@ async def fix_small_faces_job(ds_id: uuid.UUID) -> None:
     """
     run = face_size.FIX_RUNS.setdefault(ds_id, {"running": True})
     run.update(error=None, summary=None)
-    async with async_session() as db:
-        try:
-            ds = await db.get(Dataset, ds_id)
-            if ds is None:
-                return
-            images, anchor = list(ds.images), ds.anchor_uri
-            prefix = ds.prefix or _prefix(ds.id)
-            faces = dict(ds.faces or {})
-            todo = [u for u in face_size.stills(images) if u not in faces]
-            await release_connection(db)
-            run.update(stage="measuring")
-            measured = await face_size.measure_uris(todo)
-            faces.update(measured)
-            fix = await face_size.run_fix(ds_id, images, faces, prefix, anchor)
+    # ONE FIX AT A TIME, process-wide (#437): two sets fixed at once is two sets of crops and
+    # upscales in flight on a 2 GB box. The second waits here, holding nothing, and says so.
+    # The set is read AFTER the wait, so it fixes the set as it is when its turn comes.
+    if face_size.FIX_LOCK.locked():
+        run.update(stage="waiting for another fix")
+    async with face_size.FIX_LOCK:
+        async with async_session() as db:
+            try:
+                ds = await db.get(Dataset, ds_id)
+                if ds is None:
+                    return
+                images, anchor = list(ds.images), ds.anchor_uri
+                prefix = ds.prefix or _prefix(ds.id)
+                faces = dict(ds.faces or {})
+                todo = [u for u in face_size.stills(images) if u not in faces]
+                await release_connection(db)
+                run.update(stage="measuring")
+                measured = await face_size.measure_uris(todo)
+                faces.update(measured)
+                fix = await face_size.run_fix(ds_id, images, faces, prefix, anchor)
 
-            await db.refresh(ds, with_for_update=True)
-            if _is_locked(ds):
-                run["error"] = _lock_detail(ds)
-                await db.rollback()
-                return
-            # The measurements taken on the way are kept whatever the fix found to do.
-            keep = set(ds.images)
-            ds.faces = {**(ds.faces or {}), **{u: e for u, e in measured.items() if u in keep}}
-            if fix["replaced"] or fix["added"]:
-                note = face_size.apply_fix(ds, fix)
-            else:
-                note = "No small faces to fix."
-            await db.commit()
-            run.update(stage="done", summary=note)
-            logger.info("dataset %s: %s", ds.name, note)
-        except face_size.FaceCropTooOld as e:
-            run["error"] = str(e)
-        except Exception as e:
-            logger.exception("fix small faces on dataset %s failed", ds_id)
-            run["error"] = f"{type(e).__name__}: {e}"
-        finally:
-            run["running"] = False
+                await db.refresh(ds, with_for_update=True)
+                if _is_locked(ds):
+                    run["error"] = _lock_detail(ds)
+                    await db.rollback()
+                    return
+                # The measurements taken on the way are kept whatever the fix found to do.
+                keep = set(ds.images)
+                ds.faces = {**(ds.faces or {}), **{u: e for u, e in measured.items() if u in keep}}
+                if fix["replaced"] or fix["added"]:
+                    note = face_size.apply_fix(ds, fix)
+                else:
+                    note = "No small faces to fix."
+                await db.commit()
+                run.update(stage="done", summary=note)
+                logger.info("dataset %s: %s", ds.name, note)
+            except face_size.FaceCropTooOld as e:
+                run["error"] = str(e)
+            except Exception as e:
+                logger.exception("fix small faces on dataset %s failed", ds_id)
+                run["error"] = f"{type(e).__name__}: {e}"
+            finally:
+                run["running"] = False
 
 
 @router.post("/datasets/{dataset_id}/fix-small-faces", response_model=DatasetFixStatus,

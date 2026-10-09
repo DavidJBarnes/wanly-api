@@ -39,6 +39,13 @@ from app.config import settings
 
 logger = logging.getLogger(__name__)
 
+#: ONE FIX AT A TIME, process-wide (#437) -- the fix's counterpart of _MEASURE_LOCK (#434).
+#: The API runs on a 2 GB box with one uvicorn process; two sets fixed at once is two sets of
+#: downloads, crops and upscales in flight. A second fix WAITS its turn holding no DB
+#: connection and no image bytes. Its own lock, not _MEASURE_LOCK: a fix measures before and
+#: after its work, and one lock across both would deadlock it.
+FIX_LOCK = asyncio.Lock()
+
 #: How many images go to the face-crop service per call. Each call is a full base64 copy of
 #: every image in it, and the service works through them one by one on CPU, so a whole set in
 #: one request is a ~300 MB body against a 300 s read timeout. Measuring is ~1 s an image;
@@ -207,11 +214,65 @@ def _progress(ds_id: uuid.UUID, **kw) -> None:
     FIX_RUNS.setdefault(ds_id, {}).update(kw)
 
 
+async def _upscale_chunk(client, chunk: list[str], prefix: str, tag: str,
+                         replaced: dict[str, str]) -> None:
+    """Upscale one chunk of tiny whole images and upload each, recording it in `replaced`.
+    Its own function, so one chunk's bytes are gone before the next is downloaded (#437) --
+    what measure_uris does with `del` (#434)."""
+    blobs = await asyncio.gather(*(asyncio.to_thread(s3.download_bytes, u) for u in chunk))
+    r = await client.post(_url("/upscale"),
+                          json={"images": [base64.b64encode(b).decode() for b in blobs]})
+    if r.status_code == 404:
+        raise FaceCropTooOld(TOO_OLD.format(what="upscale images"))
+    r.raise_for_status()
+    for u, res in zip(chunk, r.json()["images"]):
+        if res and res.get("upscaled") and res.get("b64"):
+            stem = u.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+            replaced[u] = await asyncio.to_thread(
+                s3.upload_bytes, base64.b64decode(res["b64"]),
+                f"{prefix}/upscaled-{tag}/{len(replaced):03d}_{stem}.jpg",
+                settings.s3_images_bucket)
+
+
+async def _crop_chunk(client, chunk: list[str], prefix: str, tag: str, anchor_vec: list[float],
+                      added: dict[str, str], crop_cos: dict[str, float]) -> None:
+    """Head-and-shoulders crop + upscale of one chunk of photos, each crop uploaded and
+    recorded in `added` (and scored into `crop_cos`). One chunk held, as above."""
+    blobs = await asyncio.gather(*(asyncio.to_thread(s3.download_bytes, u) for u in chunk))
+    r = await client.post(_url("/crop"), json={
+        "images": [base64.b64encode(b).decode() for b in blobs],
+        "reference": [], "largest_only": True,
+        "framing": "head_shoulders", "upscale": True,
+    })
+    r.raise_for_status()
+    result = r.json()
+    # THE ECHO CHECK, before anything is stored: an older service ignores both fields
+    # and sends plain face crops, which would join the set as if they were the fix.
+    if result.get("framing") != "head_shoulders" or result.get("upscale") is not True:
+        raise FaceCropTooOld(TOO_OLD.format(what="crop with upscale"))
+    for f in result["faces"]:
+        src = chunk[f["source_index"]]
+        stem = src.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+        ext = {"jpeg": "jpg"}.get(str(f.get("format", "png")).lower(), "png")
+        crop = await asyncio.to_thread(
+            s3.upload_bytes, base64.b64decode(f["png_b64"]),
+            f"{prefix}/portraits-{tag}/{len(added):03d}_{stem}.{ext}",
+            settings.s3_images_bucket)
+        added[src] = crop
+        emb = f.get("embedding") or []
+        if anchor_vec and emb:
+            crop_cos[crop] = round(sum(a * b for a, b in zip(emb, anchor_vec)), 4)
+
+
 async def run_fix(ds_id: uuid.UUID, images: list[str], faces: dict[str, dict], prefix: str,
                   anchor_uri: str | None) -> dict:
     """Do the work -- every service call and upload -- and return what to apply to the set.
     Writes nothing to the database: the route applies the result under a row lock, against
-    the set as it is THEN (an image removed meanwhile is not resurrected by this)."""
+    the set as it is THEN (an image removed meanwhile is not resurrected by this).
+
+    At most FIX_CHUNK images' bytes are held at once (#437): each chunk is downloaded, sent,
+    and its results uploaded inside its own function call. What survives a chunk is only the
+    S3 keys and scores. The caller holds FIX_LOCK, so only one fix does this at a time."""
     upscale_uris, crop_uris = plan_fix(images, faces)
     total = len(upscale_uris) + len(crop_uris)
     _progress(ds_id, stage="upscaling", done=0, total=total)
@@ -227,19 +288,7 @@ async def run_fix(ds_id: uuid.UUID, images: list[str], faces: dict[str, dict], p
         # ---- tiny whole images, upscaled
         for i in range(0, len(upscale_uris), FIX_CHUNK):
             chunk = upscale_uris[i:i + FIX_CHUNK]
-            blobs = await asyncio.gather(*(asyncio.to_thread(s3.download_bytes, u) for u in chunk))
-            r = await client.post(_url("/upscale"),
-                                  json={"images": [base64.b64encode(b).decode() for b in blobs]})
-            if r.status_code == 404:
-                raise FaceCropTooOld(TOO_OLD.format(what="upscale images"))
-            r.raise_for_status()
-            for u, res in zip(chunk, r.json()["images"]):
-                if res and res.get("upscaled") and res.get("b64"):
-                    stem = u.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-                    replaced[u] = await asyncio.to_thread(
-                        s3.upload_bytes, base64.b64decode(res["b64"]),
-                        f"{prefix}/upscaled-{tag}/{len(replaced):03d}_{stem}.jpg",
-                        settings.s3_images_bucket)
+            await _upscale_chunk(client, chunk, prefix, tag, replaced)
             done += len(chunk)
             _progress(ds_id, done=done)
 
@@ -250,36 +299,10 @@ async def run_fix(ds_id: uuid.UUID, images: list[str], faces: dict[str, dict], p
             # One /embed of the anchor, so the new crops arrive scored and the set does not
             # fail the training preflight's "not scored" check until someone re-scores it.
             # The crop response already carries each crop's embedding.
-            blob = await asyncio.to_thread(s3.download_bytes, anchor_uri)
-            r = await client.post(_url("/embed"), json={"images": [base64.b64encode(blob).decode()]})
-            r.raise_for_status()
-            anchor_vec = (r.json().get("embeddings") or [[]])[0] or []
+            anchor_vec = await _embed_one(client, anchor_uri)
         for i in range(0, len(crop_uris), FIX_CHUNK):
             chunk = crop_uris[i:i + FIX_CHUNK]
-            blobs = await asyncio.gather(*(asyncio.to_thread(s3.download_bytes, u) for u in chunk))
-            r = await client.post(_url("/crop"), json={
-                "images": [base64.b64encode(b).decode() for b in blobs],
-                "reference": [], "largest_only": True,
-                "framing": "head_shoulders", "upscale": True,
-            })
-            r.raise_for_status()
-            result = r.json()
-            # THE ECHO CHECK, before anything is stored: an older service ignores both fields
-            # and sends plain face crops, which would join the set as if they were the fix.
-            if result.get("framing") != "head_shoulders" or result.get("upscale") is not True:
-                raise FaceCropTooOld(TOO_OLD.format(what="crop with upscale"))
-            for f in result["faces"]:
-                src = chunk[f["source_index"]]
-                stem = src.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-                ext = {"jpeg": "jpg"}.get(str(f.get("format", "png")).lower(), "png")
-                crop = await asyncio.to_thread(
-                    s3.upload_bytes, base64.b64decode(f["png_b64"]),
-                    f"{prefix}/portraits-{tag}/{len(added):03d}_{stem}.{ext}",
-                    settings.s3_images_bucket)
-                added[src] = crop
-                emb = f.get("embedding") or []
-                if anchor_vec and emb:
-                    crop_cos[crop] = round(sum(a * b for a, b in zip(emb, anchor_vec)), 4)
+            await _crop_chunk(client, chunk, prefix, tag, anchor_vec, added, crop_cos)
             done += len(chunk)
             _progress(ds_id, done=done)
 
@@ -289,6 +312,13 @@ async def run_fix(ds_id: uuid.UUID, images: list[str], faces: dict[str, dict], p
     for orig, new in replaced.items():
         new_faces.setdefault(new, {})["upscaled_from"] = orig
     return {"replaced": replaced, "added": added, "crop_cos": crop_cos, "faces": new_faces}
+
+
+async def _embed_one(client, uri: str) -> list[float]:
+    blob = await asyncio.to_thread(s3.download_bytes, uri)
+    r = await client.post(_url("/embed"), json={"images": [base64.b64encode(blob).decode()]})
+    r.raise_for_status()
+    return (r.json().get("embeddings") or [[]])[0] or []
 
 
 def apply_fix(ds, fix: dict) -> str:
