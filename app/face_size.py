@@ -130,21 +130,42 @@ async def measure_blobs(blobs: list[bytes]) -> list[dict]:
     return out
 
 
+#: ONE MEASURING JOB AT A TIME, process-wide (wanly-api#434). The Datasets page asks every card
+#: to measure on sight; after the living-datasets backfill that was ~1,000 unmeasured stills
+#: across a dozen cards at once, and each request pulled ALL of its set's bytes into memory
+#: together. On the 2 GB API box that thrashed it into a hang (2026-10-08). Requests now queue
+#: here; each takes its turn.
+_MEASURE_LOCK = asyncio.Lock()
+
+
 async def measure_uris(uris: list[str]) -> dict[str, dict]:
-    """{uri: entry} for these stills. Downloads concurrently, like crop does.
+    """{uri: entry} for these stills.
+
+    BOUNDED (wanly-api#434): downloaded and measured one MEASURE_CHUNK at a time, and each
+    chunk's bytes are dropped before the next is fetched, so memory holds one chunk -- never a
+    whole set -- and only one set measures at a time (_MEASURE_LOCK).
 
     An image that cannot be downloaded (deleted under the set: the 409 dialog's dead entry) is
     left out rather than failing the rest -- it simply stays unmeasured."""
     if not uris:
         return {}
-    got = await asyncio.gather(*(asyncio.to_thread(s3.download_bytes, u) for u in uris),
-                               return_exceptions=True)
-    ok = [(u, b) for u, b in zip(uris, got) if isinstance(b, (bytes, bytearray))]
-    for u, b in zip(uris, got):
-        if not isinstance(b, (bytes, bytearray)):
-            logger.warning("face size: could not download %s (%s); not measured", u, b)
-    entries = await measure_blobs([b for _, b in ok])
-    return {u: e for (u, _), e in zip(ok, entries)}
+    out: dict[str, dict] = {}
+    async with _MEASURE_LOCK:
+        for i in range(0, len(uris), MEASURE_CHUNK):
+            chunk = uris[i:i + MEASURE_CHUNK]
+            got = await asyncio.gather(
+                *(asyncio.to_thread(s3.download_bytes, u) for u in chunk),
+                return_exceptions=True)
+            ok = [(u, b) for u, b in zip(chunk, got) if isinstance(b, (bytes, bytearray))]
+            for u, b in zip(chunk, got):
+                if not isinstance(b, (bytes, bytearray)):
+                    logger.warning("face size: could not download %s (%s); not measured", u, b)
+            del got
+            if ok:
+                entries = await measure_blobs([b for _, b in ok])
+                out.update({u: e for (u, _), e in zip(ok, entries)})
+            del ok
+    return out
 
 
 # ---------------------------------------------------------------------------------------
