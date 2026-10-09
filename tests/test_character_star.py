@@ -174,3 +174,31 @@ class TestFull:
         with pytest.raises(HTTPException) as e:
             await ch.character_full(_n("nobody"), db=db)
         assert e.value.status_code == 404
+
+
+@pytest.mark.asyncio
+class TestRunsHomedOnArchivedSets:
+    async def test_listed_on_the_page_and_starrable(self, db):
+        """Payton renders with Payton-Synthetic's checkpoint, whose home is the archived
+        "Payton v1": the page lists it and the star accepts it."""
+        from app.models import TrainingRunDataset
+        c = await _char(db)
+        live = Dataset(id=uuid.uuid4(), name=c.name, kind="character", character=c.name,
+                       images=["s3://b/a.png"], prefix="p", captions={}, scores={}, faces={})
+        old = Dataset(id=uuid.uuid4(), name=f"{c.name} v1", kind="character", character=c.name,
+                      images=["s3://b/a.png"], prefix="q", captions={}, scores={}, faces={},
+                      archived_at=datetime.now(timezone.utc))
+        db.add_all([live, old])
+        await db.flush()
+        other = _n("Synth")
+        j = await _run(db, other, mode=None, checkpoints=[f"{BUCKET}/{other}_v1_final.safetensors"])
+        db.add(TrainingRunDataset(training_job_id=j.id, group_index=0, dataset_id=old.id,
+                                  dataset_name=old.name, kind="identity", character=other,
+                                  images=["s3://b/a.png"], captions=None, num_repeats=10,
+                                  source="backfill"))
+        await db.flush()
+        full = await ch.character_full(c.name, db=db)
+        assert str(j.id) in {r.job_id for r in full.runs}
+        out = await ch.star(c.id, CharacterStar(training_job_id=j.id, label="final"), Response(),
+                            _user=_U(), db=db)
+        assert out.char_lora == f"{other}_v1_final"
