@@ -1,3 +1,4 @@
+import time
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
@@ -14,6 +15,29 @@ from app.models import User
 
 security = HTTPBearer()
 api_key_header = APIKeyHeader(name="X-API-Key")
+
+#: How long a "this user exists" answer is trusted (wanly-api#434). A console page of thumbnails
+#: is one GET /files per image, and every one used to run a SELECT on users just to accept the
+#: token -- 150+ at once (a living dataset) took all 15 pooled connections, the rest waited 10 s
+#: and failed, and on the 2 GB box the pile-up hung it. The JWT's signature and expiry are
+#: checked on every request regardless; this only saves re-asking the database whether its user
+#: still exists. Only a YES is cached, so a deleted user stops working within this window.
+USER_EXISTS_TTL_S = 300.0
+_user_seen: dict[str, float] = {}
+
+
+async def _user_exists(db: AsyncSession, user_id) -> bool:
+    key = str(user_id)
+    now = time.monotonic()
+    seen = _user_seen.get(key)
+    if seen is not None and now - seen < USER_EXISTS_TTL_S:
+        return True
+    result = await db.execute(select(User.id).where(User.id == user_id))
+    if result.scalar_one_or_none() is None:
+        _user_seen.pop(key, None)
+        return False
+    _user_seen[key] = now
+    return True
 
 
 async def verify_api_key(key: str = Depends(api_key_header)):
@@ -36,8 +60,7 @@ async def verify_api_key_or_bearer(
     if auth_header.startswith("Bearer "):
         token = auth_header[7:]
         user_id = decode_access_token(token)
-        result = await db.execute(select(User).where(User.id == user_id))
-        if result.scalar_one_or_none() is not None:
+        if await _user_exists(db, user_id):
             return
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
@@ -63,8 +86,7 @@ async def verify_api_key_or_token(
     token = request.query_params.get("token")
     if token:
         user_id = decode_access_token(token)
-        result = await db.execute(select(User).where(User.id == user_id))
-        if result.scalar_one_or_none() is not None:
+        if await _user_exists(db, user_id):
             return
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
