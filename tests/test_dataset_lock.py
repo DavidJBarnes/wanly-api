@@ -427,6 +427,11 @@ class TestSharedUrisAreSafe:
         assert bucket.deleted == []
         assert before <= bucket.uris()
         assert all(u.startswith(f"s3://{BUCKET}/{clone.prefix}/faces-") for u in out.images)
+        # Lineage (#445): every face points at the photograph it was cut from -- which left the
+        # set (a replace-crop), so the page can say "from ... (removed)".
+        assert set(out.derived) == set(out.images)
+        assert {e["from"] for e in out.derived.values()} <= set(clone.images) | set(src.images)
+        assert all(e["how"] == "crop" for e in out.derived.values())
 
     async def test_purging_the_clone_leaves_the_source_whole(self, db, bucket):
         from app.models import Dataset

@@ -190,6 +190,8 @@ class DatasetResponse(BaseModel):
     scores: dict[str, float | None] = Field(default_factory=dict)
     #: {uri: face measurement} for stills (#432). An absent still has not been measured yet.
     faces: dict[str, DatasetFaceSize] = Field(default_factory=dict)
+    #: Lineage (wanly-api#445): {derived_uri: {"from", "how", "at"}}.
+    derived: dict[str, dict] = {}
     created_at: datetime | None = None
     updated_at: datetime | None = None
     #: READ-ONLY: locked by hand (#358) or archived (#419). Training no longer locks a set

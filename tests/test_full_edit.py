@@ -493,6 +493,7 @@ class TestOverHTTP:
         after = await db.get(Dataset, ds.id)
         await db.refresh(after)
         assert after.images == before + [uri]
+        assert (after.derived[uri]["from"], after.derived[uri]["how"]) == (before[0], "edit")  # #445
 
     async def test_a_locked_dataset_is_refused_and_nothing_written(self, db, wired_full):
         from app.routes.datasets import lock_dataset

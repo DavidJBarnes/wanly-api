@@ -24,6 +24,7 @@ from sqlalchemy import cast, func, or_, select
 from sqlalchemy.dialects.postgresql import JSONB, JSONPATH
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app import lineage
 from app import s3
 from app.auth import get_current_user, verify_api_key_or_bearer
 from app.config import settings
@@ -90,6 +91,8 @@ def _prune_annotations(ds: Dataset, also_drop: set[str] | None = None) -> None:
         ds.scores = scores
     if faces != (ds.faces or {}):
         ds.faces = faces
+    # Lineage (#445): an entry for a derived image that left the set goes with it.
+    lineage.prune(ds, also_drop)
 
 
 async def _validate_ownership(db: AsyncSession, kind: str | None, character: str | None,
@@ -544,7 +547,8 @@ async def clone_dataset(
                  images=list(src.images or []), prefix=_prefix(ds_id),
                  anchor_uri=src.anchor_uri, kind=src.kind, character=src.character,
                  reg_class=src.reg_class, captions=dict(src.captions or {}),
-                 scores=dict(src.scores or {}), faces=dict(src.faces or {}))
+                 scores=dict(src.scores or {}), faces=dict(src.faces or {}),
+                 derived=dict(src.derived or {}))  # lineage (#445) comes along too
     db.add(ds)
     await db.commit()
     await db.refresh(ds)
@@ -778,6 +782,10 @@ async def crop_faces(
             + (f", {no_face} with none detected" if no_face else "")
             + ("; the set kept its photos and the crops joined it" if save_as else "") + ".")
     ds.notes = f"{ds.notes}\n{note}".strip() if ds.notes else note
+    # Lineage (#445): each face from the photograph it was cut out of -- in both modes; with a
+    # replace the photograph leaves the set and the page says "from ... (removed)".
+    for crop_uri, f in zip(crop_uris, faces):
+        lineage.record(ds, crop_uri, targets[f["source_index"]], "crop")
     if save_as:
         # JSONB columns do not see an in-place mutation (see add_images); reassign.
         ds.images = list(ds.images) + crop_uris

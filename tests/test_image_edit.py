@@ -376,6 +376,8 @@ class TestOverHTTP:
         after = await db.get(Dataset, ds.id)
         await db.refresh(after)
         assert after.images == before + [uri], "appended, and nothing it held was replaced"
+        # Lineage (#445): the edit points at the image it was made from.
+        assert after.derived[uri]["from"] == before[0] and after.derived[uri]["how"] == "edit"
 
     async def test_a_locked_dataset_is_refused_before_anything_runs(self, db, wired):
         """409 like #356/#358 -- and no edit spent, no object written."""
