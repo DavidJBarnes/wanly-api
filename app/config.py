@@ -197,9 +197,11 @@ class Settings(BaseSettings):
     # the trainer's downscale to the 1024^2 area; it never upscales) is flagged and offered to
     # "Fix small faces". Joana v3 had 29 of 48 under it and learned her face slowly (#431).
     small_face_px: int = 250
-    # An image whose short side is under this is upscaled WHOLE by the fix rather than cropped:
-    # a close-up that small is already all face.
-    small_image_short_side: int = 600
+    # An image whose LONG EDGE is under this is upscaled WHOLE by the fix rather than cropped: a
+    # close-up that small is already all face. The face-crop service's rule, mirrored (#447):
+    # it brings the long edge to 1024 and leaves anything within 1.2x alone, so 1024/1.2. A
+    # 576x1024 portrait is NOT small -- the upscaler declines it -- and its small face is cropped.
+    small_image_long_edge: int = 853
     a1111_url: str = "http://2070.zero:7860"
     # Unloading is a few seconds of torch teardown. Short, because failing to free the card
     # only costs the caption, which is never fatal to a render.
