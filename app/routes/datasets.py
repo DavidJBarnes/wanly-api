@@ -907,7 +907,10 @@ async def measure_faces(
             status_code=503,
             detail="no face-crop service is configured (face_crop_url is empty)")
     have = ds.faces or {}
-    todo = [u for u in face_size.stills(ds.images) if overwrite or u not in have]
+    # A composition set also re-measures entries from before #436 kept the second face.
+    pair = ds.kind == "composition"
+    todo = [u for u in face_size.stills(ds.images)
+            if overwrite or face_size.needs_measure(have.get(u), pair)]
     if todo:
         # No connection held across the face-crop calls: a 70-image set is a minute of them.
         await release_connection(db)
@@ -960,12 +963,15 @@ async def fix_small_faces_job(ds_id: uuid.UUID) -> None:
                 images, anchor = list(ds.images), ds.anchor_uri
                 prefix = ds.prefix or _prefix(ds.id)
                 faces = dict(ds.faces or {})
-                todo = [u for u in face_size.stills(images) if u not in faces]
+                # TWO-PERSON CROPS ON A COMPOSITION SET (#436): see fix_small_faces.
+                pair = ds.kind == "composition"
+                todo = [u for u in face_size.stills(images)
+                        if face_size.needs_measure(faces.get(u), pair)]
                 await release_connection(db)
                 run.update(stage="measuring")
                 measured = await face_size.measure_uris(todo)
                 faces.update(measured)
-                fix = await face_size.run_fix(ds_id, images, faces, prefix, anchor)
+                fix = await face_size.run_fix(ds_id, images, faces, prefix, anchor, pair)
 
                 await db.refresh(ds, with_for_update=True)
                 if _is_locked(ds):
@@ -978,7 +984,7 @@ async def fix_small_faces_job(ds_id: uuid.UUID) -> None:
                 if fix["replaced"] or fix["added"]:
                     note = face_size.apply_fix(ds, fix)
                 else:
-                    note = "No small faces to fix."
+                    note = "No small faces to fix." + face_size.single_face_note(fix)
                 await db.commit()
                 run.update(stage="done", summary=note)
                 logger.info("dataset %s: %s", ds.name, note)
@@ -1007,6 +1013,14 @@ async def fix_small_faces(
       a small image   (short side under `small_image_short_side`) upscaled whole and put IN
                       PLACE of itself; the original stays in S3 and in any run that used it
 
+    ON A COMPOSITION SET (#436) the crop is a TWO-PERSON crop -- the union of the two largest
+    faces, head-and-shoulders room round both -- and "small" is the smaller of those two faces.
+    A head-and-shoulders crop of one face there would train under the two-person caption
+    ("d@vid, jo@na, 1girl, 1boy") while showing one person: the pair LoRA learns that one face
+    is both people, the bleed of #430. A photo with fewer than two faces is not cropped (a tiny
+    one is still upscaled whole), and the summary says how many there were. A face-crop service
+    without the `pair` feature is refused up front, like one without `upscale`.
+
     Returns at once; poll GET .../fix-small-faces/status. A second press while one runs returns
     that run's progress. The face-crop service is asked what it can do FIRST, so an older one
     is refused here with what it needs, not half way through a batch.
@@ -1023,9 +1037,12 @@ async def fix_small_faces(
     if run and run.get("running"):
         return _fix_status(ds.id)
     try:
-        missing = {"measure", "upscale"} - await face_size.features()
+        have = await face_size.features()
     except face_size.FaceCropTooOld as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
+    missing = {"measure", "upscale"} - have
+    if not missing and ds.kind == "composition" and "pair" not in have:
+        raise HTTPException(status_code=503, detail=face_size.NO_PAIR)
     if missing:
         raise HTTPException(
             status_code=503,

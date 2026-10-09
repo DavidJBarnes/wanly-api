@@ -148,7 +148,14 @@ class DatasetFaceSize(BaseModel):
     det_score: float | None = None
     #: How many faces the detector found. >1 means face_px may be the wrong person's.
     faces: int = 0
-    #: The head-and-shoulders crop "Fix small faces" made of this photo, if any.
+    #: The smaller of the two largest faces' heights at training size (#436): what a
+    #: COMPOSITION set's photo is judged small by. Null with fewer than two faces; absent on an
+    #: entry measured before #436 (the API re-measures those on a composition set).
+    pair_px: float | None = None
+    #: The two largest faces' boxes, [x1, y1, x2, y2] in source pixels, largest first (#436).
+    boxes: list[list[float]] | None = None
+    #: The crop "Fix small faces" made of this photo, if any: head-and-shoulders, or on a
+    #: composition set two-person.
     crop_uri: str | None = None
     #: On an upscaled copy: the original it replaced in the set (still in S3).
     upscaled_from: str | None = None

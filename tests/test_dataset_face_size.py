@@ -29,6 +29,9 @@ def _imgs(n, prefix="fs"):
 # fake service reads the size off SIZES. Upscaled and cropped outputs measure as the fix would
 # leave them: ~1024 px with a big face.
 SIZES: dict[str, tuple[int, int, float | None]] = {}
+#: Two-person photos (#436): every face's training-size height, largest first. A URI here
+#: overrides SIZES' single face; its (w, h) still come from SIZES.
+PAIRS: dict[str, list[float]] = {}
 
 
 class _S3:
@@ -61,8 +64,8 @@ class _Resp:
 class _Service:
     """The face-crop service, as of #206 unless told it is older."""
 
-    def __init__(self, old=False, ignores_upscale=False):
-        self.old, self.ignores_upscale = old, ignores_upscale
+    def __init__(self, old=False, ignores_upscale=False, no_pair=False):
+        self.old, self.ignores_upscale, self.no_pair = old, ignores_upscale, no_pair
         self.calls: list[str] = []
         self.crop_payloads: list[dict] = []
 
@@ -72,14 +75,18 @@ class _Service:
                     "faces": [{"face_h": 520.0, "face_px_at_train": 520.0, "yaw": 1.0,
                                "pitch": 2.0, "roll": 3.0, "det_score": 0.9}]}
         w, h, px = SIZES[b.decode()]
-        faces = [] if px is None else [{"face_h": px, "face_px_at_train": px, "yaw": -12.0,
-                                        "pitch": 4.0, "roll": 0.5, "det_score": 0.88}]
+        pxs = PAIRS.get(b.decode(), [] if px is None else [px])
+        faces = [{"face_h": p, "face_px_at_train": p, "yaw": -12.0, "pitch": 4.0, "roll": 0.5,
+                  "det_score": 0.88, "box": [100.0 * i, 0.0, 100.0 * i + p, p]}
+                 for i, p in enumerate(pxs)]
         return {"width": w, "height": h, "train_scale": 1.0, "faces": faces}
 
     def handle(self, method, path, body):
         self.calls.append(path)
         if path == "/health":
             feats = ["crop", "embed"] if self.old else ["crop", "embed", "measure", "upscale"]
+            if not self.old and not self.no_pair:
+                feats.append("pair")
             return _Resp({"status": "ok", **({} if self.old else {"features": feats})})
         imgs = [base64.b64decode(b) for b in (body or {}).get("images", [])]
         if path == "/measure":
@@ -93,10 +100,13 @@ class _Service:
             return _Resp({"embeddings": [[1.0, 0.0] for _ in imgs]})
         if path == "/crop":
             self.crop_payloads.append(body)
+            # framing="pair": an image with fewer than two faces is no crop, in no_face.
+            lone = [i for i, b in enumerate(imgs) if body["framing"] == "pair"
+                    and len(PAIRS.get(b.decode(), [1.0])) < 2]
             out = {"faces": [{"source_index": i, "face_index": 0, "format": "jpeg",
                               "png_b64": base64.b64encode(b"CROP:" + b).decode(),
                               "embedding": [0.6, 0.8], "upscaled": True}
-                             for i, b in enumerate(imgs)], "no_face": []}
+                             for i, b in enumerate(imgs) if i not in lone], "no_face": lone}
             if not self.ignores_upscale:
                 out.update(framing=body["framing"], upscale=body["upscale"])
             return _Resp(out)
@@ -483,3 +493,156 @@ class TestOneFixAtATime:
         assert face_size.FIX_RUNS[ds.id]["stage"] == "done"
         await db.refresh(ds)
         assert any("/upscaled-" in u for u in ds.images)
+
+
+# ------------------------------------------------------------------ #436: composition sets
+
+class TestThePairMeasurement:
+    """A composition set's photo shows both people, and is judged by the SMALLER of the two
+    largest faces: both must be learnable."""
+
+    def test_the_smaller_of_the_two_largest_faces_and_both_boxes(self):
+        e = face_size.entry_from({"width": 2000, "height": 1500, "faces": [
+            {"face_px_at_train": 300.0, "box": [0, 0, 300, 300]},
+            {"face_px_at_train": 180.0, "box": [500, 0, 680, 180]},
+            {"face_px_at_train": 40.0, "box": [900, 0, 940, 40]}]})
+        assert (e["face_px"], e["pair_px"], e["faces"]) == (300.0, 180.0, 3)
+        assert e["boxes"] == [[0, 0, 300, 300], [500, 0, 680, 180]]
+
+    def test_one_face_is_no_pair(self):
+        e = face_size.entry_from({"width": 800, "height": 600, "faces": [
+            {"face_px_at_train": 120.0, "box": [0, 0, 1, 1]}]})
+        assert e["pair_px"] is None and e["face_px"] == 120.0
+        assert face_size.entry_from(None)["boxes"] == []
+
+    def test_a_pair_photo_is_small_by_its_smaller_face(self):
+        e = {"face_px": 400.0, "pair_px": 200.0, "boxes": [[], []]}
+        assert face_size.is_small(e, pair=True) and not face_size.is_small(e)
+        # One face: not a pair photo, so not "small" to a composition set -- reported instead.
+        assert not face_size.is_small({"face_px": 100.0, "pair_px": None}, pair=True)
+
+    def test_an_entry_from_before_436_is_remeasured_on_a_pair_set_only(self):
+        old = {"face_px": 200.0, "faces": 2}
+        assert face_size.needs_measure(old, pair=True)
+        assert not face_size.needs_measure(old, pair=False)
+        assert not face_size.needs_measure({**old, "pair_px": None, "boxes": []}, pair=True)
+        assert face_size.needs_measure(None)
+
+    def test_the_plan_crops_pairs_and_leaves_one_face_photos_alone(self):
+        imgs = _imgs(4, "pp")
+        both_small, one_far, tiny_one, fine = imgs
+        faces = {both_small: {"width": 2000, "height": 1500, "face_px": 300.0,
+                              "pair_px": 150.0, "faces": 2},
+                 one_far: {"width": 2000, "height": 1500, "face_px": 100.0,
+                           "pair_px": None, "faces": 1},
+                 tiny_one: {"width": 300, "height": 300, "face_px": 200.0,
+                            "pair_px": None, "faces": 1},
+                 fine: {"width": 2000, "height": 1500, "face_px": 500.0,
+                        "pair_px": 400.0, "faces": 2}}
+        up, crop = face_size.plan_fix(imgs, faces, pair=True)
+        assert up == [tiny_one] and crop == [both_small]
+        assert face_size.single_face_photos(imgs, faces) == [one_far]
+        # The same photos on a character set: the far single face IS cropped there.
+        assert face_size.plan_fix(imgs, faces)[1] == [one_far]
+
+
+@pytest.mark.asyncio
+class TestFixOnAPairSet:
+    async def _world(self, db, monkeypatch, svc=None, prefix="p"):
+        imgs = _imgs(4, prefix)
+        pair_small, one_face, pair_fine, tiny = imgs
+        SIZES.update({pair_small: (2000, 1500, 0.0), one_face: (2000, 1500, 100.0),
+                      pair_fine: (2000, 1500, 0.0), tiny: (300, 300, 200.0)})
+        PAIRS.update({pair_small: [320.0, 140.0], pair_fine: [500.0, 420.0]})
+        ds = await _ds(db, imgs, kind="composition", character="DavidJoana",
+                       captions={pair_small: "d@vid, jo@na, 1girl, 1boy"},
+                       # Measured before #436: no boxes, so the fix re-measures it first.
+                       faces={pair_small: {"width": 2000, "height": 1500, "face_px": 320.0,
+                                           "faces": 2}})
+        svc = svc or _Service()
+        s3 = _S3()
+        _wire(monkeypatch, svc, s3)
+        face_size.FIX_RUNS.pop(ds.id, None)
+        return ds, imgs, svc, s3
+
+    async def test_it_adds_two_person_crops_and_reports_one_face_photos(
+            self, db, monkeypatch, shared_session):
+        from app.routes import datasets as mod
+        ds, (pair_small, one_face, pair_fine, tiny), svc, s3 = await self._world(db, monkeypatch)
+        await mod.fix_small_faces_job(ds.id)
+        run = face_size.FIX_RUNS[ds.id]
+        assert run["error"] is None, run
+        await db.refresh(ds)
+        crops = [u for u in s3.uploads if "/pairs-" in u]
+        assert len(crops) == 1 and not [u for u in s3.uploads if "/portraits-" in u]
+        # Only the pair with a small face is cropped; the one-face photo is not, the tiny one
+        # is upscaled whole.
+        assert [p["framing"] for p in svc.crop_payloads] == ["pair"]
+        assert base64.b64decode(svc.crop_payloads[0]["images"][0]).decode() == pair_small
+        assert ds.faces[pair_small]["crop_uri"] == crops[0]
+        assert ds.faces[pair_small]["pair_px"] == 140.0 and len(ds.faces[pair_small]["boxes"]) == 2
+        assert tiny not in ds.images and any("/upscaled-" in u for u in ds.images)
+        assert "1 two-person crop(s) added" in run["summary"]
+        assert "1 photo(s) show fewer than two faces and were not cropped" in run["summary"]
+        # Pressing it again makes nothing: the pair's crop is in the set.
+        before = list(ds.images)
+        await mod.fix_small_faces_job(ds.id)
+        await db.refresh(ds)
+        assert ds.images == before
+
+    async def test_a_photo_the_crop_finds_one_face_in_is_not_cropped(
+            self, db, monkeypatch, shared_session):
+        """The measurement said two; the crop's own detection disagreed. Nothing is made."""
+        from app.routes import datasets as mod
+        ds, imgs, svc, s3 = await self._world(db, monkeypatch, prefix="p2")
+        real = svc.handle
+
+        def lose_a_face(method, path, body):
+            if path == "/crop":
+                PAIRS[imgs[0]] = [320.0]
+            return real(method, path, body)
+        svc.handle = lose_a_face
+        await mod.fix_small_faces_job(ds.id)
+        run = face_size.FIX_RUNS[ds.id]
+        assert run["error"] is None
+        assert not [u for u in s3.uploads if "/pairs-" in u]
+        assert "2 photo(s) show fewer than two faces" in run["summary"]
+
+    async def test_a_service_without_pair_is_refused_up_front(self, db, monkeypatch):
+        from fastapi import BackgroundTasks, HTTPException
+        from app.routes import datasets as mod
+        ds, *_ = await self._world(db, monkeypatch, _Service(no_pair=True), "p3")
+        tasks = BackgroundTasks()
+        with pytest.raises(HTTPException) as e:
+            await mod.fix_small_faces(ds.id, tasks, _user=None, db=db)
+        assert e.value.status_code == 503 and "two-person" in e.value.detail
+        assert not tasks.tasks
+
+    async def test_a_character_set_does_not_need_pair(self, db, monkeypatch):
+        from fastapi import BackgroundTasks
+        from app.routes import datasets as mod
+        imgs = _imgs(2, "p4")
+        SIZES.update({imgs[0]: (1080, 1440, 120.0), imgs[1]: (1080, 1440, 420.0)})
+        ds = await _ds(db, imgs)
+        _wire(monkeypatch, _Service(no_pair=True), _S3())
+        tasks = BackgroundTasks()
+        out = await mod.fix_small_faces(ds.id, tasks, _user=None, db=db)
+        assert out.running and len(tasks.tasks) == 1
+        face_size.FIX_RUNS.pop(ds.id, None)
+
+    async def test_a_ignoring_service_that_sends_portraits_stores_nothing(
+            self, db, monkeypatch, shared_session):
+        """An older service ignores framing="pair" and echoes nothing: never stored."""
+        from app.routes import datasets as mod
+        ds, imgs, *_ = await self._world(db, monkeypatch, _Service(ignores_upscale=True), "p5")
+        await mod.fix_small_faces_job(ds.id)
+        assert "two-person" in face_size.FIX_RUNS[ds.id]["error"]
+        await db.refresh(ds)
+        assert ds.images == imgs
+
+    async def test_measure_refreshes_pre_436_entries_on_a_pair_set(self, db, monkeypatch):
+        from app.routes import datasets as mod
+        ds, (pair_small, *_), *_ = await self._world(db, monkeypatch, prefix="p6")
+        out = await mod.measure_faces(ds.id, overwrite=False, _user=None, db=db)
+        assert out.faces[pair_small].pair_px == 140.0
+        assert out.faces[pair_small].boxes and len(out.faces[pair_small].boxes) == 2

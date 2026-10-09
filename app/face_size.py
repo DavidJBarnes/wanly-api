@@ -57,6 +57,12 @@ TOO_OLD = ("the face-crop service cannot {what} yet — it needs the worker imag
            "(wanly-gpu-docker#206)")
 
 
+#: A composition fix needs framing="pair" (wanly-gpu-docker#208). Code-only on the worker:
+#: the face-crop service picks it up on a restart, no new image needed.
+NO_PAIR = ("the face-crop service cannot make two-person crops yet — it needs restarting on "
+           "wanly-gpu-docker#208 or later")
+
+
 class FaceCropTooOld(Exception):
     """The deployed face-crop service predates #206. The message says what it needs."""
 
@@ -65,13 +71,27 @@ def _url(path: str) -> str:
     return f"{settings.face_crop_url.rstrip('/')}{path}"
 
 
-def is_small(entry: dict | None) -> bool:
+def is_small(entry: dict | None, pair: bool = False) -> bool:
     """Measured, a face was found, and it trains under the small-face line. No face is a
-    different problem -- the anchor scores already catch it -- and not counted here."""
+    different problem -- the anchor scores already catch it -- and not counted here.
+
+    `pair` (a composition set, #436): judged by `pair_px`, the SMALLER of the two largest
+    faces -- both people must be learnable, and the pair LoRA learns the smaller one small.
+    A photo with fewer than two faces has none and is not counted: cropping can't make it a
+    pair photo, and the fix reports it instead."""
     if not entry:
         return False
-    px = entry.get("face_px")
+    px = entry.get("pair_px" if pair else "face_px")
     return px is not None and px < settings.small_face_px
+
+
+def needs_measure(entry: dict | None, pair: bool = False) -> bool:
+    """Unmeasured -- or, on a composition set, measured before #436 kept the second face: no
+    `boxes` (entry_from always writes a list, empty for no face; pair_px can be a real None,
+    "fewer than two faces", so it cannot be the marker). Re-measuring those is how an existing
+    pair set gets the numbers it is now judged by, with no migration. The console's
+    faceSizeSummary uses the same marker, so its "unmeasured" and this agree."""
+    return entry is None or (pair and entry.get("boxes") is None)
 
 
 def is_fixed(entry: dict | None, images) -> bool:
@@ -99,9 +119,15 @@ def entry_from(result: dict | None) -> dict:
     the same rule the crop's face 0 follows, and the same caveat: in a two-person photo the
     bigger face may be the other person's. `faces` says how many there were."""
     if not result:
-        return {"width": None, "height": None, "face_px": None, "faces": 0}
+        return {"width": None, "height": None, "face_px": None, "faces": 0, "pair_px": None,
+                "boxes": []}
     faces = result.get("faces") or []
     top = faces[0] if faces else {}
+    # THE PAIR (#436): the two largest faces' boxes (source pixels), and the smaller of their
+    # training-size heights -- what a composition set is judged by. Kept for every set: it is
+    # two numbers, and a set's kind is not this function's business.
+    two = faces[:2]
+    pair_px = (min(f.get("face_px_at_train") or 0.0 for f in two) if len(two) == 2 else None)
     return {
         "width": result.get("width"),
         "height": result.get("height"),
@@ -112,6 +138,8 @@ def entry_from(result: dict | None) -> dict:
         "roll": top.get("roll"),
         "det_score": top.get("det_score"),
         "faces": len(faces),
+        "pair_px": pair_px,
+        "boxes": [f.get("box") for f in two if f.get("box")],
     }
 
 
@@ -193,7 +221,8 @@ async def measure_uris(uris: list[str]) -> dict[str, dict]:
 FIX_RUNS: dict[uuid.UUID, dict] = {}
 
 
-def plan_fix(images: list[str], faces: dict[str, dict]) -> tuple[list[str], list[str]]:
+def plan_fix(images: list[str], faces: dict[str, dict],
+             pair: bool = False) -> tuple[list[str], list[str]]:
     """(whole images to upscale, photographs to crop) from the measurements.
 
     A SMALL IMAGE IS UPSCALED WHOLE, not cropped: a 300 px close-up is already all face, and
@@ -204,6 +233,11 @@ def plan_fix(images: list[str], faces: dict[str, dict]) -> tuple[list[str], list
     IDEMPOTENT. A photo whose crop from an earlier fix is still in the set is not cropped again
     -- the photo itself stays small-faced forever, so without this every press added another
     copy. An upscaled image is ~1024 px and never qualifies a second time.
+
+    `pair` (a composition set, #436): the crops are TWO-PERSON crops, and "small" is the
+    smaller face of the pair (is_small). A photo with fewer than two faces is never cropped --
+    see single_face_photos -- though a tiny one is still upscaled whole, which keeps whoever
+    is in it and changes nothing about what the caption claims.
     """
     present = set(images)
     upscale, crop = [], []
@@ -213,9 +247,22 @@ def plan_fix(images: list[str], faces: dict[str, dict]) -> tuple[list[str], list
             continue
         if is_small_image(e):
             upscale.append(u)
-        elif is_small(e) and not is_fixed(e, present):
+        elif is_small(e, pair) and not is_fixed(e, present):
             crop.append(u)
     return upscale, crop
+
+
+def single_face_photos(images: list[str], faces: dict[str, dict]) -> list[str]:
+    """On a composition set (#436): measured stills where the detector found fewer than two
+    faces, and that are not tiny (those are upscaled whole). Not cropped -- a one-face crop
+    under a two-person caption teaches the pair LoRA one face is both people (#430) -- but
+    named in the fix's summary, because a pair set's photo with one face is worth a look."""
+    out = []
+    for u in stills(images):
+        e = faces.get(u)
+        if e and (e.get("faces") or 0) < 2 and not is_small_image(e):
+            out.append(u)
+    return out
 
 
 def _progress(ds_id: uuid.UUID, **kw) -> None:
@@ -243,28 +290,36 @@ async def _upscale_chunk(client, chunk: list[str], prefix: str, tag: str,
 
 
 async def _crop_chunk(client, chunk: list[str], prefix: str, tag: str, anchor_vec: list[float],
-                      added: dict[str, str], crop_cos: dict[str, float]) -> None:
-    """Head-and-shoulders crop + upscale of one chunk of photos, each crop uploaded and
-    recorded in `added` (and scored into `crop_cos`). One chunk held, as above."""
+                      added: dict[str, str], crop_cos: dict[str, float],
+                      framing: str = "head_shoulders",
+                      unpaired: list[str] | None = None) -> None:
+    """Head-and-shoulders (or, with framing="pair", two-person) crop + upscale of one chunk of
+    photos, each crop uploaded and recorded in `added` (and scored into `crop_cos`). One chunk
+    held, as above. A pair photo the service found fewer than two faces in goes to `unpaired`
+    -- the measurement said two, the crop's detection disagreed; nothing is made of it."""
     blobs = await asyncio.gather(*(asyncio.to_thread(s3.download_bytes, u) for u in chunk))
     r = await client.post(_url("/crop"), json={
         "images": [base64.b64encode(b).decode() for b in blobs],
         "reference": [], "largest_only": True,
-        "framing": "head_shoulders", "upscale": True,
+        "framing": framing, "upscale": True,
     })
     r.raise_for_status()
     result = r.json()
     # THE ECHO CHECK, before anything is stored: an older service ignores both fields
     # and sends plain face crops, which would join the set as if they were the fix.
-    if result.get("framing") != "head_shoulders" or result.get("upscale") is not True:
-        raise FaceCropTooOld(TOO_OLD.format(what="crop with upscale"))
+    if result.get("framing") != framing or result.get("upscale") is not True:
+        raise FaceCropTooOld(NO_PAIR if framing == "pair"
+                             else TOO_OLD.format(what="crop with upscale"))
+    if unpaired is not None:
+        unpaired.extend(chunk[i] for i in result.get("no_face") or [])
     for f in result["faces"]:
         src = chunk[f["source_index"]]
         stem = src.rsplit("/", 1)[-1].rsplit(".", 1)[0]
         ext = {"jpeg": "jpg"}.get(str(f.get("format", "png")).lower(), "png")
         crop = await asyncio.to_thread(
             s3.upload_bytes, base64.b64decode(f["png_b64"]),
-            f"{prefix}/portraits-{tag}/{len(added):03d}_{stem}.{ext}",
+            f"{prefix}/{'pairs' if framing == 'pair' else 'portraits'}-{tag}/"
+            f"{len(added):03d}_{stem}.{ext}",
             settings.s3_images_bucket)
         added[src] = crop
         emb = f.get("embedding") or []
@@ -273,7 +328,7 @@ async def _crop_chunk(client, chunk: list[str], prefix: str, tag: str, anchor_ve
 
 
 async def run_fix(ds_id: uuid.UUID, images: list[str], faces: dict[str, dict], prefix: str,
-                  anchor_uri: str | None) -> dict:
+                  anchor_uri: str | None, pair: bool = False) -> dict:
     """Do the work -- every service call and upload -- and return what to apply to the set.
     Writes nothing to the database: the route applies the result under a row lock, against
     the set as it is THEN (an image removed meanwhile is not resurrected by this).
@@ -281,7 +336,9 @@ async def run_fix(ds_id: uuid.UUID, images: list[str], faces: dict[str, dict], p
     At most FIX_CHUNK images' bytes are held at once (#437): each chunk is downloaded, sent,
     and its results uploaded inside its own function call. What survives a chunk is only the
     S3 keys and scores. The caller holds FIX_LOCK, so only one fix does this at a time."""
-    upscale_uris, crop_uris = plan_fix(images, faces)
+    upscale_uris, crop_uris = plan_fix(images, faces, pair)
+    framing = "pair" if pair else "head_shoulders"
+    unpaired: list[str] = []
     total = len(upscale_uris) + len(crop_uris)
     _progress(ds_id, stage="upscaling", done=0, total=total)
     # A batch of its own under the set's prefix, so a second fix can never overwrite the
@@ -310,7 +367,8 @@ async def run_fix(ds_id: uuid.UUID, images: list[str], faces: dict[str, dict], p
             anchor_vec = await _embed_one(client, anchor_uri)
         for i in range(0, len(crop_uris), FIX_CHUNK):
             chunk = crop_uris[i:i + FIX_CHUNK]
-            await _crop_chunk(client, chunk, prefix, tag, anchor_vec, added, crop_cos)
+            await _crop_chunk(client, chunk, prefix, tag, anchor_vec, added, crop_cos,
+                              framing, unpaired if pair else None)
             done += len(chunk)
             _progress(ds_id, done=done)
 
@@ -319,7 +377,12 @@ async def run_fix(ds_id: uuid.UUID, images: list[str], faces: dict[str, dict], p
     new_faces = await measure_uris(list(replaced.values()) + list(added.values()))
     for orig, new in replaced.items():
         new_faces.setdefault(new, {})["upscaled_from"] = orig
-    return {"replaced": replaced, "added": added, "crop_cos": crop_cos, "faces": new_faces}
+    return {"replaced": replaced, "added": added, "crop_cos": crop_cos, "faces": new_faces,
+            "pair": pair,
+            # Pair sets: photos with fewer than two faces, not cropped. The measurement's say
+            # plus any the crop's own detection refused.
+            "single_face": (sorted(set(single_face_photos(images, faces)) | set(unpaired))
+                            if pair else [])}
 
 
 async def _embed_one(client, uri: str) -> list[float]:
@@ -360,7 +423,18 @@ def apply_fix(ds, fix: dict) -> str:
     # JSONB columns do not see in-place mutation: reassign every one.
     ds.images = [replaced.get(u, u) for u in ds.images] + list(added.values())
     ds.captions, ds.scores, ds.faces = captions, scores, faces
+    what = "two-person" if fix.get("pair") else "head-and-shoulders"
     note = (f"Fixed small faces: {len(replaced)} small image(s) upscaled in place (originals "
-            f"kept in S3), {len(added)} head-and-shoulders crop(s) added.")
+            f"kept in S3), {len(added)} {what} crop(s) added.{single_face_note(fix)}")
     ds.notes = f"{ds.notes}\n{note}".strip() if ds.notes else note
     return note
+
+
+def single_face_note(fix: dict) -> str:
+    """The pair-set report (#436): photos not cropped because fewer than two faces were found.
+    Empty on a character set, or when there were none."""
+    n = len(fix.get("single_face") or [])
+    if not n:
+        return ""
+    return (f" {n} photo(s) show fewer than two faces and were not cropped (a one-person crop "
+            f"would train under the two-person caption).")
