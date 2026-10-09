@@ -29,7 +29,7 @@ from app.auth import get_current_user, verify_api_key, verify_api_key_or_bearer
 from app.config import settings
 from app.database import get_db
 from app.enums import TRAINING_TERMINAL, TrainingStatus, WorkerKind, worker_can
-from app.models import (Dataset, LtxCharacter, Segment, TrainingJob, User, Worker,
+from app.models import (LtxCharacter, Segment, TrainingJob, User, Worker,
                         training_arch)
 from app.character_registry import identity_phrase
 from app.schemas.training import (
@@ -396,13 +396,10 @@ async def get_run_home(job_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
     job = await db.get(TrainingJob, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Training job not found")
-    home = run_datasets.home_dataset_id(await run_datasets.link_rows(db, job), job)
+    links = await run_datasets.link_rows(db, job)
+    home = run_datasets.home_dataset_id(links, job)
     if home is None:
-        living = (await db.execute(
-            select(Dataset.id).where(Dataset.kind == "character",
-                                     Dataset.character == job.character,
-                                     Dataset.archived_at.is_(None)))).scalars().first()
-        home = living
+        home = run_datasets.orphan_home(job, links, await run_datasets._set_summaries(db))
     return {"dataset_id": str(home) if home else None}
 
 
