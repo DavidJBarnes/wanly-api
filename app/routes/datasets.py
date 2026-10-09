@@ -146,6 +146,25 @@ async def _validate_ownership(db: AsyncSession, kind: str | None, character: str
     return kind, character, None
 
 
+async def _refuse_second_living(db: AsyncSession, kind: str | None, character: str | None,
+                                exclude: uuid.UUID | None = None) -> None:
+    """ONE living set per character (wanly-api#452): a character HAS its dataset. A second
+    living character set (or composition set, for a pair) is refused with the one that exists
+    named, so the way forward is obvious: add to it, or archive it first."""
+    if kind not in ("character", "composition") or not character:
+        return
+    q = select(Dataset).where(Dataset.character == character, Dataset.kind == kind,
+                              Dataset.archived_at.is_(None))
+    if exclude is not None:
+        q = q.where(Dataset.id != exclude)
+    other = (await db.execute(q)).scalars().first()
+    if other is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{character} already has its dataset, {other.name!r} — add the images "
+                   f"there, or archive it first to start a new one")
+
+
 #: A run in any other state -- queued, claimed, running, completed -- means a LoRA came, or
 #: is coming, of the set. A failed or cancelled run produced nothing, so it is not listed as
 #: having trained the set (its files are still protected: see run_datasets.trained_uris).
@@ -260,6 +279,7 @@ async def create_dataset(
         raise HTTPException(status_code=409, detail=f"a dataset called {body.name!r} already exists")
     kind, character, reg_class = await _validate_ownership(
         db, body.kind, body.character, body.reg_class)
+    await _refuse_second_living(db, kind, character)
     ds_id = uuid.uuid4()
     ds = Dataset(id=ds_id, user_id=user.id, name=body.name, tags=body.tags, notes=body.notes,
                  images=[], prefix=_prefix(ds_id), kind=kind, character=character,
@@ -377,6 +397,8 @@ async def update_dataset(
             new = {"kind": None, "character": None, "reg_class": None}
         kind, character, reg_class = await _validate_ownership(
             db, new["kind"], new["character"], new["reg_class"])
+        if ds.archived_at is None:
+            await _refuse_second_living(db, kind, character, exclude=ds.id)
         if (kind, character, reg_class) != (ds.kind, ds.character, ds.reg_class):
             # A run snapshotted its captions and owner's trigger at creation, so this would
             # not corrupt it -- but the set would then say it is somebody else's while a LoRA
@@ -551,14 +573,22 @@ async def clone_dataset(
     dupe = (await db.execute(select(Dataset).where(Dataset.name == body.name))).scalar_one_or_none()
     if dupe:
         raise HTTPException(status_code=409, detail=f"a dataset called {body.name!r} already exists")
+    # ONE LIVING SET PER CHARACTER (#452): a clone of a set whose owner already has its
+    # living set comes out UNASSIGNED -- an experiment beside the character, never a second
+    # "Joana". Assign it once the living one is archived.
+    kind, character, reg_class = src.kind, src.character, src.reg_class
+    if kind in ("character", "composition") and character and (await db.execute(
+            select(Dataset.id).where(Dataset.character == character, Dataset.kind == kind,
+                                     Dataset.archived_at.is_(None)))).first() is not None:
+        kind, character = None, None
     ds_id = uuid.uuid4()
     # Lists and dicts copied, not shared: the ORM would otherwise hold the source's own
     # objects on the clone, and a later reassign on one must not be the other's too.
     ds = Dataset(id=ds_id, user_id=user.id, name=body.name, tags=src.tags,
                  notes=(f"Cloned from {src.name!r}. " + (src.notes or "")).strip(),
                  images=list(src.images or []), prefix=_prefix(ds_id),
-                 anchor_uri=src.anchor_uri, kind=src.kind, character=src.character,
-                 reg_class=src.reg_class, captions=dict(src.captions or {}),
+                 anchor_uri=src.anchor_uri, kind=kind, character=character,
+                 reg_class=reg_class, captions=dict(src.captions or {}),
                  scores=dict(src.scores or {}), faces=dict(src.faces or {}),
                  derived=dict(src.derived or {}))  # lineage (#445) comes along too
     db.add(ds)
@@ -656,6 +686,7 @@ async def unarchive_dataset(
     if not ds:
         raise HTTPException(status_code=404, detail="Dataset not found")
     if ds.archived_at is not None:
+        await _refuse_second_living(db, ds.kind, ds.character, exclude=ds.id)
         ds.archived_at = None
         await db.commit()
         await db.refresh(ds)

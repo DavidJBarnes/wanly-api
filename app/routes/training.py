@@ -466,7 +466,10 @@ async def update_training_job(
         if body.status in TRAINING_TERMINAL:
             job.completed_at = datetime.now(timezone.utc)
             if body.status == TrainingStatus.COMPLETED:
-                await _publish_character(db, job)
+                # NOT a publish any more (wanly-api#452): which checkpoint a character
+                # renders with is the user's STAR, never "whichever run finished last". A
+                # pair's first run still creates its row, as a draft, so its page exists.
+                await _register_on_finish(db, job)
 
     await db.commit()
     await db.refresh(job)
@@ -497,7 +500,64 @@ async def set_training_notes(
     return job
 
 
-async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
+async def _register_on_finish(db: AsyncSession, job: TrainingJob) -> None:
+    """A finished run's only effect on the registry (wanly-api#452): a PAIR trained for the
+    first time gets its row -- kind, members, the joined trigger phrase -- with NO LoRA yet,
+    a draft until a checkpoint is starred. A solo character's row exists before it trains,
+    and an SDXL run never touches the registry."""
+    cfg = job.config or {}
+    if cfg.get("arch") == "sdxl" or cfg.get("mode") != "pair":
+        return
+    existing = (await db.execute(
+        select(LtxCharacter).where(LtxCharacter.name == job.character))).scalar_one_or_none()
+    if existing is not None:
+        return
+    stamp = _pair_stamp(job)
+    db.add(LtxCharacter(name=job.character, char_lora=None,
+                        trained_from=_trained_from(job), **stamp))
+    logger.info("created pair %s (draft: no starred checkpoint yet)", job.character)
+
+
+def _pair_stamp(job: TrainingJob) -> dict:
+    """kind/members/trigger/gender of a pair row, from the run's own snapshot."""
+    cfg = job.config or {}
+    phrases = [identity_phrase(job.trigger, cfg.get("gender"))]
+    phrases += [identity_phrase(g.get("trigger"), g.get("gender"))
+                for g in (job.identities or []) if g.get("kind") == "identity"]
+    return {"kind": "pair", "members": list(cfg.get("members") or []),
+            "trigger": " and ".join(p for p in phrases if p), "gender": None}
+
+
+def checkpoint_uri(job: TrainingJob, label: str) -> str | None:
+    """The uploaded checkpoint `label` (e01.. or final) of this run, or None if it is not in
+    the bucket (it may live only on the trainer: publish "none" is the default, #413)."""
+    tag = f"_{label}.safetensors"
+    return next((c for c in (job.checkpoints or []) if isinstance(c, str) and c.endswith(tag)),
+                None)
+
+
+async def star_checkpoint(db: AsyncSession, c: LtxCharacter, job: TrainingJob, uri: str) -> None:
+    """Make `uri` (one of `job`'s uploaded LTX checkpoints) the character's LoRA: char_lora,
+    provenance, base model -- and for a pair its phrase -- exactly as a publish stamped them.
+    Clears any pending star."""
+    await _publish_character(db, job, uri=uri, row=c)
+    c.star_pending = None
+
+
+async def apply_pending_stars(db: AsyncSession, job: TrainingJob, uri: str) -> None:
+    """A checkpoint just landed: any character that starred it while it was still on the
+    trainer now points at it (wanly-api#452)."""
+    label = uri.rsplit("_", 1)[-1].removesuffix(".safetensors")
+    rows = (await db.execute(select(LtxCharacter).where(
+        LtxCharacter.star_pending["training_job_id"].astext == str(job.id),
+        LtxCharacter.star_pending["label"].astext == label))).scalars().all()
+    for c in rows:
+        await star_checkpoint(db, c, job, uri)
+        logger.info("character %s: pending star %s applied -> %s", c.name, label, uri)
+
+
+async def _publish_character(db: AsyncSession, job: TrainingJob, uri: str | None = None,
+                             row: LtxCharacter | None = None) -> None:
     """Make the finished LoRA usable in a recipe.
 
     Nothing else does this. `GET /loras` lists the bucket, so the FILE is discoverable the
@@ -512,14 +572,15 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
     a v2 captioned differently must render differently (wanly-console#487). A run that recorded
     none leaves the row's alone -- it may have been set by hand for a LoRA that predates it.
     """
-    if not job.output_lora_path:
+    uri = uri or job.output_lora_path
+    if not uri:
         return
     if (job.config or {}).get("arch") == "sdxl":
         # A START-IMAGE LoRA (#398). The LTX engine cannot load it, so pointing a character
         # row at it would break every render of that character. It is downloaded from the run.
         return
     if (job.config or {}).get("mode") in ("solo", "pair"):
-        await _publish_registered(db, job)
+        await _publish_registered(db, job, uri=uri, row=row)
         return
     # ---- A PRE-#352 JOB, published exactly as it always was. Retrying an old failed run
     # must not change what it publishes to.
@@ -528,8 +589,8 @@ async def _publish_character(db: AsyncSession, job: TrainingJob) -> None:
     # button writes the stem, and the character editor says "without .safetensors" -- the
     # first auto-published character stored `david_v1_final.safetensors` and the page could
     # not tell it was in use.
-    basename = job.output_lora_path.rsplit("/", 1)[-1].removesuffix(".safetensors")
-    existing = (await db.execute(
+    basename = uri.rsplit("/", 1)[-1].removesuffix(".safetensors")
+    existing = row or (await db.execute(
         select(LtxCharacter).where(LtxCharacter.name == job.character)
     )).scalar_one_or_none()
     gender = (job.config or {}).get("gender") or None
@@ -608,7 +669,8 @@ def _trained_from(job: TrainingJob) -> list[dict]:
              "count": d.get("count", n), "kind": kind} for d, kind, n in rows]
 
 
-async def _publish_registered(db: AsyncSession, job: TrainingJob) -> None:
+async def _publish_registered(db: AsyncSession, job: TrainingJob, uri: str | None = None,
+                              row: LtxCharacter | None = None) -> None:
     """Publish a #352 run: to its OWN row, and never to anybody else's.
 
     SOLO updates the character it trained: the LoRA, provenance, base model and face. The
@@ -627,18 +689,15 @@ async def _publish_registered(db: AsyncSession, job: TrainingJob) -> None:
     Strengths are left as they are on an existing row: they may have been tuned by hand.
     """
     cfg = job.config or {}
-    basename = _lora_stem(job)
-    existing = (await db.execute(
+    basename = (uri.rsplit("/", 1)[-1].removesuffix(".safetensors") if uri
+                else _lora_stem(job))
+    existing = row or (await db.execute(
         select(LtxCharacter).where(LtxCharacter.name == job.character)
     )).scalar_one_or_none()
     stamp = {"char_lora": basename, "trained_from": _trained_from(job),
              "base_checkpoint": cfg.get("base_checkpoint")}
     if cfg.get("mode") == "pair":
-        phrases = [identity_phrase(job.trigger, cfg.get("gender"))]
-        phrases += [identity_phrase(g.get("trigger"), g.get("gender"))
-                    for g in (job.identities or []) if g.get("kind") == "identity"]
-        stamp.update(kind="pair", members=list(cfg.get("members") or []),
-                     trigger=" and ".join(p for p in phrases if p), gender=None)
+        stamp.update(_pair_stamp(job))
     if existing:
         for k, v in stamp.items():
             setattr(existing, k, v)
@@ -800,6 +859,7 @@ async def commit_training_artifact(
             detail=f"{uri} is in the bucket but has no safetensors header (a zero-filled or "
                    f"truncated file). Not recording it; the trainer should regenerate it.")
     _record_checkpoint(job, uri)
+    await apply_pending_stars(db, job, uri)
     await db.commit()
     await db.refresh(job)
     logger.info("recorded %s (%.0f MB) for %s v%d",
@@ -856,6 +916,7 @@ async def upload_training_artifact(
     key = _artifact_key(job, epoch, final)
     uri = await asyncio.to_thread(s3.upload_bytes, data, key, settings.s3_loras_bucket)
     _record_checkpoint(job, uri)
+    await apply_pending_stars(db, job, uri)
     await db.commit()
     await db.refresh(job)
     logger.info("published %s (%.0f MB) for %s v%d",

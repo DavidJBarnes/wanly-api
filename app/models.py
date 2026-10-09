@@ -687,6 +687,9 @@ class LtxCharacter(Base):
     # NULL (migration 107) or the legacy "none": no LoRA. A sheet-only character renders on
     # the base model with its reference carrying the identity.
     char_lora = mapped_column(Text, nullable=True)
+    # {training_job_id, label}: a STARRED checkpoint that is still on the trainer (#452). Its
+    # upload was requested; when it lands, char_lora points at it and this clears.
+    star_pending = mapped_column(JSONB, nullable=True)
     # The token that fills a pose's <TRIGGER> placeholder. "Adding a character costs a LoRA
     # and a trigger swap" — this is the trigger half, and it is why a new LoRA is never
     # locked out: every pose works for it the moment the row exists.
