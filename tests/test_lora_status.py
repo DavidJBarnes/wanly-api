@@ -126,3 +126,93 @@ async def test_the_grid_and_list_payloads_carry_it(db):
         row = next(r for r in rows if r["name"] == name)
         assert row["latest_lora"]["tested"] is True and row["latest_lora"]["renders"] == 1
         assert "starred_lora_renders" in row
+
+
+# ---- SDXL: tried in A1111? (#458) -------------------------------------------------------
+
+async def _usage(db, name, images, *, at=None):
+    from app.models import LoraUsage
+    db.add(LoraUsage(name=name, source="a1111", images=images,
+                     first_used_at=at, last_used_at=at or datetime.now(timezone.utc)))
+    await db.flush()
+
+
+@pytest.mark.asyncio
+async def test_the_newest_sdxl_run_is_tested_once_a1111_used_one_of_its_files(db):
+    name = _n()
+    c = await _char(db, name)
+    now = datetime.now(timezone.utc)
+    await _run(db, name, 1, done_at=now - timedelta(days=2), arch="sdxl")
+    await _run(db, name, 2, done_at=now - timedelta(days=1), arch="sdxl",
+               labels=("e06", "e11", "final"))
+    st = (await ls.lora_status(db, [c]))[name]["latest_sdxl_lora"]
+    assert st["run_version"] == 2 and st["tested"] is False and st["a1111_images"] == 0
+    # A1111 writes the file stem as it was published: `{stem}_sdxl_v{N}_{label}`; any case.
+    await _usage(db, f"{name.upper()}_sdxl_v2_e11", 266, at=now)
+    await _usage(db, f"{name}_sdxl_v1_final", 50)   # an older run's file: not the latest
+    st = (await ls.lora_status(db, [c]))[name]["latest_sdxl_lora"]
+    assert st["tested"] is True and st["a1111_images"] == 266
+    assert st["label"] == "e11" and st["name"] == f"{name}_sdxl_v2_e11"
+
+
+@pytest.mark.asyncio
+async def test_sdxl_never_changes_the_ltx_status(db):
+    name = _n()
+    c = await _char(db, name)
+    now = datetime.now(timezone.utc)
+    await _run(db, name, 1, done_at=now - timedelta(days=3))           # LTX
+    await _run(db, name, 1, done_at=now, arch="sdxl")                   # newer, SDXL
+    st = (await ls.lora_status(db, [c]))[name]
+    assert st["latest_lora"]["name"].startswith(f"{name}_v1_")
+    assert st["latest_sdxl_lora"]["run_version"] == 1
+
+
+@pytest.mark.asyncio
+async def test_lora_usage_report_upserts_totals_and_needs_the_key(db):
+    from httpx import ASGITransport, AsyncClient
+    from sqlalchemy import select
+    from app.auth import verify_api_key
+    from app.database import get_db
+    from app.main import app
+    from app.models import LoraUsage
+    name = _n("Rep") + "_sdxl_v1_e06"
+    body = {"items": [{"name": name, "source": "a1111", "images": 10,
+                       "first_used_at": "2026-10-06T14:00:00+00:00",
+                       "last_used_at": "2026-10-06T14:21:00+00:00"}]}
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as cl:
+            assert (await cl.post("/lora-usage", json=body)).status_code in (401, 403)
+            app.dependency_overrides[verify_api_key] = lambda: None
+            assert (await cl.post("/lora-usage", json=body)).json() == {"stored": 1}
+            body["items"][0]["images"] = 44          # a later run's TOTAL, not an increment
+            await cl.post("/lora-usage", json=body)
+    finally:
+        app.dependency_overrides.clear()
+    rows = (await db.execute(select(LoraUsage).where(LoraUsage.name == name))).scalars().all()
+    assert len(rows) == 1 and rows[0].images == 44
+
+
+@pytest.mark.asyncio
+async def test_the_payloads_carry_the_sdxl_status(db):
+    from httpx import ASGITransport, AsyncClient
+    from app.auth import get_current_user, verify_api_key_or_bearer
+    from app.database import get_db
+    from app.main import app
+    name = _n()
+    await _char(db, name)
+    await _run(db, name, 1, done_at=datetime.now(timezone.utc), arch="sdxl")
+    await _usage(db, f"{name}_sdxl_v1_final", 3)
+    app.dependency_overrides[get_current_user] = lambda: object()
+    app.dependency_overrides[verify_api_key_or_bearer] = lambda: None
+    app.dependency_overrides[get_db] = lambda: db
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://t") as cl:
+            book = (await cl.get("/recipes")).json()
+            listed = (await cl.get("/ltx/characters")).json()
+            full = (await cl.get(f"/ltx/characters/{name}/full")).json()
+    finally:
+        app.dependency_overrides.clear()
+    for row in (next(r for r in book["characters"] if r["name"] == name),
+                next(r for r in listed if r["name"] == name), full["character"]):
+        assert row["latest_sdxl_lora"]["tested"] is True and row["latest_sdxl_lora"]["a1111_images"] == 3

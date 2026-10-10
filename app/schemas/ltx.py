@@ -98,6 +98,10 @@ class LtxCharacterResponse(BaseModel):
     latest_lora: Optional[dict] = None
     #: The starred (render) LoRA's own use: {name, renders, last_rendered_at}.
     starred_lora_renders: Optional[dict] = None
+    #: Has the newest SDXL LoRA been tried in A1111 (#458)? {run_id, run_version, at, name,
+    #: label, uploaded, a1111_images, tested, a1111_last_used_at, checkpoints[]}, counted from
+    #: A1111's saved images by the reporter on its box. None: no completed SDXL run.
+    latest_sdxl_lora: Optional[dict] = None
 
 
 class LtxCharacterUpdate(BaseModel):

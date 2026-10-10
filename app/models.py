@@ -900,3 +900,24 @@ def training_arch():
     built on, so a check written with it agrees with the database (wanly-api#402)."""
     from sqlalchemy import func
     return func.coalesce(TrainingJob.config["arch"].astext, "ltx")
+
+
+class LoraUsage(Base):
+    """How often a LoRA file was used OUTSIDE Wanly's renders (wanly-api#458).
+
+    SDXL character LoRAs are used by hand in A1111 on 3090b. A host-side reporter
+    (wanly-gpu-docker#211) reads A1111's saved PNGs -- their `parameters` chunk names every
+    `<lora:Name:w>` -- and POSTs per-name TOTALS here, so a row is replaced, never incremented.
+    `name` is the file stem as A1111 shows it (`Joana_sdxl_v4_e11`).
+    """
+    __tablename__ = "lora_usage"
+    __table_args__ = (UniqueConstraint("name", "source", name="uq_lora_usage_name_source"),)
+
+    id = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name = mapped_column(String(255), nullable=False)
+    source = mapped_column(String(32), nullable=False, default="a1111")
+    images = mapped_column(Integer, nullable=False, default=0)
+    first_used_at = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at = mapped_column(DateTime(timezone=True), nullable=False,
+                               default=lambda: datetime.now(timezone.utc))
