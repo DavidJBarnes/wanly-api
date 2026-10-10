@@ -98,6 +98,7 @@ async def character_full(key: str, db: AsyncSession = Depends(get_db)):
     resp = LtxCharacterResponse.model_validate(c)
     st = (await lora_status(db, [c])).get(c.name) or {}
     resp.latest_lora, resp.starred_lora_renders = st.get("latest_lora"), st.get("starred_lora_renders")
+    resp.latest_sdxl_lora = st.get("latest_sdxl_lora")
     return CharacterFull(
         character=resp,
         dataset=await _respond_one(db, living) if living is not None else None,

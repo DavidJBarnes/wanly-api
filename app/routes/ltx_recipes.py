@@ -256,6 +256,8 @@ async def get_recipe_book(
                 # Has the newest LTX LoRA been tried? (app/lora_status.py) -- the grid's chip.
                 "latest_lora": status.get(c.name, {}).get("latest_lora"),
                 "starred_lora_renders": status.get(c.name, {}).get("starred_lora_renders"),
+                # SDXL: tried in A1111? (lora_usage, #458)
+                "latest_sdxl_lora": status.get(c.name, {}).get("latest_sdxl_lora"),
                 "char_lora": c.char_lora,
                 "trigger": c.trigger,
                 "gender": c.gender,
@@ -679,6 +681,7 @@ async def list_characters(
         r = LtxCharacterResponse.model_validate(c)
         st = status.get(c.name) or {}
         r.latest_lora, r.starred_lora_renders = st.get("latest_lora"), st.get("starred_lora_renders")
+        r.latest_sdxl_lora = st.get("latest_sdxl_lora")
         out.append(r)
     return out
 
