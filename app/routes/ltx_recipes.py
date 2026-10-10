@@ -22,6 +22,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.lora_status import lora_status
 from app.config import settings
 from app.s3 import list_bucket
 from app.auth import get_current_user, verify_api_key_or_bearer
@@ -174,6 +175,7 @@ async def get_recipe_book(
     # so every segment was created carrying the constant and the claim-time fallback to the
     # setting never had a NULL to fire on (console#430).
     default_negative = await default_negative_prompt(db)
+    status = await lora_status(db, chars)
 
     # Books, with a pose count each. The count is a query, not a column: adding a pose must
     # not require remembering to increment a number, and the console wants it to grey out a
@@ -251,6 +253,9 @@ async def get_recipe_book(
             {
                 "id": str(c.id),
                 "name": c.name,
+                # Has the newest LTX LoRA been tried? (app/lora_status.py) -- the grid's chip.
+                "latest_lora": status.get(c.name, {}).get("latest_lora"),
+                "starred_lora_renders": status.get(c.name, {}).get("starred_lora_renders"),
                 "char_lora": c.char_lora,
                 "trigger": c.trigger,
                 "gender": c.gender,
@@ -668,7 +673,14 @@ async def list_characters(
     db: AsyncSession = Depends(get_db),
 ):
     rows = (await db.execute(select(LtxCharacter).order_by(LtxCharacter.name))).scalars().all()
-    return list(rows)
+    status = await lora_status(db, rows)
+    out = []
+    for c in rows:
+        r = LtxCharacterResponse.model_validate(c)
+        st = status.get(c.name) or {}
+        r.latest_lora, r.starred_lora_renders = st.get("latest_lora"), st.get("starred_lora_renders")
+        out.append(r)
+    return out
 
 
 #: What a trained character may no longer change. Each is part of the caption its LoRA

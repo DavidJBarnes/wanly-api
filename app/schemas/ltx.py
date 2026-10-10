@@ -92,6 +92,12 @@ class LtxCharacterResponse(BaseModel):
     hidden: bool = False
     #: A starred checkpoint still on the trainer: {training_job_id, label} (#452).
     star_pending: Optional[dict] = None
+    #: Has the newest LTX LoRA been tried (app/lora_status.py)? {run_id, run_version, at,
+    #: name, label, uploaded, is_starred, renders, tested, last_rendered_at, checkpoints[]}.
+    #: None: no completed LTX run. Filled by the list/full routes, never by the ORM row.
+    latest_lora: Optional[dict] = None
+    #: The starred (render) LoRA's own use: {name, renders, last_rendered_at}.
+    starred_lora_renders: Optional[dict] = None
 
 
 class LtxCharacterUpdate(BaseModel):
