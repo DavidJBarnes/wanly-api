@@ -15,6 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import run_datasets
+from app.lora_status import lora_status
 from app.auth import get_current_user, verify_api_key_or_bearer
 from app.database import get_db
 from app.models import Dataset, LtxCharacter, TrainingJob, User
@@ -94,8 +95,11 @@ async def character_full(key: str, db: AsyncSession = Depends(get_db)):
         members = [_ref(rows[m]) for m in c.members if m in rows]
     pairs = [_ref(p) for p in (await db.execute(select(LtxCharacter).where(
         LtxCharacter.kind == "pair"))).scalars().all() if c.name in (p.members or [])]
+    resp = LtxCharacterResponse.model_validate(c)
+    st = (await lora_status(db, [c])).get(c.name) or {}
+    resp.latest_lora, resp.starred_lora_renders = st.get("latest_lora"), st.get("starred_lora_renders")
     return CharacterFull(
-        character=LtxCharacterResponse.model_validate(c),
+        character=resp,
         dataset=await _respond_one(db, living) if living is not None else None,
         archived=[_respond(d, None) for d in archived],
         runs=[DatasetRun(**r) for r in runs],
