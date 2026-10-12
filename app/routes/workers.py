@@ -94,6 +94,10 @@ async def register_worker(body: WorkerRegister, db: AsyncSession = Depends(get_d
         )
         db.add(worker)
 
+    # Every registration replaces the phase, None included (wanly-gpu-daemon#189): whoever
+    # registers now owns the row, and must not inherit what the previous registrar was doing.
+    worker.phase = body.phase
+
     # A worker that is registering holds nothing. Release anything still assigned to it.
     await _release_orphaned_claims(db, worker)
 
@@ -373,6 +377,10 @@ async def heartbeat(
     # restart without re-registering, so the row would otherwise advertise yesterday's set.
     if body.provides is not None:
         worker.provides = body.provides
+    # What it is doing right now (wanly-gpu-daemon#189). Conditional like the rest: a beat
+    # without one says nothing about the phase.
+    if body.phase is not None:
+        worker.phase = body.phase
 
     if worker.kind != WorkerKind.RENDER:
         # A SERVICE REPORTS ITS OWN HEALTH, because there is no claim state to derive one

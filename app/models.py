@@ -372,6 +372,12 @@ class Worker(Base):
     daemon_commit: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     image_ref: Mapped[str | None] = mapped_column(Text, nullable=True, default=None)
     drain_after_jobs: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    # What the worker is doing RIGHT NOW (wanly-gpu-daemon#189): {"phase": "syncing_loras",
+    # "detail": "Downloading Payton_v2_final (358 / 650 MB, ...)", file, done_bytes, ...}, or
+    # the supervisor's booting / switching_mode, or ready. Stored as reported, never
+    # interpreted here -- the console renders it in place of the status, so a box that is
+    # busy fetching a LoRA reads as that and not as "offline". NULL = never reported.
+    phase: Mapped[dict | None] = mapped_column(JSONB, nullable=True, default=None)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 
