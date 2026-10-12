@@ -926,3 +926,22 @@ class LoraUsage(Base):
     last_used_at = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at = mapped_column(DateTime(timezone=True), nullable=False,
                                default=lambda: datetime.now(timezone.utc))
+
+
+class CharacterPrompt(Base):
+    """A prompt that works well for a character (wanly-console#675).
+
+    David keeps MANY of these per character, each its own row, rather than one long textarea:
+    a list he adds to, copies from and prunes. Plain text; the date added is the point of
+    `created_at`. Deleted with the character.
+    """
+    __tablename__ = "character_prompts"
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    character_id = mapped_column(UUID(as_uuid=True),
+                                 ForeignKey("ltx_characters.id", ondelete="CASCADE"),
+                                 nullable=False, index=True)
+    text = mapped_column(Text, nullable=False)
+    created_at = mapped_column(DateTime(timezone=True), nullable=False,
+                               default=lambda: datetime.now(timezone.utc))
+    updated_at = mapped_column(DateTime(timezone=True), nullable=True)
