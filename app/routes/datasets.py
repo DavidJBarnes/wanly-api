@@ -32,6 +32,7 @@ from app.database import async_session, get_db, release_connection
 from app.enums import JobStatus, SegmentStatus, TrainingStatus
 from app import clips
 from app import face_size
+from app import dataset_upscale
 from app.joycaption import TRAINING_CAPTION, TRAINING_MOTION_CAPTION, CaptionError
 from app.models import Dataset, Job, LtxCharacter, Segment, TrainingJob, TrainingRunDataset, User
 from app import run_datasets
@@ -42,7 +43,7 @@ from app.regularization import (
 from app.schemas.datasets import (
     DatasetCaptionEdit, DatasetCaptionStatus, DatasetCaptionsRun, DatasetClone, DatasetCreate,
     DatasetFixStatus, DatasetLock, DatasetRun, DatasetRegularize, DatasetRegularizeStatus, DatasetResponse, DatasetScore, DatasetScores,
-    DatasetTrainedBy, DatasetUpdate,
+    DatasetTrainedBy, DatasetUpdate, DatasetUpscaleRequest,
 )
 from app.seeds import new_seed
 from app.tag_filter import tag_clause
@@ -1113,6 +1114,105 @@ async def fix_small_faces(
             dependencies=[Depends(verify_api_key_or_bearer)])
 async def fix_small_faces_status(dataset_id: uuid.UUID):
     return _fix_status(dataset_id)
+
+
+# ---------------------------------------------------------------------------------------
+# Upscale (wanly-api#460): high-res copies of chosen stills, beside their sources.
+# ---------------------------------------------------------------------------------------
+
+def _upscale_status(ds_id: uuid.UUID) -> DatasetFixStatus:
+    return DatasetFixStatus(**(dataset_upscale.RUNS.get(ds_id) or {}))
+
+
+async def upscale_images_job(ds_id: uuid.UUID, uris: list[str], factor: int) -> None:
+    """BackgroundTasks entry for "Upscale": the fix's shape (fix_small_faces_job). The work
+    runs first with no lock or connection held; the copies are applied at the end under FOR
+    UPDATE, against the set as it is then. Shares FIX_LOCK with the fix, because both hold
+    upscaled images in memory on the 2 GB box."""
+    run = dataset_upscale.RUNS.setdefault(ds_id, {"running": True})
+    run.update(error=None, summary=None)
+    if face_size.FIX_LOCK.locked():
+        run.update(stage="waiting for another fix or upscale")
+    async with face_size.FIX_LOCK:
+        async with async_session() as db:
+            try:
+                ds = await db.get(Dataset, ds_id)
+                if ds is None:
+                    return
+                todo = [u for u in uris if u in set(ds.images)]
+                prefix = ds.prefix or _prefix(ds.id)
+                faces = dict(ds.faces or {})
+                await release_connection(db)
+                result = await dataset_upscale.run_upscale(ds_id, todo, factor, prefix, faces)
+
+                await db.refresh(ds, with_for_update=True)
+                if _is_locked(ds):
+                    run["error"] = _lock_detail(ds)
+                    await db.rollback()
+                    return
+                note = dataset_upscale.apply_upscale(ds, result)
+                await db.commit()
+                run.update(stage="done", summary=note)
+                logger.info("dataset %s: %s", ds.name, note)
+            except face_size.FaceCropTooOld as e:
+                run["error"] = str(e)
+            except Exception as e:
+                logger.exception("upscale on dataset %s failed", ds_id)
+                run["error"] = f"{type(e).__name__}: {e}"
+            finally:
+                run["running"] = False
+
+
+@router.post("/datasets/{dataset_id}/upscale", response_model=DatasetFixStatus,
+             status_code=202)
+async def upscale_images(
+    dataset_id: uuid.UUID,
+    body: DatasetUpscaleRequest,
+    background_tasks: BackgroundTasks,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """"Upscale" (#460): a 2x or 4x Real-ESRGAN copy of each chosen still (long edge capped
+    at 4096 px), added right after its source, which is kept. The copy takes its source's
+    caption and score, is measured, and is recorded in lineage as an "upscale".
+
+    Stills only, and only images in this set; a locked set is refused. Runs in the
+    background: poll GET .../upscale/status."""
+    ds = await db.get(Dataset, dataset_id)
+    if not ds:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    await _refuse_if_locked(db, ds)
+    if not settings.face_crop_url:
+        raise HTTPException(
+            status_code=503,
+            detail="no face-crop service is configured (face_crop_url is empty)")
+    uris = list(dict.fromkeys(body.uris))
+    present = set(ds.images)
+    missing = [u for u in uris if u not in present]
+    if missing:
+        raise HTTPException(status_code=422,
+                            detail=f"{len(missing)} image(s) are not in this dataset")
+    if any(clips.is_clip(u) for u in uris):
+        raise HTTPException(status_code=422, detail="clips cannot be upscaled; pick stills")
+    run = dataset_upscale.RUNS.get(ds.id)
+    if run and run.get("running"):
+        return _upscale_status(ds.id)
+    try:
+        have = await face_size.features()
+    except face_size.FaceCropTooOld as e:
+        raise HTTPException(status_code=503, detail=str(e)) from e
+    if not {"measure", "upscale_target"} <= have:
+        raise HTTPException(status_code=503, detail=dataset_upscale.NOT_TARGETED)
+    dataset_upscale.RUNS[ds.id] = {"running": True, "stage": "upscaling", "done": 0,
+                                   "total": len(uris), "error": None, "summary": None}
+    background_tasks.add_task(upscale_images_job, ds.id, uris, body.factor)
+    return _upscale_status(ds.id)
+
+
+@router.get("/datasets/{dataset_id}/upscale/status", response_model=DatasetFixStatus,
+            dependencies=[Depends(verify_api_key_or_bearer)])
+async def upscale_images_status(dataset_id: uuid.UUID):
+    return _upscale_status(dataset_id)
 
 
 async def _embed_all(uris: list[str]) -> list[list[list[float]]]:
