@@ -173,6 +173,13 @@ class DatasetFixStatus(BaseModel):
     summary: str | None = None
 
 
+class DatasetUpscaleRequest(BaseModel):
+    """POST /datasets/{id}/upscale (#460): which stills, and how much. The copies' status is
+    a DatasetFixStatus at GET /datasets/{id}/upscale/status."""
+    uris: list[str] = Field(min_length=1, max_length=200)
+    factor: Literal[2, 4] = 2
+
+
 class DatasetResponse(BaseModel):
     id: uuid.UUID
     name: str
