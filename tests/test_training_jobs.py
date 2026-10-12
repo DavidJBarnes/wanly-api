@@ -731,6 +731,50 @@ class TestCancellingActuallyCancels:
         assert out.step == 7
 
 
+@pytest.mark.asyncio
+class TestCaptionTags:
+    """#462: the WD14 tags that landed in an SDXL run's captions, reported by the trainer."""
+
+    TALLY = {"images": 73, "groups": [
+        {"label": "j0ana", "kind": "identity", "images": 73,
+         "kept": [["earrings", 58], ["hoop_earrings", 41]], "stripped": [["glasses", 70]]}]}
+
+    async def _patch(self, db, job, **fields):
+        from app.routes.training import update_training_job
+        return await update_training_job(job.id, TrainingProgress(**fields), db=db)
+
+    async def test_a_report_stores_it_and_the_response_carries_it(self, db):
+        from app.schemas.training import TrainingResponse
+        job = _job(status=TrainingStatus.CLAIMED, config={"arch": "sdxl"})
+        db.add(job)
+        await db.commit()
+
+        out = await self._patch(db, job, status=TrainingStatus.RUNNING, caption_tags=self.TALLY)
+
+        # Through the response schema, where an undeclared field would silently vanish.
+        assert TrainingResponse.model_validate(out).caption_tags == self.TALLY
+
+    async def test_a_report_without_it_does_not_blank_it(self, db):
+        job = _job(status=TrainingStatus.RUNNING, caption_tags=self.TALLY)
+        db.add(job)
+        await db.commit()
+
+        out = await self._patch(db, job, step=100)
+
+        assert out.caption_tags == self.TALLY
+
+    async def test_a_retry_clears_it(self, db):
+        from app.routes.training import retry_training_job
+        _, _, job = _combo_failed()
+        job.caption_tags = self.TALLY
+        db.add(job)
+        await db.commit()
+
+        out = await retry_training_job(job.id, _user=None, db=db)
+
+        assert out.caption_tags is None
+
+
 class TestOperatorNotes:
     """A note is a human write on a machine-reported row (wanly-console#484).
 

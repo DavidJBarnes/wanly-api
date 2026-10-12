@@ -205,6 +205,9 @@ class TrainingResponse(BaseModel):
     # 3090, and "I often only want 1 or 2 epochs". The rest sit on the trainer until asked
     # for through publish_requests, and `checkpoints` records the ones that arrived.
     epochs: list | None = None
+    #: SDXL only (#462): the WD14 tags that landed in the captions, per group --
+    #: {images, groups: [{label, kind, images, kept, stripped}]}. None for LTX runs.
+    caption_tags: dict | None = None
     publish_requests: list | None = None
     #: Labels deleted forever (#413), for the trainer to remove from its disk.
     delete_requests: list | None = None
@@ -259,6 +262,7 @@ class TrainingProgress(BaseModel):
     output_lora_path: str | None = None
     loss_log: list | None = None
     epochs: list | None = None
+    caption_tags: dict | None = None
 
 
 class TrainingNotes(BaseModel):

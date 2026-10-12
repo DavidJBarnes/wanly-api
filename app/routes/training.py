@@ -438,7 +438,7 @@ async def update_training_job(
         raise HTTPException(status_code=404, detail="Training job not found")
 
     for field in ("progress_log", "step", "total_steps", "error_message",
-                  "checkpoints", "output_lora_path", "loss_log", "epochs"):
+                  "checkpoints", "output_lora_path", "loss_log", "epochs", "caption_tags"):
         value = getattr(body, field)
         if value is not None:
             setattr(job, field, value)
@@ -1163,6 +1163,8 @@ async def retry_training_job(
     job.step = None
     job.loss_log = None
     job.epochs = None
+    # The retry re-tags its images; the old tally would describe captions that are gone.
+    job.caption_tags = None
     job.checkpoints = None
     job.output_lora_path = None
     job.publish_requests = None

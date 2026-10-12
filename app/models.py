@@ -641,6 +641,11 @@ class TrainingJob(Base):
     # 3090, and "I often only want 1 or 2 epochs". The rest sit on the trainer until asked
     # for through publish_requests, and `checkpoints` records the ones that arrived.
     epochs = mapped_column(JSONB, nullable=True)
+    # SDXL only (#462): the WD14 tags that landed in the captions, per group, as the trainer
+    # tallied them at staging -- {images, groups: [{label, kind, images, kept: [[tag, n]],
+    # stripped: [[tag, n]] | null}]}. A tag the caption names is learned onto that tag, not
+    # the trigger. `stripped` is null where it is unknowable (runs backfilled from captions).
+    caption_tags = mapped_column(JSONB, nullable=True)
     publish_requests = mapped_column(JSONB, nullable=True)
     # Labels deleted forever (#413). Their S3 copies are gone already; the trainer reads this
     # on its poll and removes the files from its disk -- it cannot be called, only asked.
