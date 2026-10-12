@@ -28,6 +28,10 @@ class WorkerRegister(BaseModel):
     # "never reported" rather than "runs nothing" -- the distinction every other optional
     # worker field here already draws.
     provides: list[str] | None = None
+    # What it is doing as it registers (wanly-gpu-daemon#189), e.g. syncing_loras. Written
+    # on EVERY registration, absent included: a fresh registrar replaces whatever the last
+    # one said, so an older daemon taking over a row cannot inherit a stale "switching".
+    phase: dict[str, Any] | None = None
 
 
 class WorkerHeartbeat(BaseModel):
@@ -60,6 +64,9 @@ class WorkerHeartbeat(BaseModel):
     # answering, "degraded" when some of it is not. Render workers do not send this -- their
     # status is derived from claims -- so None means "leave it alone".
     status: WorkerStatus | None = None
+    # What the worker is doing right now (wanly-gpu-daemon#189). None = not reported this
+    # beat, which leaves the stored phase alone, like every optional field above.
+    phase: dict[str, Any] | None = None
 
 
 class WorkerRename(BaseModel):
@@ -196,6 +203,10 @@ class WorkerResponse(BaseModel):
     daemon_commit: str | None = None
     image_ref: str | None = None
     drain_after_jobs: int | None = None
+    # wanly-gpu-daemon#189: what it is doing right now -- syncing LoRAs (file, MB, rate, ETA),
+    # booting, switching modes, ready. Named on the response for the same reason as
+    # daemon_commit: a stored value a response model omits is invisible.
+    phase: dict[str, Any] | None = None
     last_heartbeat: datetime
     registered_at: datetime
     updated_at: datetime

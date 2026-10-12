@@ -13,7 +13,8 @@ from pathlib import Path
 from uuid import UUID
 
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
-from sqlalchemy import and_, false as sa_false, func, or_, select, text
+from sqlalchemy import and_, false as sa_false, func, literal, literal_column, not_, or_, select, text
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -775,6 +776,42 @@ def _model_gate(worker: Worker | None) -> tuple:
     return (or_(declares_nothing, checkpoint.in_(names)),)
 
 
+#: Any string value anywhere in the recipe equal to one of $n. Recursive on purpose: the blob
+#: names LoRAs in `characters[].char_lora`, the legacy scalar `char_lora`, and
+#: `content_loras[].name` (or a bare string in the oldest shape), and all of them count.
+_NAMES_ANY_LORA = literal_column("'$.** ? (@ == $n[*])'::jsonpath")
+
+
+def pending_lora_names(raw: str | None) -> list[str]:
+    """`?pending_loras=a.safetensors,b` -> both spellings of each, for the gate below."""
+    out: set[str] = set()
+    for part in (raw or "").split(","):
+        n = canonical(part)
+        if n and n.lower() != "none":
+            out |= {n, f"{n}.safetensors"}
+    return sorted(out)
+
+
+def _pending_lora_gate(names: list[str]) -> tuple:
+    """SQL that hides segments naming a LoRA this worker is still syncing (wanly-gpu-daemon#189).
+
+    The daemon registers BEFORE its LoRA sync now, so it can poll while Payton_v2_final is
+    halfway down. A segment naming that file must stay PENDING until it lands -- not be
+    claimed and then wait, not be failed, not be fetched a second time beside the sync. Every
+    other segment is claimable as usual; that is the point of syncing in the background.
+
+    Matched as an exact string value in the recipe, never a substring: a LoRA called
+    `Payton_v2` must not hold back `Payton_v2_final`. A segment with no recipe (SQL NULL or
+    JSONB null) names no LoRA and is never held -- hence the coalesce: jsonb_path_exists on
+    SQL NULL is NULL, and NOT NULL would hide it.
+    """
+    if not names:
+        return ()
+    hit = func.jsonb_path_exists(Segment.ltx_recipe, _NAMES_ANY_LORA,
+                                 literal({"n": names}, JSONB))
+    return (not_(func.coalesce(hit, sa_false())),)
+
+
 async def _identity_ref_for(db: AsyncSession, job: Job,
                             ltx_recipe: dict | None) -> ClaimIdentityRef | None:
     """The identity reference this segment renders with, or None.
@@ -821,6 +858,9 @@ async def claim_next_segment(
     worker_id: UUID = Query(...),
     worker_name: str = Query(None),
     kind: str = Query(None, description="'gpu' (exclude holograms), 'hologram' (only holograms), or None (any)"),
+    pending_loras: str = Query(None, description="Comma-separated LoRA files this worker is "
+                               "still syncing; segments naming any of them are skipped "
+                               "(wanly-gpu-daemon#189)"),
     db: AsyncSession = Depends(get_db),
 ):
     # Reclaim work orphaned by a dead worker.
@@ -949,7 +989,8 @@ async def claim_next_segment(
     result = await db.execute(
         select(Segment)
         .join(Job, Segment.job_id == Job.id)
-        .where(*where, *_model_gate(claiming_worker))
+        .where(*where, *_model_gate(claiming_worker),
+               *_pending_lora_gate(pending_lora_names(pending_loras)))
         .order_by(Job.priority.asc(), Segment.created_at.asc())
         .limit(1)
         .with_for_update(skip_locked=True)
