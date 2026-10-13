@@ -1378,14 +1378,14 @@ class TestThePreflightOutput:
 
     async def test_identity_captions_carry_the_registrys_trigger_and_gender(self, db):
         await _world(db)
-        g = (await _preflight(db, **SOLO))["groups"][0]
+        g = (await _preflight(db, **SOLO, caption_mode="per_image"))["groups"][0]
         assert g["trigger"] == "d@vid" and g["gender"] == "man"
         assert g["sample_captions"][0] == "d@vid, man, medium shot, standing, look 0"
         assert len(g["sample_captions"]) == 5
 
     async def test_composition_captions_name_both_people_in_member_order(self, db):
         await _world(db)
-        comp = (await _preflight(db, **PAIR))["groups"][2]
+        comp = (await _preflight(db, **PAIR, caption_mode="per_image"))["groups"][2]
         assert comp["sample_captions"][0] == (
             "d@vid, man and k3lly2026, woman, medium shot, standing, look 0")
         assert comp["trigger"] is None
@@ -1452,7 +1452,8 @@ class TestABlankCaptionIsTheBarePhrase:
         u = w["david"].images[0]
         w["david"].captions = {u: "wearing glasses"}
         await db.flush()
-        job = await create_training_job(TrainingCreate(**SOLO), user=_U(), db=db)
+        job = await create_training_job(TrainingCreate(**SOLO, caption_mode="per_image"),
+                                        user=_U(), db=db)
         assert job.config["captions"][job.dataset_images.index(u)] == "d@vid, man, wearing glasses"
         assert set(job.config["captions"]) == {"d@vid, man, wearing glasses", "d@vid, man"}
 
@@ -1748,6 +1749,16 @@ class TestTheV1Recipe:
     """caption_mode=trigger_only + regularization=False: the recipe before #352, which beat
     per-image captions with 1:1 regularization on Kelly-2000 (v1 vs v2, 2026-09-27)."""
 
+    async def test_trigger_only_is_the_default(self, db):
+        """console#678: per-image captions are opt-in. Payton v2 trained on ~40-word captions
+        by default; every word can absorb identity that should bind to the trigger."""
+        assert TrainingCreate(**SOLO).caption_mode == "trigger_only"
+        w = await _world(db)
+        w["david"].captions = {w["david"].images[0]: "wearing glasses"}
+        await db.flush()
+        g = (await _preflight(db, **SOLO))["groups"][0]
+        assert set(g["sample_captions"]) == {"d@vid, man"}
+
     async def test_trigger_only_captions_every_image_with_the_bare_phrase(self, db):
         await _world(db)
         out = await _preflight(db, **SOLO, caption_mode="trigger_only")
@@ -1876,7 +1887,8 @@ class TestTheCaptionsAreSnapshotted:
     async def test_group_zero_and_every_group_carry_their_captions(self, db):
         from app.routes.training import create_training_job
         w = await _world(db)
-        job = await create_training_job(TrainingCreate(**PAIR), user=_U(), db=db)
+        job = await create_training_job(TrainingCreate(**PAIR, caption_mode="per_image"),
+                                        user=_U(), db=db)
         assert job.trigger == "d@vid"
         assert job.dataset_images == w["david"].images
         assert job.config["captions"][0] == "d@vid, man, medium shot, standing, look 0"
@@ -1923,7 +1935,8 @@ class TestTheClaimContract:
         from app.routes.training import create_training_job
         await _world(db)
         await TestTheClaimEndpoint()._trainer(db)
-        await create_training_job(TrainingCreate(**PAIR), user=_U(), db=db)
+        await create_training_job(TrainingCreate(**PAIR, caption_mode="per_image"),
+                                  user=_U(), db=db)
         resp = await self._claim_one(db)
         assert resp.status_code == 200, resp.text
         body = resp.json()

@@ -102,7 +102,12 @@ class TrainingCreate(BaseModel):
     #: Kept because it WON: Kelly-2000 v2 (per-image captions + 1:1 regularization) rendered a
     #: generic woman at every strength where v1, on this recipe, was unmistakably her. The
     #: long captions spread what the trigger had to carry across every other token.
-    caption_mode: Literal["per_image", "trigger_only"] = "per_image"
+    #:
+    #: The DEFAULT since console#678 (2026-10-13): Payton v2 trained per-image on ~40-word
+    #: captions, the second LTX identity run to do so by accident, and every word in a caption
+    #: can absorb identity that should bind to the trigger. per_image stays choosable on
+    #: purpose. SDXL ignores this field -- the trainer re-tags with WD14 (see _captions_for).
+    caption_mode: Literal["per_image", "trigger_only"] = "trigger_only"
     #: Add a regularization pool per gender. False trains the characters alone, as before
     #: #352: identity stays strongest, and "woman"/"man" may drift toward them (a warning,
     #: not a problem -- it is a trade, not a mistake).

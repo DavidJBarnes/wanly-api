@@ -344,7 +344,7 @@ class TestThePlan:
     async def test_stills_and_clips_train_as_two_groups(self, db):
         _, clip_uris = await self._world_with_clips(db)
         out = await self._plan(db, mode="solo", character="David", regularization=False,
-                               steps=1200)
+                               steps=1200, caption_mode="per_image")
         assert out["ok"], out["problems"]
         groups = [(g["kind"], g["images"], g["num_repeats"], g["windows"]) for g in out["groups"]]
         assert groups == [("identity", 10, 10, 1), ("clip", 4, 5, 3)]
