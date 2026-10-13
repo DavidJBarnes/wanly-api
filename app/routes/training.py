@@ -155,7 +155,8 @@ async def create_training_job(
                 "captions": g0.captions,
                 "base_checkpoint": plan.base_checkpoint,
                 "reg_ratio": REG_RATIO if body.regularization else 0,
-                "caption_mode": body.caption_mode,
+                # What ran, not what was asked: captions are always the bare phrase.
+                "caption_mode": "trigger_only",
                 "allow_no_composition": body.allow_no_composition,
                 "allow_low_scores": body.allow_low_scores,
                 "dataset": g0.provenance(),

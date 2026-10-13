@@ -349,7 +349,7 @@ class TestThePlan:
         groups = [(g["kind"], g["images"], g["num_repeats"], g["windows"]) for g in out["groups"]]
         assert groups == [("identity", 10, 10, 1), ("clip", 4, 5, 3)]
         clip = out["groups"][1]
-        assert clip["sample_captions"][0] == "d@vid, man, turns and smiles 0"
+        assert clip["sample_captions"][0] == "d@vid, man"   # bodies never train (console#678)
         # 10 stills x 10 + 4 clips x 3 windows x 5 repeats
         assert out["samples_per_epoch"] == 100 + 60
 

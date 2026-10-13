@@ -1380,20 +1380,19 @@ class TestThePreflightOutput:
         await _world(db)
         g = (await _preflight(db, **SOLO))["groups"][0]
         assert g["trigger"] == "d@vid" and g["gender"] == "man"
-        assert g["sample_captions"][0] == "d@vid, man, medium shot, standing, look 0"
+        assert g["sample_captions"][0] == "d@vid, man"
         assert len(g["sample_captions"]) == 5
 
     async def test_composition_captions_name_both_people_in_member_order(self, db):
         await _world(db)
         comp = (await _preflight(db, **PAIR))["groups"][2]
-        assert comp["sample_captions"][0] == (
-            "d@vid, man and k3lly2026, woman, medium shot, standing, look 0")
+        assert comp["sample_captions"][0] == "d@vid, man and k3lly2026, woman"
         assert comp["trigger"] is None
 
     async def test_regularization_captions_carry_only_the_class_word(self, db):
         await _world(db)
         reg = (await _preflight(db, **SOLO))["groups"][1]
-        assert reg["sample_captions"][0] == "man, medium shot, standing, look 0"
+        assert reg["sample_captions"][0] == "man"
         assert reg["trigger"] is None and reg["character"] is None
 
     async def test_regularization_repeats_match_the_character_samples(self, db):
@@ -1446,15 +1445,18 @@ class TestABlankCaptionIsTheBarePhrase:
         i = job.dataset_images.index(blank)
         assert job.config["captions"][i] == "d@vid, man"
 
-    async def test_a_typed_caption_is_still_appended(self, db):
+    async def test_a_typed_caption_is_never_trained_even_when_per_image_is_asked(self, db):
+        """console#678: captions are not a choice for LTX. per_image is still accepted (an
+        old client must not 422) but has no effect, and the job records what ran."""
         from app.routes.training import create_training_job
         w = await _world(db)
         u = w["david"].images[0]
         w["david"].captions = {u: "wearing glasses"}
         await db.flush()
-        job = await create_training_job(TrainingCreate(**SOLO), user=_U(), db=db)
-        assert job.config["captions"][job.dataset_images.index(u)] == "d@vid, man, wearing glasses"
-        assert set(job.config["captions"]) == {"d@vid, man, wearing glasses", "d@vid, man"}
+        job = await create_training_job(TrainingCreate(**SOLO, caption_mode="per_image"),
+                                        user=_U(), db=db)
+        assert set(job.config["captions"]) == {"d@vid, man"}
+        assert job.config["caption_mode"] == "trigger_only"
 
     async def test_a_blank_regularization_caption_is_the_class_word(self, db):
         w = await _world(db)
@@ -1748,6 +1750,15 @@ class TestTheV1Recipe:
     """caption_mode=trigger_only + regularization=False: the recipe before #352, which beat
     per-image captions with 1:1 regularization on Kelly-2000 (v1 vs v2, 2026-09-27)."""
 
+    async def test_per_image_is_accepted_and_ignored(self, db):
+        """console#678: Payton v2 trained on ~40-word captions; every word can absorb identity
+        that should bind to the trigger. LTX always trains the bare phrase now."""
+        w = await _world(db)
+        w["david"].captions = {w["david"].images[0]: "wearing glasses"}
+        await db.flush()
+        g = (await _preflight(db, **SOLO, caption_mode="per_image"))["groups"][0]
+        assert set(g["sample_captions"]) == {"d@vid, man"}
+
     async def test_trigger_only_captions_every_image_with_the_bare_phrase(self, db):
         await _world(db)
         out = await _preflight(db, **SOLO, caption_mode="trigger_only")
@@ -1879,7 +1890,7 @@ class TestTheCaptionsAreSnapshotted:
         job = await create_training_job(TrainingCreate(**PAIR), user=_U(), db=db)
         assert job.trigger == "d@vid"
         assert job.dataset_images == w["david"].images
-        assert job.config["captions"][0] == "d@vid, man, medium shot, standing, look 0"
+        assert job.config["captions"][0] == "d@vid, man"
         assert len(job.config["captions"]) == len(job.dataset_images)
         assert job.config["caption"] == job.config["captions"][0]
         assert job.config["mode"] == "pair"
@@ -1928,7 +1939,7 @@ class TestTheClaimContract:
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert len(body["captions"]) == len(body["download_urls"]) == 10
-        assert body["captions"][0].startswith("d@vid, man, ")
+        assert body["captions"][0] == "d@vid, man"
         assert body["config"]["base_checkpoint"] == "10Eros_v1.5_bf16"
         assert "/" not in body["config"]["base_checkpoint"]
         kinds = [g["kind"] for g in body["identities"]]
@@ -1940,7 +1951,7 @@ class TestTheClaimContract:
             assert g["caption"] == g["captions"][0]
         reg = body["identities"][2]
         assert reg["trigger"] is None and reg["gender"] == "man"
-        assert reg["captions"][0].startswith("man, ")
+        assert reg["captions"][0] == "man"
 
     async def test_a_legacy_job_claims_with_no_captions(self, db):
         """A pre-#352 row sends null, never [] -- the trainer reads [] as a list to match."""
