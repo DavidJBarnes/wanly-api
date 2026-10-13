@@ -7,7 +7,9 @@ derived here, from the registry and the datasets, rather than typed into a dialo
     each member's images    its kind=character dataset (the request may choose among several)
     the composition set     the pair's kind=composition dataset
     regularization          one kind=regularization pool per gender present
-    per-image captions      "<trigger>, <gender>, <body>" from each dataset's stored bodies
+    captions                the bare phrase only -- "<trigger>, <gender>", the pair phrase,
+                            or the class word. Stored caption bodies are never trained
+                            (console#678).
     base checkpoint         the render stack's (ltx_stack.py), so a LoRA trains on what it
                             will render on
 
@@ -179,23 +181,19 @@ def _same(a: str | None, b: str | None) -> bool:
     return (a or "").casefold() == (b or "").casefold() and a is not None and b is not None
 
 
-def _final_caption(prefix: str, body: str | None) -> str:
-    body = (body or "").strip()
-    return f"{prefix}, {body}" if body else prefix
+def _captions_for(prefix: str, ds: Dataset) -> list[str]:
+    """Every image's final caption: the prefix alone, always (console#678).
 
+    LTX: every image trains under the bare phrase -- "<trigger>, <gender>" for a member, the
+    pair phrase for composition, the class word for regularization. The stored caption bodies
+    are ignored, and so is the request's `caption_mode`: the two runs that trained per-image
+    captions (Kelly-2000 v2, Payton v2 at ~40 words/image) spread identity across every word
+    of them, and every other LTX run, trigger-only, held it. Captions add nothing to this
+    flow, so they are not a choice.
 
-def _captions_for(body: TrainingCreate, prefix: str, ds: Dataset) -> list[str]:
-    """Every image's final caption. trigger_only ignores the stored bodies entirely.
-
-    SDXL (#398): the bare trigger. The trainer re-captions every image with WD14 tags at
-    stage time -- the stored bodies are qwen sentences written for LTX, and this base was
-    trained and is prompted in booru tags -- so this is a placeholder the preview shows, not
-    what trains."""
-    if body.arch == "sdxl":
-        return [prefix for _ in ds.images]
-    if body.caption_mode == "trigger_only":
-        return [prefix for _ in ds.images]
-    return [_final_caption(prefix, (ds.captions or {}).get(u)) for u in ds.images]
+    SDXL (#398): the bare trigger too, as a placeholder the preview shows. The trainer
+    re-captions every image with WD14 tags at stage time."""
+    return [prefix for _ in ds.images]
 
 
 async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
@@ -343,7 +341,7 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
         # STILLS AND CLIPS SPLIT (#411): the stills are the identity group, exactly as before;
         # the clips, if any, are a group of their own -- the trainer reads them as video.
         # _captions_for keeps captions paired with images, so it is filtered after.
-        caps = dict(zip(ds.images, _captions_for(body, prefix, ds)))
+        caps = dict(zip(ds.images, _captions_for(prefix, ds)))
         stills = [u for u in ds.images if not clips.is_clip(u)]
         moving = [u for u in ds.images if clips.is_clip(u)]
         g = Group(kind="identity", character=m.name, trigger=m.trigger, gender=m.gender,
@@ -406,7 +404,7 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
                                       for m in plan.members)
             else:
                 prefix = body.character  # unreachable in a valid plan; keeps previews sane
-            comp_caps = dict(zip(comp.images, _captions_for(body, prefix, comp)))
+            comp_caps = dict(zip(comp.images, _captions_for(prefix, comp)))
             comp_stills = [u for u in comp.images if not clips.is_clip(u)]
             if len(comp_stills) != len(comp.images):
                 plan.warn("composition_clips",
@@ -448,15 +446,11 @@ async def plan_training(db: AsyncSession, body: TrainingCreate) -> Plan:
         reg_groups.append(Group(
             kind="regularization", character=None, trigger=None, gender=gender, dataset=pool,
             images=list(pool.images),
-            captions=[_final_caption(gender, (pool.captions or {}).get(u))
-                      for u in pool.images]))
+            captions=_captions_for(gender, pool)))
 
     # ---- per-group checks that apply to every set
-    # No caption check (#365): a blank caption IS the standard. _final_caption turns it into
-    # the bare phrase -- "<trigger>, <gender>", the pair phrase, or the class word -- which is
-    # what identity trains best under (Kelly-2000 v1/v5 bare vs v2's descriptive captions,
-    # which lost her). Only props get typed. Requiring a body forced a filler word ("photo")
-    # onto every plain image.
+    # No caption check (#365, console#678): stored captions are never trained, so a set never
+    # needs one. Every image trains under the bare phrase (_captions_for).
     for g in plan.groups + reg_groups:
         _check_common(plan, g)
     # After the checks: a clip group has no 8-item floor (#411) -- three good clips are three

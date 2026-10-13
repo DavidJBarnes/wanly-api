@@ -94,19 +94,10 @@ class TrainingCreate(BaseModel):
     #: cost ~18 minutes of the 3090's uplink and a slot in the bucket first. "final" uploads
     #: the last as it is written; "all" uploads every epoch.
     publish: Literal["none", "final", "all"] = "none"
-    #: HOW IMAGES ARE CAPTIONED. "per_image" trains each image under "<trigger>, <gender>,
-    #: <its stored body>". "trigger_only" is the recipe every LoRA before #352 used -- every
-    #: image under the bare "<trigger>, <gender>" -- and stored bodies are ignored, so a set
-    #: need not be captioned at all.
-    #:
-    #: Kept because it WON: Kelly-2000 v2 (per-image captions + 1:1 regularization) rendered a
-    #: generic woman at every strength where v1, on this recipe, was unmistakably her. The
-    #: long captions spread what the trigger had to carry across every other token.
-    #:
-    #: The DEFAULT since console#678 (2026-10-13): Payton v2 trained per-image on ~40-word
-    #: captions, the second LTX identity run to do so by accident, and every word in a caption
-    #: can absorb identity that should bind to the trigger. per_image stays choosable on
-    #: purpose. SDXL ignores this field -- the trainer re-tags with WD14 (see _captions_for).
+    #: IGNORED (console#678). Every LTX run trains every image under the bare phrase --
+    #: "<trigger>, <gender>", the pair phrase, or the class word -- and stored caption bodies
+    #: are never trained; SDXL is re-tagged by the trainer's WD14. Still accepted so an older
+    #: client sending it does not 422, and recorded on the job as "trigger_only", what ran.
     caption_mode: Literal["per_image", "trigger_only"] = "trigger_only"
     #: Add a regularization pool per gender. False trains the characters alone, as before
     #: #352: identity stays strongest, and "woman"/"man" may drift toward them (a warning,
