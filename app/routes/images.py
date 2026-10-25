@@ -497,6 +497,25 @@ def _is_dataset_key(key: str) -> bool:
     return key.startswith(f"{DATASETS_PREFIX}/")
 
 
+async def _list_repo_objects() -> list[dict]:
+    """Every image object in the repo, across all folders: no folder markers, no datasets.
+
+    The cross-folder scan behind the views that must see images with NO image_meta row --
+    Untagged, and No video on its own -- which a query over image_meta cannot find.
+    """
+    bucket = settings.s3_images_bucket
+    prefixes = await asyncio.to_thread(list_common_prefixes, bucket)
+    object_lists = await asyncio.gather(
+        *[asyncio.to_thread(list_objects, bucket, prefix) for prefix in prefixes]
+    )
+    return [
+        obj
+        for sublist in object_lists
+        for obj in sublist
+        if not obj["Key"].endswith("/.folder") and not _is_dataset_key(obj["Key"])
+    ]
+
+
 @router.get("/images/untagged", dependencies=[Depends(get_current_user)])
 async def list_untagged_images(
     db: AsyncSession = Depends(get_db),
@@ -510,16 +529,7 @@ async def list_untagged_images(
     and showing them here made the Image Repo look connected to the datasets.
     """
     bucket = settings.s3_images_bucket
-    prefixes = await asyncio.to_thread(list_common_prefixes, bucket)
-    object_lists = await asyncio.gather(
-        *[asyncio.to_thread(list_objects, bucket, prefix) for prefix in prefixes]
-    )
-    objects = [
-        obj
-        for sublist in object_lists
-        for obj in sublist
-        if not obj["Key"].endswith("/.folder") and not _is_dataset_key(obj["Key"])
-    ]
+    objects = await _list_repo_objects()
     paths = [f"s3://{bucket}/{obj['Key']}" for obj in objects]
 
     tagged: set[str] = set()
@@ -1467,11 +1477,57 @@ def repo_images_only():
     )
 
 
+def no_video_clause():
+    """Restrict a query over image_meta to images no job has started from (console#690).
+
+    "Has a video" is the green "Used in a job" dot's meaning, so the filter is exactly the
+    images without the dot: no job or segment points at the path. Archived and failed jobs
+    still count, as they do for the dot -- the question is "have I rendered this", and an
+    archived render is still one.
+    """
+    return and_(*[
+        not_(select(1).where(col == ImageMeta.path).exists())
+        for col in (*_JOB_IMAGE_COLUMNS, *_SEGMENT_IMAGE_COLUMNS)
+    ])
+
+
+async def _search_no_video_scan(db: AsyncSession, limit: int, offset: int) -> dict:
+    """No video with no other criterion: every repo image no job has used, newest first.
+
+    A scan rather than the image_meta query, because a never-tagged, never-described image has
+    no row there -- and those are the likeliest of all to be unused. Same shape as Untagged.
+    """
+    bucket = settings.s3_images_bucket
+    objects = await _list_repo_objects()
+    paths = [f"s3://{bucket}/{obj['Key']}" for obj in objects]
+    used = _job_referenced_paths(await find_image_references(db, paths)) if paths else set()
+    unused = sorted(
+        (obj for obj in objects if f"s3://{bucket}/{obj['Key']}" not in used),
+        key=lambda o: o["LastModified"],
+        reverse=True,
+    )
+    page = unused[offset:offset + limit]
+    meta_map = await _meta_by_path(db, [f"s3://{bucket}/{o['Key']}" for o in page])
+    items = [
+        {
+            "key": o["Key"],
+            "path": f"s3://{bucket}/{o['Key']}",
+            "filename": o["Key"].split("/", 1)[1] if "/" in o["Key"] else o["Key"],
+            "size": o["Size"],
+            "last_modified": o["LastModified"],
+            **_meta_fields(meta_map.get(f"s3://{bucket}/{o['Key']}")),
+        }
+        for o in page
+    ]
+    return {"items": items, "total": len(unused), "limit": limit, "offset": offset}
+
+
 @router.get("/images/search", dependencies=[Depends(get_current_user)])
 async def search_images(
     q: str | None = Query(None, max_length=500),
     tags: list[str] = Query(default_factory=list),
     exclude: list[str] = Query(default_factory=list),
+    no_video: bool = Query(False),
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -1486,8 +1542,15 @@ async def search_images(
 
     Everything given ANDs. `tags=Kelly&tags=Missionary` is the 102 images carrying both, not the
     2,057 that a substring search for "kelly" used to return.
+
+    `no_video` narrows to images no job has started from (console#690), ANDed with the rest:
+    Kelly + no_video is every Kelly image never rendered.
     """
     clauses = image_filter(q, tags, exclude)
+    if no_video and not clauses:
+        return await _search_no_video_scan(db, limit, offset)
+    if no_video:
+        clauses.append(no_video_clause())
     if not clauses:
         raise HTTPException(
             status_code=400,
@@ -1534,6 +1597,7 @@ async def image_tag_counts(
     q: str | None = Query(None, max_length=500),
     tags: list[str] = Query(default_factory=list),
     exclude: list[str] = Query(default_factory=list),
+    no_video: bool = Query(False),
     db: AsyncSession = Depends(get_db),
     user = Depends(get_current_user),
 ):
@@ -1550,6 +1614,8 @@ async def image_tag_counts(
     their counts, which is the first step to cleaning them up.
     """
     clauses = image_filter(q, tags, exclude)
+    if no_video:
+        clauses.append(no_video_clause())
 
     # unnest in a LATERAL rather than the target list: a set-returning function in the select
     # list cannot then be grouped by.
