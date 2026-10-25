@@ -8,6 +8,7 @@ from app.joycaption import (CAPTION_STYLES, DEFAULT_STYLE, MOTION_DEFAULT_STYLE,
 
 CaptionStyle = Literal["terse", "standard", "rich", "raw"]
 MotionStyle = Literal["handheld", "amateur", "cinematic", "static", "none"]
+QueuePosition = Literal["top", "bottom"]
 
 #: A caption instruction as the editor sends it. No placeholders: the static half has
 #: nothing to fill in, so braces in it are just text.
@@ -48,6 +49,9 @@ class AppSettingsResponse(BaseModel):
         default_factory=lambda: dict(MOTION_PLACEHOLDERS))
     # The cap both editors are held to, so the console counts against the real number.
     prompt_max_length: int = PROMPT_MAX_CHARS
+    # Where a newly queued segment lands (#471). "top": it keeps its job's place, so a job
+    # under way runs ahead of jobs queued after it. "bottom": its job moves behind the rest.
+    segment_queue_position: QueuePosition = "top"
 
 
 class AppSettingsUpdate(BaseModel):
@@ -59,3 +63,4 @@ class AppSettingsUpdate(BaseModel):
     caption_instruction: Optional[CaptionInstruction] = None
     motion_style: Optional[MotionStyle] = None
     motion_instruction: Optional[MotionTemplate] = None
+    segment_queue_position: Optional[QueuePosition] = None

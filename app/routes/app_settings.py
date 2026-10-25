@@ -10,6 +10,7 @@ from app.database import get_db
 from app.joycaption import (CAPTION_STYLES, DEFAULT_STYLE, MOTION_DEFAULT_STYLE,
                             MOTION_STYLE_PRESETS, MOTION_TEMPLATE)
 from app.models import AppSetting, User
+from app import queue_position
 from app.schemas.app_settings import AppSettingsResponse, AppSettingsUpdate
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,9 @@ _DEFAULTS = {
     # Empty means "use the default template" (joycaption.MOTION_TEMPLATE). A non-empty
     # value is a whole template of its own (console#555).
     "motion_instruction": "",
+    # Where a newly queued segment lands (#471): "top" keeps its job's slot, "bottom" sends
+    # the job behind everything else. See app/queue_position.py.
+    queue_position.SETTING_KEY: queue_position.DEFAULT,
 }
 
 
@@ -81,6 +85,10 @@ def _to_response(settings: dict[str, str]) -> AppSettingsResponse:
         caption_instruction=settings.get("caption_instruction", ""),
         motion_style=motion_style,
         motion_instruction=settings.get("motion_instruction", ""),
+        segment_queue_position=(
+            queue_position.BOTTOM
+            if settings.get(queue_position.SETTING_KEY) == queue_position.BOTTOM
+            else queue_position.TOP),
     )
 
 

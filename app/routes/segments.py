@@ -25,6 +25,7 @@ from app.database import get_db
 from app.routes.captions import caption_image_bytes
 from app.seeds import new_seed
 from app import caption_hold
+from app.queue_position import place_queued_job
 from app.enums import SEGMENT_HELD, JobStatus, SegmentStatus, VideoStatus, WorkerKind
 from app.ltx_stack import LTX_STACK
 from app.model_requirements import CHECKPOINT, canonical
@@ -694,6 +695,7 @@ async def add_segment(
     db.add(segment)
 
     job.status = JobStatus.PENDING
+    await place_queued_job(db, job)
 
     await db.commit()
     await db.refresh(segment)
@@ -1581,6 +1583,7 @@ async def retry_segment(
 
     job = await db.get(Job, segment.job_id)
     job.status = JobStatus.PENDING
+    await place_queued_job(db, job)
 
     await db.commit()
     await db.refresh(segment)
@@ -2230,6 +2233,7 @@ async def _reroll(db: AsyncSession, job: Job, old: Segment,
                 fresh.status = SegmentStatus.AWAITING_CAPTION
                 hold_on = image
     db.add(fresh)
+    await place_queued_job(db, job)
     await db.commit()
     await db.refresh(fresh)
     if hold_on:
