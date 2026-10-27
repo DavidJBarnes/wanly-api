@@ -286,6 +286,12 @@ class ImageMeta(Base):
     scene_described_at = mapped_column(DateTime(timezone=True), nullable=True)
     # (motion_description / motion_instruction / motion_described_at held the retired motion
     # caption half, wanly-api#326; dropped by migration 122, wanly-api#481.)
+    # The Sulphur-2 prompt enhancer's video prompt for this image (wanly-api#480): the image
+    # plus its scene description, expanded into the long scene script LTX needs. Stored for the
+    # reason the scene description is -- the model is nondeterministic and the words are what
+    # the person read and kept.
+    enhanced_prompt = mapped_column(Text, nullable=True)
+    enhanced_prompt_at = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     def is_empty(self) -> bool:
@@ -296,7 +302,8 @@ class ImageMeta(Base):
         GPU work over a tag edit.
         """
         return (not (self.tags or "").strip()
-                and not (self.scene_description or "").strip())
+                and not (self.scene_description or "").strip()
+                and not (self.enhanced_prompt or "").strip())
 
 
 class Worker(Base):
