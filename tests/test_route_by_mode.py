@@ -1,6 +1,7 @@
 """Pushed work goes to a box in the matching mode (wanly-api#392).
 
-Motion captions and image edits are PUSHED to a URL. With two symmetric 3090s, each in one
+Image-description captions (to a box in "motion" mode -- the wire name stays, though the
+motion caption half went in wanly-api#481) and image edits are PUSHED to a URL. With two symmetric 3090s, each in one
 mode at a time (wanly-gpu-docker#164), the URL is whichever box is in the mode right now --
 read from the boxes, never configured per box, never a box in another mode.
 """
@@ -94,7 +95,6 @@ class TestChoosing:
         assert p.reporting is False and p.box is None and p.wait is None
 
     def test_the_url_takes_the_configured_port(self, monkeypatch):
-        monkeypatch.setattr(settings, "motion_caption_url", "")
         monkeypatch.setattr(settings, "image_description_url", "http://3090a.zero:11435")
         monkeypatch.setattr(settings, "image_edit_url", "http://3090.zero:8086")
         assert wm.motion_url("3090b") == "http://3090b:11435"
@@ -109,7 +109,6 @@ def boxes(monkeypatch):
     async def live(db):
         return [wm.parse_health(n, b) for n, b in state.items()]
     monkeypatch.setattr(wm, "live_boxes", live)
-    monkeypatch.setattr(settings, "motion_caption_url", "")
     monkeypatch.setattr(settings, "image_description_url", "http://3090a.zero:11435")
     monkeypatch.setattr(settings, "image_description_fallback_url", "")
 
@@ -120,7 +119,7 @@ def boxes(monkeypatch):
 
 
 @pytest.mark.asyncio
-class TestMotionCaptions:
+class TestImageDescriptionCaptions:
     async def test_they_go_to_the_box_in_motion_mode(self, boxes):
         boxes({"3090a.zero": _health("render"), "3090b": _health("motion")})
         assert await captions._caption_base(None, True) == "http://3090b:11435"
@@ -227,6 +226,8 @@ class TestTheSummary:
         async def fetch(name):
             return bodies.get(name)
         monkeypatch.setattr(wm, "_fetch", fetch)
+        # A hold waiting on the mode no longer shows on this summary: the "motion" line counted
+        # motion captions, a half removed in wanly-api#481.
         monkeypatch.setitem(caption_hold._mode_waits, "s3://b/x.png",
                             "no GPU in motion mode (3090a.zero: render, 3090b: edit)")
 
@@ -238,8 +239,7 @@ class TestTheSummary:
         assert a["gpu"]["vram_used_mib"] == 23100
         waits = {w["mode"]: w for w in out["waiting"]}
         assert waits["render"]["count"] >= 1 and waits["render"]["reason"] is None
-        assert waits["motion"]["count"] == 1
-        assert waits["motion"]["reason"].startswith("no GPU in motion mode")
+        assert "motion" not in waits
         assert waits["edit"]["count"] == 0
         assert set(out["scene"]) >= {"depth", "up"}
 

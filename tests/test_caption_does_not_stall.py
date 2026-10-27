@@ -90,7 +90,6 @@ def captioner(monkeypatch, small_pool):
     monkeypatch.setattr(captions, "describe", describe)
     monkeypatch.setattr(captions, "busy_render_beside_the_captioner", not_busy)
     monkeypatch.setattr(captions, "_get_all_settings", no_settings)
-    monkeypatch.setattr(config.settings, "motion_caption_enabled", False)
     monkeypatch.setattr(images, "download_bytes", lambda path: b"img")
     monkeypatch.setattr(s3, "download_bytes", lambda path: b"img")
     monkeypatch.setattr(images, "delete_object", lambda path: None)

@@ -1,5 +1,5 @@
 """Caption tickets: describe returns at once, and the caption happens in the background
-(console#564), ONE HALF AT A TIME (console#590).
+(console#564).
 
 WHAT WAS WRONG
 
@@ -10,43 +10,25 @@ WHAT WAS WRONG
     the modal's "Describing..." lived only in that page's state, so coming back showed the
     image as idle while its caption was still in line, with no sign it was coming.
 
-    Then the captions were all-or-nothing (console#590): every describe made the scene AND the
-    motion paragraph. Since the captioners split (console#572) the halves run on different
-    GPUs -- the scene on JoyCaption in seconds, the motion on Qwen3-VL in minutes -- so tagging
-    an image spent a motion caption nobody asked for, and re-rolling one half re-rolled (and
-    cleared) the other.
-
 WHAT THIS DOES
 
-    A ticket is ONE HALF of the caption of ONE image -- "scene" or "motion" -- an asyncio task
-    that takes a turn in that half's lane, captions it, and saves those words on the image's
-    ImageMeta row, never touching the other half. The person asking gets the ticket back at
-    once and polls it; the task does not care whether anyone is still listening.
+    A ticket is the scene caption of ONE image -- an asyncio task that takes a turn in the
+    scene lane, captions it, and saves those words on the image's ImageMeta row. The person
+    asking gets the ticket back at once and polls it; the task does not care whether anyone
+    is still listening.
 
-    SINGLE-FLIGHT PER IMAGE AND HALF. While a scene ticket for an image is queued or running,
-    every other request for that image's scene -- the modal, a second tab, the New Job
-    dialog, a held job (app/caption_hold.py) -- gets THAT ticket. Two captions of one half
-    would write two different descriptions, and the second would silently replace the words
-    the first person (or job) already used. The two halves are independent tickets: a scene
-    and a motion of the same image can both be in flight.
-
-    MOTION IS GROUNDED ON THE SAVED SCENE. A motion ticket reads the scene saved on the row at
-    its turn. If a scene of the image is in flight when it starts, it waits for that scene
-    first (a re-roll is about to replace the saved one); if the image has no scene at all, it
-    asks for one and waits. If a scene re-roll lands while the paragraph is being made, the
-    paragraph is made again against the new scene rather than saved beside one it never saw.
-    Re-rolling the scene does NOT touch a saved motion paragraph: the console says "Redo
-    motion to re-ground on the new scene" (motion_described_at older than scene_described_at).
+    SINGLE-FLIGHT PER IMAGE. While a scene ticket for an image is queued or running, every
+    other request for that image's scene -- the modal, a second tab, the New Job dialog, a
+    held job (app/caption_hold.py) -- gets THAT ticket. Two captions would write two different
+    descriptions, and the second would silently replace the words the first person (or job)
+    already used.
 
     Finished tickets are kept for RESULT_TTL_S so a page opened later can still show "Failed:
     retry" or pick up the finished words.
 
-TWO LANES (wanly-console#572)
-
-    Each half has its own captioner and its own line (app/caption_queue.py): a scene ticket
-    waits in the scene lane, a motion ticket in the motion lane. A scene never waits behind
-    somebody's motion paragraph, and a held job's <SCENE> is released the moment its scene is
-    saved while its <MOTION> waits for the motion.
+    HALVES. A ticket still carries `half` ("scene", always): there used to be a second,
+    motion half with its own lane (console#572/#590), removed in wanly-api#481. The field
+    and the per-half keys stay so the API's shape does not change under the console.
 
 WHAT IT DOES NOT DO
 
@@ -71,9 +53,8 @@ from datetime import datetime, timezone
 
 from app import caption_queue as cq
 from app import s3
-from app.config import settings
 from app.database import async_session
-from app.joycaption import CaptionError, CaptionerBusy, NoGpuInMode, describe_motion
+from app.joycaption import CaptionError, CaptionerBusy
 from app.models import ImageMeta
 
 logger = logging.getLogger(__name__)
@@ -83,17 +64,13 @@ RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
 
-#: The two halves of an image's caption, in the order they are made (console#590).
+#: The halves of an image's caption. Only the scene is left (the motion half went in
+#: wanly-api#481); kept as a tuple so callers that loop over halves need not change.
 SCENE = "scene"
-MOTION = "motion"
-HALVES = (SCENE, MOTION)
+HALVES = (SCENE,)
 
 #: How long a finished ticket is remembered, for a page opened after the caption finished.
 RESULT_TTL_S = 6 * 3600
-
-#: How many times a motion paragraph is made again because a scene re-roll landed while it
-#: was being made. Past this it is a failure to retry, not a loop.
-MOTION_REGROUND_ATTEMPTS = 2
 
 
 class ImageUnreadable(CaptionError):
@@ -112,7 +89,7 @@ class Ticket:
     #: The captioner refused because the box beside it is rendering (or in render mode).
     #: Waited out by the hold; shown as the reason to the person.
     busy: bool = False
-    #: ...and the refusal is "no GPU in motion mode" (wanly-api#392): waited out with no time
+    #: ...and the refusal is "no GPU in <mode> mode" (wanly-api#392): waited out with no time
     #: limit, because only a person switching a box ends it.
     mode_wait: bool = False
     unreadable: bool = False
@@ -134,16 +111,15 @@ class Ticket:
     #: Done without captioning, because the precheck said the words were already there.
     skipped: bool = False
     #: The held jobs this caption is for (console#590): [{"job_id", "name"}]. Shown on the
-    #: image as "Motion requested by job ...", because a motion caption nobody clicked for
-    #: should say who asked.
+    #: image as "requested by job ...", because a caption nobody clicked for should say who
+    #: asked.
     requested_by: list = field(default_factory=list)
     _image: bytes | None = None
     _cfg: dict | None = None
 
     @property
     def lane(self) -> str:
-        """Each half has its own line (console#572): the half IS the lane."""
-        return cq.MOTION_LANE if self.half == MOTION else cq.SCENE_LANE
+        return cq.SCENE_LANE
 
     @property
     def finished(self) -> bool:
@@ -175,7 +151,6 @@ def reset() -> None:
     _active.clear()
     _by_id.clear()
     _last.clear()
-    cq.motion_queue = cq.CaptionQueue()
 
 
 def _prune() -> None:
@@ -199,10 +174,8 @@ def _check_half(half: str) -> None:
 def active(path: str, half: str | None = None) -> Ticket | None:
     """The caption of this image that is queued or running right now, if any.
 
-    With `half`, that half's; without, either (the scene's first)."""
-    if half is None:
-        return active(path, SCENE) or active(path, MOTION)
-    t = _active.get((path, half))
+    `half` is accepted for the old per-half callers; anything but the scene has none."""
+    t = _active.get((path, half or SCENE))
     return t if t is not None and not t.finished else None
 
 
@@ -212,16 +185,11 @@ def get(ticket_id: str) -> Ticket | None:
 
 
 def latest(path: str, half: str | None = None) -> Ticket | None:
-    """What a view should show for this image's half: the one in flight, else the last
-    finished. Without `half`: whichever is in flight (scene first), else the newer finish."""
+    """What a view should show for this image: the caption in flight, else the last finished.
+    `half` is accepted for the old per-half callers; anything but the scene has none."""
     _prune()
-    if half is not None:
-        return active(path, half) or _last.get((path, half))
-    now = active(path)
-    if now is not None:
-        return now
-    done = [t for t in (_last.get((path, SCENE)), _last.get((path, MOTION))) if t]
-    return max(done, key=lambda t: t.finished_at or t.created_at) if done else None
+    half = half or SCENE
+    return active(path, half) or _last.get((path, half))
 
 
 def request(path: str, half: str = SCENE, *, origin: str = "describe",
@@ -262,8 +230,8 @@ def _start(path: str, half: str, origin: str, params: dict | None, precheck=None
 
 
 def _enter(t: Ticket) -> None:
-    """Take a place in the half's lane now (synchronously, so a position exists at once)."""
-    q = cq.motion_queue if t.half == MOTION else cq.queue
+    """Take a place in the lane now (synchronously, so a position exists at once)."""
+    q = cq.queue
     t._queue = q
     t._entry = q.reserve(t.path, kind="hold" if t.origin == "hold" else "describe",
                          token=t.id)
@@ -331,23 +299,15 @@ def recent() -> list[Ticket]:
 
 async def _run(t: Ticket) -> None:
     try:
-        if t.half == MOTION:
-            if not settings.motion_caption_enabled:
-                raise CaptionError("motion captioning is switched off (MOTION_CAPTION_ENABLED)")
-            # Before the turn, not inside it: waiting for a scene must not hold the motion
-            # captioner for everybody behind this ticket.
-            await _ensure_scene(t)
         async with t._queue.turn(t.path, reserved=t._entry):
             t.status = RUNNING
             t.started_at = datetime.now(timezone.utc)
             if t.precheck is not None and await t.precheck():
                 t.skipped = True
-            elif t.half == SCENE:
-                await _scene_step(t)
             else:
-                await _motion_step(t)
+                await _scene_step(t)
         if not t.skipped:
-            # Release what this half completes now, not when the hold next looks.
+            # Release what this caption completes now, not when the hold next looks.
             await _settle(t)
         t.status = DONE
         t._image = None  # not kept for RESULT_TTL_S
@@ -411,27 +371,23 @@ async def _saved_scene(db, path: str) -> str:
     return (meta.scene_description or "").strip() if meta else ""
 
 
-async def _motion_base() -> str:
-    """The motion captioner's URL, refusing (CaptionerBusy) while its box renders. Its own
-    short session. interactive=True routes it exactly as the modal's was routed."""
+async def _fallback_base() -> str:
+    """The image-description captioner's URL -- the scene's fallback when the scene service is
+    down -- refusing (CaptionerBusy) while its box renders. Its own short session.
+    interactive=True routes it exactly as the modal's was routed."""
     from app.routes import captions
     async with async_session() as db:
         return await captions._caption_base(db, interactive=True)
 
 
 async def _scene_step(t: Ticket) -> None:
-    """Make the scene and save it. Raises CaptionError and its kinds.
-
-    Writes the scene's columns ONLY (console#590): a saved motion paragraph stays, even though
-    it was grounded on the scene this replaces. The console says so ("Redo motion to re-ground
-    on the new scene") rather than silently throwing a paragraph away.
-    """
+    """Make the scene and save it. Raises CaptionError and its kinds."""
     from app.routes import captions
 
     await _load(t)
     p = t.params
     scene, instruction = await captions.caption_scene(
-        t._image, t._cfg, _motion_base, style=p.get("style"), instruction=p.get("instruction"))
+        t._image, t._cfg, _fallback_base, style=p.get("style"), instruction=p.get("instruction"))
     if not (scene or "").strip():
         # A blank caption is a failure wearing a success's clothes. Storing it would mark
         # the image described and stop anything ever asking again.
@@ -448,91 +404,17 @@ async def _scene_step(t: Ticket) -> None:
 
 
 def apply_scene(meta: ImageMeta, scene: str, instruction: str | None) -> None:
-    """Write the scene half onto a row, and nothing else."""
+    """Write the scene onto a row, and nothing else."""
     meta.scene_description = scene.strip()
     meta.scene_instruction = instruction
     meta.scene_described_at = datetime.now(timezone.utc)
 
 
 async def _settle(t: Ticket) -> None:
-    """Release every held segment on the image whose halves are now all saved. Non-fatal: the
+    """Release every held segment on the image whose scene is now saved. Non-fatal: the
     hold's own waiter and sweep release it anyway, this only makes it immediate."""
     from app import caption_hold
     try:
         await caption_hold.settle(t.path, finishing=t)
     except Exception:  # noqa: BLE001
         logger.exception("Caption ticket %s: could not release holds on %s", t.id, t.path)
-
-
-async def _ensure_scene(t: Ticket) -> None:
-    """Make sure the scene a motion ticket grounds on exists -- and is the one coming, when a
-    scene re-roll is in flight. Raises (CaptionerBusy / CaptionError) when there is none.
-
-    A scene in flight is waited for even if one is saved: it is about to replace the saved
-    one, and a motion paragraph about the old scene would need redoing at once. No scene at
-    all: ask for one (the motion cannot be grounded on nothing) and wait for it.
-    """
-    s = active(t.path, SCENE)
-    if s is None:
-        async with async_session() as db:
-            if await _saved_scene(db, t.path):
-                return
-        s, _ = request(t.path, SCENE, origin=t.origin, params=t.params,
-                       requested_by=t.requested_by)
-        logger.info("Caption ticket %s: %s has no scene to ground its motion on; asked for "
-                    "one (%s)", t.id, t.path, s.id)
-    await s.wait()
-    if s.status == DONE:
-        return
-    if s.withdrawn:
-        # The hold took its scene ticket back because the words were saved meanwhile.
-        async with async_session() as db:
-            if await _saved_scene(db, t.path):
-                return
-    why = s.error or "the scene caption failed"
-    if s.busy:
-        raise (NoGpuInMode(why) if s.mode_wait else CaptionerBusy(why))
-    if s.unreadable:
-        raise ImageUnreadable(why)
-    raise CaptionError(f"no scene to ground the motion on: {why}")
-
-
-async def _motion_step(t: Ticket) -> None:
-    """Make the motion paragraph, grounded on the SAVED scene, and save it beside that scene.
-
-    If a scene re-roll replaced the scene while the paragraph was being made, it is made again
-    against the new one (up to MOTION_REGROUND_ATTEMPTS) -- a paragraph saved beside a scene
-    it never saw would be invisibly mismatched.
-    """
-    p = t.params
-    for attempt in range(MOTION_REGROUND_ATTEMPTS + 1):
-        scene = await _load(t)
-        if not scene:
-            raise CaptionError(f"{t.path} has no saved scene to ground the motion on")
-        cfg = t._cfg or {}
-        base = await _motion_base()
-        motion_style = p.get("motion_style") or cfg.get("motion_style", "")
-        custom = (p["motion_instruction"] if p.get("motion_instruction") is not None
-                  else cfg.get("motion_instruction", ""))
-        motion, instruction = await describe_motion(t._image, scene, style=motion_style,
-                                                    custom=custom, base_url=base)
-        motion = (motion or "").strip()
-        if not motion:
-            raise CaptionError("the captioner returned no motion paragraph")
-        async with async_session() as db:
-            meta = await db.get(ImageMeta, t.path, populate_existing=True)
-            if meta is None:  # deleted in the meantime; the scene it was grounded on went too
-                raise CaptionError(f"{t.path} lost its saved description while captioning")
-            if (meta.scene_description or "").strip() == scene:
-                meta.motion_description = motion
-                meta.motion_instruction = instruction
-                meta.motion_described_at = datetime.now(timezone.utc)
-                await db.commit()
-                logger.info("Caption ticket %s: motion of %s saved (%d words)",
-                            t.id, t.path, len(motion.split()))
-                return
-        logger.info("Caption ticket %s: the scene of %s changed while its motion was made; "
-                    "making it again against the new scene (attempt %d)",
-                    t.id, t.path, attempt + 1)
-    raise CaptionError("the scene kept being replaced while the motion paragraph was made; "
-                       "redo motion once the scene settles")

@@ -50,7 +50,8 @@ class JobCreate(BaseModel):
 class CaptionHoldDetail(BaseModel):
     """What a caption-held job is waiting for, right now (console#562 follow-up).
 
-    `needs`: the halves not saved yet, "scene" and/or "motion". `queue_status`: "queued"
+    `needs`: the halves not saved yet -- ["scene"] or [] (the motion half went in
+    wanly-api#481). `queue_status`: "queued"
     (with `queue_position`, 1 = next up), "running", "waiting" (its waiter is between
     refusals -- the box beside the captioner is rendering), or None (no waiter yet; the sweep
     gives it one within seconds). Computed per request, never stored.
@@ -61,7 +62,7 @@ class CaptionHoldDetail(BaseModel):
     queue_position: Optional[int] = None
     queue_depth: int = 0
     note: Optional[str] = None
-    #: Which caption lane the place is in: "scene" or "motion" (wanly-console#572).
+    #: Which caption lane the place is in: "scene" (the only lane since wanly-api#481).
     lane: Optional[str] = None
 
 
@@ -80,10 +81,6 @@ class CaptionHoldSummary(BaseModel):
     queue_depth: int = 0
     queue_waiting: int = 0
     running: Optional[str] = None
-    #: The motion lane on its own (wanly-console#572); queue_* above count both lanes and
-    #: `running` is the scene lane's.
-    motion_queue_depth: int = 0
-    motion_running: Optional[str] = None
     #: Held images, the next one to be captioned first.
     images: list[CaptionHoldImage] = []
 

@@ -144,156 +144,89 @@ class TestGetEndpoint:
         assert body["words"] == 5
 
 
-class TestMotionHalf:
-    """#326: the describe call produces a motion half, and losing it is survivable."""
+class TestMotionHalfIsGone:
+    """wanly-api#481: the motion caption half was removed. Old consoles still ask for it."""
 
     @pytest.mark.asyncio
-    async def test_both_halves_are_stored_and_returned(self, db):
-        resp = await _post_scene(db, PATH, caption="a woman on a sofa",
-                                 motion="she leans back slowly, her hair swaying")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["motion_description"] == "she leans back slowly, her hair swaying"
-        assert body["motion_words"] == 7
-        assert body["motion_described_at"] is not None
-        assert body["motion_error"] is None
-
-        meta = await db.get(ImageMeta, PATH)
-        assert meta.motion_description == "she leans back slowly, her hair swaying"
-        assert meta.motion_instruction
-
-    @pytest.mark.asyncio
-    async def test_a_motion_failure_keeps_the_static_half(self, db):
-        """The ticket's partial-failure rule: <SCENE> consumes the static half today; a
-        hiccup on the second call must not throw away the first."""
-        resp = await _post_scene(db, PATH, caption="a woman on a sofa",
-                                 motion_error="captioner unreachable")
+    async def test_the_response_has_no_motion_fields(self, db):
+        resp = await _post_scene(db, PATH, caption="a woman on a sofa")
         assert resp.status_code == 200
         body = resp.json()
         assert body["scene_description"] == "a woman on a sofa"
-        assert body["motion_description"] is None
-        assert body["motion_error"] == "captioner unreachable"
-
-        meta = await db.get(ImageMeta, PATH)
-        assert meta.scene_description == "a woman on a sofa"
-        assert meta.motion_description is None
-        assert meta.motion_described_at is None
+        assert not [k for k in body if k.startswith("motion")]
 
     @pytest.mark.asyncio
-    async def test_a_motion_reroll_replaces_only_the_motion(self, db):
-        await _post_scene(db, PATH, caption="first", motion="motion one")
-        await _post_scene(db, PATH, caption="second", motion="motion two")
-
-        meta = await db.get(ImageMeta, PATH)
-        assert meta.motion_description == "motion two"
-        assert meta.scene_description == "second"
-
-    @pytest.mark.asyncio
-    async def test_a_failed_motion_leaves_the_previous_one_alone(self, db):
-        """Per half since console#590: saving one half never clears the other. The new scene
-        is saved; the old paragraph stays (older than the scene, so the console says "Redo
-        motion to re-ground on the new scene") rather than being silently thrown away."""
-        await _post_scene(db, PATH, caption="first", motion="motion one")
-        resp = await _post_scene(db, PATH, caption="second")  # motion call failed
-        assert resp.json()["motion_error"]
-
-        meta = await db.get(ImageMeta, PATH)
-        assert meta.scene_description == "second"
-        assert meta.motion_description == "motion one"
-        assert meta.motion_described_at <= meta.scene_described_at
+    async def test_asking_for_only_the_motion_half_is_a_422(self, db):
+        client, app = await _client(db)
+        try:
+            with _captioner(db, pair=_pair("unused")) as mock:
+                async with client as c:
+                    resp = await c.post("/images/scene/describe", params={"path": PATH},
+                                        json={"halves": ["motion"]})
+            assert resp.status_code == 422
+            assert "motion" in resp.json()["detail"].lower()
+            mock.assert_not_called()
+        finally:
+            app.dependency_overrides.clear()
 
     @pytest.mark.asyncio
-    async def test_a_row_holding_only_a_motion_caption_is_not_empty(self):
-        meta = ImageMeta(path=PATH, motion_description="she leans back")
-        assert not meta.is_empty()
-
-    def test_the_motion_prompt_grounds_on_the_scene(self):
-        from app.joycaption import motion_instruction_for
-
-        p = motion_instruction_for("handheld", "", "A woman on a sofa.")
-        assert p.startswith("Scene: A woman on a sofa.")
-        assert "handheld" in p
-        assert "remains still" in p  # the anti-hedge clause, measured necessary
-
-    def test_a_custom_motion_instruction_wins_entirely(self):
-        from app.joycaption import motion_instruction_for
-
-        p = motion_instruction_for("handheld", "my own words", "A woman on a sofa.")
-        assert p == "my own words"
-
-    def test_unknown_style_falls_back_to_the_default_preset(self):
-        from app.joycaption import motion_instruction_for
-
-        p = motion_instruction_for("not-a-style")
-        assert "handheld" in p
-
-
-class TestMotionKillSwitch:
-    """MOTION_CAPTION_ENABLED=false: the motion call is not made at all (#326).
-
-    The flag exists because joycaption on the 2070 will answer the motion prompt with
-    plausible junk, and a persisted half is exactly as authoritative as a real one. The
-    response must therefore read "no motion half, no failure" — not an error and not an
-    empty paragraph.
-    """
-
-    def _pair(self, db, monkeypatch, enabled, calls):
-        from app.config import settings
-        from app.routes import captions
-
-        monkeypatch.setattr(settings, "motion_caption_enabled", enabled)
-
-        async def fake_describe(image, instruction, base_url=None):
-            calls.append("static")
-            return "a woman on a sofa"
-
-        async def fake_motion(image, scene, style, custom="", base_url=None):
-            calls.append("motion")
-            return "she leans back", "the motion instruction"
-
-        async def fake_busy(db):
-            return None
-
-        async def fake_base(db, interactive):
-            return "http://captioner.test:11434"
-
-        monkeypatch.setattr(captions, "describe", fake_describe)
-        monkeypatch.setattr(captions, "describe_motion", fake_motion)
-        monkeypatch.setattr(captions, "busy_render_beside_the_captioner", fake_busy)
-        monkeypatch.setattr(captions, "_get_all_settings",
-                            lambda db: _empty_settings())
+    async def test_motion_beside_scene_is_dropped(self, db):
+        client, app = await _client(db)
+        try:
+            with _captioner(db, pair=_pair("a woman on a sofa")):
+                async with client as c:
+                    resp = await c.post("/images/scene/describe", params={"path": PATH},
+                                        json={"halves": ["scene", "motion"]})
+            assert resp.status_code == 202
+            body = resp.json()
+            assert body["half"] == "scene"
+            assert [t["half"] for t in body["tickets"]] == ["scene"]
+        finally:
+            app.dependency_overrides.clear()
 
     @pytest.mark.asyncio
-    async def test_disabled_skips_the_motion_call(self, db, monkeypatch):
-        from app.routes.captions import caption_image_pair
+    async def test_status_for_the_motion_half_is_empty_not_an_error(self, db):
+        from app.auth import verify_api_key_or_bearer
+        client, app = await _client(db)
+        app.dependency_overrides[verify_api_key_or_bearer] = lambda: None
+        try:
+            async with client as c:
+                resp = await c.get("/images/scene/status",
+                                   params={"path": PATH, "half": "motion"})
+            assert resp.status_code == 200
+            assert resp.json()["status"] is None
+        finally:
+            app.dependency_overrides.clear()
 
-        calls = []
-        self._pair(db, monkeypatch, enabled=False, calls=calls)
-        pair = await caption_image_pair(db, b"png")
-        assert calls == ["static"], "the motion call fired against the flag"
-        assert pair.motion is None
-        assert pair.motion_error is None, "a disabled feature must not look like a failure"
+
+class TestTryIsSceneOnly:
+    """POST /images/scene/try runs the caption prompt alone and stores nothing."""
 
     @pytest.mark.asyncio
-    async def test_enabled_makes_the_motion_call(self, db, monkeypatch):
-        from app.routes.captions import caption_image_pair
+    async def test_try_returns_the_caption_and_the_instruction_used(self, db):
+        from unittest.mock import AsyncMock
 
-        calls = []
-        self._pair(db, monkeypatch, enabled=True, calls=calls)
-        pair = await caption_image_pair(db, b"png")
-        assert calls == ["static", "motion"]
-        assert pair.motion == "she leans back"
+        async def _settings(db):
+            return {"caption_style": "standard", "caption_instruction": ""}
 
-    def test_the_flag_defaults_to_enabled(self):
-        from app.config import Settings
-
-        assert Settings(_env_file=None).motion_caption_enabled is True
-
-
-async def _empty_settings():
-    return {"caption_style": "standard", "caption_instruction": "",
-            "motion_style": "handheld", "motion_instruction": "",
-            "negative_prompt": ""}
+        client, app = await _client(db)
+        cap = AsyncMock(return_value=("a woman on a sofa", "my words"))
+        try:
+            with patch("app.s3.download_bytes", return_value=b"png"), \
+                 patch("app.routes.images.download_bytes", return_value=b"png"), \
+                 patch("app.routes.app_settings._get_all_settings", side_effect=_settings), \
+                 patch("app.routes.images.caption_image_bytes", cap):
+                async with client as c:
+                    resp = await c.post("/images/scene/try", params={"path": PATH},
+                                        json={"caption_instruction": "my words"})
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            assert body == {"caption": "a woman on a sofa", "words": 5,
+                            "caption_instruction_used": "my words"}
+            assert cap.await_args.kwargs["instruction"] == "my words"
+            assert await db.get(ImageMeta, PATH) is None
+        finally:
+            app.dependency_overrides.clear()
 
 
 class TestMoveCarriesTheRow:
@@ -302,8 +235,7 @@ class TestMoveCarriesTheRow:
 
     @pytest.mark.asyncio
     async def test_the_description_follows_the_object(self, db):
-        db.add(ImageMeta(path=PATH, tags="Kelly", scene_description="a woman on a sofa",
-                         motion_description="she leans back"))
+        db.add(ImageMeta(path=PATH, tags="Kelly", scene_description="a woman on a sofa"))
         await db.flush()
 
         resp = await _move(db, ["2026-09-05/00001.png"], "2026-09-06")
@@ -314,8 +246,6 @@ class TestMoveCarriesTheRow:
         assert moved is not None
         assert moved.tags == "Kelly"
         assert moved.scene_description == "a woman on a sofa"
-        # #326: the motion half cost the same GPU session and must not be dropped by a move.
-        assert moved.motion_description == "she leans back"
 
     @pytest.mark.asyncio
     async def test_an_image_with_no_row_moves_without_inventing_one(self, db):
@@ -388,22 +318,16 @@ def _captioner(db, pair=None, error=None):
         caption_tickets.reset()
 
 
-async def _post_scene(db, path, caption=None, error=None, motion=None, motion_error=None):
-    """POST /images/scene with S3 and the captioner patched out.
+def _pair(caption):
+    from tests.caption_fakes import ScenePair
+    return ScenePair(scene=caption or "", scene_instruction="an instruction")
 
-    #326: the caption is a pair, the static half and the motion half. A test that names only
-    a static caption gets motion=None — the shape the real endpoint produces when the motion
-    call failed.
-    """
+
+async def _post_scene(db, path, caption=None, error=None):
+    """POST /images/scene with S3 and the captioner patched out."""
     client, app = await _client(db)
-    from app.routes.captions import ScenePair
-
-    pair = ScenePair(scene=caption or "", scene_instruction="an instruction",
-                     motion=motion,
-                     motion_instruction="a motion instruction" if motion else None,
-                     motion_error=motion_error)
     try:
-        with _captioner(db, pair=pair, error=error):
+        with _captioner(db, pair=_pair(caption), error=error):
             async with client as c:
                 return await c.post("/images/scene", params={"path": path}, json={})
     finally:

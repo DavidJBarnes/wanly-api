@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     # image-description, for the <SCENE> placeholder (console#405) and dataset tagging. Named
     # for the capability (wanly-gpu-docker#83). As of #326 it is Qwen2.5-VL served by ollama
     # inside the wanly-services container on the 2070, chosen because one model does both
-    # halves of a video prompt: the static scene AND the motion paragraph. The old
+    # halves of a video prompt (the motion half was removed in wanly-api#481). The old
     # JOYCAPTION_* aliases still work.
     #
     # 2070-only, decided in #326: the 3090's captioner shares its card with the render stack,
@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     image_description_keep_alive: str = Field(
         "15m", validation_alias=AliasChoices("image_description_keep_alive", "joycaption_keep_alive"))
     # A cold qwen2.5vl caption (load included) measured 185-265 s on the 2070; a grounded
-    # warm motion caption up to ~50 s. 180 — the old JoyCaption number — timed the first
+    # warm long caption up to ~50 s. 180 — the old JoyCaption number — timed the first
     # cold call out. 600 leaves room for the load without letting a wedged captioner hold
     # a request open forever.
     #: THE CONTEXT WINDOW FOR A CAPTION, and the single biggest thing about caption speed.
@@ -60,43 +60,31 @@ class Settings(BaseSettings):
     #:     4096              1.5s  37.3 tok/s   all layers on GPU
     #:
     #: A caption does not want 32k. The static prompt measured 451 tokens INCLUDING the
-    #: image, and the motion prompt adds the scene paragraph -- so 4096 is roughly eight
+    #: image -- so 4096 is roughly eight
     #: times what the job needs, and every byte above that is paid for in offloaded layers.
     image_description_num_ctx: int = Field(
         4096, validation_alias=AliasChoices("image_description_num_ctx",
                                             "joycaption_num_ctx"))
     image_description_timeout_s: int = Field(
         600, validation_alias=AliasChoices("image_description_timeout_s", "joycaption_timeout_s"))
-    # The motion half of a description (#326) is an env kill-switch, and it exists because
-    # the 2070's 8 GB cannot GPU-run qwen2.5vl:7b: measured with the card empty at 2048 ctx,
-    # ollama offloads 1/29 layers and the model runs 100% CPU at 0.3-5 tok/s — a caption
-    # takes minutes, and ~13 GB of system RAM the box does not have while A1111 holds a
-    # checkpoint. With a JoyCaption-class model on the card the motion prompt is answered by
-    # a model that cannot do it, producing plausible junk persisted as authoritative. Flip
-    # this back to true when the captioner model can actually do the motion half.
-    motion_caption_enabled: bool = True
-    # TWO CAPTIONERS, ONE PER HALF (wanly-console#572 phase 1).
+    # TWO CAPTIONERS (wanly-console#572 phase 1).
     #
-    # One URL and one model used to serve both halves of a video prompt, so a 3090 swapped
-    # two vision models in and out of VRAM per image: 30 images was 60 swaps across the
-    # ZeroTier link, and is the likeliest cause of 3090a hanging on 2026-10-02. The halves are
-    # different jobs and now go to different places:
+    # One URL and one model used to serve every caption, so a 3090 swapped two vision models
+    # in and out of VRAM per image: 30 images was 60 swaps across the ZeroTier link, and is
+    # the likeliest cause of 3090a hanging on 2026-10-02. Now:
     #
-    #   scene   the static description, JoyCaption Beta One on its own always-resident ollama
-    #           (wanly-gpu-docker's scene-caption service). Small (~6 GB), never shares a card
-    #           with a render stack, so it is NEVER refused for a render; it is only ever slow
-    #           while an image edit has it unloaded on a shared card (interim, 3090b).
-    #   motion  the motion paragraph, Qwen3-VL 32B on a 3090's image-description service --
-    #           the captioner that used to do both halves.
+    #   scene   the static description that fills <SCENE>, JoyCaption Beta One on its own
+    #           always-resident ollama (wanly-gpu-docker's scene-caption service). Small
+    #           (~6 GB), never shares a card with a render stack, so it is NEVER refused for a
+    #           render; it is only ever slow while an image edit has it unloaded on a shared
+    #           card (interim, 3090b).
+    #   image-description  Qwen3-VL on a 3090 in "motion" mode (the image_description_*
+    #           settings above): dataset clip captions, and the scene half when the scene
+    #           service is down. (It also made the motion caption half until wanly-api#481
+    #           removed that half.)
     #
-    # THE OLD image_description_* SETTINGS ARE THE MOTION HALF'S FALLBACK. Every motion_* value
-    # left empty (or 0) inherits its image_description_* twin, so the motion half -- and the
-    # scene half when the scene service is down -- goes exactly where both halves went before.
-    # The EC2 env pins image_description_url to 3090a's captioner, which is why the motion
-    # default is "inherit" rather than a hostname guessed here.
-    #
-    # An EMPTY scene_caption_url turns the split off: the scene half then goes to the motion
-    # captioner too, which is the pre-#572 behaviour.
+    # An EMPTY scene_caption_url turns the split off: the scene half then goes to the
+    # image-description captioner too, which is the pre-#572 behaviour.
     scene_caption_url: str = "http://3090b.zero:11436"
     scene_caption_model: str = "joycaption:beta-one"
     # Always resident: the service exists to keep one small model on the card. The service
@@ -110,11 +98,6 @@ class Settings(BaseSettings):
     # After the scene service fails to answer, how long to send scene captions straight to the
     # fallback instead of paying a connect timeout per caption.
     scene_caption_down_s: float = 60.0
-    motion_caption_url: str = ""
-    motion_caption_model: str = ""
-    motion_caption_keep_alive: str = ""
-    motion_caption_num_ctx: int = 0
-    motion_caption_timeout_s: int = 0
     # The caption hold (console#562): how long a segment waits for its start image's caption
     # before it goes to caption_failed and asks the person what to do. Generous on purpose:
     # the wait includes the captioner being refused while the box beside it renders, and a

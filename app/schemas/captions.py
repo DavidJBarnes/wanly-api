@@ -22,5 +22,5 @@ class CaptionResponse(BaseModel):
     # described, not only what was said.
     instruction: str
     # Surfaced because length is the thing being judged: the caption sits beside a ~100-word
-    # arc, and whether it is 25 or 80 words changes the balance between scene and motion.
+    # arc, and whether it is 25 or 80 words changes the balance between scene and action.
     words: int

@@ -96,11 +96,9 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def _no_real_scene_captioner(monkeypatch):
-    from app import caption_queue
     from app.config import settings
     from app.joycaption import reset_scene_health
     monkeypatch.setattr(settings, "scene_caption_url", "")
-    monkeypatch.setattr(caption_queue, "motion_queue", caption_queue.CaptionQueue())
     reset_scene_health()
     yield
     reset_scene_health()
@@ -133,7 +131,7 @@ def _no_real_lora_bucket(monkeypatch):
 # ---------------------------------------------------------------------------
 # Routing by mode (wanly-api#392)
 #
-# Motion captions and edits ask every live box for its mode before using the configured URL.
+# Image-description captions and edits ask every live box for its mode before using the configured URL.
 # A test must never reach a real box's control API, so by default no box reports a mode --
 # which is exactly the old single-URL behaviour most tests were written against. Tests of the
 # routing stub worker_modes._fetch with boxes of their own.

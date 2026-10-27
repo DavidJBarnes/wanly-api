@@ -284,14 +284,8 @@ class ImageMeta(Base):
     # CaptionResponse returns it.
     scene_instruction = mapped_column(Text, nullable=True)
     scene_described_at = mapped_column(DateTime(timezone=True), nullable=True)
-    # The same frame read as the first frame of a 10-second clip — the motion half of the
-    # prompt (wanly-api#326). Produced in the same session as the static half and grounded
-    # on it, so the two cannot describe different people. Null until the Qwen path exists:
-    # a caption written before #326 has a static half and no motion half, and that is the
-    # normal state for the whole existing library, not a failure to retry.
-    motion_description = mapped_column(Text, nullable=True)
-    motion_instruction = mapped_column(Text, nullable=True)
-    motion_described_at = mapped_column(DateTime(timezone=True), nullable=True)
+    # (motion_description / motion_instruction / motion_described_at held the retired motion
+    # caption half, wanly-api#326; dropped by migration 122, wanly-api#481.)
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     def is_empty(self) -> bool:
@@ -302,8 +296,7 @@ class ImageMeta(Base):
         GPU work over a tag edit.
         """
         return (not (self.tags or "").strip()
-                and not (self.scene_description or "").strip()
-                and not (self.motion_description or "").strip())
+                and not (self.scene_description or "").strip())
 
 
 class Worker(Base):

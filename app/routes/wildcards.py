@@ -29,8 +29,9 @@ router = APIRouter()
 # captioner is ever called. The render would look plausible and be wrong. So for SCENE this
 # reservation is not belt-and-braces; it is the only guard there is.
 #
-# MOTION (wanly-api#335) inherits SCENE's reasoning verbatim: same after-wildcards ordering,
-# same model-output-is-not-input rule, so the reservation is likewise its only guard.
+# MOTION (wanly-api#335) was the retired motion caption half's placeholder (removed in
+# wanly-api#481). It STAYS reserved: old poses still carry <MOTION>, and the API strips it at
+# submit and claim -- a wildcard named MOTION would substitute into those prompts first.
 RESERVED_WILDCARD_NAMES = {"TRIGGER", "TRIGGER2", "SCENE", "MOTION"}
 
 
