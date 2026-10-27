@@ -26,6 +26,7 @@ from app.routes.captions import caption_image_bytes, caption_image_scene
 from app.schemas.images import (BulkImageTagsUpdate, CaptionLane, CaptionQueueEntry,
                                 CaptionQueueStatus, ImagesInUseRequest,
                                 CaptionTicket, CaptionTryRequest, CaptionTryResponse,
+                                EnhancePromptResponse,
                                 ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate)
 from app.tag_filter import like_escape, normalise_tag
 from app.tag_filter import tag_clause as _tag_clause
@@ -65,7 +66,8 @@ async def _meta_by_path(db: AsyncSession, paths: list[str]) -> dict[str, dict]:
         return {}
     rows = (await db.execute(
         select(ImageMeta.path, ImageMeta.tags,
-               ImageMeta.scene_description, ImageMeta.scene_described_at)
+               ImageMeta.scene_description, ImageMeta.scene_described_at,
+               ImageMeta.enhanced_prompt, ImageMeta.enhanced_prompt_at)
         .where(ImageMeta.path.in_(paths))
     )).all()
     return {
@@ -73,12 +75,15 @@ async def _meta_by_path(db: AsyncSession, paths: list[str]) -> dict[str, dict]:
             "tags": row[1] or None,
             "scene_description": row[2] or None,
             "scene_described_at": row[3],
+            "enhanced_prompt": row[4] or None,
+            "enhanced_prompt_at": row[5],
         }
         for row in rows
     }
 
 
-_NO_META = {"tags": None, "scene_description": None, "scene_described_at": None}
+_NO_META = {"tags": None, "scene_description": None, "scene_described_at": None,
+            "enhanced_prompt": None, "enhanced_prompt_at": None}
 
 
 def _meta_fields(meta) -> dict:
@@ -99,6 +104,8 @@ def _meta_fields(meta) -> dict:
             "tags": meta.tags or None,
             "scene_description": meta.scene_description or None,
             "scene_described_at": meta.scene_described_at,
+            "enhanced_prompt": meta.enhanced_prompt or None,
+            "enhanced_prompt_at": meta.enhanced_prompt_at,
         }
     return dict(meta)
 
@@ -612,6 +619,8 @@ async def move_images(body: dict, db: AsyncSession = Depends(get_db)):
             scene_description=meta.scene_description,
             scene_instruction=meta.scene_instruction,
             scene_described_at=meta.scene_described_at,
+            enhanced_prompt=meta.enhanced_prompt,
+            enhanced_prompt_at=meta.enhanced_prompt_at,
         ))
         await db.delete(meta)
     # A CHARACTER'S SHEET OR FACE REF MOVES WITH THE IMAGE (wanly-console#581). The row names
@@ -1046,6 +1055,8 @@ def _scene_response(path: str, meta: ImageMeta | None) -> ImageSceneResponse:
         scene_description=description,
         scene_instruction=(meta.scene_instruction if meta else None) or None,
         scene_described_at=meta.scene_described_at if meta else None,
+        enhanced_prompt=(meta.enhanced_prompt if meta else None) or None,
+        enhanced_prompt_at=meta.enhanced_prompt_at if meta else None,
         words=len(description.split()) if description else 0,
         caption=_ticket_response(path, caption_tickets.latest(path)),
         scene_caption=_ticket_response(path, caption_tickets.latest(path, caption_tickets.SCENE)),
@@ -1274,6 +1285,55 @@ async def describe_image_scene(
                             detail=scene.error or "the caption failed")
     meta = await db.get(ImageMeta, path, populate_existing=True)
     return _scene_response(path, meta)
+
+
+@router.post("/images/enhance-prompt", response_model=EnhancePromptResponse,
+             dependencies=[Depends(get_current_user)])
+async def enhance_image_prompt(path: str = Query(...), db: AsyncSession = Depends(get_db)):
+    """Send this image and its scene description to the Sulphur-2 prompt enhancer and keep the
+    video prompt it writes (wanly-api#480), replacing any previous one.
+
+    The scene description is required: it is the text the enhancer expands, and the words the
+    person already accepted for this frame. 409 without one -- describe the scene first.
+
+    Synchronous: the enhancer loads per request on the 2070 (it takes turns with the scene
+    captioner), so a cold call is ~10 s of load plus ~20 s of writing. 503 when the enhancer
+    is off or down -- it is a service on another host.
+    """
+    from app import prompt_enhance
+
+    _require_known_bucket(path)
+    if not prompt_enhance.enabled():
+        raise HTTPException(status_code=503, detail="the prompt enhancer is switched off")
+    meta = await db.get(ImageMeta, path)
+    scene = ((meta.scene_description if meta else None) or "").strip()
+    if not scene:
+        raise HTTPException(status_code=409,
+                            detail="this image has no scene description yet -- describe the "
+                                   "scene first; the enhancer expands it")
+    # Not holding a pooled connection through a ~30 s call (console#559).
+    await release_connection(db)
+    try:
+        image = await asyncio.to_thread(download_bytes, path)
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"could not read {path}: {e}") from e
+    try:
+        out = await prompt_enhance.enhance(image, scene)
+    except prompt_enhance.EnhanceError as e:
+        logger.warning("prompt enhance failed for %s: %s", path, e)
+        raise HTTPException(status_code=503, detail=str(e)) from e
+
+    now = datetime.now(timezone.utc)
+    meta = await db.get(ImageMeta, path, populate_existing=True)
+    if meta is None:
+        # Deleted (or its description cleared and the row dropped) while we waited.
+        meta = ImageMeta(path=path)
+        db.add(meta)
+    meta.enhanced_prompt = out["prompt"]
+    meta.enhanced_prompt_at = now
+    await db.commit()
+    return EnhancePromptResponse(path=path, enhanced_prompt=out["prompt"], enhanced_prompt_at=now,
+                                 words=len(out["prompt"].split()), ms=out["ms"], cold=out["cold"])
 
 
 @router.post("/images/scene/try", response_model=CaptionTryResponse,

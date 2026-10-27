@@ -180,6 +180,9 @@ class ImageSceneResponse(BaseModel):
     # different artefacts and the row has to say which this is.
     scene_instruction: Optional[str] = None
     scene_described_at: Optional[datetime] = None
+    # The Sulphur-2 prompt enhancer's video prompt (wanly-api#480). None = never enhanced.
+    enhanced_prompt: Optional[str] = None
+    enhanced_prompt_at: Optional[datetime] = None
     # Length is the thing being judged: the description sits beside a ~100-word arc, and
     # whether it is 25 or 80 words changes the balance between scene and action.
     words: int = 0
@@ -195,3 +198,14 @@ class ImageSceneResponse(BaseModel):
     # (console#590 named it per half).
     caption: Optional[CaptionTicket] = None
     scene_caption: Optional[CaptionTicket] = None
+
+
+class EnhancePromptResponse(BaseModel):
+    """POST /images/enhance-prompt (wanly-api#480): the saved prompt and what it cost."""
+    path: str
+    enhanced_prompt: str
+    enhanced_prompt_at: datetime
+    words: int
+    #: Milliseconds the enhancer took, and whether it had to load the model first.
+    ms: Optional[int] = None
+    cold: bool = False

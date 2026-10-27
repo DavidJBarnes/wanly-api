@@ -98,6 +98,12 @@ class Settings(BaseSettings):
     # After the scene service fails to answer, how long to send scene captions straight to the
     # fallback instead of paying a connect timeout per caption.
     scene_caption_down_s: float = 60.0
+    # THE PROMPT ENHANCER (wanly-api#480, wanly-gpu-docker#225): SulphurAI's Sulphur-2 prompt
+    # enhancer (Qwen3.5-9B VL) on the 2070 beside the scene captioner. It loads per request --
+    # the 2070 cannot hold it and JoyCaption at once, so a cold enhance pays a ~10 s load and
+    # may wait for a caption in flight; generation is ~500 tokens. Empty turns the button off.
+    prompt_enhance_url: str = "http://3090a:11438"
+    prompt_enhance_timeout_s: int = 600
     # The caption hold (console#562): how long a segment waits for its start image's caption
     # before it goes to caption_failed and asks the person what to do. Generous on purpose:
     # the wait includes the captioner being refused while the box beside it renders, and a
