@@ -29,6 +29,7 @@ from app.schemas.images import (BulkImageTagsUpdate, CaptionLane, CaptionQueueEn
                                 ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate)
 from app.tag_filter import like_escape, normalise_tag
 from app.tag_filter import tag_clause as _tag_clause
+from app.tag_filter import tag_prefix_clause
 from app.s3 import (
     delete_object,
     delete_prefix,
@@ -1447,8 +1448,10 @@ def image_filter(q: str | None, tags: list[str], exclude: list[str]) -> list:
     if q and q.strip():
         q = q.strip()
         # The description joins q under an OR with the filename (wanly-console#447): the
-        # filename matches as a fragment, the description as whole words.
-        clauses.append(or_(path_clause(q), description_clause(q)))
+        # filename matches as a fragment, the description as whole words. Tags match by their
+        # START (wanly-api#475): the character icon picker has only this box, and "gena" found
+        # none of the 62 images tagged Gena. Pills stay exact, so pill Kelly is never KellyYoung.
+        clauses.append(or_(path_clause(q), description_clause(q), tag_prefix_clause(ImageMeta.tags, q)))
     return clauses
 
 

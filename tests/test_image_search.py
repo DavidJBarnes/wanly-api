@@ -1,6 +1,7 @@
 """Image search: whole tags that AND, and a filename fragment that does not.
 
-Two controls, two jobs. `tags` matches a tag in full; `q` matches the S3 key as a substring.
+Two controls, two jobs. `tags` matches a tag in full; `q` matches the S3 key as a substring, and
+a tag by its start (wanly-api#475).
 
 The split exists because one substring search cannot serve both. Filenames need fragments --
 images arrive named "00111-1696092597-swapped.png", get referred to by that number in job configs
@@ -108,11 +109,24 @@ class TestAgainstTheDatabase:
         await self._seed(db)
         assert await self._paths(db, q="untagged") == {"00116-untagged.png"}
 
-    async def test_q_no_longer_matches_tags(self, db):
-        # Deliberate change. Fragment matching is right for filenames and wrong for tags, and
-        # "kelly" as free text was returning three quarters of the repo.
+    async def test_q_matches_the_start_of_a_tag(self, db):
+        # wanly-api#475: the character icon picker searches with q alone, and "gena" found none
+        # of the images tagged Gena. Same rule as the Videos search box (#473).
         await self._seed(db)
-        assert await self._paths(db, q="Missionary") == set()
+        assert await self._paths(db, q="gena") == {"00115.png"}
+        assert await self._paths(db, q="Mission") == {"00111-kelly.png"}
+
+    async def test_q_does_not_match_the_middle_of_a_tag(self, db):
+        # Prefix, not substring: "dick" is inside "Big dick", "ssion" inside Missionary.
+        await self._seed(db)
+        assert await self._paths(db, q="ssion") == set()
+        assert await self._paths(db, q="dick") == set()
+
+    async def test_typed_kelly_is_broad_but_the_pill_is_exact(self, db):
+        # The trade made on purpose: free text forgives, the pill is the exact control.
+        await self._seed(db)
+        assert len(await self._paths(db, q="kelly")) == 4
+        assert len(await self._paths(db, tags=["Kelly"])) == 2
 
     async def test_q_matches_a_description_fragment(self, db):
         # wanly-console#447: "the one where she's wearing the red dress" is a search by content
