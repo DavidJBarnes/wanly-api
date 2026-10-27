@@ -38,3 +38,17 @@ def tag_clause(column, tag: str):
     return func.concat(",", func.replace(func.lower(column), " ", ""), ",").like(
         pattern, escape="\\"
     )
+
+
+def tag_prefix_clause(column, fragment: str):
+    """Match any tag in `column` that STARTS WITH `fragment` -- the search box's tag half.
+
+    A whole-tag `q` meant typing "three" found nothing tagged Threesome (wanly-api#473). Prefix,
+    not substring: a leading comma anchors the fragment to the start of a tag, so "ar" finds AR
+    but not KarOline or stARlight. Exactness is still there for whoever wants it: the tag pills
+    use tag_clause, so pill Kelly is Kelly and never KellyYoung.
+    """
+    pattern = f"%,{like_escape(normalise_tag(fragment))}%"
+    return func.concat(",", func.replace(func.lower(column), " ", ""), ",").like(
+        pattern, escape="\\"
+    )
