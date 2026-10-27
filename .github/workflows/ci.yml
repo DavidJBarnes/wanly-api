@@ -38,19 +38,27 @@ jobs:
           python-version: '3.12'
       # The clip tests (#411) run the real ffmpeg: normalization is the feature, so a skip
       # there would pass a broken upload.
-      # Bounded (#477): an unbounded apt step hung three runs in a row on a stuck mirror.
-      # Short network timeouts + retries fail a dead mirror fast and let a slow one recover.
+      # Static ffmpeg + ffprobe from GitHub release storage (#477): apt on the runner hung or
+      # failed on four runs in one afternoon, a stalled Ubuntu mirror. apt stays as a bounded
+      # fallback rather than the only route.
       - name: Install ffmpeg
+        id: ffmpeg
+        continue-on-error: true
+        timeout-minutes: 5
+        uses: FedericoCarboni/setup-ffmpeg@v3
+      - name: Install ffmpeg (apt fallback)
+        if: steps.ffmpeg.outcome != 'success'
         timeout-minutes: 8
         run: |
           APT="-o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30"
           for attempt in 1 2 3; do
-            sudo timeout 150 apt-get $APT update -qq \
-              && sudo timeout 150 apt-get $APT install -y -qq --no-install-recommends ffmpeg \
+            sudo timeout 150 apt-get $APT update \
+              && sudo timeout 150 apt-get $APT install -y --no-install-recommends ffmpeg \
               && break
             echo "apt attempt $attempt failed; retrying"; sleep 10
           done
-          ffmpeg -version | head -1
+      - name: Check ffmpeg
+        run: ffmpeg -version | head -1 && ffprobe -version | head -1
       - name: Install dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt pytest pytest-asyncio
       - name: Test
