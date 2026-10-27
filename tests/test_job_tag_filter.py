@@ -5,7 +5,8 @@ Two issues, one fix. Videos could only be narrowed by a substring search over na
 "AR" to find AR videos returned everything whose name or tags merely contained "ar").
 
 So `tags` matches a tag in FULL and every pill ANDs, while `q` keeps matching the job NAME as a
-fragment -- a half-remembered name is often the only handle there is -- but matches tags whole.
+fragment -- a half-remembered name is often the only handle there is -- and matches a tag by its
+start (#473: "three" has to find Threesome), never by a substring.
 
 These run against real Postgres: the whole point is what the database does with commas and
 NULLs, and a rendered-SQL assertion would test the string rather than the behaviour.
@@ -83,7 +84,7 @@ class TestJobFilter:
         user = await self._seed(db)
         assert "untagged take" not in await self._names(db, user, status_filter="finalized", tags=["kelly"])
 
-    async def test_search_matches_a_whole_tag_not_a_fragment_of_one(self, db):
+    async def test_search_matches_a_whole_tag(self, db):
         # The #353 fix, tag half: q=AR still finds the AR-*tagged* job, and no longer drags in
         # the one tagged `argentina` or `starlight` purely on those tags.
         user = await self._seed(db)
@@ -136,6 +137,65 @@ class TestJobFilter:
         # A tag of "%" must not become match-everything.
         user = await self._seed(db)
         assert await self._names(db, user, status_filter="finalized", tags=["%"]) == set()
+
+
+@pytest.mark.asyncio
+class TestSearchTagPrefix:
+    """#473: the search box finds a tag from its first letters.
+
+    David added `Threesome` by hand, typed "three" and got nothing, because `q` only matched
+    tags whole. Names here deliberately share nothing with the tags, so every hit is a tag hit.
+    """
+
+    async def _seed(self, db):
+        user = User(username=str(uuid.uuid4()), password_hash="x")
+        db.add(user)
+        await db.flush()
+        for name, tags in [
+            ("clip 1", "Kelly, Pawg, Threesome"),
+            ("clip 2", "Karoline, Doggystyle"),
+            ("clip 3", "KellyYoung, Big dick"),
+            ("clip 4", None),
+        ]:
+            db.add(Job(
+                user_id=user.id, name=name, tags=tags, status=JobStatus.FINALIZED,
+                width=640, height=640, fps=60, seed=1000,
+            ))
+        await db.flush()
+        return user
+
+    async def _names(self, db, user, **kwargs):
+        clauses = job_filter(user_id=user.id, status_filter="finalized", **kwargs)
+        return set((await db.execute(select(Job.name).where(*clauses))).scalars().all())
+
+    async def test_the_start_of_a_tag_finds_it(self, db):
+        user = await self._seed(db)
+        assert await self._names(db, user, search="thr") == {"clip 1"}
+
+    async def test_any_tag_in_the_list_not_just_the_first(self, db):
+        user = await self._seed(db)
+        assert await self._names(db, user, search="dogg") == {"clip 2"}
+
+    async def test_the_middle_of_a_tag_does_not(self, db):
+        # Prefix, not substring: "some" is inside Threesome, "aro" inside Karoline.
+        user = await self._seed(db)
+        assert await self._names(db, user, search="some") == set()
+        assert await self._names(db, user, search="aro") == set()
+
+    async def test_case_and_spaces_are_ignored(self, db):
+        user = await self._seed(db)
+        assert await self._names(db, user, search="BIG D") == {"clip 3"}
+
+    async def test_typed_kelly_is_broad_but_the_pill_is_exact(self, db):
+        # The trade made on purpose: free text is the forgiving control, the pill the exact one.
+        user = await self._seed(db)
+        assert await self._names(db, user, search="kelly") == {"clip 1", "clip 3"}
+        assert await self._names(db, user, tags=["kelly"]) == {"clip 1"}
+
+    async def test_like_wildcards_in_the_search_are_escaped(self, db):
+        user = await self._seed(db)
+        assert await self._names(db, user, search="%") == set()
+        assert await self._names(db, user, search="_") == set()
 
 
 @pytest.mark.asyncio

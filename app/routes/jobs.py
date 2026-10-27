@@ -34,7 +34,7 @@ from app.routes.segments import (
     _refuse_draft_submit, _refuse_empty_submit, _resolve_trigger, _resolve_wildcards_outside_scene,
 )
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
-from app.tag_filter import like_escape, tag_clause
+from app.tag_filter import like_escape, tag_clause, tag_prefix_clause
 
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -261,9 +261,9 @@ def job_filter(
     to contain "ar"; `q` matches the job NAME as a fragment, because a half-remembered name is
     often the only handle there is.
 
-    `q` also matches a whole tag, so typing a tag name still finds it -- but it no longer matches
-    tags by substring, which is what made searching "AR" return jobs tagged `argentina` or
-    `starlight` (#353).
+    `q` also matches any tag that STARTS WITH the typed text, so "three" finds Threesome (#473).
+    Never a substring of a tag, which is what made searching "AR" return jobs tagged `starlight`
+    (#353).
 
     Tag pills are strictly conjunctive: each one narrows, so two pills mean "both tags on one
     job". There is no OR.
@@ -275,7 +275,7 @@ def job_filter(
         clauses.append(
             or_(
                 Job.name.ilike(f"%{like_escape(search.strip())}%", escape="\\"),
-                tag_clause(Job.tags, search),
+                tag_prefix_clause(Job.tags, search),
             )
         )
     clauses += [tag_clause(Job.tags, t) for t in (tags or []) if t.strip()]
