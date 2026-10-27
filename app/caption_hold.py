@@ -1,26 +1,20 @@
-"""Hold a segment until the caption its prompt needs exists (console#562).
+"""Hold a segment until the scene caption its prompt needs exists (console#562).
 
 WHAT WAS WRONG
 
-    A pose fills <SCENE> and <MOTION> from its start image's saved captions (see
-    _resolve_scene in app/routes/segments.py). Before this, the two halves failed in two
-    different ways, and both were silent:
-
-      * <SCENE> on a cache miss was captioned AGAIN, synchronously, inside the submit. The
-        submit blocked for the length of a caption, and the words it baked in were not the
-        ones the image modal was producing at that moment -- two captions of one image, two
-        different descriptions, and the render used whichever the API happened to make.
-      * <MOTION> is cache-only and, if nothing was saved by the time a worker claimed the
-        segment, was DROPPED. Caption an image, click Use as Starting Image, submit: if the
-        3090 claimed before the motion paragraph landed, the render ran without it and
-        nothing said so.
+    A pose fills <SCENE> from its start image's saved caption (see _resolve_scene in
+    app/routes/segments.py). Before this, <SCENE> on a cache miss was captioned AGAIN,
+    synchronously, inside the submit. The submit blocked for the length of a caption, and the
+    words it baked in were not the ones the image modal was producing at that moment -- two
+    captions of one image, two different descriptions, and the render used whichever the API
+    happened to make.
 
 WHAT THIS DOES
 
-    A segment whose prompt needs a caption half that is not saved yet is created
-    AWAITING_CAPTION instead of PENDING, and the submit returns at once. The claim endpoint
-    only ever hands out PENDING, so a held segment is not claimable by construction -- no
-    daemon change, no race with the claim.
+    A segment whose prompt needs a scene that is not saved yet is created AWAITING_CAPTION
+    instead of PENDING, and the submit returns at once. The claim endpoint only ever hands
+    out PENDING, so a held segment is not claimable by construction -- no daemon change, no
+    race with the claim.
 
     One background waiter per IMAGE (not per segment) then gets the words:
 
@@ -32,14 +26,14 @@ WHAT THIS DOES
          TICKET (app/caption_tickets.py), single-flight per image, which takes a turn in the
          ordinary caption queue -- the same line the modal stands in. A describe clicked
          while the job's ticket is queued joins that ticket rather than queueing a second.
-      3. RELEASE. When every half a held segment needs is saved on the image's ImageMeta row,
-         the placeholders are filled from THAT row -- exactly the words the lightbox shows --
+      3. RELEASE. When the scene a held segment needs is saved on the image's ImageMeta row,
+         the placeholder is filled from THAT row -- exactly the words the lightbox shows --
          and the segment goes to PENDING.
 
     Failure is loud. A caption error, an unreadable image, or the captioner refusing for
     longer than caption_hold_timeout_s moves the segment to CAPTION_FAILED with the reason in
     error_message, and it stays there until a person picks Retry caption or Render without
-    (routes in app/routes/segments.py). Nothing here ever drops a half on its own.
+    (routes in app/routes/segments.py). Nothing here ever drops the scene on its own.
 
     State lives in the database, so a restart loses nothing but the in-memory waiters, and
     caption_hold_monitor re-creates those: once at startup and every caption_hold_sweep_s.
@@ -51,18 +45,19 @@ WHAT IT DOES NOT CHANGE
     * Continuations whose start image is not known yet (start_image NULL, index > 0) keep the
       deferral: the frame does not exist until the previous segment renders, so there is
       nothing to wait on. The claim resolves them exactly as before.
-    * <MOTION> gates whenever the prompt carries it and motion captioning can run
-      (motion_captioning_can_run: MOTION_CAPTION_ENABLED, true by default). Only with the
-      kill-switch off does <SCENE> gate alone -- then <MOTION> is filled if a paragraph
-      happens to be saved and is otherwise deferred to the claim and dropped there, because
-      waiting for a half that is switched off would be waiting forever. The claim refuses a
-      prompt that the drop leaves empty or trigger-only (console#577), so that case is loud.
+
+<MOTION> IS GONE (wanly-api#481)
+
+    There used to be a second, motion half with its own placeholder, gated here like the
+    scene. It was removed. A prompt that still carries <MOTION> (an old pose, a segment held
+    before the removal) never waits for it: the placeholder is stripped at submit, at release
+    and at the claim (segments._strip_legacy_motion), never held and never sent as text.
 
 THE PLACEHOLDER HAS TO ARRIVE
 
-    Everything here keys on a literal <SCENE>/<MOTION> in the submitted prompt. The console
-    used to delete an unfilled one before submitting, so this never fired and a Motion recipe
-    queued mid-caption rendered with an empty prompt (console#577). It now sends the bare
+    Everything here keys on a literal <SCENE> in the submitted prompt. The console used to
+    delete an unfilled one before submitting, so this never fired and a recipe queued
+    mid-caption rendered with an empty prompt (console#577). It now sends the bare
     placeholder; the API refuses a blank one at submit and at the claim either way.
 
 NEVER BLOCKS THE LOOP, NEVER HOLDS A CONNECTION ACROSS A CAPTION
@@ -91,7 +86,6 @@ from app.models import ImageMeta, Job, Segment
 logger = logging.getLogger(__name__)
 
 SCENE = "scene"
-MOTION = "motion"
 
 #: How often a waiter looks at the queue while joining a describe-kind turn that is not a
 #: caption ticket. Tickets are awaited directly; this is only the fallback.
@@ -120,64 +114,34 @@ def _seg():
 # Pure rules
 # ---------------------------------------------------------------------------------------
 
-def motion_captioning_can_run() -> bool:
-    """Can a caption of an image produce the motion paragraph at all?
-
-    MOTION_CAPTION_ENABLED, the env kill-switch from #326 -- true by default, and set false
-    only for a captioner whose model cannot answer the directional prompt. While it is on,
-    every caption this module makes (run_caption_pair / describe_motion) produces the
-    paragraph, so waiting for one is waiting for something that will come.
-    """
-    return bool(settings.motion_caption_enabled)
-
-
 def needed_halves(prompt: str | None) -> set[str]:
-    """The caption halves this prompt must wait for.
+    """The caption halves this prompt must wait for: the scene, whenever it carries <SCENE>.
 
-    <SCENE> whenever the prompt carries it. <MOTION> whenever the prompt carries it and
-    motion captioning can run -- a Motion recipe's prompt is little more than its trigger
-    phrase and <MOTION>, so rendering it without the paragraph renders nothing (console#577).
-    With the kill-switch off no caption will ever produce the paragraph, so waiting for one
-    would be waiting forever; the placeholder keeps its pre-#562 behaviour instead (filled if
-    saved, otherwise deferred to the claim, which refuses the prompt if that leaves it empty).
+    A legacy <MOTION> is never waited for (wanly-api#481); it is stripped instead.
     """
-    seg = _seg()
-    prompt = prompt or ""
-    out: set[str] = set()
-    if seg.SCENE_PLACEHOLDER in prompt:
-        out.add(SCENE)
-    if seg.MOTION_PLACEHOLDER in prompt and motion_captioning_can_run():
-        out.add(MOTION)
-    return out
+    return {SCENE} if _seg().SCENE_PLACEHOLDER in (prompt or "") else set()
 
 
 def saved_halves(meta: ImageMeta | None) -> dict[str, str]:
     """The words saved on an image's row, by half. A blank column is not a saved half."""
     out: dict[str, str] = {}
-    if meta is None:
-        return out
-    if (meta.scene_description or "").strip():
+    if meta is not None and (meta.scene_description or "").strip():
         out[SCENE] = meta.scene_description
-    if (meta.motion_description or "").strip():
-        out[MOTION] = meta.motion_description
     return out
 
 
 def fill_saved(prompt: str, meta: ImageMeta | None) -> str:
-    """Fill each placeholder that has saved words; leave the rest literal.
+    """Fill <SCENE> if it has saved words, leaving it literal otherwise; strip any legacy
+    <MOTION> (wanly-api#481).
 
-    The same single non-rescanning pass _resolve_scene uses, so words put in for one half can
-    never be read as the other half's placeholder. The text is the row's, verbatim: what the
-    lightbox shows is what renders.
+    str.replace does not rescan what it inserted, so caption words that happen to contain
+    "<SCENE>" stay words. The text is the row's, verbatim: what the lightbox shows is what
+    renders.
     """
     seg = _seg()
-    saved = saved_halves(meta)
-
-    def fill(m) -> str:
-        half = SCENE if m.group(0) == seg.SCENE_PLACEHOLDER else MOTION
-        return saved.get(half, m.group(0))
-
-    return seg._CAPTION_PLACEHOLDERS.sub(fill, prompt)
+    prompt = seg._strip_legacy_motion(prompt)
+    scene = saved_halves(meta).get(SCENE)
+    return prompt.replace(seg.SCENE_PLACEHOLDER, scene) if scene is not None else prompt
 
 
 def hold_image(start_image: str | None, index: int, job_starting_image: str | None) -> str | None:
@@ -244,8 +208,6 @@ def caption_in_flight(path: str, halves=None) -> bool:
     A caption ticket (app/caption_tickets.py) of one of `halves` (default: either), or -- for
     anything that takes a queue turn without one -- a describe-kind turn. Dataset captions and
     Settings tries take turns too, but write nothing on the image's row, so they are not worth
-    waiting for. Per half since console#590: a motion re-roll in flight does not hold a
-    segment that only uses the scene.
     """
     halves = tuple(halves) if halves else tickets.HALVES
     return any(tickets.active(path, h) is not None for h in halves) or caption_queue.in_flight(
@@ -267,8 +229,8 @@ async def settle(path: str, finishing=None) -> set[str]:
     on this image is held any more (all released, or none were). One short session, rows
     locked so a Retry or Render-without on the same segment cannot interleave.
 
-    A segment one of whose halves a person is re-rolling right now is NOT released, though
-    its words are saved (gate()'s rule, per half since console#590): the re-rolled words are
+    A segment whose scene a person is re-rolling right now is NOT released, though its words
+    are saved (gate()'s rule): the re-rolled words are
     the ones on the person's screen. Its hold waits for that re-roll. `finishing` is the
     ticket calling this as it saves -- it is still in flight, but it is not a re-roll to wait
     for any more.
@@ -354,13 +316,11 @@ def hold_place(path: str) -> dict:
     again (the box beside the captioner is rendering), or about to ask. None: no waiter at
     all -- the sweep gives it one within caption_hold_sweep_s.
     """
-    t = tickets.active(path)  # the scene's first: the motion may be waiting on it
+    t = tickets.active(path)
     depth = caption_queue.depth()
     note = _notes.get(path)
     if t is not None:
         v = tickets.view(t)
-        # The depth of the lane the ticket is in: a motion paragraph's place is in the motion
-        # lane (wanly-console#572), and "#1 of 1" beside a 9-deep scene lane would be wrong.
         return {"queue_status": v["status"], "queue_position": v["position"],
                 "queue_depth": v["depth"], "note": note, "lane": v.get("lane")}
     st = caption_queue.status(path)
@@ -373,9 +333,8 @@ def hold_place(path: str) -> dict:
             "queue_depth": depth, "note": note, "lane": None}
 
 
-#: Images whose hold is waiting because no box is in motion mode (wanly-api#392), with the
-#: reason. Their tickets are not in any lane while they wait, so the per-mode summary counts
-#: them from here.
+#: Images whose hold is waiting because no box is in the mode the scene's fallback captioner
+#: needs (wanly-api#392: the scene service down and no box in "motion" mode), with the reason.
 _mode_waits: dict[str, str] = {}
 
 
@@ -391,8 +350,7 @@ def wait_note(path: str) -> str | None:
     if place["queue_status"] == "running":
         where = "captioning now"
     elif place["queue_status"] == "queued" and place["queue_position"]:
-        lane = "motion caption queue" if place.get("lane") == "motion" else "caption queue"
-        where = f"#{place['queue_position']} of {place['queue_depth']} in the {lane}"
+        where = f"#{place['queue_position']} of {place['queue_depth']} in the caption queue"
     else:
         where = None
     parts = [p for p in (note, where) if p]
@@ -400,9 +358,9 @@ def wait_note(path: str) -> str | None:
 
 
 def missing_halves(prompt: str | None, meta: ImageMeta | None) -> list[str]:
-    """What a held prompt is still waiting for, in a fixed order: ["scene", "motion"]."""
+    """What a held prompt is still waiting for: ["scene"] or []."""
     missing = needed_halves(prompt) - saved_halves(meta).keys()
-    return [h for h in (SCENE, MOTION) if h in missing]
+    return [h for h in (SCENE,) if h in missing]
 
 
 async def held_jobs(path: str) -> tuple[set[str], dict[str, list[dict]]]:
@@ -410,8 +368,7 @@ async def held_jobs(path: str) -> tuple[set[str], dict[str, list[dict]]]:
     ({half}, {half: [{"job_id", "name"}]}).
 
     The jobs are what a caption ticket the hold asks for carries as `requested_by`, so the
-    image can say "Motion requested by job ..." (console#590) -- a motion caption nobody
-    clicked for.
+    image can say "requested by job ..." (console#590) -- a caption nobody clicked for.
     """
     async with async_session() as db:
         rows = (await db.execute(
@@ -441,11 +398,7 @@ async def _hold(path: str) -> None:
 
     Everything goes through caption tickets (app/caption_tickets.py), the same single-flight
     table describe uses, so "join the caption already running" and "make one" are the same
-    call: request() hands back the image's ticket for that half if there is one. One ticket
-    PER HALF the held segments still need (console#590): a job missing only its motion asks
-    for the motion alone, and the scene a person already read is never re-made for it. A
-    motion ticket on an image with no scene asks for the scene itself (it cannot be grounded
-    on nothing).
+    call: request() hands back the image's scene ticket if there is one.
 
     TIME LIMIT. caption_hold_timeout_s bounds how long the captioner may keep REFUSING (the
     box beside it rendering), counted from the first refusal in a row. It does not bound time
@@ -468,10 +421,13 @@ async def _hold(path: str) -> None:
 
             used, jobs = await held_jobs(path)
             if not used:
-                return  # nothing held here any more
+                # Nothing held here needs a caption any more -- or only a legacy <MOTION> did
+                # (wanly-api#481), which settle() strips on release.
+                await settle(path)
+                return
             # A person's re-roll of a half these segments use is waited for, never released
             # ahead of (gate()'s rule): its words are about to be on the person's screen.
-            rerolls = [tickets.active(path, h) for h in (SCENE, MOTION)
+            rerolls = [tickets.active(path, h) for h in (SCENE,)
                        if h in used and _needs_now(path, h)]
             if rerolls:
                 _notes[path] = "waiting for the caption already running for this image"
@@ -484,7 +440,7 @@ async def _hold(path: str) -> None:
             if not outstanding:
                 return
             waits: list[tuple[str, tickets.Ticket, bool]] = []
-            for half in (SCENE, MOTION):
+            for half in (SCENE,):
                 if half in outstanding:
                     t, joined = tickets.request(
                         path, half, origin="hold", precheck=_precheck(path, half),
@@ -495,7 +451,7 @@ async def _hold(path: str) -> None:
             await asyncio.gather(*(t.wait() for _, t, _ in waits))
 
             refused: str | None = None
-            #: Every refusal was "no GPU in motion mode" (wanly-api#392): no time limit.
+            #: Every refusal was "no GPU in <mode> mode" (wanly-api#392): no time limit.
             mode_only = True
             for half, t, own in waits:
                 if t.status != tickets.FAILED or t.withdrawn:

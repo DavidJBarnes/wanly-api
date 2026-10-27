@@ -1,13 +1,15 @@
-"""Two captioners, one per half (wanly-console#572 phase 1).
+"""Two captioners (wanly-console#572 phase 1).
 
-The scene goes to JoyCaption on the scene-caption service; the motion paragraph to the shared
-captioner that used to do both (image_description_*). Pinned here:
+The scene goes to JoyCaption on the scene-caption service; everything else (dataset clip
+sheets, the scene's fallback) to the image-description captioner (image_description_*,
+motion_captioner() -- named for the "motion" worker mode). Pinned here:
 
-  * the motion captioner inherits every image_description_* value it does not set, so nothing
-    changes until the new settings are set;
+  * the image-description captioner is exactly the image_description_* settings (the
+    motion_caption_* overrides went with the motion half, wanly-api#481);
   * the scene service is never refused for a render, and when it is down the scene falls back
     to the shared captioner -- loudly, and without paying a connect timeout per caption;
-  * the render refusal matches the MOTION captioner's host, never the scene service's.
+  * the render refusal matches the image-description captioner's host, never the scene
+    service's.
 """
 import logging
 import uuid
@@ -29,10 +31,6 @@ def unsplit(monkeypatch):
     monkeypatch.setattr(settings, "image_description_keep_alive", "15m")
     monkeypatch.setattr(settings, "image_description_num_ctx", 4096)
     monkeypatch.setattr(settings, "image_description_timeout_s", 600)
-    for k in ("motion_caption_url", "motion_caption_model", "motion_caption_keep_alive"):
-        monkeypatch.setattr(settings, k, "")
-    monkeypatch.setattr(settings, "motion_caption_num_ctx", 0)
-    monkeypatch.setattr(settings, "motion_caption_timeout_s", 0)
 
 
 @pytest.fixture
@@ -79,28 +77,26 @@ def _down_for(host):
 
 
 class TestTheSettings:
-    def test_the_defaults_point_the_scene_at_3090b_and_inherit_the_motion(self, monkeypatch):
+    def test_the_defaults_point_the_scene_at_3090b(self, monkeypatch):
         monkeypatch.setenv("DATABASE_URL", "sqlite://")
         monkeypatch.setenv("JWT_SECRET", "x")
         s = Settings(_env_file=None)
         assert s.scene_caption_url == "http://3090b.zero:11436"
         assert s.scene_caption_model == "joycaption:beta-one"
         assert s.scene_caption_keep_alive == "-1"
-        # Empty = inherit image_description_* (what EC2's env pins to 3090a's captioner).
-        assert s.motion_caption_url == "" and s.motion_caption_model == ""
+        # The motion half's settings are gone (wanly-api#481).
+        assert not hasattr(s, "motion_caption_url")
+        assert not hasattr(s, "motion_caption_enabled")
 
-    def test_the_motion_captioner_inherits_every_unset_value(self, unsplit):
+    def test_the_image_description_captioner_is_the_image_description_settings(self, unsplit):
         cap = jc.motion_captioner()
         assert (cap.url, cap.model, cap.keep_alive, cap.num_ctx, cap.timeout_s) == (
             "http://3090a.zero:11435", "qwen3-vl:32b", "15m", 4096, 600)
         assert cap.beside_render is True
 
-    def test_motion_settings_override_one_value_at_a_time(self, unsplit, monkeypatch):
-        monkeypatch.setattr(settings, "motion_caption_url", "http://3090b.zero:11435/")
-        monkeypatch.setattr(settings, "motion_caption_num_ctx", 8192)
-        cap = jc.motion_captioner()
-        assert cap.url == "http://3090b.zero:11435" and cap.num_ctx == 8192
-        assert cap.model == "qwen3-vl:32b"
+    def test_a_url_override_keeps_everything_else(self, unsplit):
+        cap = jc.motion_captioner("http://3090b.zero:11435/")
+        assert cap.url == "http://3090b.zero:11435" and cap.model == "qwen3-vl:32b"
 
     def test_an_empty_scene_url_turns_the_split_off(self, unsplit):
         assert jc.scene_captioner() is None
@@ -115,7 +111,7 @@ class TestTheRequest:
         rec = _Recorder(lambda url: _Resp())
         monkeypatch.setattr(jc.httpx, "AsyncClient", rec)
         await jc.describe(b"img", "scene please", captioner=jc.scene_captioner())
-        await jc.describe(b"img", "motion please")
+        await jc.describe(b"img", "clip sheet please")
         (u1, p1), (u2, p2) = rec.posts
         assert u1 == "http://3090b.zero:11436/api/generate"
         assert p1["model"] == "joycaption:beta-one" and p1["keep_alive"] == -1
@@ -185,13 +181,12 @@ class TestSceneFallback:
             await captions.describe_scene(b"img", "d", fallback)
 
 
-class TestTheRefusalIsTheMotionCaptioners:
+class TestTheRefusalIsTheImageDescriptionCaptioners:
     def _w(self, name):
         return Worker(id=uuid.uuid4(), friendly_name=name, hostname="h", ip_address="1.2.3.4",
                       kind="render", kinds=["render"], status="online-busy")
 
-    def test_the_motion_host_is_matched_and_the_scene_host_never_is(self, split, monkeypatch):
-        monkeypatch.setattr(settings, "motion_caption_url", "http://3090a.zero:11435")
+    def test_the_image_description_host_is_matched_and_the_scene_host_never_is(self, split):
         a, b = self._w("3090a.zero"), self._w("3090b.zero")
         assert jc.captioner_host() == "3090a.zero"
         assert jc.render_worker_beside_the_captioner([b, a]) is a

@@ -59,24 +59,21 @@ class TestTheRefusal:
     def test_the_interactive_path_refuses_by_name_and_claim_time_does_not(self):
         import inspect
         from app.routes import captions, segments
-        # The routing lives in _caption_base since #326 gave the static and motion calls
-        # one shared decision; the behaviour these lines pin is unchanged.
+        # The routing lives in _caption_base (#326); the behaviour these lines pin is unchanged.
         src = inspect.getsource(captions._caption_base)
         assert "busy_render_beside_the_captioner(db) if interactive else None" in src
         assert "base = captioner_for(busy, interactive)" in src
         assert "raise CaptionerBusy" in src
         # Since wanly-console#572 the scene half goes to the scene service, which shares no
         # render card and is never refused; only its FALLBACK -- the shared captioner -- goes
-        # through the busy-checked base, and so does every motion caption.
+        # through the busy-checked base, and so does every clip-sheet caption.
         assert "describe(image, instruction, base_url=base)" in inspect.getsource(
             captions.describe_scene)
         assert "base = await fallback_base()" in inspect.getsource(captions.describe_scene)
         assert "_caption_base(db, interactive)" in inspect.getsource(
             captions.caption_image_bytes)
-        assert "_caption_base(db, interactive)" in inspect.getsource(
-            captions.caption_image_pair)
-        src = inspect.getsource(captions.run_caption_pair)
-        assert "base = await base_for()" in src and "base_url=base" in src
+        # Dataset clip sheets go to the image-description captioner through the same gate.
+        assert "_caption_base(db, True)" in inspect.getsource(captions.caption_clip_sheet)
         # Claim-time <SCENE> resolution opts out: the worker was just handed the segment and
         # has not loaded the render; a failed caption there is non-fatal by design.
         assert "caption_image_bytes(db, image, interactive=False)" in inspect.getsource(segments)

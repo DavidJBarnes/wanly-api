@@ -28,7 +28,6 @@ WHERE IT RUNS
 import base64
 import hashlib
 import logging
-import re
 import time
 from dataclasses import dataclass
 
@@ -56,13 +55,14 @@ class CaptionerUnreachable(CaptionError):
 #
 # One URL and one model used to serve both halves, so a 3090 swapped two vision models per
 # image. Now each half has its own captioner, resolved here, and the image_description_*
-# settings are the motion half's fallback for every value it leaves unset.
+# settings are the image-description captioner's (the one on a box in "motion" mode).
 # ---------------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Captioner:
     """Where one half of a caption is made, and how the request to it is shaped."""
-    #: "scene" (JoyCaption on the scene-caption service) or "motion" (the shared captioner,
+    #: "scene" (JoyCaption on the scene-caption service) or "motion" (the image-description
+    #: captioner on a box in motion mode -- the worker mode's wire name -- the shared one,
     #: which also does the scene when the scene service is down or not configured).
     role: str
     url: str
@@ -77,21 +77,23 @@ class Captioner:
 
 
 def motion_captioner(url: str | None = None) -> Captioner:
-    """The motion half's captioner: motion_caption_*, each falling back to image_description_*.
+    """The image-description captioner (Qwen3-VL on a box in "motion" mode): image_description_*.
 
-    Also THE captioner for anything that is not the scene service -- the scene half when the
-    scene service is down, and the single captioner of a deployment that has not split them.
-    `url` overrides the address (captioner_for's choice of primary or fallback) and keeps
-    everything else.
+    Named for the worker mode it lives on, which is still spelled "motion" on the wire; the
+    motion caption half it was first built for is gone (wanly-api#481). It is THE captioner
+    for anything that is not the scene service -- dataset clip captions, the scene half when
+    the scene service is down, and the single captioner of a deployment that has not split
+    them. `url` overrides the address (captioner_for's choice of primary or fallback) and
+    keeps everything else.
     """
     s = settings
     return Captioner(
         role="motion",
-        url=(url or s.motion_caption_url or s.image_description_url).rstrip("/"),
-        model=s.motion_caption_model or s.image_description_model,
-        keep_alive=s.motion_caption_keep_alive or s.image_description_keep_alive,
-        num_ctx=s.motion_caption_num_ctx or s.image_description_num_ctx,
-        timeout_s=s.motion_caption_timeout_s or s.image_description_timeout_s,
+        url=(url or s.image_description_url).rstrip("/"),
+        model=s.image_description_model,
+        keep_alive=s.image_description_keep_alive,
+        num_ctx=s.image_description_num_ctx,
+        timeout_s=s.image_description_timeout_s,
         beside_render=True,
     )
 
@@ -231,7 +233,8 @@ TRAINING_CAPTION = (
 )
 
 
-#: The TRAINING caption for a dataset CLIP (wanly-api#411), asked of the motion captioner over
+#: The TRAINING caption for a dataset CLIP (wanly-api#411), asked of the image-description captioner
+#: (motion_captioner) over
 #: a 2x2 sheet of the clip's frames in reading order.
 #:
 #: WHY VERBS OF CHANGE. A clip is in the set to teach the face IN MOTION. A caption of stative
@@ -264,204 +267,11 @@ def instruction_for(style: str, custom: str = "") -> str:
     return CAPTION_STYLES.get(style, CAPTION_STYLES[DEFAULT_STYLE])
 
 
-# ---------------------------------------------------------------------------------------
-# Motion descriptions (wanly-api#326)
-#
-# The other half of the caption: the image read as the FIRST FRAME of a 10-second clip,
-# which is the prompt an image-to-video model actually wants. Prototyped on the 2070 with
-# qwen2.5vl on 2026-09-15/16; the findings below shaped these prompts and are load-bearing.
-#
-# 1. WITHOUT AN ANTI-HEDGE THE MODEL DESCRIBES A STILL PHOTO. Untuned it returned "her
-#    expression remains neutral... the camera remains steady" for every frame. "The action
-#    implied by the frame begins and continues throughout" plus an explicit ban on
-#    remains-still hedging is what produced real motion language.
-# 2. DIRECTION AND AMPLITUDE MUST BE ASKED FOR BY NAME ("up and down, deeper or shallower,
-#    in or out"). "Describe the motion" gets adjectives; the named axes get the verbs a
-#    video prompt needs.
-# 3. BEATS DON'T WORK. A 0-3s/3-7s/7-10s format reads beautifully but LTX has no timestamp
-#    syntax; one flowing paragraph is the form it can consume.
-# 4. STYLE TALK CROWDS OUT ACTION. The variant that asked the model to also choose a
-#    capture style answered with the man "remains still". The style sentence therefore sits
-#    at the END, after the action has claimed the word budget.
-# 5. GROUNDING ON THE STATIC CAPTION stops the two paragraphs contradicting each other
-#    (ungrounded, it invented hip motion on a hand-motion frame; grounded on a static half
-#    that says "holding his penis with both hands", the motion kept the hands).
-# ---------------------------------------------------------------------------------------
-
-MOTION_BASE = (
-    "Write a text-to-video prompt for a 10-second clip that begins with this exact frame. "
-    "The main action implied by the frame begins and continues throughout the clip. "
-    "Describe the action in explicit physical direction and amplitude: who moves, in which "
-    "direction (toward or away from the other person, deeper or shallower, up and down, "
-    "hips rocking in or out), how far and how fast, and how the rhythm changes over the ten "
-    "seconds. Cover how each person's body follows the motion - arching back, head tilting, "
-    "hands repositioning, gripping - and how expressions and eye contact evolve. Add "
-    "secondary motion: hair sway, skin, fabric stretching. "
-)
-
-MOTION_TAIL = (
-    " Single continuous shot, no cuts, no scene change. Do not hedge with 'remains still' "
-    "or 'slight shift' unless a person genuinely is static. One flowing paragraph, under "
-    "110 words, starting with the main subject."
-)
-
-#: Capture-style sentence, spliced in before the tail. Measured: a style preset changes the
-#: flavour of the output without stealing word budget from the action when it sits at the
-#: end ("none" exists for exactly that reason).
-MOTION_STYLE_PRESETS: dict[str, str] = {
-    # The house style for this material: consumer-cam realism.
-    "handheld": ("Render it as handheld footage with natural micro-shake and small "
-                 "reflexive reframing. "),
-    "amateur": ("Render it as amateur consumer-camera footage: micro-shake, available "
-                "indoor light, no cinematic polish. "),
-    "cinematic": ("Render it as cinematic footage: slow controlled push-in, shallow depth "
-                  "of field, filmic color. "),
-    "static": "Camera locked off on a tripod, no movement at all. ",
-    # No sentence at all — the model's own default, and the option that leaves the most
-    # words for the action.
-    "none": "",
-}
-MOTION_DEFAULT_STYLE = "handheld"
-
-#: Identity lock + the LTX-2.3 audio half. The soundscape sentence is free signal: LTX 2.3
-#: renders synced sound, and "soft gasps and moans, room tone" is promptable.
-MOTION_GROUNDING = "Keep both people's faces, bodies and wardrobe exactly as in the frame for the whole clip. End with one sentence on the soundscape over the ten seconds."
-
-
-#: The longest instruction either editor will store or send (console#555). Generous next to
-#: the defaults (~430 characters for "rich", ~1100 for the motion template) so an edit has
-#: room, but bounded: the instruction shares the captioner's context with the image, and a
-#: prompt the size of an essay is a mistake, not a style.
+#: The longest caption instruction the Settings editor will store or send (console#555).
+#: Generous next to the defaults (~430 characters for "rich") so an edit has room, but
+#: bounded: the instruction shares the captioner's context with the image, and a prompt the
+#: size of an essay is a mistake, not a style.
 PROMPT_MAX_CHARS = 4000
-
-# ---------------------------------------------------------------------------------------
-# The motion prompt as an editable template (console#555)
-#
-# Settings used to offer a "custom motion instruction" that REPLACED the prompt outright,
-# and silently took the scene grounding with it (finding 5 above). The prompt is now a
-# template, and the default is simply the pieces above laid out in it, so an override is an
-# edit of the real text rather than a blank box.
-#
-#   {style}                  the capture-style sentence for the chosen motion style
-#                            (MOTION_STYLE_PRESETS; "" for "none")
-#   {scene}                  the static caption, stripped
-#   {#scene}...{/scene}      a section kept only when there IS a scene; removed, markers
-#                            and all, when there is not
-#
-# THE SECTION IS WHY THIS IS NOT str.format. With no scene, today's prompt is not the
-# grounded one with an empty "Scene: " line -- the whole grounding (the "Scene:" header AND
-# the identity lock after the prompt) is absent. A template that cannot say "only when" can
-# only reproduce one of the two cases, and both are load-bearing. One flat, non-nesting
-# section is the least syntax that expresses it.
-#
-# Placeholders are {name} with an identifier inside; anything else in braces ("{a b}", a
-# lone "{") is literal text. An unknown identifier is a typo that would otherwise reach the
-# captioner verbatim, so saving one is refused (validate_motion_template). Rendering, by
-# contrast, never raises: a stored value predating validation still renders, unknowns left
-# as they are.
-#
-# A template with NO placeholders renders to itself -- which is exactly what a pre-#555
-# custom motion instruction meant (the whole prompt, no grounding). Existing overrides keep
-# their meaning without a migration or a special case.
-# ---------------------------------------------------------------------------------------
-
-MOTION_SCENE_OPEN = "{#scene}"
-MOTION_SCENE_CLOSE = "{/scene}"
-
-#: Renders to exactly what motion_instruction_for produced before #555, with and without a
-#: scene -- pinned by tests/test_motion_template.py. Built from the pieces rather than
-#: restated, so the text has one home and the findings above stay attached to it.
-MOTION_TEMPLATE = (
-    MOTION_SCENE_OPEN + "Scene: {scene}\n\n" + MOTION_SCENE_CLOSE
-    + MOTION_BASE + "{style}" + MOTION_TAIL
-    + MOTION_SCENE_OPEN + "\n\n" + MOTION_GROUNDING
-    + " Do not restate the scene description." + MOTION_SCENE_CLOSE
-)
-
-#: What each placeholder means, for the Settings legend. The API owns the list so the
-#: legend cannot drift from what the renderer accepts.
-MOTION_PLACEHOLDERS: dict[str, str] = {
-    "{scene}": "The image caption (the static half) this motion prompt is grounded on.",
-    "{style}": "The capture-style sentence for the chosen capture style; empty for None.",
-    "{#scene}...{/scene}": "Kept only when there is a scene caption; dropped entirely "
-                           "otherwise. Put the grounding inside it.",
-}
-
-_PLACEHOLDER = re.compile(r"\{([#/]?[A-Za-z_][A-Za-z0-9_]*)\}")
-_SCENE_SECTION = re.compile(re.escape(MOTION_SCENE_OPEN) + r"(.*?)"
-                            + re.escape(MOTION_SCENE_CLOSE), re.DOTALL)
-_KNOWN = {"scene", "style", "#scene", "/scene"}
-
-
-def validate_motion_template(template: str) -> str:
-    """Refuse a template the renderer would mangle. Returns it unchanged; raises ValueError.
-
-    Unknown placeholders ("{sceen}") and unbalanced or nested sections. The message names
-    the offending text, because it surfaces verbatim as the 422 the editor shows.
-    """
-    unknown = sorted({m.group(0) for m in _PLACEHOLDER.finditer(template)
-                      if m.group(1) not in _KNOWN})
-    if unknown:
-        raise ValueError(
-            f"unknown placeholder{'s' if len(unknown) > 1 else ''} {', '.join(unknown)}; "
-            "the motion template understands {scene}, {style} and {#scene}...{/scene}")
-    depth = 0
-    for m in _PLACEHOLDER.finditer(template):
-        if m.group(1) == "#scene":
-            if depth:
-                raise ValueError("{#scene} sections cannot be nested; close the first "
-                                 "with {/scene} before opening another")
-            depth = 1
-        elif m.group(1) == "/scene":
-            if not depth:
-                raise ValueError("{/scene} without a matching {#scene} before it")
-            depth = 0
-    if depth:
-        raise ValueError("{#scene} is never closed; add {/scene} where the section ends")
-    return template
-
-
-def render_motion_template(template: str, style_sentence: str, scene: str = "") -> str:
-    """Fill a motion template. Never raises; see the block comment above for the syntax.
-
-    One substitution pass, so a scene caption that happens to contain "{style}" is inserted
-    as text rather than expanded.
-    """
-    scene = (scene or "").strip()
-    text = _SCENE_SECTION.sub(lambda m: m.group(1) if scene else "", template)
-    values = {"scene": scene, "style": style_sentence}
-    text = _PLACEHOLDER.sub(lambda m: values.get(m.group(1), m.group(0)), text)
-    return text.strip()
-
-
-def motion_instruction_for(style: str, custom: str = "", scene: str = "") -> str:
-    """The motion instruction, grounded on the static caption when one is given.
-
-    `custom` is the saved motion template (console#555); empty means MOTION_TEMPLATE. It is
-    rendered like the default, so an override keeps its grounding for as long as it keeps
-    the {#scene} section. One with no placeholders at all -- every override written before
-    #555 -- renders to itself: the whole prompt, grounding and all, as it always meant.
-
-    `scene` is the static caption from the first call of the same session; it anchors
-    identity and wardrobe so the motion paragraph cannot contradict what the person just
-    read and accepted.
-    """
-    template = custom.strip() if custom and custom.strip() else MOTION_TEMPLATE
-    style_sentence = MOTION_STYLE_PRESETS.get(style,
-                                              MOTION_STYLE_PRESETS[MOTION_DEFAULT_STYLE])
-    return render_motion_template(template, style_sentence, scene)
-
-
-async def describe_motion(image_bytes: bytes, scene_description: str, style: str,
-                          custom: str = "", base_url: str | None = None) -> tuple[str, str]:
-    """The motion paragraph for an image, grounded on its static caption.
-
-    Returns (motion, instruction_used) — same provenance rule as the static caption: the
-    row must say how each half was made. Raises CaptionError; callers treat that as
-    non-fatal to the static half.
-    """
-    instruction = motion_instruction_for(style, custom, scene_description)
-    return await describe(image_bytes, instruction, base_url), instruction
 
 
 def image_key(image_bytes: bytes, instruction: str) -> str:
@@ -547,8 +357,8 @@ class NoGpuInMode(CaptionerBusy):
 
 
 def captioner_host() -> str:
-    """The host of the captioner that shares a card with a render stack: the MOTION
-    captioner's (image_description_url unless motion_caption_url is set) -- `3090.zero` for
+    """The host of the captioner that shares a card with a render stack: the
+    image-description captioner's (image_description_url) -- `3090.zero` for
     http://3090.zero:11434. The scene service is never this: it never shares a render card."""
     from urllib.parse import urlsplit
     return (urlsplit(motion_captioner().url).hostname or "").lower()
@@ -671,7 +481,7 @@ async def describe(image_bytes: bytes, instruction: str, base_url: str | None = 
     """Caption one image. Raises CaptionError; callers must treat that as non-fatal.
 
     `captioner` says which one and how to ask it (model, keep_alive, context, timeout); the
-    default is the motion captioner, which is also the single captioner of an unsplit
+    default is the image-description captioner, which is also the single captioner of an unsplit
     deployment. `base_url` overrides only the address -- captioner_for's choice.
     """
     cap = captioner or motion_captioner()

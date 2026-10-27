@@ -3,9 +3,8 @@
 ollama runs OLLAMA_NUM_PARALLEL=1, so concurrent describes were ALWAYS serialised -- they
 just did their waiting at the captioner, inside an HTTP request that could time out.
 Measured on the 3090 at ~25s a call and two calls an image, latency climbed 18s, 28s, 27s,
-42s, 57s, 1m10, 1m27 and then requests began failing -- with the scene half of the same
-image already stored and the motion half lost, which is what "scene described, but the
-motion caption failed" actually was.
+42s, 57s, 1m10, 1m27 and then requests began failing -- with part of the same image's work
+already stored and the rest lost.
 
 Waiting here instead buys two things the race could not: a known order, and a position every
 response can report.

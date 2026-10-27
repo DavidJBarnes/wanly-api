@@ -22,7 +22,7 @@ from app.database import async_session, get_db, release_connection
 from app.joycaption import CaptionError, CaptionerBusy
 from app.enums import JobStatus, SegmentStatus, TrainingStatus
 from app.models import Dataset, Favorite, ImageMeta, Job, LtxCharacter, Segment, TrainingJob, User
-from app.routes.captions import caption_image_pair, caption_image_scene
+from app.routes.captions import caption_image_bytes, caption_image_scene
 from app.schemas.images import (BulkImageTagsUpdate, CaptionLane, CaptionQueueEntry,
                                 CaptionQueueStatus, ImagesInUseRequest,
                                 CaptionTicket, CaptionTryRequest, CaptionTryResponse,
@@ -65,8 +65,7 @@ async def _meta_by_path(db: AsyncSession, paths: list[str]) -> dict[str, dict]:
         return {}
     rows = (await db.execute(
         select(ImageMeta.path, ImageMeta.tags,
-               ImageMeta.scene_description, ImageMeta.scene_described_at,
-               ImageMeta.motion_description, ImageMeta.motion_described_at)
+               ImageMeta.scene_description, ImageMeta.scene_described_at)
         .where(ImageMeta.path.in_(paths))
     )).all()
     return {
@@ -74,15 +73,12 @@ async def _meta_by_path(db: AsyncSession, paths: list[str]) -> dict[str, dict]:
             "tags": row[1] or None,
             "scene_description": row[2] or None,
             "scene_described_at": row[3],
-            "motion_description": row[4] or None,
-            "motion_described_at": row[5],
         }
         for row in rows
     }
 
 
-_NO_META = {"tags": None, "scene_description": None, "scene_described_at": None,
-            "motion_description": None, "motion_described_at": None}
+_NO_META = {"tags": None, "scene_description": None, "scene_described_at": None}
 
 
 def _meta_fields(meta) -> dict:
@@ -616,9 +612,6 @@ async def move_images(body: dict, db: AsyncSession = Depends(get_db)):
             scene_description=meta.scene_description,
             scene_instruction=meta.scene_instruction,
             scene_described_at=meta.scene_described_at,
-            motion_description=meta.motion_description,
-            motion_instruction=meta.motion_instruction,
-            motion_described_at=meta.motion_described_at,
         ))
         await db.delete(meta)
     # A CHARACTER'S SHEET OR FACE REF MOVES WITH THE IMAGE (wanly-console#581). The row names
@@ -864,9 +857,7 @@ def _split_tags(blob: str | None) -> list[str]:
 async def describe_untagged(db: AsyncSession, paths: list[str]) -> int:
     """Describe the SCENE of each of `paths` that has none yet, serially.
 
-    Scene only (console#590): the motion paragraph is minutes of the motion captioner, and
-    is made only when someone clicks Describe motion or a held job needs it -- tagging must
-    not spend one. A saved motion paragraph is left as it is.
+    Scene only (console#590).
 
     The captioning half of bulk tagging (api#340): tagging an image is the moment someone
     decided it was worth keeping, which is the rule console#414 built single-image
@@ -1048,25 +1039,16 @@ async def bulk_update_image_tags(
 # ---------------------------------------------------------------------------------------
 
 
-def _scene_response(path: str, meta: ImageMeta | None,
-                    motion_error: str | None = None) -> ImageSceneResponse:
+def _scene_response(path: str, meta: ImageMeta | None) -> ImageSceneResponse:
     description = (meta.scene_description if meta else None) or None
-    motion = (meta.motion_description if meta else None) or None
     return ImageSceneResponse(
         path=path,
         scene_description=description,
         scene_instruction=(meta.scene_instruction if meta else None) or None,
         scene_described_at=meta.scene_described_at if meta else None,
         words=len(description.split()) if description else 0,
-        motion_description=motion,
-        motion_instruction=(meta.motion_instruction if meta else None) or None,
-        motion_described_at=meta.motion_described_at if meta else None,
-        motion_words=len(motion.split()) if motion else 0,
-        motion_error=motion_error,
         caption=_ticket_response(path, caption_tickets.latest(path)),
         scene_caption=_ticket_response(path, caption_tickets.latest(path, caption_tickets.SCENE)),
-        motion_caption=_ticket_response(path,
-                                        caption_tickets.latest(path, caption_tickets.MOTION)),
         **_queue_fields(path),
     )
 
@@ -1117,8 +1099,8 @@ def _require_known_bucket(path: str) -> None:
 
 
 def _requesters(ticket_id: str | None) -> list[dict]:
-    """The held jobs a queued ticket is for, so the queue poll alone can say "Motion requested
-    by job ..." (console#590)."""
+    """The held jobs a queued ticket is for, so the queue poll alone can say "requested by
+    job ..." (console#590)."""
     t = caption_tickets.get(ticket_id) if ticket_id else None
     return [dict(r) for r in t.requested_by] if t is not None else []
 
@@ -1172,9 +1154,18 @@ def _describe_params(body: ImageSceneRequest | None) -> dict:
 
 
 def _halves(body: ImageSceneRequest | None) -> list[str]:
-    """The halves asked for, scene first. None (an old client) means both."""
+    """The halves asked for: the scene. Omitted means the scene.
+
+    "motion" is what an older console asks for (Describe motion / Redo motion); that half was
+    removed (wanly-api#481). Beside "scene" it is dropped; on its own it is a 422 that says so,
+    rather than a scene caption nobody asked for.
+    """
     asked = body.halves if body is not None and body.halves else list(caption_tickets.HALVES)
-    return [h for h in caption_tickets.HALVES if h in asked]
+    halves = [h for h in caption_tickets.HALVES if h in asked]
+    if not halves:
+        raise HTTPException(status_code=422,
+                            detail="The motion caption was removed; only the scene is captioned.")
+    return halves
 
 
 def _request_halves(path: str, body: ImageSceneRequest | None):
@@ -1198,18 +1189,15 @@ async def request_image_scene(
     GET /images/caption-queue) and fills the words in when the ticket is done. Navigating
     away, closing the tab or a phone going to sleep loses nothing.
 
-    PER HALF (console#590): `halves` is ["scene"], ["motion"] or both (the default, for old
-    clients). Each half is a ticket of its own, in its own lane, and saving one never clears
-    or overwrites the other -- so this one call is Describe, Describe motion, Redo scene,
-    Redo motion and each half's Retry. Motion is grounded on the SAVED scene (the one in
-    flight, when a scene is being made).
+    The scene only (the motion half was removed in wanly-api#481): `halves` may be omitted or
+    ["scene"]; ["motion"] alone is a 422. So this one call is Describe, Redo and Retry.
 
     ALWAYS regenerates the halves asked for -- unless a caption of that half is already
     queued or running, in which case this IS that caption (joined=true). Two captions of one
     half would write two different descriptions, and a held job might already be using the
     first (console#562).
 
-    The answer is the first half's ticket, with every half's in `tickets`.
+    The answer is the scene's ticket, also listed in `tickets`.
     """
     _require_known_bucket(path)
     # Nothing here waits, but the auth lookup opened a transaction; give the connection back.
@@ -1227,20 +1215,19 @@ async def image_scene_status(path: str = Query(...),
                              half: Optional[Literal["scene", "motion"]] = Query(None)):
     """This image's caption ticket: queued (with position), running, done or failed.
 
-    `half` picks the scene's or the motion's (console#590). Without it: whichever is in
-    flight (the scene first), else the one that finished last. `scene` and `motion` carry
-    both halves either way.
+    `half` is accepted for older consoles: "scene" or omitted is the scene's ticket; "motion"
+    (a half removed in wanly-api#481) answers status null, as for an image never asked
+    about. `scene` carries the scene's ticket either way.
 
     status null: nothing in flight and nothing remembered -- either never asked for, or
     finished long enough ago (or before a restart) that the saved words are the answer.
     No database: tickets live in this process.
     """
     _require_known_bucket(path)
-    t = caption_tickets.latest(path, half)
+    t = caption_tickets.latest(path) if half in (None, caption_tickets.SCENE) else None
     out = (CaptionTicket(path=path, **caption_tickets.view(None)) if t is None
            else _ticket_response(path, t))
     out.scene = _ticket_response(path, caption_tickets.latest(path, caption_tickets.SCENE))
-    out.motion = _ticket_response(path, caption_tickets.latest(path, caption_tickets.MOTION))
     return out
 
 
@@ -1279,22 +1266,14 @@ async def describe_image_scene(
     asked = _request_halves(path, body)
     for t, _ in asked:
         await t.wait()
-    by_half = {t.half: t for t, _ in asked}
-    first = asked[0][0]
-    scene = by_half.get(caption_tickets.SCENE)
-    hard = scene if scene is not None else first
-    if hard.status == caption_tickets.FAILED:
+    scene = asked[0][0]
+    if scene.status == caption_tickets.FAILED:
         # 404 for an image that cannot be read; 503 for the captioner, as /captions/describe
         # does -- it being down is a temporary condition on another host.
-        raise HTTPException(status_code=404 if hard.unreadable else 503,
-                            detail=hard.error or "the caption failed")
-    motion = by_half.get(caption_tickets.MOTION)
-    # A motion failure beside a saved scene is the old partial success, not an error.
-    motion_error = (motion.error or "the motion caption failed") if (
-        motion is not None and motion is not hard and motion.status == caption_tickets.FAILED
-    ) else None
+        raise HTTPException(status_code=404 if scene.unreadable else 503,
+                            detail=scene.error or "the caption failed")
     meta = await db.get(ImageMeta, path, populate_existing=True)
-    return _scene_response(path, meta, motion_error=motion_error)
+    return _scene_response(path, meta)
 
 
 @router.post("/images/scene/try", response_model=CaptionTryResponse,
@@ -1304,24 +1283,19 @@ async def try_caption_prompts(
     body: CaptionTryRequest | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Run the caption and motion prompts from the Settings editors on one image (console#555).
+    """Run the caption prompt from the Settings editor on one image (console#555).
 
     POST /images/scene WITHOUT THE WRITE. The Settings page calls it twice -- once with the
-    unsaved editor text, once with nothing (the saved prompts) -- and shows the two side by
+    unsaved editor text, once with nothing (the saved prompt) -- and shows the two side by
     side, so a prompt can be judged before it is saved. Storing either result would put a
     caption from a prompt nobody has adopted onto the image's record, where the next job
     would pick it up as the description.
 
-    Not POST /captions/describe, although that is also a no-store preview: it produces the
-    static half only, and the motion prompt -- grounded on the static half -- is half of
-    what is being tried. This is the same two-call pair /images/scene makes, through the
-    same function.
-
-    THROUGH THE CAPTION QUEUE, same as /images/scene. A try is two describes on the one-slot
-    captioner, and a person comparing prompts clicks "Try" repeatedly; outside the queue
-    those calls would race the bulk-tag and dataset captioning that is already waiting, and
-    the back of that line would start timing out (app/caption_queue.py). Same refusal rules
-    too: a box that is rendering answers 503 with its name.
+    THROUGH THE CAPTION QUEUE, same as /images/scene. A person comparing prompts clicks "Try"
+    repeatedly; outside the queue those calls would race the bulk-tag and dataset captioning
+    that is already waiting, and the back of that line would start timing out
+    (app/caption_queue.py). Same refusal rules too: a box that is rendering answers 503 with
+    its name. (It also tried the motion prompt until wanly-api#481 removed that half.)
     """
     from app.caption_queue import queue as caption_queue
     from app.joycaption import instruction_for
@@ -1330,9 +1304,9 @@ async def try_caption_prompts(
     _require_known_bucket(path)
     body = body or CaptionTryRequest()
 
-    # Resolved HERE rather than left to caption_image_pair, because "" means something
-    # different in each place: to this request it is "the default", while caption_image_pair
-    # would send an empty instruction to the captioner.
+    # Resolved HERE rather than left to caption_image_bytes, because "" means something
+    # different in each place: to this request it is "the default", while the captioner
+    # would be sent an empty instruction.
     cfg = await _get_all_settings(db)
     style = body.caption_style or cfg.get("caption_style", "")
     custom = (body.caption_instruction if body.caption_instruction is not None
@@ -1347,32 +1321,18 @@ async def try_caption_prompts(
         except Exception as e:
             raise HTTPException(status_code=404, detail=f"could not read {path}: {e}") from e
         try:
-            # motion_template None falls through to the saved one and "" to the default
-            # template -- caption_image_pair already reads it that way.
-            pair = await caption_image_pair(
-                db, image, instruction=instruction,
-                motion_style=body.motion_style, motion_instruction=body.motion_template)
+            caption, used = await caption_image_bytes(db, image, instruction=instruction)
         except CaptionError as e:
             logger.warning("prompt try failed for %s: %s", path, e)
             raise HTTPException(status_code=503, detail=str(e)) from e
 
-    if not pair.scene.strip():
+    if not (caption or "").strip():
         raise HTTPException(status_code=503,
                             detail="the captioner returned nothing for this image")
-    logger.info("prompt try on %s: caption %d words, motion %s", path,
-                len(pair.scene.split()),
-                f"{len(pair.motion.split())} words" if pair.motion else
-                (f"failed ({pair.motion_error})" if pair.motion_error else "off"))
-    return CaptionTryResponse(
-        caption=pair.scene,
-        words=len(pair.scene.split()),
-        motion=pair.motion,
-        motion_words=len(pair.motion.split()) if pair.motion else 0,
-        motion_error=pair.motion_error,
-        motion_enabled=settings.motion_caption_enabled,
-        caption_instruction_used=pair.scene_instruction,
-        motion_instruction_used=pair.motion_instruction,
-    )
+    logger.info("prompt try on %s: caption %d words", path, len(caption.split()))
+    return CaptionTryResponse(caption=caption, words=len(caption.split()),
+                              caption_instruction_used=used)
+
 
 def search_pattern(q: str) -> str:
     """The LIKE pattern for a user's query, with their wildcards neutralised.

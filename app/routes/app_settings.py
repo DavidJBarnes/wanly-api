@@ -7,8 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
 from app.database import get_db
-from app.joycaption import (CAPTION_STYLES, DEFAULT_STYLE, MOTION_DEFAULT_STYLE,
-                            MOTION_STYLE_PRESETS, MOTION_TEMPLATE)
+from app.joycaption import CAPTION_STYLES, DEFAULT_STYLE
 from app.models import AppSetting, User
 from app import queue_position
 from app.schemas.app_settings import AppSettingsResponse, AppSettingsUpdate
@@ -26,12 +25,8 @@ _DEFAULTS = {
     "caption_style": DEFAULT_STYLE,
     # Empty means "use the style". A non-empty value wins over it.
     "caption_instruction": "",
-    # The motion half (#326): how the capture should look when the frame is described as a
-    # 10-second clip. "handheld" is the house style measured in the prototype.
-    "motion_style": MOTION_DEFAULT_STYLE,
-    # Empty means "use the default template" (joycaption.MOTION_TEMPLATE). A non-empty
-    # value is a whole template of its own (console#555).
-    "motion_instruction": "",
+    # (motion_style / motion_instruction were the retired motion caption half's settings,
+    # wanly-api#481. Rows left in app_settings by older releases are simply never read.)
     # Where a newly queued segment lands (#471): "top" keeps its job's slot, "bottom" sends
     # the job behind everything else. See app/queue_position.py.
     queue_position.SETTING_KEY: queue_position.DEFAULT,
@@ -55,9 +50,6 @@ def _unpin_defaults(updates: dict, current: dict[str, str]) -> dict:
     caption = out.get("caption_instruction")
     if caption and caption.strip() == CAPTION_STYLES.get(style, "").strip():
         out["caption_instruction"] = ""
-    motion = out.get("motion_instruction")
-    if motion and motion.strip() == MOTION_TEMPLATE.strip():
-        out["motion_instruction"] = ""
     return out
 
 
@@ -74,17 +66,10 @@ def _to_response(settings: dict[str, str]) -> AppSettingsResponse:
         # back rather than 500 the whole settings page over one bad row.
         logger.warning("unknown caption_style %r in app_settings; using %r", style, DEFAULT_STYLE)
         style = DEFAULT_STYLE
-    motion_style = settings.get("motion_style") or MOTION_DEFAULT_STYLE
-    if motion_style not in MOTION_STYLE_PRESETS:
-        logger.warning("unknown motion_style %r in app_settings; using %r",
-                       motion_style, MOTION_DEFAULT_STYLE)
-        motion_style = MOTION_DEFAULT_STYLE
     return AppSettingsResponse(
         negative_prompt=settings["negative_prompt"],
         caption_style=style,
         caption_instruction=settings.get("caption_instruction", ""),
-        motion_style=motion_style,
-        motion_instruction=settings.get("motion_instruction", ""),
         segment_queue_position=(
             queue_position.BOTTOM
             if settings.get(queue_position.SETTING_KEY) == queue_position.BOTTOM

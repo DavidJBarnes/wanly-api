@@ -112,14 +112,14 @@ class SegmentResponse(BaseModel):
     # caption queue. Computed per request by the job detail route, like blocked_reason.
     caption_image: Optional[str] = None
     caption_wait: Optional[str] = None
-    # Structured: the halves still missing ("scene", "motion") and the image's place in the
+    # Structured: the halves still missing (["scene"] or []) and the image's place in the
     # caption queue -- "queued" + position (1 = next up), "running", "waiting" (between
     # refusals), or None (no waiter yet). console#562 follow-up.
     caption_needs: Optional[list[str]] = None
     caption_queue_status: Optional[str] = None
     caption_queue_position: Optional[int] = None
     caption_queue_depth: Optional[int] = None
-    #: "scene" or "motion": which caption lane the position is in (wanly-console#572).
+    #: Which caption lane the position is in: "scene" (the only lane since wanly-api#481).
     caption_queue_lane: Optional[str] = None
 
     model_config = {"from_attributes": True}

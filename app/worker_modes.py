@@ -3,8 +3,8 @@
 THE MODEL (wanly-console#572, wanly-gpu-docker#164). Each 3090 is in ONE mode at a time --
 `render`, `train`, `motion` or `edit` -- and either box can be in any of them. Renders and
 training are PULLED (a box claims what its mode lets it run), so they need nothing from here.
-Motion captions and image edits are PUSHED to a URL, and that URL used to be one configured
-box. With two symmetric boxes the right box is whichever one is in the mode right now, so it
+Image-description captions (dataset clips, the scene fallback) and image edits are PUSHED to
+a URL, and that URL used to be one configured box. With two symmetric boxes the right box is whichever one is in the mode right now, so it
 is found at request time, from the boxes themselves.
 
 ASKED OF THE BOX, NEVER STORED. Same rule as GET /workers/{id}/mode: the container is the only
@@ -23,7 +23,7 @@ canonical(), so every comparison here is between modes, not spellings.
 
 PORTS. A box's /health knows its CONTAINER ports, not the host ports they are published on,
 so the URL of a box's captioner or image-edit takes its port from the configured URL
-(motion_caption_url / image_description_url, image_edit_url). Every box publishes a service on
+(image_description_url, image_edit_url). Every box publishes a service on
 the same host port, like worker_control_port.
 """
 from __future__ import annotations
@@ -232,7 +232,7 @@ def url_on(box: str, configured_url: str | None, default_port: int) -> str:
 
 
 def motion_url(box: str) -> str:
-    return url_on(box, settings.motion_caption_url or settings.image_description_url, 11434)
+    return url_on(box, settings.image_description_url, 11434)
 
 
 def edit_url(box: str) -> str:

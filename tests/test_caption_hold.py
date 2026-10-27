@@ -10,7 +10,7 @@ What this file protects, one class each:
   * failure is loud -- caption_failed with the reason -- and Retry / Render without are the
     only ways out;
   * the sweep re-creates the waiters after a restart;
-  * with motion captioning off only <SCENE> gates;
+  * a legacy <MOTION> (wanly-api#481) is stripped, never held for;
   * continuations whose frame does not exist yet are untouched.
 
 The captioner is a mock that records, so "was not called" is an assertion, not a hope.
@@ -33,14 +33,16 @@ from app.enums import JobStatus, SegmentStatus
 from app.joycaption import CaptionError, CaptionerBusy
 from app.main import app
 from app.models import ImageMeta, Job, Segment, User
-from app.routes.captions import ScenePair
+from tests.caption_fakes import ScenePair
 
 IMG = f"s3://{settings.s3_images_bucket}/2026-09-30/00042.png"
 OTHER = f"s3://{settings.s3_images_bucket}/2026-09-30/00043.png"
 SCENE_WORDS = "a woman in a red dress sitting on a sofa, looking at the viewer"
-MOTION_WORDS = "she leans forward slowly, her hair swaying as she reaches toward the camera"
-BOTH = "k3lly, <SCENE>, <MOTION>"
 SCENE_ONLY = "k3lly, <SCENE>, she smiles"
+BOTH = SCENE_ONLY  # the default held prompt (the motion half is gone, wanly-api#481)
+FILLED = f"k3lly, {SCENE_WORDS}, she smiles"
+#: A prompt written before wanly-api#481: its <MOTION> must be stripped, never held for.
+LEGACY = "k3lly, <SCENE>, <MOTION>, she smiles"
 
 
 # --- fixtures ------------------------------------------------------------------------------
@@ -73,7 +75,6 @@ def fast(monkeypatch):
     monkeypatch.setattr(caption_hold, "caption_queue", fresh)
     monkeypatch.setattr(caption_hold, "JOIN_POLL_S", 0.01)
     monkeypatch.setattr(caption_hold, "BUSY_RETRY_S", 0.01)
-    monkeypatch.setattr(settings, "motion_caption_enabled", True)
     caption_hold._waiters.clear()
     caption_hold._notes.clear()
     caption_tickets.reset()
@@ -84,14 +85,11 @@ def fast(monkeypatch):
 
 @pytest.fixture
 def captioner(monkeypatch):
-    """The captioner and everything around it, mocked. `.pair` and `.motion` record calls."""
+    """The captioner and everything around it, mocked. `.pair` records the scene calls."""
     class C:
-        pair = AsyncMock(return_value=ScenePair(
-            scene=SCENE_WORDS, scene_instruction="i-scene",
-            motion=MOTION_WORDS, motion_instruction="i-motion"))
-        motion = AsyncMock(return_value=(MOTION_WORDS, "i-motion"))
-    from tests.caption_fakes import drive_halves_from
-    drive_halves_from(monkeypatch, C.pair, C.motion)
+        pair = AsyncMock(return_value=ScenePair(scene=SCENE_WORDS, scene_instruction="i-scene"))
+    from tests.caption_fakes import drive_scene_from
+    drive_scene_from(monkeypatch, C.pair)
     monkeypatch.setattr("app.routes.captions._caption_base", AsyncMock(return_value="http://c"))
     monkeypatch.setattr(caption_hold.s3, "download_bytes", lambda uri: b"png-bytes")
     return C
@@ -122,13 +120,12 @@ async def _held(db, job, *, prompt=BOTH, index=0, start_image=None,
     return seg
 
 
-async def _meta(db, path=IMG, scene=SCENE_WORDS, motion=MOTION_WORDS) -> ImageMeta:
+async def _meta(db, path=IMG, scene=SCENE_WORDS) -> ImageMeta:
     meta = await db.get(ImageMeta, path)
     if meta is None:
         meta = ImageMeta(path=path)
         db.add(meta)
     meta.scene_description = scene
-    meta.motion_description = motion
     await db.flush()
     return meta
 
@@ -141,15 +138,12 @@ async def _fresh(db, obj):
 # --- pure rules ------------------------------------------------------------------------------
 
 class TestWhatGates:
-    def test_both_halves_gate_when_motion_is_on(self):
-        assert caption_hold.needed_halves(BOTH) == {"scene", "motion"}
+    def test_the_scene_gates(self):
+        assert caption_hold.needed_halves(SCENE_ONLY) == {"scene"}
 
-    def test_motion_off_leaves_only_the_scene_gating(self, monkeypatch):
-        # The kill-switch (MOTION_CAPTION_ENABLED=false, for a captioner that cannot do the
-        # motion half). Waiting for a paragraph no caption will ever produce would be waiting
-        # forever.
-        monkeypatch.setattr(settings, "motion_caption_enabled", False)
-        assert caption_hold.needed_halves(BOTH) == {"scene"}
+    def test_a_legacy_motion_never_gates(self):
+        # wanly-api#481: no caption will ever produce motion words again.
+        assert caption_hold.needed_halves(LEGACY) == {"scene"}
         assert caption_hold.needed_halves("k3lly, <MOTION>") == set()
 
     def test_a_filled_prompt_needs_nothing(self):
@@ -164,20 +158,21 @@ class TestWhatGates:
 
 class TestFillIsVerbatim:
     def test_it_fills_exactly_the_saved_words(self):
-        meta = ImageMeta(path=IMG, scene_description=SCENE_WORDS,
-                         motion_description=MOTION_WORDS)
-        assert caption_hold.fill_saved(BOTH, meta) == f"k3lly, {SCENE_WORDS}, {MOTION_WORDS}"
-
-    def test_a_caption_containing_the_other_placeholder_stays_words(self):
-        # Single pass: the scene's literal "<MOTION>" must not become a second substitution.
-        meta = ImageMeta(path=IMG, scene_description="a sign reading <MOTION>",
-                         motion_description=MOTION_WORDS)
-        out = caption_hold.fill_saved(BOTH, meta)
-        assert out == f"k3lly, a sign reading <MOTION>, {MOTION_WORDS}"
-
-    def test_a_missing_half_stays_literal(self):
         meta = ImageMeta(path=IMG, scene_description=SCENE_WORDS)
-        assert caption_hold.fill_saved(BOTH, meta) == f"k3lly, {SCENE_WORDS}, <MOTION>"
+        assert caption_hold.fill_saved(SCENE_ONLY, meta) == FILLED
+
+    def test_a_caption_containing_the_placeholder_stays_words(self):
+        meta = ImageMeta(path=IMG, scene_description="a sign reading <SCENE>")
+        assert caption_hold.fill_saved(SCENE_ONLY, meta) == "k3lly, a sign reading <SCENE>, she smiles"
+
+    def test_a_missing_scene_stays_literal(self):
+        assert caption_hold.fill_saved(SCENE_ONLY, ImageMeta(path=IMG)) == SCENE_ONLY
+
+    def test_a_legacy_motion_is_stripped_tidily(self):
+        meta = ImageMeta(path=IMG, scene_description=SCENE_WORDS)
+        out = caption_hold.fill_saved(LEGACY, meta)
+        assert out == FILLED
+        assert "<MOTION>" not in out and ", ," not in out
 
 
 # --- the submit decision ---------------------------------------------------------------------
@@ -197,24 +192,17 @@ class TestGate:
         await _meta(db)
         prompt, held = await caption_hold.gate(db, BOTH, IMG)
         assert held is False
-        assert prompt == f"k3lly, {SCENE_WORDS}, {MOTION_WORDS}"
+        assert prompt == FILLED
 
     async def test_a_missing_scene_holds(self, db):
         prompt, held = await caption_hold.gate(db, BOTH, IMG)
         assert held is True and prompt == BOTH
 
-    async def test_a_missing_motion_holds_when_motion_is_on(self, db):
-        await _meta(db, motion=None)
-        _, held = await caption_hold.gate(db, BOTH, IMG)
-        assert held is True
-
-    async def test_motion_off_releases_on_the_scene_alone(self, db, monkeypatch):
-        monkeypatch.setattr(settings, "motion_caption_enabled", False)
-        await _meta(db, motion=None)
-        prompt, held = await caption_hold.gate(db, BOTH, IMG)
+    async def test_a_legacy_motion_does_not_hold_once_the_scene_is_saved(self, db):
+        await _meta(db)
+        prompt, held = await caption_hold.gate(db, LEGACY, IMG)
         assert held is False
-        # <MOTION> keeps its pre-#562 behaviour: literal here, the claim's business.
-        assert prompt == f"k3lly, {SCENE_WORDS}, <MOTION>"
+        assert prompt == FILLED
 
     async def test_a_caption_in_flight_holds_even_over_saved_words(self, db):
         # A re-roll running in the modal: the words about to land are the ones on screen.
@@ -283,14 +271,33 @@ class TestSettle:
         assert await caption_hold.settle(IMG) == set()
         seg = await _fresh(db, seg)
         assert seg.status == SegmentStatus.PENDING
-        assert seg.prompt == f"k3lly, {SCENE_WORDS}, {MOTION_WORDS}"
+        assert seg.prompt == FILLED
 
-    async def test_it_keeps_waiting_while_a_half_is_missing(self, db, shared_session):
+    async def test_it_keeps_waiting_while_the_scene_is_missing(self, db, shared_session):
         job = await _job(db)
         seg = await _held(db, job)
-        await _meta(db, motion=None)
-        assert await caption_hold.settle(IMG) == {"motion"}
+        assert await caption_hold.settle(IMG) == {"scene"}
         assert (await _fresh(db, seg)).status == SegmentStatus.AWAITING_CAPTION
+
+    async def test_a_legacy_held_segment_is_released_with_motion_stripped(
+            self, db, shared_session):
+        # Held before wanly-api#481 on both halves: the scene alone now releases it.
+        job = await _job(db)
+        seg = await _held(db, job, prompt=LEGACY)
+        await _meta(db)
+        assert await caption_hold.settle(IMG) == set()
+        seg = await _fresh(db, seg)
+        assert seg.status == SegmentStatus.PENDING
+        assert seg.prompt == FILLED
+
+    async def test_a_segment_held_only_for_motion_is_released_at_once(
+            self, db, shared_session):
+        job = await _job(db)
+        seg = await _held(db, job, prompt="k3lly, <MOTION>, she smiles")
+        assert await caption_hold.settle(IMG) == set()
+        seg = await _fresh(db, seg)
+        assert seg.status == SegmentStatus.PENDING
+        assert seg.prompt == "k3lly, she smiles"
 
     async def test_a_segment_on_another_image_is_not_touched(self, db, shared_session):
         job = await _job(db, starting_image=OTHER)
@@ -325,7 +332,7 @@ class TestSingleFlight:
             async with caption_queue.turn(IMG):
                 entered.set()
                 await finish.wait()
-                await _meta(db, scene="the modal's words", motion="the modal's motion")
+                await _meta(db, scene="the modal's words")
         m = asyncio.create_task(modal())
         await entered.wait()
 
@@ -336,10 +343,9 @@ class TestSingleFlight:
         await asyncio.wait_for(asyncio.gather(m, waiter), 5)
 
         captioner.pair.assert_not_called()
-        captioner.motion.assert_not_called()
         seg = await _fresh(db, seg)
         assert seg.status == SegmentStatus.PENDING
-        assert seg.prompt == "k3lly, the modal's words, the modal's motion"
+        assert seg.prompt == "k3lly, the modal's words, she smiles"
 
     async def test_two_jobs_on_one_image_share_one_waiter_and_one_caption(
             self, db, shared_session, captioner):
@@ -352,7 +358,7 @@ class TestSingleFlight:
         for seg in (a, b):
             seg = await _fresh(db, seg)
             assert seg.status == SegmentStatus.PENDING
-            assert seg.prompt == f"k3lly, {SCENE_WORDS}, {MOTION_WORDS}"
+            assert seg.prompt == FILLED
 
     async def test_with_nothing_in_flight_it_captions_through_the_queue_and_saves(
             self, db, shared_session, captioner):
@@ -360,8 +366,7 @@ class TestSingleFlight:
         await asyncio.wait_for(caption_hold.ensure(IMG), 5)
         meta = await db.get(ImageMeta, IMG)
         assert meta.scene_description == SCENE_WORDS
-        assert meta.motion_description == MOTION_WORDS
-        assert (await _fresh(db, seg)).prompt == f"k3lly, {SCENE_WORDS}, {MOTION_WORDS}"
+        assert (await _fresh(db, seg)).prompt == FILLED
 
     async def test_words_landing_while_it_queued_are_used_not_redone(
             self, db, shared_session, captioner):
@@ -383,19 +388,6 @@ class TestSingleFlight:
         captioner.pair.assert_not_called()
         assert (await _fresh(db, seg)).status == SegmentStatus.PENDING
 
-    async def test_a_saved_scene_is_kept_and_only_the_motion_is_made(
-            self, db, shared_session, captioner):
-        # Regenerating the pair would replace the scene the person already read.
-        await _meta(db, scene="the words she read", motion=None)
-        seg = await _held(db, await _job(db))
-        await asyncio.wait_for(caption_hold.ensure(IMG), 5)
-        captioner.pair.assert_not_called()
-        assert captioner.motion.await_args.args[1] == "the words she read"
-        meta = await db.get(ImageMeta, IMG)
-        assert meta.scene_description == "the words she read"
-        assert (await _fresh(db, seg)).prompt == f"k3lly, the words she read, {MOTION_WORDS}"
-
-
 @pytest.mark.asyncio
 class TestFailureIsLoud:
     async def test_a_caption_error_fails_the_segment_with_the_reason(
@@ -407,17 +399,6 @@ class TestFailureIsLoud:
         assert seg.status == SegmentStatus.CAPTION_FAILED
         assert "captioner unreachable" in seg.error_message
         assert seg.prompt == BOTH  # nothing dropped
-
-    async def test_a_failed_motion_half_fails_it_and_keeps_the_scene(
-            self, db, shared_session, captioner):
-        captioner.pair.return_value = ScenePair(
-            scene=SCENE_WORDS, scene_instruction="i", motion_error="timed out")
-        seg = await _held(db, await _job(db))
-        await asyncio.wait_for(caption_hold.ensure(IMG), 5)
-        seg = await _fresh(db, seg)
-        assert seg.status == SegmentStatus.CAPTION_FAILED
-        assert "motion caption failed: timed out" in seg.error_message
-        assert (await db.get(ImageMeta, IMG)).scene_description == SCENE_WORDS
 
     async def test_an_unreadable_image_fails_it(self, db, shared_session, captioner,
                                                 monkeypatch):
@@ -444,13 +425,13 @@ class TestFailureIsLoud:
 
     async def test_a_busy_box_that_frees_up_is_captioned(
             self, db, shared_session, captioner, monkeypatch):
-        # Refused once; then the scene's base and the motion's base (two lanes, two asks).
-        base = AsyncMock(side_effect=[CaptionerBusy("rendering"), "http://c", "http://c"])
+        # Refused once; then the scene's base.
+        base = AsyncMock(side_effect=[CaptionerBusy("rendering"), "http://c"])
         monkeypatch.setattr("app.routes.captions._caption_base", base)
         seg = await _held(db, await _job(db))
         await asyncio.wait_for(caption_hold.ensure(IMG), 5)
         assert (await _fresh(db, seg)).status == SegmentStatus.PENDING
-        assert base.await_count == 3
+        assert base.await_count == 2
 
 
 # --- restart -------------------------------------------------------------------------------
@@ -469,6 +450,18 @@ class TestRestartSweep:
         # waiter to wait on (console#562 follow-up).
         seg = await _fresh(db, seg)
         assert seg.status == SegmentStatus.PENDING
+        captioner.pair.assert_not_called()
+
+    async def test_the_sweep_releases_a_segment_held_only_for_a_legacy_motion(
+            self, db, shared_session, captioner):
+        # A row held before wanly-api#481 on <MOTION> alone: nothing to wait for any more.
+        seg = await _held(db, await _job(db), prompt="k3lly, <MOTION>, she smiles")
+        await caption_hold.sweep()
+        if IMG in caption_hold._waiters:
+            await asyncio.wait_for(caption_hold._waiters[IMG], 5)
+        seg = await _fresh(db, seg)
+        assert seg.status == SegmentStatus.PENDING
+        assert seg.prompt == "k3lly, she smiles"
         captioner.pair.assert_not_called()
 
     async def test_a_resumed_hold_with_no_words_captions(self, db, shared_session, captioner):
@@ -550,7 +543,39 @@ class TestSubmit:
             Segment.__table__.select().where(Segment.job_id == uuid.UUID(resp.json()["id"]))
         )).one()
         assert seg.status == SegmentStatus.PENDING
-        assert seg.prompt == f"k3lly, {SCENE_WORDS}, {MOTION_WORDS}"
+        assert seg.prompt == FILLED
+        assert ensured == []
+
+    async def test_new_job_with_a_legacy_motion_is_filled_pending_and_stripped(
+            self, db, ensured, no_live_caption):
+        await _meta(db)
+        user = await _user(db)
+        data = {"name": "j", "width": 832, "height": 1216, "fps": 24,
+                "starting_image_uri": IMG,
+                "first_segment": {"prompt": "<TRIGGER>, <SCENE>, <MOTION>, she smiles"}}
+        async with _client(db, user) as c:
+            resp = await c.post("/jobs", data={"data": json.dumps(data)})
+        assert resp.status_code in (200, 201), resp.text
+        seg = (await db.execute(
+            Segment.__table__.select().where(Segment.job_id == uuid.UUID(resp.json()["id"]))
+        )).one()
+        assert seg.status == SegmentStatus.PENDING
+        assert SCENE_WORDS in seg.prompt
+        assert "<MOTION>" not in seg.prompt and ", ," not in seg.prompt
+        assert seg.prompt.endswith(f"{SCENE_WORDS}, she smiles")
+        assert ensured == []
+
+    async def test_next_segment_with_a_legacy_motion_is_filled_pending_and_stripped(
+            self, db, ensured, no_live_caption):
+        await _meta(db, path=OTHER)
+        user = await _user(db)
+        job = await _job(db, user, status=JobStatus.AWAITING)
+        async with _client(db, user) as c:
+            resp = await c.post(f"/jobs/{job.id}/segments",
+                                json={"prompt": LEGACY, "start_image": OTHER})
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["status"] == SegmentStatus.PENDING
+        assert resp.json()["prompt"] == FILLED
         assert ensured == []
 
     async def test_next_segment_with_a_start_image_is_held_not_captioned(
@@ -596,21 +621,21 @@ class TestTheTwoWaysOut:
     async def test_render_without_fills_what_is_saved_and_drops_the_rest(self, db, ensured):
         user = await _user(db)
         job = await _job(db, user)
-        seg = await _held(db, job, status=SegmentStatus.CAPTION_FAILED)
-        await _meta(db, motion=None)
+        seg = await _held(db, job, prompt=LEGACY, status=SegmentStatus.CAPTION_FAILED)
+        await _meta(db)
         async with _client(db, user) as c:
             resp = await c.post(f"/segments/{seg.id}/caption/skip")
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["status"] == SegmentStatus.PENDING
-        assert body["prompt"] == f"k3lly, {SCENE_WORDS}"
+        assert body["prompt"] == FILLED
         assert body["error_message"] is None
 
     async def test_render_without_leaves_no_placeholder_for_the_claim_to_caption(
             self, db, ensured):
         user = await _user(db)
         job = await _job(db, user)
-        seg = await _held(db, job, status=SegmentStatus.CAPTION_FAILED)
+        seg = await _held(db, job, prompt=LEGACY, status=SegmentStatus.CAPTION_FAILED)
         async with _client(db, user) as c:
             body = (await c.post(f"/segments/{seg.id}/caption/skip")).json()
         assert "<SCENE>" not in body["prompt"] and "<MOTION>" not in body["prompt"]

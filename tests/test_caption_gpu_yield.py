@@ -184,8 +184,8 @@ class TestTheContextIsSentExplicitly:
         assert seen["options"]["num_ctx"] == jc.settings.image_description_num_ctx
 
     def test_the_default_leaves_room_without_costing_layers(self):
-        """The static prompt measured 451 tokens INCLUDING the image, and the motion prompt
-        adds the scene paragraph. 4096 is ~8x the job; 32768 is what pushed layers to CPU."""
+        """The static prompt measured 451 tokens INCLUDING the image. 4096 is ~8x the job;
+        32768 is what pushed layers to CPU."""
         from app.config import settings
 
         assert 2048 <= settings.image_description_num_ctx <= 8192

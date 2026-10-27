@@ -7,7 +7,6 @@ _resolve_trigger already documents for <TRIGGER>.
 """
 import asyncio
 import logging
-from dataclasses import dataclass
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,7 +17,7 @@ from app.config import settings
 from app.database import get_db
 from app.joycaption import (CaptionError, CaptionerBusy, CaptionerUnreachable, NoGpuInMode,
                             busy_render_beside_the_captioner, captioner_for, describe,
-                            describe_motion, instruction_for, mark_scene_down, mark_scene_up,
+                            instruction_for, mark_scene_down, mark_scene_up,
                             scene_captioner, scene_marked_down)
 from app.models import User
 from app.routes.app_settings import _get_all_settings
@@ -29,8 +28,8 @@ router = APIRouter()
 
 
 async def _caption_base(db: AsyncSession, interactive: bool) -> str:
-    """Where to send a MOTION caption (or a scene caption the scene service could not take),
-    refusing if the box that captioner shares a card with is rendering.
+    """Where to send an image-description caption -- a dataset clip sheet, or a scene caption
+    the scene service could not take -- refusing if the box that captioner shares a card with is rendering.
 
     The scene service never comes through here (wanly-console#572): it shares a card with no
     render stack, so it has nothing to be refused for. See caption_scene.
@@ -42,9 +41,9 @@ async def _caption_base(db: AsyncSession, interactive: bool) -> str:
     interactive=False and prefers the fallback outright: the claiming box is about to load
     the render. See captioner_for.
 
-    ROUTED BY MODE FIRST (wanly-api#392). When the boxes say what mode they are in, a motion
-    caption goes to a box in MOTION mode -- whichever one it is, no config change -- and never to
-    a box in another mode. None in motion mode: the fallback captioner if one is configured,
+    ROUTED BY MODE FIRST (wanly-api#392). When the boxes say what mode they are in, such a
+    caption goes to a box in "motion" mode (the wire name of the image-description mode) --
+    whichever one it is, no config change -- and never to a box in another mode. None in motion mode: the fallback captioner if one is configured,
     else NoGpuInMode, which a held job waits out with that reason (no time limit: switching a
     box is what ends it). Only when no box reports a mode does the old single-URL path below run.
     """
@@ -79,11 +78,11 @@ async def _caption_base(db: AsyncSession, interactive: bool) -> str:
 
 
 async def describe_scene(image: bytes, instruction: str, fallback_base) -> str:
-    """The static half: on the scene service, or on the motion captioner if that is down.
+    """The scene: on the scene service, or on the image-description captioner if that is down.
 
-    `fallback_base` is an async callable returning the motion captioner's URL -- with its
-    render refusal, which can raise CaptionerBusy -- and is called only when it is needed, so
-    a scene caption is never refused because a render is running on the motion box
+    `fallback_base` is an async callable returning the image-description captioner's URL --
+    with its render refusal, which can raise CaptionerBusy -- and is called only when it is
+    needed, so a scene caption is never refused because a render is running on that box
     (wanly-console#572).
 
     Every fallback is logged with its reason (app/joycaption.py mark_scene_down), so "scene
@@ -130,67 +129,21 @@ async def caption_image_bytes(db: AsyncSession, image: bytes,
 
 
 async def caption_clip_sheet(db: AsyncSession, sheet: bytes, instruction: str) -> str:
-    """Caption a clip's contact sheet (wanly-api#411) on the MOTION captioner.
+    """Caption a clip's contact sheet (wanly-api#411) on the image-description captioner.
 
     Never the scene captioner: JoyCaption describes one photograph, and a 2x2 grid reads to it
     as four photographs. Qwen3-VL reads the grid as moments in order, which is the only reason
-    to send a sheet. Same render gate and fallback as any motion caption.
+    to send a sheet. Same render gate and fallback as any image-description caption.
     """
     base = await _caption_base(db, True)
     return await describe(sheet, instruction, base_url=base)
-
-
-@dataclass
-class ScenePair:
-    """What one describe call produced. Motion None + error set is a partial success.
-
-    A plain tuple of five was rejected: two of the four strings are instructions and a swap
-    is invisible at the call site and in the response.
-    """
-    scene: str
-    scene_instruction: str
-    motion: str | None = None
-    motion_instruction: str | None = None
-    motion_error: str | None = None
-    #: The motion error is the motion captioner refusing for a render -- wait it out, it is
-    #: not the captioner failing.
-    motion_busy: bool = False
-
-
-async def caption_image_pair(db: AsyncSession, image: bytes,
-                             style: str | None = None,
-                             instruction: str | None = None,
-                             motion_style: str | None = None,
-                             motion_instruction: str | None = None,
-                             interactive: bool = True) -> ScenePair:
-    """Caption bytes twice: the static scene, then the motion half grounded on it.
-
-    Two sequential Ollama calls, not one combined one: the combined-call motion half
-    measurably degraded in the #326 prototype, and two calls keep per-output instruction
-    provenance the way the static half already has it. Both calls go to the same captioner
-    in the same keep_alive window, so the model is warm for the second one.
-
-    A motion failure is NOT this call's failure. The static half is what <SCENE> consumes
-    today and what claim-time resolution reuses; a captioner hiccup on the second call must
-    not throw away the first (the ticket's partial-failure rule). The caller persists what
-    came back and surfaces the gap.
-    """
-    cfg = await _get_all_settings(db)
-
-    async def base_for() -> str:
-        return await _caption_base(db, interactive)
-    return await run_caption_pair(image, cfg, base_for, style=style, instruction=instruction,
-                                  motion_style=motion_style,
-                                  motion_instruction=motion_instruction)
 
 
 async def caption_image_scene(db: AsyncSession, image: bytes,
                               interactive: bool = True) -> tuple[str, str]:
     """The scene half alone, with the saved settings: (scene, instruction_used).
 
-    What tagging an image spends (console#590): the scene, never the motion paragraph -- that
-    is minutes of the motion captioner, and is made only on an explicit Describe motion or a
-    held job's need.
+    What tagging an image spends (console#590).
     """
     cfg = await _get_all_settings(db)
 
@@ -204,56 +157,15 @@ async def caption_scene(image: bytes, cfg: dict, fallback_base,
                         instruction: str | None = None) -> tuple[str, str]:
     """The static half alone: (scene, instruction_used).
 
-    On the scene service (wanly-console#572), never refused for a render; on the motion
-    captioner -- through `fallback_base`, which carries the render refusal -- only when the
-    scene service is down or not configured. The caption tickets call this in the scene lane
-    and the motion half separately in the motion lane, so a scene never waits for a motion.
+    On the scene service (wanly-console#572), never refused for a render; on the
+    image-description captioner -- through `fallback_base`, which carries the render refusal
+    -- only when the scene service is down or not configured. The caption tickets call this
+    in the scene lane.
     """
     if instruction is None:
         instruction = instruction_for(style or cfg.get("caption_style", ""),
                                       cfg.get("caption_instruction", ""))
     return await describe_scene(image, instruction, fallback_base), instruction
-
-
-async def run_caption_pair(image: bytes, cfg: dict, base_for,
-                           style: str | None = None,
-                           instruction: str | None = None,
-                           motion_style: str | None = None,
-                           motion_instruction: str | None = None) -> ScenePair:
-    """caption_image_pair's captioner half, with the settings read already done.
-
-    `base_for` is an async callable for the motion captioner's URL (with the render refusal);
-    it is asked only when a motion caption -- or a scene caption the scene service cannot
-    take -- actually needs it. A refusal on the MOTION half is that half's failure, not the
-    pair's: the scene is kept, exactly as a motion captioner error is.
-    """
-    scene, instruction = await caption_scene(image, cfg, base_for, style=style,
-                                             instruction=instruction)
-
-    # Kill-switch (#326): with a captioner whose model cannot do the motion half
-    # (joycaption on the 2070 answers the directional prompt with plausible junk), the
-    # motion call is skipped and motion stays None WITHOUT an error — an absent section,
-    # not a failure, and the lightbox renders it that way.
-    if not settings.motion_caption_enabled:
-        return ScenePair(scene=scene, scene_instruction=instruction)
-
-    custom = (motion_instruction if motion_instruction is not None
-              else cfg.get("motion_instruction", ""))
-    try:
-        base = await base_for()
-    except CaptionerBusy as e:
-        logger.info("motion caption refused (static half kept): %s", e)
-        return ScenePair(scene=scene, scene_instruction=instruction, motion_error=str(e),
-                         motion_busy=True)
-    try:
-        motion, motion_instr = await describe_motion(
-            image, scene, style=motion_style or cfg.get("motion_style", ""),
-            custom=custom, base_url=base)
-    except CaptionError as e:
-        logger.warning("motion caption failed (static half kept): %s", e)
-        return ScenePair(scene=scene, scene_instruction=instruction, motion_error=str(e))
-    return ScenePair(scene=scene, scene_instruction=instruction,
-                     motion=motion, motion_instruction=motion_instr)
 
 
 @router.post("/captions/describe", response_model=CaptionResponse)

@@ -472,12 +472,13 @@ async def list_workers(
 async def worker_modes_summary(db: AsyncSession = Depends(get_db)):
     """Every box's mode, and what is waiting on each mode (wanly-api#392, console#589).
 
-    One call for the Workers page's summary line -- "render: 4 segments · motion: 12 captions
-    (no GPU in motion mode) · edit: 2 · train: 1 run" -- so "why isn't my caption moving?" is
-    answered without opening jobs one by one. The modes are read from the boxes, like
+    One call for the Workers page's summary line -- "render: 4 segments · edit: 2 (no GPU in
+    edit mode) · train: 1 run" -- so "why isn't my work moving?" is answered without opening
+    jobs one by one. (A "motion" line counted motion captions until wanly-api#481 removed
+    that caption half; scene captions are summed up in `scene`.) The modes are read from the boxes, like
     everything else about a mode; the counts from this API's own queues.
     """
-    from app import caption_hold, caption_queue
+    from app import caption_queue
     from app import full_edit
     from app.joycaption import scene_status
     from app.models import TrainingJob
@@ -514,8 +515,6 @@ async def worker_modes_summary(db: AsyncSession = Depends(get_db)):
         select(func.count()).select_from(TrainingJob)
         .where(TrainingJob.status == TrainingStatus.PENDING)
     )).scalar() or 0
-    mode_waits = caption_hold.mode_waiting()
-    motion_count = caption_queue.motion_queue.depth() + len(mode_waits)
     edits = [j for j in full_edit.queue.jobs.values()
              if j.state in ("queued", "waiting", "running")]
 
@@ -524,16 +523,11 @@ async def worker_modes_summary(db: AsyncSession = Depends(get_db)):
             return None
         return worker_modes.no_gpu_in(mode, reporting)
 
-    motion_reason = None
-    if motion_count and reporting:
-        p = worker_modes.choose("motion", states)
-        motion_reason = p.wait or (next(iter(mode_waits.values())) if mode_waits else None)
     edit_reason = next((j.message for j in edits if j.state == "waiting" and j.message), None)
 
     waiting = [
         ModeWaiting(mode="render", count=pending_segments, unit="segments",
                     reason=reason_unless(pending_segments, served_by("render"), "render")),
-        ModeWaiting(mode="motion", count=motion_count, unit="captions", reason=motion_reason),
         ModeWaiting(mode="edit", count=len(edits), unit="edits", reason=edit_reason),
         # Until wanly-gpu-docker#165 the trainer also claims on a box in render mode.
         ModeWaiting(mode="train", count=pending_runs, unit="runs",

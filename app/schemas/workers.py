@@ -144,7 +144,7 @@ class ModeWaiting(BaseModel):
     count: int
     #: "segments", "captions", "edits", "runs".
     unit: str
-    #: Set when the work cannot move: "no GPU in motion mode (...)". None when it can.
+    #: Set when the work cannot move: "no GPU in edit mode (...)". None when it can.
     reason: str | None = None
 
 

@@ -1,15 +1,16 @@
-"""console#577: a Motion recipe queued before its caption lands must never render empty.
+"""console#577: a recipe queued before its caption lands must never render empty.
 
-What happened: the console deleted the unfilled <MOTION> before it submitted, so the caption
-hold (console#562) never saw a placeholder, the segment went out PENDING, and the claim handed
-the GPU "k3lly2026, woman," -- a render with no prompt to speak of.
+What happened: the console deleted the unfilled placeholder before it submitted, so the caption
+hold (console#562) never saw it, the segment went out PENDING, and the claim handed the GPU
+"k3lly2026, woman," -- a render with no prompt to speak of. (It was a Motion recipe's
+<MOTION> then; that half was removed in wanly-api#481, and a legacy <MOTION> is now stripped
+-- the guards below are what keep a stripped-to-the-trigger prompt from rendering.)
 
 Two layers, one class each:
 
-  * THE HOLD, end to end in shape. The prompt is exactly what the console's submitPrompt now
-    sends (pinned by the console's captionRegion.test.ts, which asserts this same string): the
-    job is held, is not claimable while held, is released once the motion paragraph is saved,
-    and the claim hands out the saved words VERBATIM.
+  * THE HOLD, end to end in shape: a "<trigger>, <SCENE>" prompt is held, is not claimable
+    while held, is released once the scene is saved, and the claim hands out the saved words
+    VERBATIM.
   * THE GUARDS. Whatever the client does: a prompt that is blank once the placeholders are
     removed is a 422 at submit, and a prompt that resolves to blank or only the trigger phrase
     is never handed out -- it goes to caption_failed with the reason, and Render without
@@ -34,13 +35,11 @@ from app.models import ImageMeta, Job, Segment, User
 
 IMG = f"s3://{settings.s3_images_bucket}/2026-09-30/00577.png"
 SCENE_WORDS = "a woman in a green sweater sitting on the edge of a bed, looking at the viewer"
-MOTION_WORDS = ("she slowly leans back onto her elbows, her hair falling off one shoulder, "
-                "and smiles as the camera drifts closer")
 
-#: What the console's submitPrompt sends for a Motion recipe whose caption has not landed.
-#: The console test "sends a Motion recipe's prompt exactly as the API's hold test posts it"
-#: pins the same string -- change both or neither.
-SUBMITTED = "k3lly2026, woman, <MOTION>"
+#: A recipe whose words all come from the start frame's scene caption.
+SUBMITTED = "k3lly2026, woman, <SCENE>"
+#: A Motion recipe from before wanly-api#481: once <MOTION> is stripped, only the trigger.
+LEGACY_MOTION = "k3lly2026, woman, <MOTION>"
 TRIGGER_ONLY = "k3lly2026, woman,"
 RECIPE = {"characters": [{"name": "Kelly 577", "trigger": "k3lly2026", "gender": "woman"}]}
 
@@ -55,7 +54,6 @@ def fresh_hold_state(monkeypatch):
     monkeypatch.setattr(caption_queue_module, "queue", fresh)
     monkeypatch.setattr(caption_hold, "caption_queue", fresh)
     monkeypatch.setattr(caption_hold, "JOIN_POLL_S", 0.01)
-    monkeypatch.setattr(settings, "motion_caption_enabled", True)
     caption_hold._waiters.clear()
     caption_hold._notes.clear()
     caption_tickets.reset()
@@ -84,15 +82,14 @@ def ensured(monkeypatch):
 
 
 @pytest.fixture
-def motion_captioner(monkeypatch):
-    """The captioner, for the motion-only path: the scene is saved, the paragraph is not."""
-    motion = AsyncMock(return_value=(MOTION_WORDS, "i-motion"))
-    pair = AsyncMock(side_effect=AssertionError("the saved scene must not be re-described"))
-    from tests.caption_fakes import drive_halves_from
-    drive_halves_from(monkeypatch, pair, motion)
+def scene_captioner(monkeypatch):
+    """The captioner, for the hold's own scene caption."""
+    from tests.caption_fakes import ScenePair, drive_scene_from
+    pair = AsyncMock(return_value=ScenePair(scene=SCENE_WORDS, scene_instruction="i-scene"))
+    drive_scene_from(monkeypatch, pair)
     monkeypatch.setattr("app.routes.captions._caption_base", AsyncMock(return_value="http://c"))
     monkeypatch.setattr(caption_hold.s3, "download_bytes", lambda uri: b"png-bytes")
-    return motion
+    return pair
 
 
 async def _user(db) -> User:
@@ -118,13 +115,12 @@ async def _segment(db, job, prompt, *, status=SegmentStatus.PENDING, index=0) ->
     return seg
 
 
-async def _meta(db, *, scene=SCENE_WORDS, motion=None) -> ImageMeta:
+async def _meta(db, *, scene=SCENE_WORDS) -> ImageMeta:
     meta = await db.get(ImageMeta, IMG)
     if meta is None:
         meta = ImageMeta(path=IMG)
         db.add(meta)
     meta.scene_description = scene
-    meta.motion_description = motion
     await db.flush()
     return meta
 
@@ -173,11 +169,10 @@ async def _only_segment(db, job_id) -> Segment:
 # --- the hold, end to end in shape ------------------------------------------------------------
 
 @pytest.mark.asyncio
-class TestTheMotionRecipeWaitsForItsWords:
+class TestTheSceneRecipeWaitsForItsWords:
     async def test_held_released_and_rendered_with_the_saved_words_verbatim(
             self, db, shared_session, ensured):
-        # The frame's scene is described; the motion paragraph is still being written.
-        await _meta(db, motion=None)
+        # The frame's scene is still being written.
         user = await _user(db)
 
         resp = await _submit_job(db, user, SUBMITTED)
@@ -190,35 +185,34 @@ class TestTheMotionRecipeWaitsForItsWords:
         # Not claimable while it waits -- this is the render that used to go out empty.
         assert await _claim(db) is None
 
-        # The paragraph lands (the modal's caption, the dialog's, the hold's own -- the
-        # release does not care which), and the hold releases the segment.
-        await _meta(db, motion=MOTION_WORDS)
+        # The scene lands (the modal's caption, the dialog's, the hold's own -- the release
+        # does not care which), and the hold releases the segment.
+        await _meta(db)
         assert await caption_hold.settle(IMG) == set()
 
         body = await _claim(db)
         assert body is not None
         assert body["id"] == str(seg.id)
-        assert body["prompt"] == f"k3lly2026, woman, {MOTION_WORDS}"
-        assert MOTION_WORDS in body["prompt"]
+        assert body["prompt"] == f"k3lly2026, woman, {SCENE_WORDS}"
 
     async def test_the_holds_own_caption_fills_it(
-            self, db, shared_session, ensured, motion_captioner):
-        # Nobody else is captioning the frame: the hold's waiter makes the paragraph itself,
-        # grounded on the saved scene, and releases the segment with exactly those words.
-        await _meta(db, motion=None)
+            self, db, shared_session, ensured, scene_captioner):
+        # Nobody else is captioning the frame: the hold's waiter makes the scene itself and
+        # releases the segment with exactly those words.
         user = await _user(db)
         resp = await _submit_job(db, user, SUBMITTED)
         assert resp.status_code == 201, resp.text
 
         await _REAL_ENSURE(IMG)
 
-        motion_captioner.assert_awaited_once()
-        assert (await db.get(ImageMeta, IMG)).motion_description == MOTION_WORDS
+        scene_captioner.assert_awaited_once()
+        assert (await db.get(ImageMeta, IMG)).scene_description == SCENE_WORDS
         body = await _claim(db)
-        assert body["prompt"] == f"k3lly2026, woman, {MOTION_WORDS}"
+        assert body["prompt"] == f"k3lly2026, woman, {SCENE_WORDS}"
 
-    async def test_a_motion_only_prompt_gates_on_motion(self):
-        assert caption_hold.needed_halves(SUBMITTED) == {"motion"}
+    async def test_a_scene_prompt_gates_on_the_scene_and_motion_never_gates(self):
+        assert caption_hold.needed_halves(SUBMITTED) == {"scene"}
+        assert caption_hold.needed_halves(LEGACY_MOTION) == set()
 
 
 # --- the submit guard -------------------------------------------------------------------------
@@ -226,7 +220,7 @@ class TestTheMotionRecipeWaitsForItsWords:
 @pytest.mark.asyncio
 class TestSubmitRefusesAnEmptyPrompt:
     @pytest.mark.parametrize("prompt", ["", "   ", "<MOTION>", "<SCENE>, <MOTION>",
-                                        " , <motion></motion>, "])
+                                        " , <motion></motion>, ", "<SCENE>"])
     async def test_new_job_blank_once_placeholders_are_removed_is_422(
             self, db, ensured, prompt):
         user = await _user(db)
@@ -247,7 +241,15 @@ class TestSubmitRefusesAnEmptyPrompt:
         resp = await _submit_job(db, user, SUBMITTED)
         assert resp.status_code == 201, resp.text
 
-    @pytest.mark.parametrize("prompt", ["<MOTION>", "", TRIGGER_ONLY])
+    async def test_a_legacy_motion_recipe_is_422_and_says_why(self, db, ensured):
+        # Once <MOTION> is stripped (wanly-api#481) only the trigger phrase is left.
+        user = await _user(db)
+        resp = await _submit_job(db, user, LEGACY_MOTION)
+        assert resp.status_code == 422, resp.text
+        detail = resp.json()["detail"]
+        assert "trigger phrase" in detail and "<MOTION> is no longer supported" in detail
+
+    @pytest.mark.parametrize("prompt", ["<MOTION>", "", TRIGGER_ONLY, LEGACY_MOTION])
     async def test_next_segment_empty_is_422(self, db, ensured, prompt):
         user = await _user(db)
         job = await _job(db, user, status=JobStatus.AWAITING)
@@ -262,27 +264,43 @@ class TestSubmitRefusesAnEmptyPrompt:
 
 @pytest.mark.asyncio
 class TestClaimNeverHandsOutAnEmptyPrompt:
-    async def test_an_unfilled_motion_that_resolves_to_the_trigger_is_caption_failed(
-            self, db, monkeypatch):
-        # How a PENDING segment can still carry an unfilled <MOTION>: the kill-switch is off
-        # (so the hold does not gate on it), or it was queued before this fix. The claim
-        # drops the placeholder, and what is left is only the trigger phrase.
-        monkeypatch.setattr(settings, "motion_caption_enabled", False)
-        await _meta(db, motion=None)
+    async def test_a_legacy_motion_that_leaves_the_trigger_is_caption_failed(self, db):
+        # A PENDING segment queued before wanly-api#481 can still carry <MOTION>. The claim
+        # strips it (persisted), and what is left is only the trigger phrase.
+        await _meta(db)
         user = await _user(db)
         job = await _job(db, user)
-        seg = await _segment(db, job, SUBMITTED)
+        seg = await _segment(db, job, LEGACY_MOTION)
 
         assert await _claim(db) is None
 
         await db.refresh(seg)
         await db.refresh(job)
         assert seg.status == SegmentStatus.CAPTION_FAILED
-        assert "<MOTION>" in seg.error_message and "trigger phrase" in seg.error_message
-        # The placeholder survives for a Retry to fill; nothing was assigned a worker.
-        assert seg.prompt == SUBMITTED
+        assert "trigger phrase" in seg.error_message
+        # Stripped for good: a Retry can never hold for it; nothing was assigned a worker.
+        assert "<MOTION>" not in seg.prompt
+        assert seg.prompt == "k3lly2026, woman"
         assert seg.worker_id is None and seg.claimed_at is None
         assert job.status == JobStatus.PENDING
+
+    async def test_a_legacy_motion_beside_real_words_is_stripped_and_handed_out(self, db):
+        await _meta(db)
+        user = await _user(db)
+        seg = await _segment(db, await _job(db, user),
+                             "k3lly2026, woman, <SCENE>, <MOTION>, she waves")
+        body = await _claim(db)
+        assert body["id"] == str(seg.id)
+        assert body["prompt"] == f"k3lly2026, woman, {SCENE_WORDS}, she waves"
+        assert "<MOTION>" not in body["prompt"]
+
+    async def test_a_filled_legacy_motion_region_is_stripped_words_and_all(self, db):
+        user = await _user(db)
+        seg = await _segment(db, await _job(db, user),
+                             "k3lly2026, woman, she waves, <motion>old paragraph</motion>")
+        body = await _claim(db)
+        assert body["id"] == str(seg.id)
+        assert body["prompt"] == "k3lly2026, woman, she waves"
 
     @pytest.mark.parametrize("prompt", ["", " , ", TRIGGER_ONLY, "k3lly2026"])
     async def test_blank_or_trigger_only_is_never_handed_out(self, db, prompt):
@@ -317,23 +335,21 @@ class TestClaimNeverHandsOutAnEmptyPrompt:
 @pytest.mark.asyncio
 class TestRenderWithoutRefusesAnEmptyPrompt:
     async def test_dropping_the_only_half_is_refused(self, db, ensured):
-        await _meta(db, motion=None)
         user = await _user(db)
         job = await _job(db, user)
         seg = await _segment(db, job, SUBMITTED, status=SegmentStatus.CAPTION_FAILED)
         async with _client(db, user) as c:
             resp = await c.post(f"/segments/{seg.id}/caption/skip")
         assert resp.status_code == 422, resp.text
-        assert "<MOTION>" in resp.json()["detail"]
+        assert "<SCENE>" in resp.json()["detail"]
         await db.refresh(seg)
         assert seg.status == SegmentStatus.CAPTION_FAILED
         assert seg.prompt == SUBMITTED
 
     async def test_it_still_works_when_something_is_left(self, db, ensured):
-        await _meta(db, motion=None)
         user = await _user(db)
         job = await _job(db, user)
-        seg = await _segment(db, job, "k3lly2026, woman, she waves, <MOTION>",
+        seg = await _segment(db, job, "k3lly2026, woman, she waves, <SCENE>, <MOTION>",
                              status=SegmentStatus.CAPTION_FAILED)
         async with _client(db, user) as c:
             resp = await c.post(f"/segments/{seg.id}/caption/skip")

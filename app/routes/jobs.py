@@ -32,6 +32,7 @@ from app.model_requirements import (
 )
 from app.routes.segments import (
     _refuse_draft_submit, _refuse_empty_submit, _resolve_trigger, _resolve_wildcards_outside_scene,
+    _strip_legacy_motion,
 )
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
 from app.tag_filter import like_escape, tag_clause, tag_prefix_clause
@@ -212,13 +213,14 @@ async def create_job(
     # <TRIGGER> first, exactly as add_segment does. The console normally fills it before it
     # submits; this catches a prompt that still carries it -- and fills a SHEET-ONLY
     # character's from its description (wanly-console#581) by the same rule as continuations.
-    prompt = await _resolve_trigger(db, seg.prompt, seg.ltx_recipe)
+    # A legacy <MOTION> is stripped before anything else sees it (wanly-api#481).
+    prompt = await _resolve_trigger(db, _strip_legacy_motion(seg.prompt), seg.ltx_recipe)
     resolved_prompt, prompt_template = await _resolve_wildcards_outside_scene(db, prompt)
-    # The caption hold (console#562). A <SCENE>/<MOTION> the New Job dialog had no words for
-    # yet -- the modal's caption still running, or a dialog submitted without waiting -- holds
-    # the segment until they are saved, instead of the claim captioning the frame a second
-    # time (<SCENE>) or dropping the half (<MOTION>). When the words are already saved they
-    # are filled now. Not held: None, and the claim resolves as it always has.
+    # The caption hold (console#562). A <SCENE> the New Job dialog had no words for yet --
+    # the modal's caption still running, or a dialog submitted without waiting -- holds the
+    # segment until they are saved, instead of the claim captioning the frame a second time.
+    # When the words are already saved they are filled now. Not held: None, and the claim
+    # resolves as it always has.
     hold_on = caption_hold.hold_image(seg.start_image, 0, job.starting_image)
     gated = await caption_hold.gate(db, resolved_prompt, hold_on)
     held = False
@@ -676,7 +678,7 @@ async def caption_hold_summary(db: AsyncSession = Depends(get_db)):
         jobs_by_image[key].add(job_id)
     for key, img in images.items():
         img.jobs = len(jobs_by_image[key])
-        img.needs = [h for h in ("scene", "motion") if h in img.needs]
+        img.needs = [h for h in ("scene",) if h in img.needs]
     rank = {"running": 0, "queued": 1, "waiting": 2}
 
     def order(img: CaptionHoldImage):
@@ -690,8 +692,6 @@ async def caption_hold_summary(db: AsyncSession = Depends(get_db)):
         queue_depth=cq.total_depth(),
         queue_waiting=sum(len(q.waiting_paths()) for _, q in cq.lanes()),
         running=caption_queue.running_path(),
-        motion_queue_depth=cq.motion_queue.depth(),
-        motion_running=cq.motion_queue.running_path(),
         images=sorted(images.values(), key=order),
     )
 

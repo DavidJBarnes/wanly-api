@@ -9,9 +9,8 @@ WHY THIS EXISTS
 
         18s  28s  18s  27s  22s  21s  37s  48s  51s  1m10  55s  1m17  ...
 
-    and at IMAGE_DESCRIPTION_TIMEOUT_S the back of the queue starts failing -- with the
-    front half of the same image already written, which is exactly how "scene described,
-    but the motion caption failed" happens. Raising the timeout only moves the cliff.
+    and at IMAGE_DESCRIPTION_TIMEOUT_S the back of the queue starts failing, with part of the
+    same image's work already written. Raising the timeout only moves the cliff.
 
     The queue does two things the bare race could not: the work happens in a KNOWN ORDER,
     and every response can say where it sits, so the UI can show "3rd of 7" instead of a
@@ -171,23 +170,16 @@ class CaptionQueue:
 
 
 #: THE SCENE LANE. One queue per captioner, because each is one ollama slot. Named `queue`
-#: because it was the only one, and everything that is not a caption ticket's motion half --
-#: dataset captions, Settings tries, the scene half of every describe -- still stands in it.
+#: because it is the only one: dataset captions, Settings tries and every scene describe stand
+#: in it. (A second, motion lane existed for the motion caption half until wanly-api#481.)
 queue = CaptionQueue()
 
-#: THE MOTION LANE (wanly-console#572). The motion paragraph is made on a different, slower
-#: captioner (Qwen3-VL 32B against JoyCaption's seconds), so it waits in a line of its own: a
-#: ticket takes a turn here only after its scene is saved, and the next image's scene does
-#: not wait for this image's motion.
-motion_queue = CaptionQueue()
-
 SCENE_LANE = "scene"
-MOTION_LANE = "motion"
 
 
 def lanes() -> list[tuple[str, CaptionQueue]]:
-    """Both lanes, scene first. Read at call time: tests replace the module attributes."""
-    return [(SCENE_LANE, queue), (MOTION_LANE, motion_queue)]
+    """Every lane -- just the scene's now. Read at call time: tests replace the attribute."""
+    return [(SCENE_LANE, queue)]
 
 
 def total_depth() -> int:
