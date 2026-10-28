@@ -1290,11 +1290,14 @@ async def describe_image_scene(
 @router.post("/images/enhance-prompt", response_model=EnhancePromptResponse,
              dependencies=[Depends(get_current_user)])
 async def enhance_image_prompt(path: str = Query(...), db: AsyncSession = Depends(get_db)):
-    """Send this image and its scene description to the Sulphur-2 prompt enhancer and keep the
-    video prompt it writes (wanly-api#480), replacing any previous one.
+    """Send this image and what happens in it to the Sulphur-2 prompt enhancer and keep the video
+    prompt it writes (wanly-api#480), replacing any previous one.
 
-    The scene description is required: it is the text the enhancer expands, and the words the
-    person already accepted for this frame. 409 without one -- describe the scene first.
+    "What happens" is the descriptions of ALL the image's Action tags (wanly-api#486,
+    prompt_enhance.action_prompt): the short motion prompt the enhancer expands. The scene
+    description is not sent. The enhancer sees the image, and given a description of the
+    frame it writes a longer description of the frame instead of motion. 409 when the image
+    has no Action tag with a description.
 
     Synchronous: the enhancer loads per request on the 2070 (it takes turns with the scene
     captioner), so a cold call is ~10 s of load plus ~20 s of writing. 503 when the enhancer
@@ -1306,11 +1309,12 @@ async def enhance_image_prompt(path: str = Query(...), db: AsyncSession = Depend
     if not prompt_enhance.enabled():
         raise HTTPException(status_code=503, detail="the prompt enhancer is switched off")
     meta = await db.get(ImageMeta, path)
-    scene = ((meta.scene_description if meta else None) or "").strip()
-    if not scene:
+    action = await prompt_enhance.action_prompt(db, meta.tags if meta else None)
+    if not action:
         raise HTTPException(status_code=409,
-                            detail="this image has no scene description yet -- describe the "
-                                   "scene first; the enhancer expands it")
+                            detail="this image has no Action tag with a description -- tag it "
+                                   "with an action, and give that tag a description in "
+                                   "Settings; the enhancer expands it")
     # Not holding a pooled connection through a ~30 s call (console#559).
     await release_connection(db)
     try:
@@ -1318,7 +1322,7 @@ async def enhance_image_prompt(path: str = Query(...), db: AsyncSession = Depend
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"could not read {path}: {e}") from e
     try:
-        out = await prompt_enhance.enhance(image, scene)
+        out = await prompt_enhance.enhance(image, action)
     except prompt_enhance.EnhanceError as e:
         logger.warning("prompt enhance failed for %s: %s", path, e)
         raise HTTPException(status_code=503, detail=str(e)) from e

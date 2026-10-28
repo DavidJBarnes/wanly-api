@@ -2,8 +2,13 @@
 
 The service (wanly-gpu-docker#225, `prompt-enhance` on the 2070 beside the scene captioner)
 takes what the model card says to send -- the text you want enhanced and, optionally, the
-image -- and answers with the long scene script LTX needs. We send the image and its saved
-scene description, so the enhancer starts from words the person already accepted.
+image -- and answers with the long scene script LTX needs.
+
+THE TEXT IS WHAT HAPPENS, NOT WHAT THE FRAME IS (wanly-api#486). The enhancer stands in for
+LTX-2's own i2v enhancer, whose spec is "follow the user's raw input prompt: all requested
+motion, actions, audio" and "describe only changes from the image". It sees the image itself.
+Sending the scene description (as #480 did) got back long descriptions of a still frame. So
+the text is the image's Action tags' descriptions -- every one, in the image's tag order.
 """
 from __future__ import annotations
 
@@ -12,9 +17,39 @@ import logging
 
 import httpx
 
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import settings
+from app.models import ACTION_GROUP, TitleTag
 
 logger = logging.getLogger(__name__)
+
+
+async def action_prompt(db: AsyncSession, tags: str | None) -> str | None:
+    """The "what happens" text for an image: its Action tags' descriptions, ALL of them, in the
+    order the image carries the tags. None when it has no Action tag with a description.
+
+    Image tags are stored by name, matched case-insensitively. A tag with no description
+    contributes nothing (a non-motion Action tag, or one not written yet).
+    """
+    names = [t.strip() for t in (tags or "").split(",") if t.strip()]
+    if not names:
+        return None
+    rows = (await db.execute(
+        select(TitleTag).where(TitleTag.group == ACTION_GROUP,
+                               func.lower(TitleTag.name).in_([n.lower() for n in names]))
+    )).scalars().all()
+    by_name = {r.name.lower(): (r.description or "").strip() for r in rows}
+    seen: set[str] = set()
+    lines = []
+    for n in names:
+        key = n.lower()
+        if key in seen or not by_name.get(key):
+            continue
+        seen.add(key)
+        lines.append(by_name[key])
+    return "\n".join(lines) or None
 
 
 class EnhanceError(RuntimeError):
@@ -30,12 +65,12 @@ async def _post(url: str, payload: dict) -> httpx.Response:
         return await c.post(url, json=payload, timeout=settings.prompt_enhance_timeout_s)
 
 
-async def enhance(image: bytes, scene_description: str) -> dict:
+async def enhance(image: bytes, text: str) -> dict:
     """{prompt, ms, cold} from the enhancer, or EnhanceError."""
     url = (settings.prompt_enhance_url or "").strip().rstrip("/")
     if not url:
         raise EnhanceError("the prompt enhancer is not configured (PROMPT_ENHANCE_URL is empty)")
-    payload = {"text": scene_description, "image_b64": base64.b64encode(image).decode()}
+    payload = {"text": text, "image_b64": base64.b64encode(image).decode()}
     try:
         r = await _post(f"{url}/enhance", payload)
     except httpx.HTTPError as e:

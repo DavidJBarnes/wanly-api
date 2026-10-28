@@ -7,10 +7,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user
 from app.database import get_db
-from app.models import TitleTag, User
-from app.schemas.tags import TitleTagCreate, TitleTagResponse
+from app.models import ACTION_GROUP, TitleTag, User
+from app.schemas.tags import TitleTagCreate, TitleTagResponse, TitleTagUpdate
 
 router = APIRouter()
+
+def _description(group: int, text: str | None) -> str | None:
+    """The description to store: None when blank; a 400 when a Person tag is given one."""
+    text = (text or "").strip() or None
+    if text is not None and group != ACTION_GROUP:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST,
+                            detail="Only Action tags have a description")
+    return text
 
 
 @router.get("/tags", response_model=list[TitleTagResponse])
@@ -47,8 +55,24 @@ async def create_tag(
     if existing.scalars().first():
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Tag already exists in this group")
 
-    tag = TitleTag(name=name, group=body.group)
+    tag = TitleTag(name=name, group=body.group, description=_description(body.group, body.description))
     db.add(tag)
+    await db.commit()
+    await db.refresh(tag)
+    return tag
+
+
+@router.patch("/tags/{tag_id}", response_model=TitleTagResponse)
+async def update_tag(
+    tag_id: UUID,
+    body: TitleTagUpdate,
+    _user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    tag = await db.get(TitleTag, tag_id)
+    if tag is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tag not found")
+    tag.description = _description(tag.group, body.description)
     await db.commit()
     await db.refresh(tag)
     return tag

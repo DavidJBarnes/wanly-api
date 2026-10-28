@@ -215,6 +215,13 @@ class Video(Base):
     job = relationship("Job", back_populates="videos")
 
 
+# The two tag groups (wanly-api#486). Person tags name who is in an image; Action tags say what
+# is happening, and only they carry a description -- the "what happens" prompt Enhance prompt
+# sends to the Sulphur-2 enhancer (app/prompt_enhance.action_prompt).
+PERSON_GROUP = 1
+ACTION_GROUP = 2
+
+
 class TitleTag(Base):
     __tablename__ = "title_tags"
     __table_args__ = (
@@ -224,7 +231,11 @@ class TitleTag(Base):
 
     id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name = mapped_column(String(255), nullable=False)
+    # PERSON_GROUP or ACTION_GROUP (above).
     group = mapped_column(Integer, nullable=False)
+    # Action tags only: the short "what happens" prompt Enhance prompt sends to the Sulphur-2
+    # enhancer for an image carrying this tag (wanly-api#486). Always NULL on a Person tag.
+    description = mapped_column(Text, nullable=True)
     created_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
