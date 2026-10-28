@@ -88,6 +88,7 @@ router = APIRouter()
 
 
 SCENE_PLACEHOLDER = "<SCENE>"
+PROMPT_PLACEHOLDER = "<PROMPT>"
 
 
 async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
@@ -325,6 +326,64 @@ def _drop_placeholder(prompt: str, placeholder: str) -> str:
 
 def _drop_scene(prompt: str) -> str:
     return _drop_placeholder(prompt, SCENE_PLACEHOLDER)
+
+
+# ---------------------------------------------------------------------------------------
+# <PROMPT>: the job's start image's enhanced prompt (wanly-api#484)
+# ---------------------------------------------------------------------------------------
+
+# Every caption/placeholder tag, any case. Scrubbed from the enhancer's text before it goes
+# in: it is model output, and the claim fills <SCENE> AFTER <PROMPT>, so a literal tag in it
+# would be taken for a placeholder.
+_PLACEHOLDER_TAG = re.compile(r"</?(?:scene|motion|prompt)>", re.IGNORECASE)
+
+
+async def _cached_enhanced_prompt(db: AsyncSession, image_uri: str | None) -> str | None:
+    if not _is_describable(image_uri):
+        return None
+    meta = await db.get(ImageMeta, image_uri)
+    text = _PLACEHOLDER_TAG.sub("", (meta.enhanced_prompt or "") if meta else "").strip()
+    return text or None
+
+
+def _prompt_image(segment: Segment, job: Job, resolved_start_image: str | None) -> str | None:
+    """The frame <PROMPT> comes from: the JOB's start image, for every segment.
+
+    A continuation starts from the previous segment's last frame, and nobody enhances a
+    generated frame -- so a per-frame lookup would miss on every segment after the first.
+    Instead each segment reuses the script written for the image the job started from
+    (decided with David, wanly-api#484). Segment 0 uses its own start image, which is the
+    job's unless it was set explicitly.
+    """
+    return resolved_start_image if segment.index == 0 else job.starting_image
+
+
+async def _resolve_enhanced_prompt(db: AsyncSession, prompt: str, image_uri: str | None) -> str:
+    """Fill a recipe's <PROMPT> with the enhanced prompt saved on `image_uri`.
+
+    The enhanced prompt is the Sulphur-2 enhancer's scene script (wanly-api#480), made by
+    clicking Enhance prompt in the image modal and kept on image_meta.enhanced_prompt.
+
+    CACHE-ONLY, like the retired <MOTION> (wanly-api#335). This never calls the enhancer:
+    an enhance is ~25 s warm, and the claim is polled with a 10 s timeout -- and the script's
+    value is that a person read it in the modal before rendering with it.
+
+    Claim-time only. The stored prompt keeps the literal <PROMPT> (and the template keeps it
+    for a re-roll), so an Enhance clicked after the job was queued is still picked up.
+
+    A MISS IS DROPPED, and logged, for the reason <SCENE> is: a literal placeholder is
+    garbage tokens for the encoder. A recipe that is only "<TRIGGER>, <PROMPT>" then has
+    nothing left but the trigger, and the claim's empty-prompt check refuses it.
+    """
+    if PROMPT_PLACEHOLDER not in (prompt or ""):
+        return prompt
+    text = await _cached_enhanced_prompt(db, image_uri)
+    if text is None:
+        logger.info("Dropping %s: %s has no enhanced prompt", PROMPT_PLACEHOLDER, image_uri)
+        return _drop_placeholder(prompt, PROMPT_PLACEHOLDER)
+    logger.info("Resolved %s from %s (enhanced prompt, %d words)",
+                PROMPT_PLACEHOLDER, image_uri, len(text.split()))
+    return prompt.replace(PROMPT_PLACEHOLDER, text)
 
 
 # ---------------------------------------------------------------------------------------
@@ -1138,6 +1197,12 @@ async def claim_next_segment(
     if _has_legacy_motion(segment.prompt):
         segment.prompt = _strip_legacy_motion(segment.prompt)
     submitted_prompt = segment.prompt
+    # <PROMPT> before <SCENE> (wanly-api#484): its text is scrubbed of placeholder tags, so
+    # the scene pass below cannot mistake enhancer output for a placeholder. Persisted with
+    # the rest; a caption_failed restores submitted_prompt, literal <PROMPT> and all.
+    prompt_image = _prompt_image(segment, job, resolved_start_image)
+    if PROMPT_PLACEHOLDER in (segment.prompt or ""):
+        segment.prompt = await _resolve_enhanced_prompt(db, segment.prompt, prompt_image)
     if (SCENE_PLACEHOLDER in (segment.prompt or "")
             or _CAPTION_REGION.search(segment.prompt or "")):
         resolved = await _resolve_scene(db, segment.prompt, resolved_start_image, final=True)
@@ -1162,6 +1227,9 @@ async def claim_next_segment(
         if SCENE_PLACEHOLDER in (submitted_prompt or "") and not (
                 resolved_start_image and await _cached_scene(db, resolved_start_image)):
             unresolved.append(SCENE_PLACEHOLDER)
+        if PROMPT_PLACEHOLDER in (submitted_prompt or "") and not await _cached_enhanced_prompt(
+                db, prompt_image):
+            unresolved.append(PROMPT_PLACEHOLDER)
         segment.prompt = submitted_prompt
         segment.status = SegmentStatus.CAPTION_FAILED
         segment.error_message = _empty_prompt_reason(unresolved)
