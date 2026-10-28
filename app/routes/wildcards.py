@@ -32,7 +32,10 @@ router = APIRouter()
 # MOTION (wanly-api#335) was the retired motion caption half's placeholder (removed in
 # wanly-api#481). It STAYS reserved: old poses still carry <MOTION>, and the API strips it at
 # submit and claim -- a wildcard named MOTION would substitute into those prompts first.
-RESERVED_WILDCARD_NAMES = {"TRIGGER", "TRIGGER2", "SCENE", "MOTION"}
+#
+# PROMPT (wanly-api#484) is filled at the claim from the job's start image's enhanced prompt.
+# Wildcards resolve at submit, so a wildcard named PROMPT would substitute first.
+RESERVED_WILDCARD_NAMES = {"TRIGGER", "TRIGGER2", "SCENE", "MOTION", "PROMPT"}
 
 
 @router.get("/wildcards", response_model=list[WildcardResponse])
