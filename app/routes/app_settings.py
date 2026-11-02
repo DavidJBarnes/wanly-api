@@ -9,7 +9,7 @@ from app.auth import get_current_user
 from app.database import get_db
 from app.joycaption import CAPTION_STYLES, DEFAULT_STYLE
 from app.models import AppSetting, User
-from app import queue_position
+from app import queue_position, stage2_sigmas
 from app.schemas.app_settings import AppSettingsResponse, AppSettingsUpdate
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,8 @@ _DEFAULTS = {
     # Where a newly queued segment lands (#471): "top" keeps its job's slot, "bottom" sends
     # the job behind everything else. See app/queue_position.py.
     queue_position.SETTING_KEY: queue_position.DEFAULT,
+    # Blank means the validated schedule. See app/stage2_sigmas.py.
+    stage2_sigmas.SETTING_KEY: "",
 }
 
 
@@ -50,6 +52,11 @@ def _unpin_defaults(updates: dict, current: dict[str, str]) -> dict:
     caption = out.get("caption_instruction")
     if caption and caption.strip() == CAPTION_STYLES.get(style, "").strip():
         out["caption_instruction"] = ""
+    # Same reason: the default typed back in must not pin it, or send a field an older engine
+    # would refuse.
+    sigmas = out.get(stage2_sigmas.SETTING_KEY)
+    if sigmas and stage2_sigmas.is_default(sigmas):
+        out[stage2_sigmas.SETTING_KEY] = ""
     return out
 
 
@@ -74,6 +81,7 @@ def _to_response(settings: dict[str, str]) -> AppSettingsResponse:
             queue_position.BOTTOM
             if settings.get(queue_position.SETTING_KEY) == queue_position.BOTTOM
             else queue_position.TOP),
+        stage2_sigmas=settings.get(stage2_sigmas.SETTING_KEY, ""),
     )
 
 
