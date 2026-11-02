@@ -299,6 +299,48 @@ def _job_render_size(job: Job, recipe: bool) -> tuple[int, int]:
     return render_size(job.width, job.height, recipe)
 
 
+@router.get("/holograms")
+async def list_holograms(
+    limit: int = Query(500, ge=1, le=2000),
+    search: str | None = Query(None, min_length=1, max_length=255, alias="q", description="As GET /jobs"),
+    tags: list[str] = Query(default_factory=list, description="As GET /jobs"),
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Every playable hologram on the user's finalized jobs, newest first (console#713).
+
+    The pool for the shuffled AR playlist. One query, because the alternative is a Quest asking
+    for every job in the library to find the few that were ever made into holograms. Paths are
+    checked rather than status: a remake nulls them while it runs, so that clip sits out.
+    """
+    result = await db.execute(
+        select(Segment, Job.name)
+        .join(Job, Segment.job_id == Job.id)
+        .where(
+            *job_filter(user_id=user.id, status_filter="finalized", search=search, tags=tags),
+            Segment.hologram_video_path.is_not(None),
+            Segment.hologram_manifest_path.is_not(None),
+        )
+        .order_by(Job.created_at.desc())
+        .limit(limit)
+    )
+    return [
+        {
+            "segment_id": segment.id,
+            "job_id": segment.job_id,
+            "job_name": job_name,
+            "flavor": segment.hologram_flavor or "2d_matte",
+            "video_path": segment.hologram_video_path,
+            "manifest_path": segment.hologram_manifest_path,
+            "poster_path": segment.hologram_poster_path,
+            # As GET /segments/{id}/hologram: artifacts live at fixed S3 keys, so this busts the
+            # cached /files redirect after a remake.
+            "version": segment.completed_at.isoformat() if segment.completed_at else None,
+        }
+        for segment, job_name in result.all()
+    ]
+
+
 @router.get("/jobs", response_model=JobListResponse)
 async def list_jobs(
     limit: int = Query(50, ge=1, le=200),
