@@ -1,7 +1,8 @@
 from typing import Annotated, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
+from app import stage2_sigmas as sigmas
 from app.joycaption import CAPTION_STYLES, DEFAULT_STYLE, PROMPT_MAX_CHARS
 
 CaptionStyle = Literal["terse", "standard", "rich", "raw"]
@@ -33,6 +34,9 @@ class AppSettingsResponse(BaseModel):
     # Where a newly queued segment lands (#471). "top": it keeps its job's place, so a job
     # under way runs ahead of jobs queued after it. "bottom": its job moves behind the rest.
     segment_queue_position: QueuePosition = "top"
+    # LTX stage 2's noise schedule (console#717). "" means the default below.
+    stage2_sigmas: str = ""
+    stage2_sigmas_default: str = sigmas.DEFAULT
 
 
 class AppSettingsUpdate(BaseModel):
@@ -45,3 +49,10 @@ class AppSettingsUpdate(BaseModel):
     # An older console still sending motion_style / motion_instruction is not refused: unknown
     # fields are ignored (pydantic's default), and nothing reads those keys any more.
     segment_queue_position: Optional[QueuePosition] = None
+    # "" clears it back to the default, as with caption_instruction.
+    stage2_sigmas: Optional[str] = None
+
+    @field_validator("stage2_sigmas")
+    @classmethod
+    def _valid_stage2_sigmas(cls, v: Optional[str]) -> Optional[str]:
+        return None if v is None else sigmas.normalise(v)

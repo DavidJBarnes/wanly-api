@@ -38,6 +38,7 @@ from app.models import (
     AppSetting, ImageMeta, Job, LtxCharacter, Segment, User, Video, Wildcard, Worker,
 )
 from app.negative_prompt import default_negative_prompt
+from app.stage2_sigmas import SETTING_KEY as STAGE2_SIGMAS_KEY, configured_stage2_sigmas
 from app.s3 import (
     delete_object, download_file, generate_presigned_url, move_object, parse_s3_uri,
 )
@@ -1290,6 +1291,17 @@ async def claim_next_segment(
     # is the one that renders. Generations only -- a reprocess carrier renders nothing.
     identity_ref = (await _identity_ref_for(db, job, segment.ltx_recipe)
                     if segment.reprocess_type is None else None)
+
+    # Stage 2's schedule from Settings (console#717). Read at claim and stamped on the blob, so
+    # the segment records what it actually ran. A new dict, because the column does not track
+    # in-place changes. Popped when unset: a re-roll copies its predecessor's blob, and clearing
+    # the setting must take effect on it too.
+    if segment.reprocess_type is None and segment.ltx_recipe:
+        sigmas = await configured_stage2_sigmas(db)
+        recipe = {k: v for k, v in segment.ltx_recipe.items() if k != STAGE2_SIGMAS_KEY}
+        if sigmas:
+            recipe[STAGE2_SIGMAS_KEY] = sigmas
+        segment.ltx_recipe = recipe
 
     await db.commit()
     await db.refresh(segment)
