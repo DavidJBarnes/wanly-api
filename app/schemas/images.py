@@ -209,3 +209,30 @@ class EnhancePromptResponse(BaseModel):
     #: Milliseconds the enhancer took, and whether it had to load the model first.
     ms: Optional[int] = None
     cold: bool = False
+
+
+class EnhanceQueueRequest(BaseModel):
+    """POST /images/enhance-prompt/queue (console#719)."""
+    paths: list[str] = Field(min_length=1, max_length=2000)
+    #: Replace prompts the images already have. Off for a bulk ask, so re-selecting a filter
+    #: result cannot overwrite words someone read and kept.
+    redo: bool = False
+
+
+class EnhanceQueueFailure(BaseModel):
+    path: str
+    error: str
+
+
+class EnhanceQueueStatus(BaseModel):
+    """What the enhancer's queue looks like (console#719). `waiting` includes `running`."""
+    running: Optional[str] = None
+    waiting: list[str] = []
+    failed: list[EnhanceQueueFailure] = []
+
+
+class EnhanceQueueResult(BaseModel):
+    queued: int
+    already_enhanced: int
+    no_action: int
+    status: EnhanceQueueStatus

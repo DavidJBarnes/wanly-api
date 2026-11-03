@@ -10,6 +10,7 @@ from slowapi.errors import RateLimitExceeded
 from sqlalchemy.exc import TimeoutError as PoolTimeout
 
 from app.caption_hold import caption_hold_monitor
+from app.enhance_queue import enhance_queue_monitor
 from app.config import settings
 from app.heartbeat_monitor import heartbeat_monitor
 from app.reservation_monitor import reservation_monitor
@@ -27,6 +28,7 @@ async def lifespan(app: FastAPI):
         # Segments held on a caption (console#562): resumes their waiters after a restart
         # and releases any whose words were saved while nobody was watching.
         asyncio.create_task(caption_hold_monitor()),
+        asyncio.create_task(enhance_queue_monitor()),
     ]
     yield
     for task in tasks:
