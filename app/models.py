@@ -303,6 +303,10 @@ class ImageMeta(Base):
     # the person read and kept.
     enhanced_prompt = mapped_column(Text, nullable=True)
     enhanced_prompt_at = mapped_column(DateTime(timezone=True), nullable=True)
+    # The enhancer's queue (console#719, app/enhance_queue.py): when this image joined it, and
+    # why its last turn failed. Both null is an image the queue has nothing to say about.
+    enhance_queued_at = mapped_column(DateTime(timezone=True), nullable=True)
+    enhance_error = mapped_column(Text, nullable=True)
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     def is_empty(self) -> bool:

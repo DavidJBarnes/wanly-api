@@ -3,10 +3,10 @@ import logging
 import re
 import uuid
 from typing import Literal, Optional
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 from sqlalchemy import and_, func, not_, or_, select, text, true, update
 from sqlalchemy import delete as sa_delete
 from sqlalchemy.dialects.postgresql import array as pg_array
@@ -21,12 +21,13 @@ from app import run_datasets
 from app.database import async_session, get_db, release_connection
 from app.joycaption import CaptionError, CaptionerBusy
 from app.enums import JobStatus, SegmentStatus, TrainingStatus
-from app.models import Dataset, Favorite, ImageMeta, Job, LtxCharacter, Segment, TrainingJob, User
+from app.models import Dataset, Favorite, ImageMeta, Job, LtxCharacter, Segment, TrainingJob
 from app.routes.captions import caption_image_bytes, caption_image_scene
 from app.schemas.images import (BulkImageTagsUpdate, CaptionLane, CaptionQueueEntry,
                                 CaptionQueueStatus, ImagesInUseRequest,
                                 CaptionTicket, CaptionTryRequest, CaptionTryResponse,
-                                EnhancePromptResponse,
+                                EnhancePromptResponse, EnhanceQueueFailure, EnhanceQueueRequest,
+                                EnhanceQueueResult, EnhanceQueueStatus,
                                 ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate)
 from app.tag_filter import like_escape, normalise_tag
 from app.tag_filter import tag_clause as _tag_clause
@@ -621,6 +622,8 @@ async def move_images(body: dict, db: AsyncSession = Depends(get_db)):
             scene_described_at=meta.scene_described_at,
             enhanced_prompt=meta.enhanced_prompt,
             enhanced_prompt_at=meta.enhanced_prompt_at,
+            enhance_queued_at=meta.enhance_queued_at,
+            enhance_error=meta.enhance_error,
         ))
         await db.delete(meta)
     # A CHARACTER'S SHEET OR FACE REF MOVES WITH THE IMAGE (wanly-console#581). The row names
@@ -1338,6 +1341,74 @@ async def enhance_image_prompt(path: str = Query(...), db: AsyncSession = Depend
     await db.commit()
     return EnhancePromptResponse(path=path, enhanced_prompt=out["prompt"], enhanced_prompt_at=now,
                                  words=len(out["prompt"].split()), ms=out["ms"], cold=out["cold"])
+
+
+async def _enhance_queue_status(db: AsyncSession) -> EnhanceQueueStatus:
+    from app import enhance_queue
+
+    waiting = (await db.execute(
+        select(ImageMeta.path).where(ImageMeta.enhance_queued_at.is_not(None))
+        .order_by(ImageMeta.enhance_queued_at, ImageMeta.path))).scalars().all()
+    failed = (await db.execute(
+        select(ImageMeta.path, ImageMeta.enhance_error).where(ImageMeta.enhance_error.is_not(None))
+        .order_by(ImageMeta.path))).all()
+    return EnhanceQueueStatus(
+        running=enhance_queue.running if enhance_queue.running in waiting else None,
+        waiting=list(waiting),
+        failed=[EnhanceQueueFailure(path=p, error=e) for p, e in failed])
+
+
+@router.get("/images/enhance-prompt/queue", response_model=EnhanceQueueStatus,
+            dependencies=[Depends(get_current_user)])
+async def enhance_queue_status(db: AsyncSession = Depends(get_db)):
+    return await _enhance_queue_status(db)
+
+
+@router.post("/images/enhance-prompt/queue", response_model=EnhanceQueueResult,
+             dependencies=[Depends(get_current_user)])
+async def enhance_queue_add(body: EnhanceQueueRequest, db: AsyncSession = Depends(get_db)):
+    """Queue images for the prompt enhancer and return at once (console#719).
+
+    An image with no Action tag description is counted rather than queued, since it would only
+    fail later. An image already in line keeps its place.
+    """
+    from app import prompt_enhance
+
+    if not prompt_enhance.enabled():
+        raise HTTPException(status_code=503, detail="the prompt enhancer is switched off")
+    queued = already_enhanced = no_action = 0
+    now = datetime.now(timezone.utc)
+    for offset, path in enumerate(dict.fromkeys(body.paths)):
+        _require_known_bucket(path)
+        meta = await db.get(ImageMeta, path)
+        if meta is not None and meta.enhance_queued_at is not None:
+            continue
+        if meta is not None and meta.enhanced_prompt and not body.redo:
+            already_enhanced += 1
+            continue
+        if not await prompt_enhance.action_prompt(db, meta.tags if meta else None):
+            no_action += 1
+            continue
+        meta.enhance_error = None
+        # Apart by a microsecond each, so a batch runs in the order it was asked for.
+        meta.enhance_queued_at = now + timedelta(microseconds=offset)
+        queued += 1
+    await db.commit()
+    return EnhanceQueueResult(queued=queued, already_enhanced=already_enhanced, no_action=no_action,
+                              status=await _enhance_queue_status(db))
+
+
+@router.delete("/images/enhance-prompt/queue", response_model=EnhanceQueueStatus,
+               dependencies=[Depends(get_current_user)])
+async def enhance_queue_clear(db: AsyncSession = Depends(get_db)):
+    """Empty the line and forget the failures. An enhance already under way finishes, and its
+    result is dropped."""
+    await db.execute(update(ImageMeta)
+                     .where(or_(ImageMeta.enhance_queued_at.is_not(None),
+                                ImageMeta.enhance_error.is_not(None)))
+                     .values(enhance_queued_at=None, enhance_error=None))
+    await db.commit()
+    return await _enhance_queue_status(db)
 
 
 @router.post("/images/scene/try", response_model=CaptionTryResponse,
