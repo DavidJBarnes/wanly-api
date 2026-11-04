@@ -169,6 +169,11 @@ class CaptionQueueStatus(BaseModel):
     #: are going to the fallback (the image-description captioner) because the scene service
     #: is down.
     scene_captioner: Optional[dict] = None
+    #: Uploads waiting in the describe queue (console#727) that are not in the lane yet. The
+    #: queue feeds the lane one image at a time, so `depth` alone hides a whole upload batch.
+    backlog: int = 0
+    #: Images the describe queue gave up on; GET /images/describe-queue names them.
+    backlog_failed: int = 0
 
 
 class ImageSceneResponse(BaseModel):
@@ -236,3 +241,20 @@ class EnhanceQueueResult(BaseModel):
     already_enhanced: int
     no_action: int
     status: EnhanceQueueStatus
+
+
+class DescribeQueueFailure(BaseModel):
+    path: str
+    error: str
+
+
+class DescribeQueueStatus(BaseModel):
+    """The scene describer's queue (console#727). `waiting` includes `running`."""
+    running: Optional[str] = None
+    waiting: int = 0
+    failed: list[DescribeQueueFailure] = []
+
+
+class DescribeQueueRetried(BaseModel):
+    retried: int
+    status: DescribeQueueStatus
