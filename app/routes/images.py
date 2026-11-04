@@ -5,7 +5,7 @@ import uuid
 from typing import Literal, Optional
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Form, HTTPException, Query, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from sqlalchemy import and_, func, not_, or_, select, text, true, update
 from sqlalchemy import delete as sa_delete
@@ -14,18 +14,19 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import get_current_user, verify_api_key_or_bearer, verify_api_key_or_token
-from app import caption_tickets
+from app import caption_tickets, describe_queue
 from app.config import settings
 from app.routes.datasets import DATASETS_PREFIX
 from app import run_datasets
-from app.database import async_session, get_db, release_connection
-from app.joycaption import CaptionError, CaptionerBusy
+from app.database import get_db, release_connection
+from app.joycaption import CaptionError
 from app.enums import JobStatus, SegmentStatus, TrainingStatus
 from app.models import Dataset, Favorite, ImageMeta, Job, LtxCharacter, Segment, TrainingJob
-from app.routes.captions import caption_image_bytes, caption_image_scene
+from app.routes.captions import caption_image_bytes
 from app.schemas.images import (BulkImageTagsUpdate, CaptionLane, CaptionQueueEntry,
                                 CaptionQueueStatus, ImagesInUseRequest,
                                 CaptionTicket, CaptionTryRequest, CaptionTryResponse,
+                                DescribeQueueRetried, DescribeQueueStatus,
                                 EnhancePromptResponse, EnhanceQueueFailure, EnhanceQueueRequest,
                                 EnhanceQueueResult, EnhanceQueueStatus,
                                 ImageSceneRequest, ImageSceneResponse, ImageTagsUpdate)
@@ -352,7 +353,14 @@ async def upload_image(
     file: UploadFile,
     filename: str | None = None,
     folder: str | None = Form(None),
+    db: AsyncSession = Depends(get_db),
 ):
+    """Store an image in the repo and put it in line to be described (console#727).
+
+    Most images arrive here from A1111's upload script, many of them never tagged, so the
+    description no longer waits for a tag: an upload is enough. The queue (app/describe_queue.py)
+    runs in the background; this answers as soon as the object is stored.
+    """
     data = await file.read()
     if not filename:
         ext = ""
@@ -368,6 +376,13 @@ async def upload_image(
     key = f"{prefix}/{filename}"
     bucket = settings.s3_images_bucket
     uri = await asyncio.to_thread(upload_bytes, data, key, bucket)
+    if describe_queue.is_image(uri) and not _is_dataset_key(key):
+        meta = await db.get(ImageMeta, uri)
+        if meta is None:
+            meta = ImageMeta(path=uri)
+            db.add(meta)
+        describe_queue.queue(meta)
+        await db.commit()
     return {"path": uri}
 
 
@@ -624,6 +639,8 @@ async def move_images(body: dict, db: AsyncSession = Depends(get_db)):
             enhanced_prompt_at=meta.enhanced_prompt_at,
             enhance_queued_at=meta.enhance_queued_at,
             enhance_error=meta.enhance_error,
+            describe_queued_at=meta.describe_queued_at,
+            describe_error=meta.describe_error,
         ))
         await db.delete(meta)
     # A CHARACTER'S SHEET OR FACE REF MOVES WITH THE IMAGE (wanly-console#581). The row names
@@ -866,76 +883,9 @@ def _split_tags(blob: str | None) -> list[str]:
     return [t.strip() for t in (blob or "").split(",") if t.strip()]
 
 
-async def describe_untagged(db: AsyncSession, paths: list[str]) -> int:
-    """Describe the SCENE of each of `paths` that has none yet, serially.
-
-    Scene only (console#590).
-
-    The captioning half of bulk tagging (api#340): tagging an image is the moment someone
-    decided it was worth keeping, which is the rule console#414 built single-image
-    auto-describe on — but the bulk endpoint has no client loop to hang it on, and a
-    client loop would die with the tab. So the description happens here, after the tag
-    commit, one image at a time: each caption is two sequential Ollama calls on a GPU
-    shared with the render stack, so parallelism buys nothing and OOMs something.
-
-    The loop stops at the first captioner refusal (render busy, box down) and leaves the
-    rest undescribed — visibly, in the lightbox. A later bulk-add re-queues them; retry
-    with backoff across a ~30-minute render is not worth a queue table for one user.
-
-    Returns the number described. The caller must have committed the tags already: a
-    failure here must never take a tag write with it.
-    """
-    described = 0
-    for path in paths:
-        meta = await db.get(ImageMeta, path)
-        if meta is None or (meta.scene_description or "").strip():
-            continue  # row gone, or someone described it in the meantime
-        if caption_tickets.active(path, caption_tickets.SCENE) is not None:
-            continue  # a scene of it is already coming (console#564); a second would race it
-        try:
-            image = await asyncio.to_thread(download_bytes, path)
-            scene, instruction = await caption_image_scene(db, image)
-        except CaptionerBusy as e:
-            logger.info("auto-describe batch stopping at %s: %s", path, e)
-            break
-        except CaptionError as e:
-            # A box-wide refusal (unreachable) and a per-image refusal look the same from
-            # here, and the cost of guessing wrong is one wasted caption per image. Stop
-            # rather than hammer whatever is wrong.
-            logger.warning("auto-describe stopping at %s: %s", path, e)
-            break
-        except Exception:
-            # An unreadable image (deleted between commit and here) is that image's
-            # problem, not the batch's.
-            logger.exception("auto-describe could not read %s; skipping", path)
-            continue
-        if not (scene or "").strip():
-            logger.warning("auto-describe got an empty caption for %s; skipping", path)
-            continue
-        caption_tickets.apply_scene(meta, scene, instruction)
-        await db.commit()
-        described += 1
-    return described
-
-
-async def describe_untagged_job(paths: list[str]) -> None:
-    """BackgroundTasks entry: describe_untagged on its own session.
-
-    Background tasks run after the response is sent and the request's session is closed,
-    so this opens one of its own, the way stitch_video does.
-    """
-    async with async_session() as db:
-        try:
-            n = await describe_untagged(db, paths)
-            logger.info("bulk-tag auto-describe: %d of %d described", n, len(paths))
-        except Exception:
-            logger.exception("bulk-tag auto-describe failed")
-
-
 @router.post("/images/tags", dependencies=[Depends(get_current_user)])
 async def bulk_update_image_tags(
     body: BulkImageTagsUpdate,
-    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
 ):
     """Add or remove the same tags across many images at once (console#517).
@@ -1015,9 +965,11 @@ async def bulk_update_image_tags(
             # "No row" means "never tagged" to the untagged view, so a remove that changes
             # nothing must not create an empty row — only an add materialises one.
             if merged_val is not None:
-                db.add(ImageMeta(path=path, tags=merged_val))
+                new_meta = ImageMeta(path=path, tags=merged_val)
+                describe_queue.queue(new_meta)  # a new row has never been described
+                db.add(new_meta)
                 results.append({"path": path, "tags": merged_val, "changed": True})
-                to_describe.append(path)  # a new row has never been described
+                to_describe.append(path)
             else:
                 results.append({"path": path, "tags": None, "changed": False})
             continue
@@ -1028,6 +980,7 @@ async def bulk_update_image_tags(
         # (console#414), so the batch captions it too (api#340). From the DB row, not the
         # client's cache — the console has no way to say what the captioner has done.
         if body.mode == "add" and before != after and not (meta.scene_description or "").strip():
+            describe_queue.queue(meta)  # no-op for one already in line, which keeps its place
             to_describe.append(path)
         meta.tags = merged_val
         if meta.is_empty():
@@ -1036,8 +989,6 @@ async def bulk_update_image_tags(
                         "changed": before != after})
 
     await db.commit()
-    if to_describe:
-        background_tasks.add_task(describe_untagged_job, to_describe)
     return {"results": results, "mode": body.mode, "describing": len(to_describe)}
 
 
@@ -1129,12 +1080,14 @@ async def caption_queue_status():
     single cheap poll that answers "is anything captioning, and how much is behind it"
     whatever page you are on.
 
-    No database and no captioner call -- the queue is in this process.
+    No database and no captioner call -- the queue is in this process. The describe queue's
+    size (console#727) is the runner's cached count, not a query.
     """
     from app import caption_queue as cq
     from app.joycaption import scene_status
 
     lanes = cq.lanes()
+    backlog, backlog_failed = describe_queue.backlog()
     return CaptionQueueStatus(
         depth=sum(q.depth() for _, q in lanes),
         waiting=sum(len(q.waiting_paths()) for _, q in lanes),
@@ -1147,7 +1100,35 @@ async def caption_queue_status():
                            running=q.running_path()) for name, q in lanes],
         scene_captioner=scene_status(),
         recent=[_ticket_response(t.path, t) for t in caption_tickets.recent()],
+        backlog=backlog,
+        backlog_failed=backlog_failed,
     )
+
+
+@router.get("/images/describe-queue", response_model=DescribeQueueStatus,
+            dependencies=[Depends(get_current_user)])
+async def describe_queue_status(db: AsyncSession = Depends(get_db)):
+    """The describe queue (console#727): how many are in line, and which it gave up on."""
+    return DescribeQueueStatus(**await describe_queue.status(db))
+
+
+@router.post("/images/describe-queue/retry", response_model=DescribeQueueRetried,
+             dependencies=[Depends(get_current_user)])
+async def describe_queue_retry(db: AsyncSession = Depends(get_db)):
+    """Put every image the queue gave up on back in line, behind what is already there."""
+    failed = (await db.execute(
+        select(ImageMeta).where(ImageMeta.describe_error.is_not(None))
+        .order_by(ImageMeta.path))).scalars().all()
+    now = datetime.now(timezone.utc)
+    retried = 0
+    for offset, meta in enumerate(failed):
+        meta.describe_error = None
+        # Apart by a microsecond each, so they run in a stable order.
+        if describe_queue.queue(meta, now + timedelta(microseconds=offset)):
+            retried += 1
+    await db.commit()
+    return DescribeQueueRetried(retried=retried,
+                                status=DescribeQueueStatus(**await describe_queue.status(db)))
 
 
 @router.get("/images/scene", response_model=ImageSceneResponse,

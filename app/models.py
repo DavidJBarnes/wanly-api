@@ -307,6 +307,11 @@ class ImageMeta(Base):
     # why its last turn failed. Both null is an image the queue has nothing to say about.
     enhance_queued_at = mapped_column(DateTime(timezone=True), nullable=True)
     enhance_error = mapped_column(Text, nullable=True)
+    # The scene describer's queue (console#727, app/describe_queue.py): every upload joins it,
+    # so an image is described without anyone having to tag it first. Same shape as the
+    # enhancer's: when it joined, and why its last turn failed.
+    describe_queued_at = mapped_column(DateTime(timezone=True), nullable=True)
+    describe_error = mapped_column(Text, nullable=True)
     updated_at = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
     def is_empty(self) -> bool:
@@ -318,7 +323,8 @@ class ImageMeta(Base):
         """
         return (not (self.tags or "").strip()
                 and not (self.scene_description or "").strip()
-                and not (self.enhanced_prompt or "").strip())
+                and not (self.enhanced_prompt or "").strip()
+                and self.describe_queued_at is None)
 
 
 class Worker(Base):
