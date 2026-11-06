@@ -26,7 +26,7 @@ from app.routes.captions import caption_image_bytes
 from app.seeds import new_seed
 from app import caption_hold
 from app.queue_position import place_queued_job
-from app.enums import SEGMENT_HELD, JobStatus, SegmentStatus, VideoStatus, WorkerKind
+from app.enums import SEGMENT_HELD, JobStatus, SegmentStatus, VideoStatus, WorkerKind, worker_can
 from app.ltx_stack import LTX_STACK
 from app.model_requirements import CHECKPOINT, canonical
 from app.character_registry import draft_message, is_draft
@@ -84,6 +84,10 @@ SMASHCUT_CARRIER_INDEX = 2000
 
 # Reprocess types that run on the CPU-only track (no ComfyUI/GPU): holograms + smashcut concat.
 _CPU_REPROCESS_TYPES = ("ar_hologram", "smashcut_concat")
+# How long a CPU carrier waits for a live hologram worker before a render worker may take it
+# anyway (wanly-gpu-docker#228). The hologram worker is the default home; this is the fallback
+# for one that is up but not claiming -- waiting for memory headroom, say, or wedged.
+HOLOGRAM_FALLBACK_MINUTES = 15
 
 router = APIRouter()
 
@@ -911,6 +915,19 @@ async def _identity_ref_for(db: AsyncSession, job: Job,
     return ClaimIdentityRef(url=url, mode=mode, uri=uri, character=row.name)
 
 
+async def _hologram_worker_live(db: AsyncSession, heartbeat_cutoff: datetime) -> bool:
+    """Is a worker of kind `hologram` heartbeating? Then holograms are its work first."""
+    hologram = str(WorkerKind.HOLOGRAM)
+    found = await db.execute(
+        select(Worker.id).where(
+            or_(Worker.kind == hologram, Worker.kinds.contains([hologram])),
+            Worker.last_heartbeat >= heartbeat_cutoff,
+            Worker.status != "offline",
+        ).limit(1)
+    )
+    return found.first() is not None
+
+
 @router.get("/segments/next", dependencies=[Depends(verify_api_key)])
 async def claim_next_segment(
     worker_id: UUID = Query(...),
@@ -1003,6 +1020,12 @@ async def claim_next_segment(
         stale.claimed_at = None
         stale.progress_log = None
 
+    # Read once, used three times: the hologram routing and the gate need this worker's row
+    # before the query, and the GPU name is snapshotted off the same row after it.
+    claiming_worker = await db.get(Worker, worker_id)
+    makes_holograms = (claiming_worker is not None
+                       and worker_can(claiming_worker, WorkerKind.HOLOGRAM))
+
     # Split work by kind so the CPU-only reprocess track runs concurrently with GPU generation:
     #   kind="gpu"      -> generations only (exclude CPU reprocess carriers)
     #   kind="hologram" -> CPU-only reprocess carriers: holograms + smashcut (claimable even on
@@ -1019,6 +1042,13 @@ async def claim_next_segment(
             Segment.discarded.is_(False),
             Segment.reprocess_type.in_(_CPU_REPROCESS_TYPES),
         )
+        # A render worker is the FALLBACK for holograms, not their home (wanly-gpu-docker#228):
+        # while a hologram worker is live, a render worker takes only a carrier that has
+        # already waited HOLOGRAM_FALLBACK_MINUTES for it. Otherwise a 3090 between renders
+        # grabs it and holds its next render for the 4-6 minutes it takes.
+        if not makes_holograms and await _hologram_worker_live(db, heartbeat_cutoff):
+            where = (*where, Segment.created_at
+                     < now - timedelta(minutes=HOLOGRAM_FALLBACK_MINUTES))
     elif kind == "gpu":
         where = (
             Segment.status == SegmentStatus.PENDING,
@@ -1040,14 +1070,14 @@ async def claim_next_segment(
                 Segment.reprocess_type.in_(_CPU_REPROCESS_TYPES),
             ),
         )
-    # Read once, used twice: the gate needs this worker's inventory before the query, and the
-    # GPU name is snapshotted off the same row after it.
-    claiming_worker = await db.get(Worker, worker_id)
+    # A hologram worker is no render worker, so _model_gate refuses it everything -- which is
+    # right for every kind of work but the one it exists for.
+    gate = (() if kind == "hologram" and makes_holograms else _model_gate(claiming_worker))
 
     result = await db.execute(
         select(Segment)
         .join(Job, Segment.job_id == Job.id)
-        .where(*where, *_model_gate(claiming_worker),
+        .where(*where, *gate,
                *_pending_lora_gate(pending_lora_names(pending_loras)))
         .order_by(Job.priority.asc(), Segment.created_at.asc())
         .limit(1)

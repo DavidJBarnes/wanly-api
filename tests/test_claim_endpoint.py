@@ -64,7 +64,7 @@ async def _segment(db, job, index=0, *, status=SegmentStatus.PENDING, discarded=
     return seg
 
 
-async def _claim(db, kind="gpu"):
+async def _claim(db, kind="gpu", worker_id=WORKER_ID):
     """Call the endpoint exactly as the daemon does."""
     app.dependency_overrides[get_db] = lambda: db
     app.dependency_overrides[verify_api_key] = lambda: None
@@ -77,7 +77,7 @@ async def _claim(db, kind="gpu"):
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             return await client.get(
                 "/segments/next",
-                params={"worker_id": str(WORKER_ID), "worker_name": "3090.zero", "kind": kind},
+                params={"worker_id": str(worker_id), "worker_name": "3090.zero", "kind": kind},
             )
     finally:
         app.dependency_overrides.clear()
@@ -285,6 +285,85 @@ class TestKindRouting:
         await _segment(db, job, 0)
 
         assert (await _claim(db, kind="gpu")).json() is None
+
+
+async def _kind_worker(db, kind, *, worker_id=None, heartbeat_ago_minutes=0,
+                       status="online") -> Worker:
+    worker = Worker(
+        id=worker_id or uuid.uuid4(), friendly_name=f"{kind}-{uuid.uuid4().hex[:6]}",
+        hostname="h", ip_address="10.0.0.3", kind=kind, kinds=[kind], status=status,
+        last_heartbeat=datetime.now(timezone.utc) - timedelta(minutes=heartbeat_ago_minutes),
+    )
+    db.add(worker)
+    await db.flush()
+    return worker
+
+
+@pytest.mark.asyncio
+class TestHologramWorker:
+    """The 2070's scene container makes holograms; the 3090s are the fallback (wanly-gpu-docker#228)."""
+
+    async def test_a_hologram_worker_claims_a_carrier(self, db):
+        holo = await _kind_worker(db, "hologram")
+        job = await _job(db, status=JobStatus.FINALIZED)
+        carrier = await _segment(db, job, 1000, reprocess_type="ar_hologram")
+
+        body = (await _claim(db, kind="hologram", worker_id=holo.id)).json()
+
+        assert body is not None and body["id"] == str(carrier.id)
+
+    async def test_and_a_smashcut(self, db):
+        holo = await _kind_worker(db, "hologram")
+        job = await _job(db)
+        carrier = await _segment(db, job, 2000, reprocess_type="smashcut_concat")
+
+        body = (await _claim(db, kind="hologram", worker_id=holo.id)).json()
+
+        assert body is not None and body["id"] == str(carrier.id)
+
+    async def test_but_never_a_generation(self, db):
+        holo = await _kind_worker(db, "hologram")
+        job = await _job(db)
+        await _segment(db, job, 0)
+
+        for kind in ("gpu", "hologram", None):
+            assert (await _claim(db, kind=kind, worker_id=holo.id)).json() is None
+
+    async def test_a_service_still_claims_nothing(self, db):
+        svc = await _kind_worker(db, "service")
+        job = await _job(db)
+        await _segment(db, job, 1000, reprocess_type="ar_hologram")
+
+        assert (await _claim(db, kind="hologram", worker_id=svc.id)).json() is None
+
+    async def test_a_render_worker_leaves_a_fresh_carrier_to_a_live_hologram_worker(self, db):
+        await _kind_worker(db, "hologram")
+        render = await _kind_worker(db, "render", status="online-idle")
+        job = await _job(db)
+        await _segment(db, job, 1000, reprocess_type="ar_hologram")
+
+        assert (await _claim(db, kind="hologram", worker_id=render.id)).json() is None
+
+    async def test_but_takes_one_that_has_waited_past_the_fallback(self, db):
+        await _kind_worker(db, "hologram")
+        render = await _kind_worker(db, "render", status="online-idle")
+        job = await _job(db)
+        carrier = await _segment(db, job, 1000, reprocess_type="ar_hologram",
+                                 created_at=datetime.now(timezone.utc) - timedelta(minutes=16))
+
+        body = (await _claim(db, kind="hologram", worker_id=render.id)).json()
+
+        assert body is not None and body["id"] == str(carrier.id)
+
+    async def test_and_takes_any_while_the_hologram_worker_is_down(self, db):
+        await _kind_worker(db, "hologram", heartbeat_ago_minutes=10)
+        render = await _kind_worker(db, "render", status="online-idle")
+        job = await _job(db)
+        carrier = await _segment(db, job, 1000, reprocess_type="ar_hologram")
+
+        body = (await _claim(db, kind="hologram", worker_id=render.id)).json()
+
+        assert body is not None and body["id"] == str(carrier.id)
 
 
 async def _worker(db, *, heartbeat_ago_minutes=0) -> Worker:

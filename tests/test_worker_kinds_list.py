@@ -63,6 +63,16 @@ class TestRegistration:
         assert w.status == "online-idle"
 
 
+    async def test_a_hologram_box_registers_with_the_service_vocabulary(self, db):
+        """wanly-gpu-docker#228: the 2070's scene container. It claims holograms, but its
+        supervisor reports its health the way a service does."""
+        from app.routes.workers import register_worker
+        w = await register_worker(WorkerRegister(
+            friendly_name="3090a-scene", hostname="h", ip_address="1.2.3.4",
+            kind=WorkerKind.HOLOGRAM, kinds=[WorkerKind.HOLOGRAM]), db=db)
+        assert w.kind == "hologram" and w.kinds == ["hologram"]
+        assert w.status == "online"
+
 class TestTheTrainingGate:
     def test_reads_kinds_not_kind(self):
         import inspect
