@@ -102,6 +102,11 @@ class WorkerKind(StrEnum):
     #: jobs and never segments, and a SERVICE takes neither. Collapsing them would mean the
     #: captioner on the 2070 being offered a 50-minute training run it has no GPU for.
     TRAINER = "trainer"
+    #: Makes AR holograms and smashcut concats -- the CPU-only reprocess carriers -- and nothing
+    #: else (wanly-gpu-docker#228): the 2070's scene container, so a hologram neither waits for a
+    #: 3090's render nor holds its next one. Its own kind because the claim gate keys on kinds:
+    #: as a SERVICE it could claim nothing, as a RENDER it would be offered every generation.
+    HOLOGRAM = "hologram"
 
 
 #: Convenience for the model's column defaults, which cannot reference the enum member
