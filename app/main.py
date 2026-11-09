@@ -16,7 +16,7 @@ from app.config import settings
 from app.heartbeat_monitor import heartbeat_monitor
 from app.reservation_monitor import reservation_monitor
 from app.limiter import limiter
-from app.routes import app_settings, auth, captions, character_prompts, character_sheets, characters, datasets, favorites, files, image_edit, images, jobs, lora_usage, ltx_recipes, runpod, segments, stats, tags, training, videos, wildcards, workers
+from app.routes import app_settings, auth, captions, character_prompts, character_sheets, characters, datasets, face_loops, favorites, files, image_edit, images, jobs, lora_usage, ltx_recipes, runpod, segments, stats, tags, training, videos, wildcards, workers
 
 logger = logging.getLogger(__name__)
 
@@ -107,3 +107,4 @@ app.include_router(stats.router)
 app.include_router(datasets.router)
 app.include_router(training.router)
 app.include_router(lora_usage.router)
+app.include_router(face_loops.router)

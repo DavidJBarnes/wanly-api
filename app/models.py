@@ -972,3 +972,33 @@ class CharacterPrompt(Base):
     created_at = mapped_column(DateTime(timezone=True), nullable=False,
                                default=lambda: datetime.now(timezone.utc))
     updated_at = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class FaceLoop(Base):
+    """A short, calm, looping face clip of a character, prepared for the AR face page
+    (wanly-api#495, wanly-console#742).
+
+    Made by an ordinary LTX render (Prompt recipe, the character's own LoRA, a calm prompt, from
+    a close-up photo) followed by a CPU preparation step on this box (app/face_loop_prep.py) that
+    picks the calmest window and writes the loop + mesh data under `asset_prefix`.
+
+    status: rendering (job queued/running) -> processing -> ready | failed.
+    """
+    __tablename__ = "face_loops"
+
+    id = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    character_id = mapped_column(UUID(as_uuid=True), ForeignKey("ltx_characters.id", ondelete="CASCADE"),
+                                 nullable=False, index=True)
+    label = mapped_column(String(120), nullable=False)
+    preset = mapped_column(String(32), nullable=False)
+    prompt = mapped_column(Text, nullable=False)
+    start_image = mapped_column(Text, nullable=False)
+    job_id = mapped_column(UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="SET NULL"), nullable=True, index=True)
+    status = mapped_column(String(16), nullable=False, default="rendering", server_default="rendering")
+    asset_prefix = mapped_column(Text, nullable=True)
+    window_start = mapped_column(Float, nullable=True)
+    window_end = mapped_column(Float, nullable=True)
+    stats = mapped_column(JSONB, nullable=True)
+    error = mapped_column(Text, nullable=True)
+    created_at = mapped_column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+    updated_at = mapped_column(DateTime(timezone=True), nullable=True)

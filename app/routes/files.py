@@ -17,6 +17,7 @@ from app.models import Job, Segment, User, Video
 from app.s3 import generate_presigned_url, upload_bytes
 from app.schemas.segments import SegmentResponse
 from app.stitch import stitch_video
+from app.routes.face_loops import on_render_uploaded
 
 logger = logging.getLogger(__name__)
 
@@ -174,6 +175,8 @@ async def upload_segment_output(
             job.status = JobStatus.AWAITING
 
     await db.commit()
+    # A face loop's render (wanly-api#495): prepare the loop once the clip has landed.
+    await on_render_uploaded(db, segment, background_tasks)
     await db.refresh(segment)
     return segment
 
