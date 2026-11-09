@@ -275,10 +275,20 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
 # mouth, open eyes and sharpness; real_034 (face 691 px, dead-on, neutral) made the loops David
 # called "very good". Same criteria here, so the picker can put the good candidates first.
 
+# Start photos are cropped to a face-centred square (crop_start) and rendered at START_SIZE, so
+# the face ends up START_SIZE / START_FACE_SPAN px tall whatever the photo's resolution. A face
+# smaller than that in the photo gets upscaled (soft); bigger gives no further benefit.
+START_SIZE = 1024
+START_FACE_SPAN = 1.75  # crop side, in face heights (real_034: face 691 px in a 1024 frame)
+START_FACE_PX = START_SIZE / START_FACE_SPAN
+
+
 def photo_score(face_px: float, yaw: float, pitch: float, roll: float, mouth: float, eyes: float, sharp: float) -> tuple[float, bool]:
-    """(score, suitable). mouth/eyes are openings as a fraction of face height."""
+    """(score, suitable). mouth/eyes are openings as a fraction of face height. Face size counts
+    up to what the crop can use (START_FACE_PX); past that, sharpness and pose decide."""
     suitable = mouth < 0.03 and eyes > 0.035 and abs(yaw) < 12 and abs(pitch) < 18 and abs(roll) < 10
-    score = (face_px / 400) * max(0.0, 1 - abs(yaw) / 25) * max(0.0, 1 - abs(pitch) / 40) * min(1.0, sharp / 100)
+    usable = min(face_px, START_FACE_PX)
+    score = (usable / 400) * max(0.0, 1 - abs(yaw) / 25) * max(0.0, 1 - abs(pitch) / 40) * min(1.0, sharp / 100)
     return score * (1.0 if suitable else 0.2), suitable
 
 
@@ -319,3 +329,34 @@ def photo_detector():
 
     return vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=MODEL_PATH), num_faces=1, output_facial_transformation_matrixes=True))
+
+
+def crop_start(image_bytes: bytes, detector) -> tuple[bytes, int, int]:
+    """Crop a start photo to a face-centred square, START_FACE_SPAN face heights a side, at most
+    START_SIZE² (PNG). The render size derives from the start image (~1 MP), so an uncropped
+    4000x3000 phone photo rendered the face at ~460 px; cropped, any good photo gives ~585+.
+    Raises ValueError if there is no face."""
+    import cv2
+    import mediapipe as mp
+
+    img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise ValueError("start image could not be decoded")
+    h, w = img.shape[:2]
+    r = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
+    if not r.face_landmarks:
+        raise ValueError("no face found in the start photo")
+    p = r.face_landmarks[0]
+    top, chin = np.array([p[10].x * w, p[10].y * h]), np.array([p[152].x * w, p[152].y * h])
+    fh = float(np.linalg.norm(chin - top))
+    c = (top + chin) / 2
+    side = int(min(fh * START_FACE_SPAN, w, h))
+    x0 = int(np.clip(c[0] - side / 2, 0, w - side))
+    y0 = int(np.clip(c[1] - side * 0.48, 0, h - side))
+    crop = img[y0:y0 + side, x0:x0 + side]
+    if side > START_SIZE:
+        crop = cv2.resize(crop, (START_SIZE, START_SIZE), interpolation=cv2.INTER_AREA)
+    ok, png = cv2.imencode(".png", crop)
+    if not ok:
+        raise ValueError("could not encode the cropped start photo")
+    return png.tobytes(), crop.shape[1], crop.shape[0]

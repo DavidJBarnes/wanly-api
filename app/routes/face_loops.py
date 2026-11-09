@@ -29,7 +29,7 @@ from app.face_loop_presets import FPS, FRAMES, PRESETS, build_prompt
 from app.models import Dataset, FaceLoop, Job, LtxCharacter, LtxRecipe, Segment, User
 from app.regularization import REG_PRIORITY_BASE
 from app.routes.characters import _find
-from app.s3 import delete_prefix, download_bytes, download_file, head_object, upload_file
+from app.s3 import delete_prefix, download_bytes, download_file, head_object, upload_bytes, upload_file
 from app.schemas.face_loops import FaceLoopCreate, FaceLoopPhoto, FaceLoopPreset, FaceLoopResponse, FaceLoopUpdate
 
 logger = logging.getLogger(__name__)
@@ -146,17 +146,30 @@ async def rank_photos(key: str, db: AsyncSession = Depends(get_db)):
     return sorted(rated, key=lambda p: p.score, reverse=True)
 
 
-async def _image_size(uri: str) -> tuple[int, int]:
-    import cv2
-    import numpy as np
+async def _cropped_start(uri: str, character: str) -> tuple[str, int, int]:
+    """Crop the chosen photo to a face-centred square (face_loop_prep.crop_start) and store it,
+    so every loop renders with the face filling the frame. Returns (uri, width, height)."""
+    import hashlib
+
+    from app.face_loop_prep import crop_start, photo_detector
 
     if await asyncio.to_thread(head_object, uri) is None:
         raise HTTPException(status_code=400, detail=f"start image not found: {uri}")
     data = await asyncio.to_thread(download_bytes, uri)
-    img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_UNCHANGED)
-    if img is None:
-        raise HTTPException(status_code=400, detail="start image could not be decoded")
-    return int(img.shape[1]), int(img.shape[0])
+
+    def work():
+        det = photo_detector()
+        try:
+            return crop_start(data, det)
+        finally:
+            det.close()
+
+    try:
+        png, w, h = await asyncio.to_thread(work)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    key = f"ar-face/{_slug(character)}/starts/{hashlib.sha256(png).hexdigest()[:16]}.png"
+    return await asyncio.to_thread(upload_bytes, png, key, settings.s3_jobs_bucket), w, h
 
 
 @router.post("/ltx/characters/{key}/face-loops", response_model=FaceLoopResponse, status_code=201)
@@ -169,7 +182,7 @@ async def create_loop(key: str, body: FaceLoopCreate, user: User = Depends(get_c
                                .order_by(LtxRecipe.is_default.desc()))).scalars().first()
     if recipe is None:
         raise HTTPException(status_code=409, detail=f"no {PROMPT_RECIPE!r} recipe to render with")
-    width, height = await _image_size(body.start_image)
+    start_uri, width, height = await _cropped_start(body.start_image, c.name)
 
     preset = PRESETS[body.preset]
     motion = body.motion.strip() if body.preset == "custom" else preset["motion"]
@@ -188,11 +201,12 @@ async def create_loop(key: str, body: FaceLoopCreate, user: User = Depends(get_c
         Job.user_id == user.id, Job.priority < REG_PRIORITY_BASE))).scalar_one() + 1
     job = Job(user_id=user.id, name=f"{c.name} - Face Loop ({label})", width=width, height=height, fps=FPS,
               seed=uuid.uuid4().int % (2 ** 47), continuation_mode="traditional", priority=next_priority,
-              tags="FaceLoop", starting_image=body.start_image)
+              tags="FaceLoop", starting_image=start_uri)
     db.add(job)
     await db.flush()
     db.add(Segment(job_id=job.id, index=0, prompt=prompt, duration_seconds=FRAMES / FPS, speed=1.0,
                    negative_prompt=preset["negative"], ltx_recipe=ltx_recipe, auto_finalize=False))
+    # start_image records the photo that was CHOSEN; the job carries the cropped one.
     loop = FaceLoop(character_id=c.id, label=label, preset=body.preset, prompt=prompt,
                     start_image=body.start_image, job_id=job.id, status="rendering",
                     created_at=datetime.now(timezone.utc))
