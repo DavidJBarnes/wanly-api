@@ -11,3 +11,12 @@ boto3==1.42.50
 python-multipart==0.0.20
 httpx==0.28.1
 slowapi==0.1.9
+# Face loops (wanly-api#495): MediaPipe face landmarks + video I/O for loop preparation.
+# mediapipe itself is installed with --no-deps in the Dockerfile: its declared deps pull the GUI
+# OpenCV build and an audio stack this server never uses. These are the deps it actually imports.
+opencv-python-headless==4.12.0.88
+numpy==2.2.6
+absl-py==2.5.1
+flatbuffers==25.12.19
+certifi==2026.10.23
+matplotlib==3.10.7
