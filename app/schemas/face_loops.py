@@ -58,3 +58,16 @@ class FaceLoopPreset(BaseModel):
     id: str
     label: str
     motion: str
+
+
+class FaceLoopPhoto(BaseModel):
+    """A candidate start photo and how well it suits a face loop (bigger, frontal, mouth closed,
+    eyes open, sharp = better). `suitable` is the hard check; `score` orders them."""
+    uri: str
+    score: float
+    suitable: bool
+    face_px: int
+    yaw: float
+    pitch: float
+    mouth_closed: bool
+    eyes_open: bool

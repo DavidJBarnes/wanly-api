@@ -266,3 +266,56 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
         "crop_px": side,
     }
     return Prepared(out_dir, (s0 / fps, s1 / fps), len(order), fps, stats)
+
+
+# --- Start-photo ranking (the Face loops tab's photo picker) ---------------------------------
+#
+# The loop is only as sharp and still as its start photo: LTX animates FROM it. The hand-run
+# pick (console#742) ranked Kelly-2026's 83 training photos by face size, frontality, a closed
+# mouth, open eyes and sharpness; real_034 (face 691 px, dead-on, neutral) made the loops David
+# called "very good". Same criteria here, so the picker can put the good candidates first.
+
+def photo_score(face_px: float, yaw: float, pitch: float, roll: float, mouth: float, eyes: float, sharp: float) -> tuple[float, bool]:
+    """(score, suitable). mouth/eyes are openings as a fraction of face height."""
+    suitable = mouth < 0.03 and eyes > 0.035 and abs(yaw) < 12 and abs(pitch) < 18 and abs(roll) < 10
+    score = (face_px / 400) * max(0.0, 1 - abs(yaw) / 25) * max(0.0, 1 - abs(pitch) / 40) * min(1.0, sharp / 100)
+    return score * (1.0 if suitable else 0.2), suitable
+
+
+def rate_photo(image_bytes: bytes, detector) -> dict | None:
+    """Rate one photo with an IMAGE-mode FaceLandmarker (with transformation matrices).
+    None if it holds no detectable face."""
+    import cv2
+    import mediapipe as mp
+
+    img = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    r = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
+    if not r.face_landmarks:
+        return None
+    p = r.face_landmarks[0]
+
+    def pt(i):
+        return np.array([p[i].x * w, p[i].y * h])
+
+    fh = float(np.linalg.norm(pt(10) - pt(152)))
+    mouth = float(np.linalg.norm(pt(13) - pt(14)) / fh)
+    eyes = float((np.linalg.norm(pt(159) - pt(145)) + np.linalg.norm(pt(386) - pt(374))) / 2 / fh)
+    m = np.asarray(r.facial_transformation_matrixes[0])
+    yaw, pitch = euler(m)
+    roll = math.degrees(math.atan2(m[1, 0], m[0, 0]))
+    xs, ys = [q.x * w for q in p], [q.y * h for q in p]
+    sub = img[max(0, int(min(ys))):int(max(ys)), max(0, int(min(xs))):int(max(xs))]
+    sharp = float(cv2.Laplacian(cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY), cv2.CV_64F).var()) if sub.size else 0.0
+    score, suitable = photo_score(fh, yaw, pitch, roll, mouth, eyes, sharp)
+    return {"score": round(score, 3), "suitable": suitable, "face_px": round(fh), "yaw": round(yaw, 1),
+            "pitch": round(pitch, 1), "mouth_closed": mouth < 0.03, "eyes_open": eyes > 0.035}
+
+
+def photo_detector():
+    from mediapipe.tasks.python import BaseOptions, vision
+
+    return vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
+        base_options=BaseOptions(model_asset_path=MODEL_PATH), num_faces=1, output_facial_transformation_matrixes=True))
