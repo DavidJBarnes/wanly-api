@@ -114,10 +114,10 @@ async def _setup(db, kind="solo"):
 def no_s3(monkeypatch):
     calls = {"deleted": []}
 
-    async def size(uri):
-        return 1024, 1024
+    async def cropped(uri, character):
+        return "s3://wanly-jobs/ar-face/kelly/starts/abc.png", 1024, 1024
 
-    monkeypatch.setattr(fl, "_image_size", size)
+    monkeypatch.setattr(fl, "_cropped_start", cropped)
     monkeypatch.setattr(fl, "delete_prefix", lambda prefix, bucket: calls["deleted"].append((bucket, prefix)) or 1)
     return calls
 
@@ -129,7 +129,9 @@ class TestRoutes:
         r = await fl.create_loop(c.name, FaceLoopCreate(preset="calm", start_image="s3://imgs/p.png"), user=u, db=db)
         assert r.status == "rendering" and r.label == "Calm smile + blinks" and r.character == c.name
         job = await db.get(Job, r.job_id)
-        assert job.starting_image == "s3://imgs/p.png" and (job.width, job.height) == (1024, 1024)
+        # the job renders from the face-centred crop; the loop remembers the photo that was chosen
+        assert job.starting_image == "s3://wanly-jobs/ar-face/kelly/starts/abc.png" and (job.width, job.height) == (1024, 1024)
+        assert r.start_image == "s3://imgs/p.png"
         assert job.tags == "FaceLoop"
         seg = (await db.execute(Segment.__table__.select().where(Segment.job_id == job.id))).mappings().one()
         assert seg["ltx_recipe"]["recipe"] == "Prompt" and seg["ltx_recipe"]["frames"] == FRAMES
@@ -191,6 +193,11 @@ class TestRoutes:
 
 
 class TestPhotoScore:
+    def test_face_size_counts_only_up_to_what_the_crop_uses(self):
+        huge, _ = prep.photo_score(1647, 0.4, 13, 0, 0.002, 0.07, 480)
+        enough, _ = prep.photo_score(prep.START_FACE_PX, 0.4, 13, 0, 0.002, 0.07, 480)
+        assert huge == enough
+
     def test_big_frontal_neutral_sharp_photo_wins(self):
         good, ok = prep.photo_score(690, 0.3, 13, 0, 0.002, 0.07, 480)
         small, _ = prep.photo_score(300, 0.3, 13, 0, 0.002, 0.07, 480)
