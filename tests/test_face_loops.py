@@ -188,3 +188,32 @@ class TestRoutes:
         with pytest.raises(HTTPException) as e:
             await fl.reprocess_loop(r.id, BackgroundTasks(), db=db)
         assert e.value.status_code == 409
+
+
+class TestPhotoScore:
+    def test_big_frontal_neutral_sharp_photo_wins(self):
+        good, ok = prep.photo_score(690, 0.3, 13, 0, 0.002, 0.07, 480)
+        small, _ = prep.photo_score(300, 0.3, 13, 0, 0.002, 0.07, 480)
+        turned, _ = prep.photo_score(690, 20, 13, 0, 0.002, 0.07, 480)
+        assert ok and good > small and good > turned
+
+    def test_open_mouth_or_shut_eyes_is_unsuitable_and_ranked_down(self):
+        a, ok_a = prep.photo_score(690, 0, 10, 0, 0.08, 0.07, 480)
+        b, ok_b = prep.photo_score(690, 0, 10, 0, 0.002, 0.01, 480)
+        c, ok_c = prep.photo_score(690, 0, 10, 0, 0.002, 0.07, 480)
+        assert not ok_a and not ok_b and ok_c and c > 4 * max(a, b)
+
+
+@pytest.mark.asyncio
+class TestPhotoCandidates:
+    async def test_living_and_training_sets_are_both_candidates(self, db):
+        from app.models import Dataset
+        u, c = await _setup(db)
+        train = Dataset(name="train", images=["s3://i/real_034.png", "s3://i/shared.png"])
+        db.add(train)
+        await db.flush()
+        c.trained_from = [{"kind": "identity", "dataset_id": str(train.id)}]
+        db.add(Dataset(name="living", images=["s3://i/a.png", "s3://i/shared.png"], character=c.name, kind="character"))
+        await db.flush()
+        got = await fl.candidate_photos(db, c)
+        assert sorted(got) == ["s3://i/a.png", "s3://i/real_034.png", "s3://i/shared.png"]
