@@ -10,7 +10,7 @@ RUN python -m venv /opt/venv && \
 # Face landmark model for face-loop preparation (wanly-api#495). Baked in so a prep never
 # depends on reaching Google's bucket at run time.
 RUN mkdir -p /models && \
-    python -c "import urllib.request; urllib.request.urlretrieve('https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task', '/models/face_landmarker.task'); urllib.request.urlretrieve('https://storage.googleapis.com/mediapipe-models/image_segmenter/hair_segmenter/float32/1/hair_segmenter.tflite', '/models/hair_segmenter.tflite')"
+    python -c "import urllib.request; urllib.request.urlretrieve('https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task', '/models/face_landmarker.task'); urllib.request.urlretrieve('https://storage.googleapis.com/mediapipe-models/image_segmenter/hair_segmenter/float32/1/hair_segmenter.tflite', '/models/hair_segmenter.tflite'); urllib.request.urlretrieve('https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_multiclass_256x256/float32/1/selfie_multiclass_256x256.tflite', '/models/selfie_multiclass_256x256.tflite')"
 
 # ---
 

@@ -32,9 +32,15 @@ SIZE = 768  # source crops are ~850-900 px; 512 threw away detail David judged o
 FACE_MM = 190.0  # forehead-to-chin, for reporting travel in rough millimetres
 MODEL_PATH = os.environ.get("FACE_LANDMARKER_MODEL", "/app/models/face_landmarker.task")
 HAIR_MODEL_PATH = os.environ.get("HAIR_SEGMENTER_MODEL", "/app/models/hair_segmenter.tflite")
+# Full head (console#753): MediaPipe's multiclass selfie segmenter (background, hair, body-skin,
+# face-skin, clothes, others) gives the whole head down to the collar.
+HEAD_MODEL_PATH = os.environ.get("HEAD_SEGMENTER_MODEL", "/app/models/selfie_multiclass_256x256.tflite")
+HEAD_CLASSES = (1, 2, 3)  # hair, body-skin (neck), face-skin; not clothes, background, others
 # Hair (console#751): a wider square of the same render frames, cut out by MediaPipe's hair
-# segmenter, worn on a head shell in AR. HAIR_SPAN = the square's side in face-box sides.
-HAIR_SIZE = 768
+# segmenter, worn on a head shell in AR. HAIR_SPAN = the square's side in face-box sides. On
+# today's renders the square is clipped to the whole 1024² frame; 1024 keeps it at full
+# resolution, since the hair modes draw the FACE from this video too (console#753).
+HAIR_SIZE = 1024
 HAIR_SPAN = 3.0
 
 # Expression-free landmarks (eye corners, nose bridge, forehead, cheekbones, face sides):
@@ -293,7 +299,7 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
     hair_rows = smooth_circular(np.stack([
         hair_uv_rows(sc, r, t, centre, (sx, sy, side), (hx, hy, hside), size)
         for sc, r, t in stabilise_transforms(raw)]))
-    hair_pct = write_hair(hair_crops, order, fps, out_dir)
+    hair_pct, head_pct = write_hair(hair_crops, order, fps, out_dir)
 
     # 5. files
     with open(os.path.join(out_dir, "face.bin"), "wb") as f:
@@ -304,9 +310,11 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
         "anchors": ANCHORS, "units": f"px of the {size} crop, centred on the anchor centroid",
         "layout": "float32: positions[frames][468][3] then uvs[frames][468][2]",
         "anchorResidualPx": round(resid, 3),
-        # console#751: hair.mp4 is HAIR_SIZE wide, colour on top and the hair mask below;
-        # hair.bin maps a stabilised head point to the hair image per frame.
+        # console#751: hair.mp4 is HAIR_SIZE wide, colour on top and the masks below (red = hair,
+        # green = the whole head, console#753); hair.bin maps a stabilised head point to the hair
+        # image per frame.
         "hair": {"video": "hair.mp4", "size": HAIR_SIZE, "layout": "float32: rows[frames][2][4]",
+                 "masks": {"r": "hair", "g": "head"},
                  "uv": "u right, v down, 0..1 of the colour square",
                  # a face-crop image point (u, v down) is (a + c u, b + c v) in the hair square,
                  # so the player can draw the face from hair.mp4 too (one video, no sync)
@@ -326,51 +334,79 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
         "frontal_pct": round(100 * float(np.mean([abs(f.yaw) < 20 and abs(f.pitch) < 20 for f in infos[s0:s1]]))),
         "crop_px": side,
         "hair_pct": hair_pct,
+        "head_pct": head_pct,
     }
     return Prepared(out_dir, (s0 / fps, s1 / fps), len(order), fps, stats)
 
 
-def write_hair(hair_crops: list[bytes], order: list[int], fps: float, out_dir: str) -> float:
-    """hair.mp4: each loop frame's hair square on top, its hair mask (white = hair) below.
-    The mask is the segmenter's confidence, smoothed around the (circular) loop so it does not
-    flicker. Returns the mean hair share of the square, in percent."""
-    import cv2
-    import mediapipe as mp
-    from mediapipe.tasks.python import BaseOptions, vision
+def head_mask(hair: np.ndarray, classes: list[np.ndarray]) -> np.ndarray:
+    """The whole head (hair + face + neck, not clothes) from the multiclass segmenter's confidence
+    masks, never smaller than the hair mask — the hair segmenter has the finer hair edges."""
+    head = np.clip(sum(classes[k] for k in HEAD_CLASSES), 0, 1)
+    return np.maximum(hair, head)
 
-    seg = vision.ImageSegmenter.create_from_options(vision.ImageSegmenterOptions(
-        base_options=BaseOptions(model_asset_path=HAIR_MODEL_PATH), output_confidence_masks=True,
-        output_category_mask=False))
-    masks: list[np.ndarray] = []
-    try:
-        for jpg in hair_crops:
-            img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
-            r = seg.segment(mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
-            m = np.asarray(r.confidence_masks[-1].numpy_view(), np.float32).reshape(img.shape[:2])
-            masks.append((np.clip(m, 0, 1) * 255).astype(np.uint8))
-    finally:
-        seg.close()
+
+def smooth_masks(masks: list[np.ndarray], order: list[int], i: int) -> np.ndarray:
+    """Loop frame i's mask, smoothed around the (circular) loop so it does not flicker, uint8."""
+    import cv2
+
     n = len(order)
     radius, sigma = 3, SMOOTH_SIGMA
     weights = np.exp(-0.5 * (np.arange(-radius, radius + 1) / sigma) ** 2)
     weights /= weights.sum()
+    m = sum(wt * masks[order[(i + d) % n]].astype(np.float32) for d, wt in zip(range(-radius, radius + 1), weights))
+    return cv2.GaussianBlur(m, (0, 0), 1.5).astype(np.uint8)
+
+
+def write_hair(hair_crops: list[bytes], order: list[int], fps: float, out_dir: str) -> tuple[float, float]:
+    """hair.mp4: each loop frame's hair square on top, its masks below — red = hair (console#751),
+    green and blue = the whole head down to the collar (console#753). Old loops have a grey mask
+    (all three = hair), so `.r` is the hair either way. Masks are segmenter confidence, smoothed
+    around the loop. Returns the mean hair and head shares of the square, in percent."""
+    import cv2
+    import mediapipe as mp
+    from mediapipe.tasks.python import BaseOptions, vision
+
+    def segmenter(path):
+        return vision.ImageSegmenter.create_from_options(vision.ImageSegmenterOptions(
+            base_options=BaseOptions(model_asset_path=path), output_confidence_masks=True,
+            output_category_mask=False))
+
+    def as_u8(m):
+        return (np.clip(m, 0, 1) * 255).astype(np.uint8)
+
+    hair_seg, head_seg = segmenter(HAIR_MODEL_PATH), segmenter(HEAD_MODEL_PATH)
+    hairs: list[np.ndarray] = []
+    heads: list[np.ndarray] = []
+    try:
+        for jpg in hair_crops:
+            img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+            im = mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            shape = img.shape[:2]
+            hair = np.asarray(hair_seg.segment(im).confidence_masks[-1].numpy_view(), np.float32).reshape(shape)
+            classes = [np.asarray(c.numpy_view(), np.float32).reshape(shape) for c in head_seg.segment(im).confidence_masks]
+            hairs.append(as_u8(hair))
+            heads.append(as_u8(head_mask(hair, classes)))
+    finally:
+        hair_seg.close()
+        head_seg.close()
     s = HAIR_SIZE
     enc = subprocess.Popen(
         ["ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{s}x{2 * s}",
          "-r", str(fps), "-i", "-", *_codec_args(), "-pix_fmt", "yuv420p",
          "-movflags", "+faststart", os.path.join(out_dir, "hair.mp4")],
         stdin=subprocess.PIPE)
-    share = []
+    hair_share, head_share = [], []
     for i, k in enumerate(order):
-        m = sum(wt * masks[order[(i + d) % n]].astype(np.float32) for d, wt in zip(range(-radius, radius + 1), weights))
-        m = cv2.GaussianBlur(m, (0, 0), 1.5).astype(np.uint8)
-        share.append(float((m > 127).mean()))
+        hm, dm = smooth_masks(hairs, order, i), smooth_masks(heads, order, i)
+        hair_share.append(float((hm > 127).mean()))
+        head_share.append(float((dm > 127).mean()))
         img = cv2.imdecode(np.frombuffer(hair_crops[k], np.uint8), cv2.IMREAD_COLOR)
-        enc.stdin.write(np.vstack([img, cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)]).tobytes())
+        enc.stdin.write(np.vstack([img, np.dstack([dm, dm, hm])]).tobytes())  # BGR: head, head, hair
     enc.stdin.close()
     if enc.wait(timeout=600) != 0:
         raise RuntimeError("ffmpeg failed to encode the hair")
-    return round(100 * float(np.mean(share)), 1)
+    return round(100 * float(np.mean(hair_share)), 1), round(100 * float(np.mean(head_share)), 1)
 
 
 # --- Start-photo ranking (the Face loops tab's photo picker) ---------------------------------

@@ -99,6 +99,16 @@ class TestPrompt:
         assert hy + side / 2 < 430  # centred above the face box's centre
         assert prep.hair_window([(100, 100, 900, 950)], 1024, 1024)[2] == 1024
 
+    def test_head_mask_is_hair_face_and_neck_not_clothes(self):
+        # multiclass order: background, hair, body-skin, face-skin, clothes, others
+        one_hot = [np.eye(6, dtype=np.float32)[j][None] for j in range(6)]  # classes x (1 x 6 px)
+        hair = np.array([[0, 0.3, 0, 0, 0, 0]], np.float32)  # the hair model sees a faint strand
+        head = prep.head_mask(hair, one_hot)
+        np.testing.assert_allclose(head, [[0, 1, 1, 1, 0, 0]])
+        # never smaller than the hair mask: a strand the multiclass model calls background stays
+        hair = np.array([[0.8, 0, 0, 0, 0, 0]], np.float32)
+        assert prep.head_mask(hair, one_hot)[0, 0] == pytest.approx(0.8)
+
     def test_prompt_is_trigger_scene_motion_still(self):
         p = build_prompt("k3lly2026", "woman", PRESETS["calm"]["motion"])
         lines = p.split("\n")
