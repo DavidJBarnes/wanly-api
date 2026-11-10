@@ -9,6 +9,7 @@ import uuid
 
 import numpy as np
 import pytest
+from sqlalchemy import select
 from fastapi import BackgroundTasks, HTTPException
 from pydantic import ValidationError
 
@@ -190,6 +191,31 @@ class TestRoutes:
         with pytest.raises(HTTPException) as e:
             await fl.reprocess_loop(r.id, BackgroundTasks(), db=db)
         assert e.value.status_code == 409
+
+
+    async def test_retrying_an_old_failed_render_recrops_its_start(self, db, no_s3):
+        """#500: jobs made before the fix carry an 831x831 crop; both Retry paths re-crop it."""
+        from app.routes.segments import retry_segment
+
+        u, c = await _setup(db)
+        for via_loop in (True, False):
+            r = await fl.create_loop(c.name, FaceLoopCreate(start_image="s3://imgs/p.png"), user=u, db=db)
+            job = await db.get(Job, r.job_id)
+            job.width = job.height = 831
+            job.starting_image = "s3://old/crop.png"
+            seg = (await db.execute(select(Segment).where(Segment.job_id == job.id))).scalars().one()
+            seg.status, seg.error_message = SegmentStatus.FAILED, "422 width=831"
+            await db.flush()
+            if via_loop:
+                out = await fl.reprocess_loop(r.id, BackgroundTasks(), db=db)
+                assert out.status == "rendering"
+            else:
+                await retry_segment(seg.id, user=u, db=db)
+            await db.refresh(job)
+            await db.refresh(seg)
+            assert (job.width, job.height) == (1024, 1024)
+            assert job.starting_image == "s3://wanly-jobs/ar-face/kelly/starts/abc.png"
+            assert seg.status == SegmentStatus.PENDING and seg.error_message is None
 
 
 class TestPhotoScore:

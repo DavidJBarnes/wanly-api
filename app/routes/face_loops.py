@@ -172,6 +172,19 @@ async def _cropped_start(uri: str, character: str) -> tuple[str, int, int]:
     return await asyncio.to_thread(upload_bytes, png, key, settings.s3_jobs_bucket), w, h
 
 
+async def refresh_start_for_retry(db: AsyncSession, job: Job | None) -> None:
+    """Before a face-loop render is retried: jobs made before #500 can carry a start crop that
+    is not 64-divisible (831x831), which LTX's two-stage graph refuses on every retry. Re-crop
+    the chosen photo (now always START_SIZE²) onto the job. Other jobs are left alone."""
+    if job is None or (job.width % 64 == 0 and job.height % 64 == 0):
+        return
+    x = (await db.execute(select(FaceLoop).where(FaceLoop.job_id == job.id))).scalars().first()
+    if x is None:
+        return
+    name = (await db.execute(select(LtxCharacter.name).where(LtxCharacter.id == x.character_id))).scalar_one()
+    job.starting_image, job.width, job.height = await _cropped_start(x.start_image, name)
+
+
 @router.post("/ltx/characters/{key}/face-loops", response_model=FaceLoopResponse, status_code=201)
 async def create_loop(key: str, body: FaceLoopCreate, user: User = Depends(get_current_user),
                       db: AsyncSession = Depends(get_db)):
@@ -248,9 +261,20 @@ async def delete_loop(loop_id: uuid.UUID, db: AsyncSession = Depends(get_db)):
 @router.post("/face-loops/{loop_id}/reprocess", response_model=FaceLoopResponse,
              dependencies=[Depends(get_current_user)])
 async def reprocess_loop(loop_id: uuid.UUID, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):
-    """Run the preparation again on the finished render (after a failure, or a restart mid-way)."""
+    """Run the preparation again on the finished render (after a failure, or a restart mid-way).
+    If the render itself failed, queue the render again instead (re-cropping an old start)."""
     x = await _loop(db, loop_id)
     seg = (await db.execute(select(Segment).where(Segment.job_id == x.job_id, Segment.index == 0))).scalars().first()
+    if seg is not None and seg.status == SegmentStatus.FAILED and not seg.discarded:
+        from app.routes.segments import requeue_failed_segment
+
+        job = await db.get(Job, x.job_id)
+        await refresh_start_for_retry(db, job)
+        await requeue_failed_segment(db, seg, job)
+        x.status, x.error, x.updated_at = "rendering", None, datetime.now(timezone.utc)
+        await db.commit()
+        await db.refresh(x)
+        return (await _response(db, [x]))[0]
     if seg is None or seg.status != SegmentStatus.COMPLETED or not seg.output_path:
         raise HTTPException(status_code=409, detail="the render has not finished yet")
     x.status, x.error, x.updated_at = "processing", None, datetime.now(timezone.utc)

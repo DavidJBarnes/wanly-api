@@ -1679,6 +1679,18 @@ async def retry_segment(
             detail="This take was discarded. Restore it before retrying, or re-roll instead.",
         )
 
+    job = await db.get(Job, segment.job_id)
+    from app.routes.face_loops import refresh_start_for_retry
+
+    await refresh_start_for_retry(db, job)
+    await requeue_failed_segment(db, segment, job)
+    await db.commit()
+    await db.refresh(segment)
+    return segment
+
+
+async def requeue_failed_segment(db: AsyncSession, segment: Segment, job: Job) -> None:
+    """Put a failed segment back in the queue, in place (shared with the face-loop Retry)."""
     segment.status = SegmentStatus.PENDING
     segment.worker_id = None
     segment.worker_name = None
@@ -1686,14 +1698,8 @@ async def retry_segment(
     segment.completed_at = None
     segment.error_message = None
     segment.progress_log = None
-
-    job = await db.get(Job, segment.job_id)
     job.status = JobStatus.PENDING
     await place_queued_job(db, job)
-
-    await db.commit()
-    await db.refresh(segment)
-    return segment
 
 
 async def _held_segment(db: AsyncSession, segment_id: UUID, user: User) -> tuple[Segment, Job]:
