@@ -279,6 +279,7 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
 # the face ends up START_SIZE / START_FACE_SPAN px tall whatever the photo's resolution. A face
 # smaller than that in the photo gets upscaled (soft); bigger gives no further benefit.
 START_SIZE = 1024
+assert START_SIZE % 64 == 0, "LTX two-stage renders need sides divisible by 64"
 START_FACE_SPAN = 1.75  # crop side, in face heights (real_034: face 691 px in a 1024 frame)
 START_FACE_PX = START_SIZE / START_FACE_SPAN
 
@@ -332,8 +333,8 @@ def photo_detector():
 
 
 def crop_start(image_bytes: bytes, detector) -> tuple[bytes, int, int]:
-    """Crop a start photo to a face-centred square, START_FACE_SPAN face heights a side, at most
-    START_SIZE² (PNG). The render size derives from the start image (~1 MP), so an uncropped
+    """Crop a start photo to a face-centred square, START_FACE_SPAN face heights a side, resized to
+    exactly START_SIZE² (PNG). The render size derives from the start image (~1 MP), so an uncropped
     4000x3000 phone photo rendered the face at ~460 px; cropped, any good photo gives ~585+.
     Raises ValueError if there is no face."""
     import cv2
@@ -354,8 +355,11 @@ def crop_start(image_bytes: bytes, detector) -> tuple[bytes, int, int]:
     x0 = int(np.clip(c[0] - side / 2, 0, w - side))
     y0 = int(np.clip(c[1] - side * 0.48, 0, h - side))
     crop = img[y0:y0 + side, x0:x0 + side]
-    if side > START_SIZE:
-        crop = cv2.resize(crop, (START_SIZE, START_SIZE), interpolation=cv2.INTER_AREA)
+    # Always exactly START_SIZE²: the render size is the start image's, and LTX's two-stage graph
+    # (spatial upsampler) needs both sides divisible by 64. A smaller crop (831 px) was refused.
+    if side != START_SIZE:
+        interp = cv2.INTER_AREA if side > START_SIZE else cv2.INTER_CUBIC
+        crop = cv2.resize(crop, (START_SIZE, START_SIZE), interpolation=interp)
     ok, png = cv2.imencode(".png", crop)
     if not ok:
         raise ValueError("could not encode the cropped start photo")

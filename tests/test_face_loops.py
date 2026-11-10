@@ -193,6 +193,25 @@ class TestRoutes:
 
 
 class TestPhotoScore:
+    @pytest.mark.parametrize("size", [(700, 560), (3000, 4000)])
+    def test_start_crop_is_always_render_safe(self, size, monkeypatch):
+        import sys
+        from types import SimpleNamespace as NS
+
+        import cv2
+
+        # crop_start only uses mediapipe to wrap the image for the detector, which is faked here.
+        monkeypatch.setitem(sys.modules, "mediapipe", NS(Image=lambda **_: None, ImageFormat=NS(SRGB=1)))
+
+        w, h = size
+        lm = [NS(x=0.5, y=0.5) for _ in range(468)]
+        lm[10], lm[152] = NS(x=0.5, y=0.3), NS(x=0.5, y=0.7)
+        det = NS(detect=lambda _img: NS(face_landmarks=[lm]))
+        ok, jpg = cv2.imencode(".jpg", np.full((h, w, 3), 128, np.uint8))
+        png, cw, ch = prep.crop_start(jpg.tobytes(), det)
+        assert (cw, ch) == (prep.START_SIZE, prep.START_SIZE) and cw % 64 == 0
+        assert cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR).shape[:2] == (ch, cw)
+
     def test_face_size_counts_only_up_to_what_the_crop_uses(self):
         huge, _ = prep.photo_score(1647, 0.4, 13, 0, 0.002, 0.07, 480)
         enough, _ = prep.photo_score(prep.START_FACE_PX, 0.4, 13, 0, 0.002, 0.07, 480)
