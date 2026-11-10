@@ -75,6 +75,30 @@ class TestShape:
 
 
 class TestPrompt:
+    def test_hair_rows_map_stabilised_points_back_to_the_frame(self):
+        """console#751: a stabilised head point must land where that frame's pixel is."""
+        rng = np.random.default_rng(3)
+        size, face_box, hair_box = 768, (130, 90, 835), (0, 0, 1024)
+        ref = rng.uniform(100, 600, (468, 3)) * [1, -1, 1]
+        ang = 0.05
+        r = np.array([[math.cos(ang), -math.sin(ang), 0], [math.sin(ang), math.cos(ang), 0], [0, 0, 1]])
+        frame = (1.03 * (r @ ref.T)).T + [4, -6, 2]  # this frame's own landmark space
+        shapes = np.stack([ref, frame])
+        stab, _ = prep.stabilise(shapes)
+        centre = ref[prep.ANCHORS].mean(0)
+        sc, rr, t = prep.stabilise_transforms(shapes)[1]
+        rows = prep.hair_uv_rows(sc, rr, t, centre, face_box, hair_box, size)
+        uv = (rows @ np.c_[stab[1], np.ones(468)].T).T
+        sx, sy, side = face_box
+        want = np.c_[(sx + frame[:, 0] * side / size) / 1024, (sy - frame[:, 1] * side / size) / 1024]
+        assert np.abs(uv - want).max() < 1e-4
+
+    def test_hair_window_is_square_raised_and_inside(self):
+        hx, hy, side = prep.hair_window([(400, 300, 600, 560)], 1024, 1024)
+        assert side == 780 and 0 <= hx and hx + side <= 1024 and 0 <= hy and hy + side <= 1024
+        assert hy + side / 2 < 430  # centred above the face box's centre
+        assert prep.hair_window([(100, 100, 900, 950)], 1024, 1024)[2] == 1024
+
     def test_prompt_is_trigger_scene_motion_still(self):
         p = build_prompt("k3lly2026", "woman", PRESETS["calm"]["motion"])
         lines = p.split("\n")

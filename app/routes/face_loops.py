@@ -318,7 +318,7 @@ async def prepare_loop(loop_id: uuid.UUID) -> None:
                     out = os.path.join(tmp, "out")
                     result = await asyncio.to_thread(prepare, src, out)
                     prefix = f"ar-face/{_slug(c.name if c else 'character')}/{x.id}"
-                    for name in ("loop.mp4", "face.json", "face.bin", "poster.jpg"):
+                    for name in ("loop.mp4", "face.json", "face.bin", "poster.jpg", "hair.mp4", "hair.bin"):
                         await asyncio.to_thread(upload_file, os.path.join(out, name), f"{prefix}/{name}",
                                                 settings.s3_jobs_bucket)
                 x.asset_prefix = f"s3://{settings.s3_jobs_bucket}/{prefix}"

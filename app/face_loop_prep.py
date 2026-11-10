@@ -31,6 +31,11 @@ WINDOW_S = 3.0
 SIZE = 768  # source crops are ~850-900 px; 512 threw away detail David judged on
 FACE_MM = 190.0  # forehead-to-chin, for reporting travel in rough millimetres
 MODEL_PATH = os.environ.get("FACE_LANDMARKER_MODEL", "/app/models/face_landmarker.task")
+HAIR_MODEL_PATH = os.environ.get("HAIR_SEGMENTER_MODEL", "/app/models/hair_segmenter.tflite")
+# Hair (console#751): a wider square of the same render frames, cut out by MediaPipe's hair
+# segmenter, worn on a head shell in AR. HAIR_SPAN = the square's side in face-box sides.
+HAIR_SIZE = 768
+HAIR_SPAN = 3.0
 
 # Expression-free landmarks (eye corners, nose bridge, forehead, cheekbones, face sides):
 # aligning on these removes head motion without flattening the expression.
@@ -108,6 +113,43 @@ def stabilise(shapes: np.ndarray) -> tuple[np.ndarray, float]:
     out = np.stack(out)
     resid = float(np.mean([np.linalg.norm(q[ANCHORS] - ref[ANCHORS], axis=1).mean() for q in out]))
     return out - ref[ANCHORS].mean(0), resid
+
+
+def stabilise_transforms(shapes: np.ndarray) -> list[tuple[float, np.ndarray, np.ndarray]]:
+    """The per-frame (scale, R, t) stabilise() applies (frame -> frame 0, before centring)."""
+    ref = shapes[0]
+    return [umeyama(p[ANCHORS], ref[ANCHORS]) for p in shapes]
+
+
+def hair_window(boxes: list[tuple[float, float, float, float]], w: int, h: int, span: float = HAIR_SPAN):
+    """Square (x, y, side) for the hair: the face box's union, `span` times its side, raised so
+    the crown is in, clipped to the frame (kept square)."""
+    b = np.array(boxes)
+    x0, y0, x1, y1 = b[:, 0].min(), b[:, 1].min(), b[:, 2].max(), b[:, 3].max()
+    side = min(max(x1 - x0, y1 - y0) * span, w, h)
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2 - 0.1 * side
+    hx = int(np.clip(cx - side / 2, 0, w - side))
+    hy = int(np.clip(cy - side / 2, 0, h - side))
+    return hx, hy, int(side)
+
+
+def hair_uv_rows(sc: float, r: np.ndarray, t: np.ndarray, centre: np.ndarray, face_box: tuple[int, int, int],
+                 hair_box: tuple[int, int, int], size: int) -> np.ndarray:
+    """2x4 affine taking a STABILISED head point q (the face.bin space) to that frame's hair-image
+    coordinates (u right, v DOWN, 0..1 of the hair square).
+
+    stabilised q = sc R p + t - centre, so p = M q + b with M = Rᵀ/sc, b = M (centre - t); p is
+    the frame's own landmark space (x = px right, y = -px down, of the size² face crop), which
+    maps to render px as (sx + p.x k, sy - p.y k), k = side/size; then into the hair square.
+    """
+    sx, sy, side = face_box
+    hx, hy, hside = hair_box
+    m = r.T / sc
+    b = m @ (centre - t)
+    k = side / size / hside
+    row_u = np.append(k * m[0], (sx - hx) / hside + k * b[0])
+    row_v = np.append(-k * m[1], (sy - hy) / hside - k * b[1])
+    return np.stack([row_u, row_v]).astype(np.float32)
 
 
 def smooth_circular(a: np.ndarray, sigma: float = SMOOTH_SIGMA, radius: int = 3) -> np.ndarray:
@@ -196,17 +238,21 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
         raise ValueError("no stretch of the render keeps a detectable face for the whole window")
     s0, s1, _, travel = win
     sx, sy, side = square_box([f.box for f in infos[s0:s1]], w, h)
+    hx, hy, hside = hair_window([f.box for f in infos[s0:s1]], w, h)
 
     # 3. crops (JPEG-compressed in memory), ping-pong, encode
     cap = cv2.VideoCapture(video_path)
     cap.set(cv2.CAP_PROP_POS_FRAMES, s0)
     crops: list[bytes] = []
+    hair_crops: list[bytes] = []
     for _ in range(s1 - s0):
         ok, fr = cap.read()
         if not ok:
             break
         c = cv2.resize(fr[sy:sy + side, sx:sx + side], (size, size), interpolation=cv2.INTER_AREA)
         crops.append(cv2.imencode(".jpg", c, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes())
+        hc = cv2.resize(fr[hy:hy + hside, hx:hx + hside], (HAIR_SIZE, HAIR_SIZE), interpolation=cv2.INTER_AREA)
+        hair_crops.append(cv2.imencode(".jpg", hc, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes())
     cap.release()
     order = pingpong(len(crops))
     os.makedirs(out_dir, exist_ok=True)
@@ -240,8 +286,14 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
             shapes.append(np.array([(q.x * size, -q.y * size, -q.z * size) for q in p], np.float32))
     finally:
         det.close()
-    pos, resid = stabilise(np.stack(shapes))
+    raw = np.stack(shapes)
+    pos, resid = stabilise(raw)
     pos, uv = smooth_circular(pos), smooth_circular(np.stack(uvs))
+    centre = raw[0][ANCHORS].mean(0)
+    hair_rows = smooth_circular(np.stack([
+        hair_uv_rows(sc, r, t, centre, (sx, sy, side), (hx, hy, hside), size)
+        for sc, r, t in stabilise_transforms(raw)]))
+    hair_pct = write_hair(hair_crops, order, fps, out_dir)
 
     # 5. files
     with open(os.path.join(out_dir, "face.bin"), "wb") as f:
@@ -252,7 +304,16 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
         "anchors": ANCHORS, "units": f"px of the {size} crop, centred on the anchor centroid",
         "layout": "float32: positions[frames][468][3] then uvs[frames][468][2]",
         "anchorResidualPx": round(resid, 3),
+        # console#751: hair.mp4 is HAIR_SIZE wide, colour on top and the hair mask below;
+        # hair.bin maps a stabilised head point to the hair image per frame.
+        "hair": {"video": "hair.mp4", "size": HAIR_SIZE, "layout": "float32: rows[frames][2][4]",
+                 "uv": "u right, v down, 0..1 of the colour square",
+                 # a face-crop image point (u, v down) is (a + c u, b + c v) in the hair square,
+                 # so the player can draw the face from hair.mp4 too (one video, no sync)
+                 "faceToHair": [round((sx - hx) / hside, 6), round((sy - hy) / hside, 6), round(side / hside, 6)]},
     }
+    with open(os.path.join(out_dir, "hair.bin"), "wb") as f:
+        f.write(hair_rows.astype(np.float32).tobytes())
     with open(os.path.join(out_dir, "face.json"), "w") as f:
         json.dump(meta, f, indent=1)
     cv2.imwrite(os.path.join(out_dir, "poster.jpg"), cv2.imdecode(np.frombuffer(crops[0], np.uint8), cv2.IMREAD_COLOR))
@@ -264,8 +325,52 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
         "anchor_residual_px": round(resid, 2),
         "frontal_pct": round(100 * float(np.mean([abs(f.yaw) < 20 and abs(f.pitch) < 20 for f in infos[s0:s1]]))),
         "crop_px": side,
+        "hair_pct": hair_pct,
     }
     return Prepared(out_dir, (s0 / fps, s1 / fps), len(order), fps, stats)
+
+
+def write_hair(hair_crops: list[bytes], order: list[int], fps: float, out_dir: str) -> float:
+    """hair.mp4: each loop frame's hair square on top, its hair mask (white = hair) below.
+    The mask is the segmenter's confidence, smoothed around the (circular) loop so it does not
+    flicker. Returns the mean hair share of the square, in percent."""
+    import cv2
+    import mediapipe as mp
+    from mediapipe.tasks.python import BaseOptions, vision
+
+    seg = vision.ImageSegmenter.create_from_options(vision.ImageSegmenterOptions(
+        base_options=BaseOptions(model_asset_path=HAIR_MODEL_PATH), output_confidence_masks=True,
+        output_category_mask=False))
+    masks: list[np.ndarray] = []
+    try:
+        for jpg in hair_crops:
+            img = cv2.imdecode(np.frombuffer(jpg, np.uint8), cv2.IMREAD_COLOR)
+            r = seg.segment(mp.Image(image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(img, cv2.COLOR_BGR2RGB)))
+            m = np.asarray(r.confidence_masks[-1].numpy_view(), np.float32).reshape(img.shape[:2])
+            masks.append((np.clip(m, 0, 1) * 255).astype(np.uint8))
+    finally:
+        seg.close()
+    n = len(order)
+    radius, sigma = 3, SMOOTH_SIGMA
+    weights = np.exp(-0.5 * (np.arange(-radius, radius + 1) / sigma) ** 2)
+    weights /= weights.sum()
+    s = HAIR_SIZE
+    enc = subprocess.Popen(
+        ["ffmpeg", "-loglevel", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{s}x{2 * s}",
+         "-r", str(fps), "-i", "-", *_codec_args(), "-pix_fmt", "yuv420p",
+         "-movflags", "+faststart", os.path.join(out_dir, "hair.mp4")],
+        stdin=subprocess.PIPE)
+    share = []
+    for i, k in enumerate(order):
+        m = sum(wt * masks[order[(i + d) % n]].astype(np.float32) for d, wt in zip(range(-radius, radius + 1), weights))
+        m = cv2.GaussianBlur(m, (0, 0), 1.5).astype(np.uint8)
+        share.append(float((m > 127).mean()))
+        img = cv2.imdecode(np.frombuffer(hair_crops[k], np.uint8), cv2.IMREAD_COLOR)
+        enc.stdin.write(np.vstack([img, cv2.cvtColor(m, cv2.COLOR_GRAY2BGR)]).tobytes())
+    enc.stdin.close()
+    if enc.wait(timeout=600) != 0:
+        raise RuntimeError("ffmpeg failed to encode the hair")
+    return round(100 * float(np.mean(share)), 1)
 
 
 # --- Start-photo ranking (the Face loops tab's photo picker) ---------------------------------
@@ -282,6 +387,7 @@ START_SIZE = 1024
 assert START_SIZE % 64 == 0, "LTX two-stage renders need sides divisible by 64"
 START_FACE_SPAN = 1.75  # crop side, in face heights (real_034: face 691 px in a 1024 frame)
 START_FACE_PX = START_SIZE / START_FACE_SPAN
+START_HEAD_ROOM = 0.57  # face centre this far down the crop (0.5 = centred)
 
 
 def photo_score(face_px: float, yaw: float, pitch: float, roll: float, mouth: float, eyes: float, sharp: float) -> tuple[float, bool]:
@@ -353,7 +459,9 @@ def crop_start(image_bytes: bytes, detector) -> tuple[bytes, int, int]:
     c = (top + chin) / 2
     side = int(min(fh * START_FACE_SPAN, w, h))
     x0 = int(np.clip(c[0] - side / 2, 0, w - side))
-    y0 = int(np.clip(c[1] - side * 0.48, 0, h - side))
+    # 0.57, not 0.48 (console#751): the crop's top sits ~0.5 face heights above the forehead
+    # landmark, so the whole head (crown included) is in the render for the hair.
+    y0 = int(np.clip(c[1] - side * START_HEAD_ROOM, 0, h - side))
     crop = img[y0:y0 + side, x0:x0 + side]
     # Always exactly START_SIZE²: the render size is the start image's, and LTX's two-stage graph
     # (spatial upsampler) needs both sides divisible by 64. A smaller crop (831 px) was refused.
