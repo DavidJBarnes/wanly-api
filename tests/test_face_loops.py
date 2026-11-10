@@ -303,3 +303,36 @@ class TestPhotoCandidates:
         await db.flush()
         got = await fl.candidate_photos(db, c)
         assert sorted(got) == ["s3://i/a.png", "s3://i/real_034.png", "s3://i/shared.png"]
+
+
+class TestLoopWrap:
+    """wanly-api#505: soft turnarounds, rare file wraps, clipped crowns flagged."""
+
+    def test_window_with_still_ends_beats_one_moving_at_its_ends(self):
+        n = 72
+        # same expression range; one peaks mid-window (still at the ends), one sweeps through its ends
+        still = [_frame(jaw=0.01 * (1 - math.cos(2 * math.pi * i / (n - 1))) / 2) for i in range(n)]
+        moving = [_frame(jaw=0.01 * (2 * i / (n - 1) - 1)) for i in range(n)]
+        assert prep.end_speed(still) < prep.end_speed(moving)
+        assert prep.window_score(still)[0] > prep.window_score(moving)[0]
+
+    def test_crown_clip_reads_the_top_rows(self):
+        m = np.zeros((100, 100), np.uint8)
+        m[40:, 30:70] = 255
+        assert prep.crown_clip(m) == 0
+        m[:, 30:70] = 255
+        assert prep.crown_clip(m) == pytest.approx(0.4)
+
+    def test_repeat_file_concatenates_without_reencoding(self, tmp_path):
+        import shutil
+        import subprocess
+        if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+            pytest.skip("no ffmpeg")
+        f = str(tmp_path / "loop.mp4")
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=24:duration=1",
+                        "-pix_fmt", "yuv420p", f], check=True)
+        prep.repeat_file(f, 3)
+        frames = subprocess.run(["ffprobe", "-v", "error", "-count_frames", "-select_streams", "v:0", "-show_entries",
+                                 "stream=nb_read_frames", "-of", "csv=p=0", f], capture_output=True, text=True).stdout
+        assert int(frames) == 72
+        assert not (tmp_path / "loop.mp4.one.mp4").exists()
