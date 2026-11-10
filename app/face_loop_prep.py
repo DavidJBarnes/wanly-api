@@ -49,6 +49,13 @@ ANCHORS = [33, 133, 362, 263, 168, 6, 197, 195, 5, 4, 1, 10, 151, 9, 8, 116, 345
 # Chin, mouth corners, lips: how much the expression moves the jaw/mouth.
 EXPRESSION = [152, 61, 291, 13, 14]
 SMOOTH_SIGMA = 1.2
+# wanly-api#505: the headset's video player stalls a few frames when a file wraps back to its
+# start, so each file holds REPEATS ping-pong cycles (the data stays one cycle; the player
+# indexes frames modulo it). And a window whose ends are still turns round softly instead of
+# bouncing: END_FRAMES at each end are scored for speed, END_MM_S is the speed that halves it.
+REPEATS = 3
+END_FRAMES = 4
+END_MM_S = 10.0
 
 
 @dataclass
@@ -79,7 +86,17 @@ def window_score(frames: list[FrameInfo]) -> tuple[float, float]:
     travel = float(np.linalg.norm(ex - ex.mean(0), axis=2).max() * FACE_MM)
     frontal = float(((np.abs(yaw) < 20) & (np.abs(pitch) < 20)).mean())
     score = px.mean() * frontal / (1 + yaw.std() / 5 + pitch.std() / 5) / (1 + travel / 4)
-    return float(score), travel
+    return float(score) / (1 + end_speed(frames) / END_MM_S), travel
+
+
+def end_speed(frames: list[FrameInfo], fps: float = 24.0) -> float:
+    """Expression speed (rough mm/s) over the first and last END_FRAMES — the ping-pong turns
+    round there, so motion at full speed reads as a bounce."""
+    if len(frames) < 2 * END_FRAMES:
+        return 0.0
+    ex = np.stack([f.expr for f in frames]) * FACE_MM
+    step = np.linalg.norm(np.diff(ex, axis=0), axis=2).max(axis=1)  # worst point, per frame
+    return float(max(step[:END_FRAMES - 1].mean(), step[-(END_FRAMES - 1):].mean()) * fps)
 
 
 def best_window(frames: list[FrameInfo], fps: float, window_s: float = WINDOW_S, step: int = 2):
@@ -156,6 +173,19 @@ def hair_uv_rows(sc: float, r: np.ndarray, t: np.ndarray, centre: np.ndarray, fa
     row_u = np.append(k * m[0], (sx - hx) / hside + k * b[0])
     row_v = np.append(-k * m[1], (sy - hy) / hside - k * b[1])
     return np.stack([row_u, row_v]).astype(np.float32)
+
+
+def repeat_file(path: str, repeats: int = REPEATS) -> None:
+    """Rewrite an encoded loop as `repeats` back-to-back copies (stream copy, no re-encode)."""
+    if repeats <= 1:
+        return
+    tmp = path + ".one.mp4"
+    os.replace(path, tmp)
+    try:
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-stream_loop", str(repeats - 1), "-i", tmp,
+                        "-c", "copy", "-movflags", "+faststart", path], check=True, timeout=600)
+    finally:
+        os.remove(tmp)
 
 
 def smooth_circular(a: np.ndarray, sigma: float = SMOOTH_SIGMA, radius: int = 3) -> np.ndarray:
@@ -272,6 +302,7 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
     enc.stdin.close()
     if enc.wait(timeout=600) != 0:
         raise RuntimeError("ffmpeg failed to encode the loop")
+    repeat_file(os.path.join(out_dir, "loop.mp4"))
 
     # 4. landmarks on the encoded frames: UVs + 3D shape
     det = detector(False)
@@ -299,14 +330,14 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
     hair_rows = smooth_circular(np.stack([
         hair_uv_rows(sc, r, t, centre, (sx, sy, side), (hx, hy, hside), size)
         for sc, r, t in stabilise_transforms(raw)]))
-    hair_pct, head_pct = write_hair(hair_crops, order, fps, out_dir)
+    hair_pct, head_pct, crown_clip_pct = write_hair(hair_crops, order, fps, out_dir)
 
     # 5. files
     with open(os.path.join(out_dir, "face.bin"), "wb") as f:
         f.write(pos.astype(np.float32).tobytes())
         f.write(uv.astype(np.float32).tobytes())
     meta = {
-        "fps": fps, "size": size, "frames": len(order), "pingpong": True, "vertices": 468,
+        "fps": fps, "size": size, "frames": len(order), "pingpong": True, "repeats": REPEATS, "vertices": 468,
         "anchors": ANCHORS, "units": f"px of the {size} crop, centred on the anchor centroid",
         "layout": "float32: positions[frames][468][3] then uvs[frames][468][2]",
         "anchorResidualPx": round(resid, 3),
@@ -335,6 +366,8 @@ def prepare(video_path: str, out_dir: str, size: int = SIZE) -> Prepared:
         "crop_px": side,
         "hair_pct": hair_pct,
         "head_pct": head_pct,
+        "crown_clip_pct": crown_clip_pct,
+        "end_speed_mm_s": round(end_speed(infos[s0:s1], fps), 1),
     }
     return Prepared(out_dir, (s0 / fps, s1 / fps), len(order), fps, stats)
 
@@ -358,11 +391,18 @@ def smooth_masks(masks: list[np.ndarray], order: list[int], i: int) -> np.ndarra
     return cv2.GaussianBlur(m, (0, 0), 1.5).astype(np.uint8)
 
 
-def write_hair(hair_crops: list[bytes], order: list[int], fps: float, out_dir: str) -> tuple[float, float]:
+def crown_clip(head: np.ndarray) -> float:
+    """Share of the square's top rows that is head (uint8 mask): hair running off the top edge,
+    which the player can only fill by stretching the edge. 0 = the crown is in."""
+    return float((head[:3] > 127).mean())
+
+
+def write_hair(hair_crops: list[bytes], order: list[int], fps: float, out_dir: str) -> tuple[float, float, float]:
     """hair.mp4: each loop frame's hair square on top, its masks below — red = hair (console#751),
     green and blue = the whole head down to the collar (console#753). Old loops have a grey mask
     (all three = hair), so `.r` is the hair either way. Masks are segmenter confidence, smoothed
-    around the loop. Returns the mean hair and head shares of the square, in percent."""
+    around the loop. Returns the mean hair and head shares of the square and the crown clip
+    (crown_clip), in percent. The frames are written REPEATS times (wanly-api#505)."""
     import cv2
     import mediapipe as mp
     from mediapipe.tasks.python import BaseOptions, vision
@@ -396,17 +436,20 @@ def write_hair(hair_crops: list[bytes], order: list[int], fps: float, out_dir: s
          "-r", str(fps), "-i", "-", *_codec_args(), "-pix_fmt", "yuv420p",
          "-movflags", "+faststart", os.path.join(out_dir, "hair.mp4")],
         stdin=subprocess.PIPE)
-    hair_share, head_share = [], []
+    hair_share, head_share, clip = [], [], []
     for i, k in enumerate(order):
         hm, dm = smooth_masks(hairs, order, i), smooth_masks(heads, order, i)
         hair_share.append(float((hm > 127).mean()))
         head_share.append(float((dm > 127).mean()))
+        clip.append(crown_clip(dm))
         img = cv2.imdecode(np.frombuffer(hair_crops[k], np.uint8), cv2.IMREAD_COLOR)
         enc.stdin.write(np.vstack([img, np.dstack([dm, dm, hm])]).tobytes())  # BGR: head, head, hair
     enc.stdin.close()
     if enc.wait(timeout=600) != 0:
         raise RuntimeError("ffmpeg failed to encode the hair")
-    return round(100 * float(np.mean(hair_share)), 1), round(100 * float(np.mean(head_share)), 1)
+    repeat_file(os.path.join(out_dir, "hair.mp4"))
+    return (round(100 * float(np.mean(hair_share)), 1), round(100 * float(np.mean(head_share)), 1),
+            round(100 * float(np.mean(clip)), 1))
 
 
 # --- Start-photo ranking (the Face loops tab's photo picker) ---------------------------------
