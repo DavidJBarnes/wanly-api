@@ -24,7 +24,7 @@ from app.config import settings
 from app.database import get_db
 from app.routes.captions import caption_image_bytes
 from app.seeds import new_seed
-from app import caption_hold
+from app import caption_hold, enhance_hold
 from app.queue_position import place_queued_job
 from app.enums import SEGMENT_HELD, JobStatus, SegmentStatus, VideoStatus, WorkerKind, worker_can
 from app.ltx_stack import LTX_STACK
@@ -93,7 +93,7 @@ router = APIRouter()
 
 
 SCENE_PLACEHOLDER = "<SCENE>"
-PROMPT_PLACEHOLDER = "<PROMPT>"
+PROMPT_PLACEHOLDER = enhance_hold.PROMPT_PLACEHOLDER
 
 
 async def _resolve_scene(db: AsyncSession, prompt: str, image_uri: str | None,
@@ -1070,6 +1070,10 @@ async def claim_next_segment(
                 Segment.reprocess_type.in_(_CPU_REPROCESS_TYPES),
             ),
         )
+    # Not while its <PROMPT> image is still being enhanced, or failed to be (wanly-api#507):
+    # the claim would drop the placeholder and render without the prompt the job was made for.
+    if kind != "hologram":
+        where = (*where, *enhance_hold.claim_gate())
     # A hologram worker is no render worker, so _model_gate refuses it everything -- which is
     # right for every kind of work but the one it exists for.
     gate = (() if kind == "hologram" and makes_holograms else _model_gate(claiming_worker))

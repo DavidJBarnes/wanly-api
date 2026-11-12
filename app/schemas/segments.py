@@ -110,6 +110,10 @@ class SegmentResponse(BaseModel):
     # A caption-held segment (console#562): the image its caption comes from, and -- while it
     # is awaiting_caption -- what the hold is doing right now and where the image sits in the
     # caption queue. Computed per request by the job detail route, like blocked_reason.
+    # Held on its <PROMPT> image's enhance (wanly-api#507): "queued" (in the enhancer's line)
+    # or "failed" (no enhanced prompt, last try failed). blocked_reason has the words. Job
+    # detail only, like blocked_reason.
+    enhance_wait: Optional[str] = None
     caption_image: Optional[str] = None
     caption_wait: Optional[str] = None
     # Structured: the halves still missing (["scene"] or []) and the image's place in the
