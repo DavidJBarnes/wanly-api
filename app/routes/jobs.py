@@ -17,7 +17,7 @@ from sqlalchemy import or_
 from app.auth import get_current_user, verify_api_key_or_bearer
 from app.config import settings
 from app.database import get_db
-from app import caption_hold
+from app import caption_hold, enhance_hold
 from app.enums import JOB_VALID_TRANSITIONS, SEGMENT_HELD, JobStatus, SegmentStatus, VideoStatus
 from app.regularization import REG_PRIORITY_BASE
 from app.render_size import RECIPE_SQL, render_size, renders_through_recipe
@@ -32,7 +32,7 @@ from app.model_requirements import (
 )
 from app.routes.segments import (
     _refuse_draft_submit, _refuse_empty_submit, _resolve_trigger, _resolve_wildcards_outside_scene,
-    _strip_legacy_motion,
+    _prompt_image, _strip_legacy_motion,
 )
 from app.s3 import delete_object, delete_prefix, delete_prefix_except, upload_bytes
 from app.tag_filter import like_escape, tag_clause, tag_prefix_clause
@@ -781,6 +781,36 @@ async def _annotate_blocked(db: AsyncSession, segments, seg_responses) -> None:
             response.blocked_reason = f"No online worker can load {describe(min(misses, key=len))}"
 
 
+async def _annotate_enhance_wait(db: AsyncSession, job: Job, segments, seg_responses) -> None:
+    """Say when a PENDING segment is held on its <PROMPT> image's enhance (wanly-api#507).
+
+    The claim skips it (enhance_hold.claim_gate); without this it would sit PENDING beside an
+    idle fleet looking like an empty queue. Overrides a model blocked_reason: the enhance is
+    the nearer wait, and the model one is still reported once it clears.
+    """
+    pending = [s for s in segments
+               if s.status == SegmentStatus.PENDING and not s.discarded
+               and enhance_hold.wants(s.prompt)]
+    if not pending:
+        return
+    paths = {s.id: _prompt_image(s, job, s.start_image or job.starting_image) for s in pending}
+    metas = await _metas(db, paths.values())
+    queued = (await db.execute(
+        select(ImageMeta.path).where(ImageMeta.enhance_queued_at.is_not(None))
+        .order_by(ImageMeta.enhance_queued_at, ImageMeta.path))).scalars().all()
+    by_id = {sr.id: sr for sr in seg_responses}
+    for seg in pending:
+        path = paths[seg.id]
+        meta = metas.get(path) if path else None
+        st = enhance_hold.state(meta)
+        sr = by_id.get(seg.id)
+        if st is None or sr is None:
+            continue
+        position = queued.index(path) + 1 if path in queued else None
+        sr.enhance_wait = st
+        sr.blocked_reason = enhance_hold.reason(st, meta, path, position, len(queued))
+
+
 
 @router.get("/jobs/{job_id}", response_model=JobDetailResponse)
 async def get_job(
@@ -827,6 +857,7 @@ async def get_job(
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
     await _annotate_blocked(db, segments, seg_responses)
+    await _annotate_enhance_wait(db, job, segments, seg_responses)
     caption_hold_state = _annotate_held(job, segments, seg_responses,
                                         await _held_metas(db, job, segments))
     render_width, render_height = _job_render_size(
@@ -985,6 +1016,7 @@ async def reopen_job(
         seg_responses = [SegmentResponse.model_validate(s) for s in segments]
 
     await _annotate_blocked(db, segments, seg_responses)
+    await _annotate_enhance_wait(db, job, segments, seg_responses)
     caption_hold_state = _annotate_held(job, segments, seg_responses,
                                         await _held_metas(db, job, segments))
     render_width, render_height = _job_render_size(
